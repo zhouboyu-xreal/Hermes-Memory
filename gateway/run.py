@@ -3941,6 +3941,10 @@ class GatewayRunner:
                     return await self._handle_profile_command(event)
                 if _cmd_def_inner.name == "mydata":
                     return await self._handle_mydata_command(event)
+                if _cmd_def_inner.name == "memory":
+                    return await self._handle_memory_command(event)
+                if _cmd_def_inner.name == "remember":
+                    return await self._handle_remember_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
 
@@ -4135,6 +4139,12 @@ class GatewayRunner:
 
         if canonical == "mydata":
             return await self._handle_mydata_command(event)
+
+        if canonical == "memory":
+            return await self._handle_memory_command(event)
+
+        if canonical == "remember":
+            return await self._handle_remember_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -5885,13 +5895,175 @@ class GatewayRunner:
                 content = entry.content.replace("\n", " ").strip()
                 if len(content) > 220:
                     content = content[:217] + "..."
-                lines.append(f"{idx}. `{entry.id}` — {content}")
+                lines.append(f"{idx}. [{entry.kind}] {content}")
             if len(memories) > 10:
                 lines.append(f"... and {len(memories) - 10} more.")
         else:
             lines.append("No separate UI-managed memories are stored yet.")
 
         return "\n".join(lines)
+
+    async def _handle_memory_command(self, event: MessageEvent) -> str:
+        """Handle gateway /memory management commands."""
+        raw_args = event.get_command_args().strip()
+        if not raw_args:
+            return self._memory_help_text()
+
+        command, _, remainder = raw_args.partition(" ")
+        subcommand = command.strip().lower()
+        args = remainder.strip()
+
+        if subcommand in {"help", "-h", "--help"}:
+            return self._memory_help_text()
+        if subcommand in {"list", "ls"}:
+            return self._format_gateway_memory_entries(
+                self._gateway_memory_store().list_entries(event.source),
+                title="Your saved memories",
+            )
+        if subcommand in {"search", "find"}:
+            if not args:
+                return "Usage: /memory search <text>"
+            return self._format_gateway_memory_entries(
+                self._gateway_memory_store().search_entries(event.source, args),
+                title=f"Memory search: {args}",
+            )
+        if subcommand in {"add", "save"}:
+            if not args:
+                return "Usage: /memory add <memory>"
+            return self._save_gateway_memory(event, args, source_label="gateway:/memory")
+        if subcommand in {"delete", "del", "remove", "rm"}:
+            if not args:
+                return "Usage: /memory delete <search text>"
+            return self._delete_gateway_memory_by_query(event, args)
+        if subcommand in {"edit", "update"}:
+            return "Editing memories is not available in Feishu. Delete and add a replacement memory instead."
+
+        return f"Unknown /memory subcommand: {subcommand}\n\n{self._memory_help_text()}"
+
+    async def _handle_remember_command(self, event: MessageEvent) -> str:
+        content = event.get_command_args().strip()
+        if not content:
+            return "Usage: /remember <memory>"
+        return self._save_gateway_memory(event, content, source_label="gateway:/remember")
+
+    def _delete_gateway_memory_by_query(self, event: MessageEvent, query: str) -> str:
+        store = self._gateway_memory_store()
+        matches = store.search_entries(event.source, query)
+        if not matches:
+            return f"No saved memory matched `{query}`."
+        if len(matches) == 1:
+            return self._delete_gateway_memory(event, matches[0].id)
+        return (
+            "Multiple memories matched. Use a more specific keyword.\n\n"
+            + self._format_gateway_memory_entries(matches, title=f"Matches for: {query}")
+        )
+
+    def _gateway_memory_store(self):
+        from gateway.user_memory import GatewayUserMemoryStore
+
+        return GatewayUserMemoryStore()
+
+    def _gateway_memory_session_key(self, event: MessageEvent) -> str | None:
+        try:
+            return self.session_store.get_or_create_session(event.source).session_key
+        except Exception:
+            try:
+                return build_session_key(event.source)
+            except Exception:
+                return None
+
+    def _save_gateway_memory(
+        self,
+        event: MessageEvent,
+        content: str,
+        *,
+        source_label: str,
+        kind: str = "fact",
+    ) -> str:
+        from gateway.user_memory import apply_builtin_gateway_memory
+
+        store = self._gateway_memory_store()
+        try:
+            entry = store.add_entry(
+                event.source,
+                content,
+                kind=kind,
+                source_label=source_label,
+            )
+        except ValueError as exc:
+            return str(exc)
+
+        result = apply_builtin_gateway_memory(
+            event.source,
+            session_key=self._gateway_memory_session_key(event),
+            action="add",
+            target="user",
+            content=entry.content,
+        )
+        if not result.get("success"):
+            store.delete_entry(event.source, entry.id)
+            return f"Could not save memory: {result.get('error') or 'unknown error'}"
+
+        return (
+            f"Saved memory: {entry.content}\n\n"
+            "Note: the current agent session may keep its old memory snapshot. "
+            "Use /new to force a fresh memory snapshot."
+        )
+
+    def _delete_gateway_memory(self, event: MessageEvent, entry_id: str) -> str:
+        from gateway.user_memory import apply_builtin_gateway_memory
+
+        store = self._gateway_memory_store()
+        entry = store.get_entry(event.source, entry_id)
+        if entry is None:
+            return f"No saved memory found with id `{entry_id}`."
+
+        builtin_result = apply_builtin_gateway_memory(
+            event.source,
+            session_key=self._gateway_memory_session_key(event),
+            action="remove",
+            target="user",
+            old_text=entry.content,
+        )
+        deleted = store.delete_entry(event.source, entry_id)
+        if deleted is None:
+            return f"No saved memory found with id `{entry_id}`."
+
+        if not builtin_result.get("success") and "No entry matched" not in str(builtin_result.get("error", "")):
+            return (
+                f"Deleted managed memory `{entry_id}`, but the built-in memory update failed: "
+                f"{builtin_result.get('error') or 'unknown error'}"
+            )
+        return (
+            f"Deleted memory: {deleted.content}\n\n"
+            "Use /new if you need the current agent session to drop any old memory snapshot."
+        )
+
+    @staticmethod
+    def _format_gateway_memory_entries(entries, *, title: str) -> str:
+        lines = [f"**{title}**"]
+        if not entries:
+            lines.append("No saved memories.")
+            return "\n".join(lines)
+        for entry in entries[:20]:
+            preview = entry.content.replace("\n", " ").strip()
+            if len(preview) > 260:
+                preview = preview[:257] + "..."
+            lines.append(f"- [{entry.kind}] {preview}")
+        if len(entries) > 20:
+            lines.append(f"... and {len(entries) - 20} more.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _memory_help_text() -> str:
+        return "\n".join([
+            "**Memory commands**",
+            "/memory list",
+            "/memory search <text>",
+            "/memory add <memory>",
+            "/memory delete <search text>",
+            "/remember <memory>",
+        ])
 
     @staticmethod
     def _format_epoch_for_gateway(value: Any) -> str:

@@ -12,8 +12,10 @@ import json
 import re
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from gateway.config import Platform
 from gateway.session import SessionSource
@@ -28,6 +30,8 @@ _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 class GatewayUserMemoryEntry:
     id: str
     content: str
+    kind: str = "fact"
+    confidence: float = 1.0
     created_at: str = ""
     updated_at: str = ""
     source: str = ""
@@ -94,12 +98,129 @@ class GatewayUserMemoryStore:
                 GatewayUserMemoryEntry(
                     id=str(item.get("id") or f"mem-{idx}"),
                     content=content,
+                    kind=str(item.get("kind") or "fact"),
+                    confidence=_coerce_confidence(item.get("confidence")),
                     created_at=str(item.get("created_at") or ""),
                     updated_at=str(item.get("updated_at") or ""),
                     source=str(item.get("source") or ""),
                 )
             )
         return entries
+
+    def get_entry(
+        self,
+        source: SessionSource | None,
+        entry_id: str,
+    ) -> GatewayUserMemoryEntry | None:
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return None
+        for entry in self.list_entries(source):
+            if entry.id == entry_id:
+                return entry
+        return None
+
+    def search_entries(
+        self,
+        source: SessionSource | None,
+        query: str,
+    ) -> list[GatewayUserMemoryEntry]:
+        query = str(query or "").strip().lower()
+        if not query:
+            return self.list_entries(source)
+        return [
+            entry
+            for entry in self.list_entries(source)
+            if query in entry.id.lower()
+            or query in entry.content.lower()
+            or query in entry.kind.lower()
+        ]
+
+    def add_entry(
+        self,
+        source: SessionSource | None,
+        content: str,
+        *,
+        kind: str = "fact",
+        source_label: str = "gateway",
+    ) -> GatewayUserMemoryEntry:
+        content = str(content or "").strip()
+        if not content:
+            raise ValueError("Memory content cannot be empty.")
+
+        entries = self.list_entries(source)
+        for existing in entries:
+            if existing.content == content:
+                return existing
+
+        now = _now_iso()
+        entry = GatewayUserMemoryEntry(
+            id=_new_memory_id(),
+            content=content,
+            kind=_normalize_kind(kind),
+            confidence=1.0,
+            created_at=now,
+            updated_at=now,
+            source=source_label,
+        )
+        entries.append(entry)
+        self.save_entries(source, entries)
+        return entry
+
+    def update_entry(
+        self,
+        source: SessionSource | None,
+        entry_id: str,
+        content: str,
+        *,
+        kind: str | None = None,
+    ) -> tuple[GatewayUserMemoryEntry | None, GatewayUserMemoryEntry | None]:
+        content = str(content or "").strip()
+        if not content:
+            raise ValueError("Memory content cannot be empty.")
+
+        entries = self.list_entries(source)
+        updated_entries: list[GatewayUserMemoryEntry] = []
+        old_entry: GatewayUserMemoryEntry | None = None
+        new_entry: GatewayUserMemoryEntry | None = None
+        for entry in entries:
+            if entry.id == entry_id:
+                old_entry = entry
+                new_entry = GatewayUserMemoryEntry(
+                    id=entry.id,
+                    content=content,
+                    kind=_normalize_kind(kind or entry.kind),
+                    confidence=entry.confidence,
+                    created_at=entry.created_at,
+                    updated_at=_now_iso(),
+                    source=entry.source,
+                )
+                updated_entries.append(new_entry)
+            else:
+                updated_entries.append(entry)
+
+        if old_entry is None:
+            return None, None
+        self.save_entries(source, updated_entries)
+        return old_entry, new_entry
+
+    def delete_entry(
+        self,
+        source: SessionSource | None,
+        entry_id: str,
+    ) -> GatewayUserMemoryEntry | None:
+        entries = self.list_entries(source)
+        kept: list[GatewayUserMemoryEntry] = []
+        deleted: GatewayUserMemoryEntry | None = None
+        for entry in entries:
+            if entry.id == entry_id:
+                deleted = entry
+            else:
+                kept.append(entry)
+        if deleted is None:
+            return None
+        self.save_entries(source, kept)
+        return deleted
 
     def save_entries(self, source: SessionSource | None, entries: list[GatewayUserMemoryEntry]) -> None:
         """Persist entries for future management flows."""
@@ -110,6 +231,8 @@ class GatewayUserMemoryStore:
                 {
                     "id": entry.id,
                     "content": entry.content,
+                    "kind": entry.kind,
+                    "confidence": entry.confidence,
                     "created_at": entry.created_at,
                     "updated_at": entry.updated_at,
                     "source": entry.source,
@@ -129,6 +252,27 @@ class GatewayUserMemoryStore:
             except OSError:
                 pass
             raise
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _new_memory_id() -> str:
+    return f"mem-{uuid4().hex[:8]}"
+
+
+def _normalize_kind(kind: str) -> str:
+    value = str(kind or "fact").strip().lower()
+    return value if value else "fact"
+
+
+def _coerce_confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(1.0, max(0.0, confidence))
 
 
 def gateway_builtin_memory_dir(
@@ -172,3 +316,34 @@ def load_builtin_gateway_memory(
     store = MemoryStore(memory_dir=memory_dir)
     store.load_from_disk()
     return list(store.user_entries), list(store.memory_entries)
+
+
+def apply_builtin_gateway_memory(
+    source: SessionSource | None,
+    *,
+    session_key: str | None = None,
+    action: str,
+    content: str | None = None,
+    old_text: str | None = None,
+    target: str = "user",
+) -> dict[str, Any]:
+    """Apply a built-in memory action to this gateway user's isolated files."""
+    memory_dir = gateway_builtin_memory_dir(source, session_key=session_key)
+    if memory_dir is None:
+        return {"success": False, "error": "No gateway user memory scope is available."}
+
+    from tools.memory_tool import memory_tool, MemoryStore
+
+    store = MemoryStore(memory_dir=memory_dir)
+    store.load_from_disk()
+    raw = memory_tool(
+        action=action,
+        target=target,
+        content=content,
+        old_text=old_text,
+        store=store,
+    )
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"success": False, "error": raw}

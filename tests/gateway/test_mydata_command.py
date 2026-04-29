@@ -98,7 +98,8 @@ async def test_mydata_command_shows_user_scoped_memory(tmp_path, monkeypatch):
     assert "Your Hermes Data" in result
     assert "on_union_1" in result
     assert "sess-1" in result
-    assert "mem-1" in result
+    assert "mem-1" not in result
+    assert "UI 管理记忆" in result
     assert "代码证据" in result
     assert "飞书中使用 /mydata" in result
     assert "sess-other" not in result
