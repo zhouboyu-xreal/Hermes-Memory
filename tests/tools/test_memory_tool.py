@@ -207,6 +207,26 @@ class TestMemoryStorePersistence:
         store.load_from_disk()
         assert len(store.memory_entries) == 2
 
+    def test_custom_memory_dir_is_instance_scoped(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path / "global")
+
+        first = MemoryStore(memory_dir=tmp_path / "feishu_user_a")
+        second = MemoryStore(memory_dir=tmp_path / "feishu_user_b")
+        first.load_from_disk()
+        second.load_from_disk()
+
+        first.add("user", "Name: Alice")
+        second.add("user", "Name: Bob")
+
+        reloaded_first = MemoryStore(memory_dir=tmp_path / "feishu_user_a")
+        reloaded_second = MemoryStore(memory_dir=tmp_path / "feishu_user_b")
+        reloaded_first.load_from_disk()
+        reloaded_second.load_from_disk()
+
+        assert reloaded_first.user_entries == ["Name: Alice"]
+        assert reloaded_second.user_entries == ["Name: Bob"]
+        assert not (tmp_path / "global" / "USER.md").exists()
+
 
 class TestMemoryStoreSnapshot:
     def test_snapshot_frozen_at_load(self, store):

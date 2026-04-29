@@ -54,6 +54,40 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 
 
+def _gateway_memory_dir(
+    *,
+    platform: Optional[str],
+    user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    gateway_session_key: Optional[str] = None,
+) -> Optional[Path]:
+    """Return a per-user memory directory for gateway-origin conversations.
+
+    Built-in memory files are otherwise profile-global. For messaging
+    platforms, that means one user's USER.md facts can be injected into
+    another user's session. Scope gateway memories by the gateway session key
+    first, because the gateway also caches AIAgent instances by that key. The
+    session key already includes Feishu/Lark user_id_alt (union_id) when
+    per-user group isolation is enabled.
+    """
+    platform_key = (platform or "").strip().lower()
+    if not platform_key or platform_key in {"cli", "local"}:
+        return None
+
+    stable_identity = (
+        (gateway_session_key or "").strip()
+        or (user_id_alt or "").strip()
+        or (user_id or "").strip()
+        or (chat_id or "").strip()
+    )
+    if not stable_identity:
+        return None
+
+    digest = hashlib.sha256(stable_identity.encode("utf-8")).hexdigest()[:16]
+    return get_hermes_home() / "memories" / "gateway" / platform_key / f"user_{digest}"
+
+
 _OPENAI_CLS_CACHE: Optional[type] = None
 
 
@@ -918,6 +952,7 @@ class AIAgent:
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
+        user_id_alt: str = None,
         user_name: str = None,
         chat_id: str = None,
         chat_name: str = None,
@@ -991,6 +1026,7 @@ class AIAgent:
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
+        self._user_id_alt = user_id_alt  # Stable alternate platform user identifier (e.g. Feishu union_id)
         self._user_name = user_name
         self._chat_id = chat_id
         self._chat_name = chat_name
@@ -1652,9 +1688,17 @@ class AIAgent:
                 self._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
                 if self._memory_enabled or self._user_profile_enabled:
                     from tools.memory_tool import MemoryStore
+                    _memory_dir = _gateway_memory_dir(
+                        platform=platform,
+                        user_id=user_id,
+                        user_id_alt=user_id_alt,
+                        chat_id=chat_id,
+                        gateway_session_key=gateway_session_key,
+                    )
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        memory_dir=_memory_dir,
                     )
                     self._memory_store.load_from_disk()
             except Exception:
@@ -1695,6 +1739,8 @@ class AIAgent:
                         # Thread gateway user identity for per-user memory scoping
                         if self._user_id:
                             _init_kwargs["user_id"] = self._user_id
+                        if self._user_id_alt:
+                            _init_kwargs["user_id_alt"] = self._user_id_alt
                         if self._user_name:
                             _init_kwargs["user_name"] = self._user_name
                         if self._chat_id:
