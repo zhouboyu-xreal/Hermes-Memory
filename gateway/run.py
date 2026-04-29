@@ -5782,11 +5782,19 @@ class GatewayRunner:
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
 
-        from gateway.user_memory import GatewayUserMemoryStore, gateway_user_identity
+        from gateway.user_memory import (
+            GatewayUserMemoryStore,
+            gateway_user_identity,
+            load_builtin_gateway_memory,
+        )
 
         platform, user_key = gateway_user_identity(source)
         memory_store = GatewayUserMemoryStore()
         memories = memory_store.list_entries(source)
+        builtin_user_memories, builtin_agent_memories = load_builtin_gateway_memory(
+            source,
+            session_key=session_entry.session_key,
+        )
 
         source_user_id = source.user_id if source else None
         recent_sessions: list[dict[str, Any]] = []
@@ -5847,7 +5855,31 @@ class GatewayRunner:
                 label = title or sid[:18]
                 lines.append(f"{idx}. `{sid}` · {label} · {when}")
 
-        lines.extend(["", "**User-scoped memories:**"])
+        lines.extend(["", "**Built-in user memories:**"])
+        if builtin_user_memories:
+            for idx, content in enumerate(builtin_user_memories[:10], start=1):
+                preview = content.replace("\n", " ").strip()
+                if len(preview) > 220:
+                    preview = preview[:217] + "..."
+                lines.append(f"{idx}. {preview}")
+            if len(builtin_user_memories) > 10:
+                lines.append(f"... and {len(builtin_user_memories) - 10} more.")
+        else:
+            lines.append("No built-in USER.md memories are stored for this gateway user yet.")
+
+        lines.extend(["", "**Built-in agent memories:**"])
+        if builtin_agent_memories:
+            for idx, content in enumerate(builtin_agent_memories[:10], start=1):
+                preview = content.replace("\n", " ").strip()
+                if len(preview) > 220:
+                    preview = preview[:217] + "..."
+                lines.append(f"{idx}. {preview}")
+            if len(builtin_agent_memories) > 10:
+                lines.append(f"... and {len(builtin_agent_memories) - 10} more.")
+        else:
+            lines.append("No built-in MEMORY.md entries are stored for this gateway user yet.")
+
+        lines.extend(["", "**Managed UI memories:**"])
         if memories:
             for idx, entry in enumerate(memories[:10], start=1):
                 content = entry.content.replace("\n", " ").strip()
@@ -5857,8 +5889,7 @@ class GatewayRunner:
             if len(memories) > 10:
                 lines.append(f"... and {len(memories) - 10} more.")
         else:
-            lines.append("No user-scoped memories are stored yet.")
-            lines.append("This view does not expose profile-global USER.md to avoid mixing users.")
+            lines.append("No separate UI-managed memories are stored yet.")
 
         return "\n".join(lines)
 

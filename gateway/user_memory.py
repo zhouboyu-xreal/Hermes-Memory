@@ -129,3 +129,46 @@ class GatewayUserMemoryStore:
             except OSError:
                 pass
             raise
+
+
+def gateway_builtin_memory_dir(
+    source: SessionSource | None,
+    *,
+    session_key: str | None = None,
+) -> Path | None:
+    """Return the built-in MemoryStore directory used by gateway AIAgents."""
+    if not source:
+        return None
+    platform = source.platform.value if isinstance(source.platform, Platform) else str(source.platform)
+    platform_key = platform.strip().lower()
+    if not platform_key or platform_key in {"cli", "local"}:
+        return None
+
+    stable_identity = (
+        (session_key or "").strip()
+        or (source.user_id_alt or "").strip()
+        or (source.user_id or "").strip()
+        or (source.chat_id or "").strip()
+    )
+    if not stable_identity:
+        return None
+
+    digest = hashlib.sha256(stable_identity.encode("utf-8")).hexdigest()[:16]
+    return get_hermes_home() / "memories" / "gateway" / platform_key / f"user_{digest}"
+
+
+def load_builtin_gateway_memory(
+    source: SessionSource | None,
+    *,
+    session_key: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Load built-in ``(USER.md entries, MEMORY.md entries)`` for a gateway user."""
+    memory_dir = gateway_builtin_memory_dir(source, session_key=session_key)
+    if memory_dir is None:
+        return [], []
+
+    from tools.memory_tool import MemoryStore
+
+    store = MemoryStore(memory_dir=memory_dir)
+    store.load_from_disk()
+    return list(store.user_entries), list(store.memory_entries)

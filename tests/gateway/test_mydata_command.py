@@ -7,7 +7,11 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
-from gateway.user_memory import GatewayUserMemoryEntry, GatewayUserMemoryStore
+from gateway.user_memory import (
+    GatewayUserMemoryEntry,
+    GatewayUserMemoryStore,
+    gateway_builtin_memory_dir,
+)
 
 
 def _make_source() -> SessionSource:
@@ -76,11 +80,15 @@ async def test_mydata_command_shows_user_scoped_memory(tmp_path, monkeypatch):
         [
             GatewayUserMemoryEntry(
                 id="mem-1",
-                content="用户希望 Hermes 先给代码证据，再给通俗解释。",
+                content="UI 管理记忆：用户喜欢简洁回答。",
                 source="feishu",
             )
         ],
     )
+    builtin_dir = gateway_builtin_memory_dir(source, session_key=build_session_key(source))
+    builtin_dir.mkdir(parents=True)
+    (builtin_dir / "USER.md").write_text("用户希望 Hermes 先给代码证据，再给通俗解释。", encoding="utf-8")
+    (builtin_dir / "MEMORY.md").write_text("飞书中使用 /mydata 查看自己的数据。", encoding="utf-8")
 
     runner = _make_runner(tmp_path)
     event = MessageEvent(text="/mydata", source=source, message_id="m1")
@@ -92,6 +100,7 @@ async def test_mydata_command_shows_user_scoped_memory(tmp_path, monkeypatch):
     assert "sess-1" in result
     assert "mem-1" in result
     assert "代码证据" in result
+    assert "飞书中使用 /mydata" in result
     assert "sess-other" not in result
 
 
@@ -108,6 +117,6 @@ async def test_mydata_command_empty_memory_does_not_expose_global_user_md(tmp_pa
 
     result = await runner._handle_mydata_command(event)
 
-    assert "No user-scoped memories are stored yet." in result
-    assert "does not expose profile-global USER.md" in result
+    assert "No built-in USER.md memories are stored for this gateway user yet." in result
+    assert "No separate UI-managed memories are stored yet." in result
     assert "global user profile" not in result
