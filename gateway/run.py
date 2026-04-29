@@ -3939,6 +3939,8 @@ class GatewayRunner:
                     return await self._handle_commands_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
+                if _cmd_def_inner.name == "mydata":
+                    return await self._handle_mydata_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
 
@@ -4130,6 +4132,9 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "mydata":
+            return await self._handle_mydata_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -5767,6 +5772,104 @@ class GatewayRunner:
         ])
 
         return "\n".join(lines)
+
+    async def _handle_mydata_command(self, event: MessageEvent) -> str:
+        """Handle /mydata command.
+
+        First-pass user-facing data view for gateway users.  This intentionally
+        reads only gateway-user-scoped memory, not the profile-global USER.md.
+        """
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+
+        from gateway.user_memory import GatewayUserMemoryStore, gateway_user_identity
+
+        platform, user_key = gateway_user_identity(source)
+        memory_store = GatewayUserMemoryStore()
+        memories = memory_store.list_entries(source)
+
+        source_user_id = source.user_id if source else None
+        recent_sessions: list[dict[str, Any]] = []
+        total_sessions_for_user: int | None = None
+        current_message_count: int | None = None
+
+        if self._session_db:
+            try:
+                candidates = self._session_db.search_sessions(source=platform, limit=200)
+                if source_user_id:
+                    recent_sessions = [
+                        row for row in candidates
+                        if str(row.get("user_id") or "") == str(source_user_id)
+                    ]
+                else:
+                    recent_sessions = [
+                        row for row in candidates
+                        if row.get("id") == session_entry.session_id
+                    ]
+                total_sessions_for_user = len(recent_sessions)
+                current_message_count = self._session_db.message_count(session_entry.session_id)
+            except Exception:
+                recent_sessions = []
+                total_sessions_for_user = None
+                current_message_count = None
+
+        lines = [
+            "👤 **Your Hermes Data**",
+            "",
+            f"**Platform:** `{platform}`",
+            f"**User key:** `{user_key}`",
+        ]
+        if source and source.user_name:
+            lines.append(f"**User name:** {source.user_name}")
+        if source and source.chat_type:
+            lines.append(f"**Chat type:** `{source.chat_type}`")
+        if source and source.chat_id:
+            lines.append(f"**Chat:** `{source.chat_id}`")
+        lines.extend([
+            "",
+            f"**Current session:** `{session_entry.session_id}`",
+            f"**Session key:** `{session_entry.session_key}`",
+            f"**Created:** {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
+            f"**Last activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
+        ])
+        if current_message_count is not None:
+            lines.append(f"**Messages in current session:** {current_message_count:,}")
+        if total_sessions_for_user is not None:
+            lines.append(f"**Recent sessions for this user:** {total_sessions_for_user:,}")
+
+        if recent_sessions:
+            lines.extend(["", "**Recent conversations:**"])
+            for idx, row in enumerate(recent_sessions[:5], start=1):
+                sid = str(row.get("id") or "")
+                title = str(row.get("title") or "").strip()
+                last_active = row.get("last_active") or row.get("started_at")
+                when = self._format_epoch_for_gateway(last_active)
+                label = title or sid[:18]
+                lines.append(f"{idx}. `{sid}` · {label} · {when}")
+
+        lines.extend(["", "**User-scoped memories:**"])
+        if memories:
+            for idx, entry in enumerate(memories[:10], start=1):
+                content = entry.content.replace("\n", " ").strip()
+                if len(content) > 220:
+                    content = content[:217] + "..."
+                lines.append(f"{idx}. `{entry.id}` — {content}")
+            if len(memories) > 10:
+                lines.append(f"... and {len(memories) - 10} more.")
+        else:
+            lines.append("No user-scoped memories are stored yet.")
+            lines.append("This view does not expose profile-global USER.md to avoid mixing users.")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_epoch_for_gateway(value: Any) -> str:
+        try:
+            if value is None:
+                return "unknown"
+            return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return str(value) if value is not None else "unknown"
 
     async def _handle_agents_command(self, event: MessageEvent) -> str:
         """Handle /agents command - list active agents and running tasks."""
