@@ -3943,8 +3943,6 @@ class GatewayRunner:
                     return await self._handle_mydata_command(event)
                 if _cmd_def_inner.name == "memory":
                     return await self._handle_memory_command(event)
-                if _cmd_def_inner.name == "remember":
-                    return await self._handle_remember_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
 
@@ -4142,9 +4140,6 @@ class GatewayRunner:
 
         if canonical == "memory":
             return await self._handle_memory_command(event)
-
-        if canonical == "remember":
-            return await self._handle_remember_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -5917,14 +5912,14 @@ class GatewayRunner:
             return self._memory_help_text()
         if subcommand in {"list", "ls"}:
             return self._format_gateway_memory_entries(
-                self._gateway_memory_store().list_entries(event.source),
+                self._gateway_all_memory_entries(event),
                 title="Your saved memories",
             )
         if subcommand in {"search", "find"}:
             if not args:
                 return "Usage: /memory search <text>"
             return self._format_gateway_memory_entries(
-                self._gateway_memory_store().search_entries(event.source, args),
+                self._search_gateway_all_memory_entries(event, args),
                 title=f"Memory search: {args}",
             )
         if subcommand in {"add", "save"}:
@@ -5940,22 +5935,18 @@ class GatewayRunner:
 
         return f"Unknown /memory subcommand: {subcommand}\n\n{self._memory_help_text()}"
 
-    async def _handle_remember_command(self, event: MessageEvent) -> str:
-        content = event.get_command_args().strip()
-        if not content:
-            return "Usage: /remember <memory>"
-        return self._save_gateway_memory(event, content, source_label="gateway:/remember")
-
     def _delete_gateway_memory_by_query(self, event: MessageEvent, query: str) -> str:
-        store = self._gateway_memory_store()
-        matches = store.search_entries(event.source, query)
+        matches = self._search_gateway_memory_delete_candidates(event, query)
         if not matches:
             return f"No saved memory matched `{query}`."
         if len(matches) == 1:
-            return self._delete_gateway_memory(event, matches[0].id)
+            return self._delete_gateway_memory_candidate(event, matches[0])
         return (
             "Multiple memories matched. Use a more specific keyword.\n\n"
-            + self._format_gateway_memory_entries(matches, title=f"Matches for: {query}")
+            + self._format_gateway_memory_entries(
+                [match["entry"] for match in matches],
+                title=f"Matches for: {query}",
+            )
         )
 
     def _gateway_memory_store(self):
@@ -5971,6 +5962,105 @@ class GatewayRunner:
                 return build_session_key(event.source)
             except Exception:
                 return None
+
+    def _gateway_all_memory_entries(self, event: MessageEvent):
+        from gateway.user_memory import (
+            GatewayUserMemoryEntry,
+            load_builtin_gateway_memory,
+        )
+
+        session_key = self._gateway_memory_session_key(event)
+        managed = self._gateway_memory_store().list_entries(event.source)
+        builtin_user, builtin_agent = load_builtin_gateway_memory(
+            event.source,
+            session_key=session_key,
+        )
+
+        entries = []
+        seen: set[str] = set()
+        for entry in managed:
+            key = entry.content.strip()
+            if key and key not in seen:
+                entries.append(entry)
+                seen.add(key)
+        for content in builtin_user:
+            key = content.strip()
+            if key and key not in seen:
+                entries.append(GatewayUserMemoryEntry(id="", content=key, kind="user"))
+                seen.add(key)
+        for content in builtin_agent:
+            key = content.strip()
+            if key and key not in seen:
+                entries.append(GatewayUserMemoryEntry(id="", content=key, kind="memory"))
+                seen.add(key)
+        return entries
+
+    def _search_gateway_all_memory_entries(self, event: MessageEvent, query: str):
+        query = str(query or "").strip().lower()
+        if not query:
+            return self._gateway_all_memory_entries(event)
+        return [
+            entry
+            for entry in self._gateway_all_memory_entries(event)
+            if query in entry.content.lower() or query in entry.kind.lower()
+        ]
+
+    def _search_gateway_memory_delete_candidates(
+        self,
+        event: MessageEvent,
+        query: str,
+    ) -> list[dict[str, Any]]:
+        query = str(query or "").strip().lower()
+        if not query:
+            return []
+
+        from gateway.user_memory import GatewayUserMemoryEntry, load_builtin_gateway_memory
+
+        session_key = self._gateway_memory_session_key(event)
+        managed = self._gateway_memory_store().list_entries(event.source)
+        builtin_user, builtin_agent = load_builtin_gateway_memory(
+            event.source,
+            session_key=session_key,
+        )
+
+        candidates: dict[str, dict[str, Any]] = {}
+        for entry in managed:
+            content = entry.content.strip()
+            if not content:
+                continue
+            candidate = candidates.setdefault(
+                content,
+                {"entry": entry, "managed_id": entry.id, "targets": set()},
+            )
+            candidate["managed_id"] = entry.id
+        for target, contents, kind in (
+            ("user", builtin_user, "user"),
+            ("memory", builtin_agent, "memory"),
+        ):
+            for content in contents:
+                normalized = content.strip()
+                if not normalized:
+                    continue
+                candidate = candidates.setdefault(
+                    normalized,
+                    {
+                        "entry": GatewayUserMemoryEntry(
+                            id="",
+                            content=normalized,
+                            kind=kind,
+                        ),
+                        "managed_id": "",
+                        "targets": set(),
+                    },
+                )
+                candidate["targets"].add(target)
+
+        return [
+            candidate
+            for content, candidate in candidates.items()
+            if query in content.lower()
+            or query in str(candidate["entry"].kind).lower()
+        ]
 
     def _save_gateway_memory(
         self,
@@ -6010,32 +6100,38 @@ class GatewayRunner:
             "Use /new to force a fresh memory snapshot."
         )
 
-    def _delete_gateway_memory(self, event: MessageEvent, entry_id: str) -> str:
+    def _delete_gateway_memory_candidate(self, event: MessageEvent, candidate: dict[str, Any]) -> str:
         from gateway.user_memory import apply_builtin_gateway_memory
 
         store = self._gateway_memory_store()
-        entry = store.get_entry(event.source, entry_id)
-        if entry is None:
-            return f"No saved memory found with id `{entry_id}`."
+        entry = candidate["entry"]
+        managed_id = str(candidate.get("managed_id") or "")
+        targets = set(candidate.get("targets") or set())
+        if managed_id and not targets:
+            targets.add("user")
 
-        builtin_result = apply_builtin_gateway_memory(
-            event.source,
-            session_key=self._gateway_memory_session_key(event),
-            action="remove",
-            target="user",
-            old_text=entry.content,
-        )
-        deleted = store.delete_entry(event.source, entry_id)
-        if deleted is None:
-            return f"No saved memory found with id `{entry_id}`."
+        errors: list[str] = []
+        for target in sorted(targets):
+            builtin_result = apply_builtin_gateway_memory(
+                event.source,
+                session_key=self._gateway_memory_session_key(event),
+                action="remove",
+                target=target,
+                old_text=entry.content,
+            )
+            if not builtin_result.get("success") and "No entry matched" not in str(builtin_result.get("error", "")):
+                errors.append(str(builtin_result.get("error") or "unknown error"))
 
-        if not builtin_result.get("success") and "No entry matched" not in str(builtin_result.get("error", "")):
+        if managed_id:
+            store.delete_entry(event.source, managed_id)
+
+        if errors:
             return (
-                f"Deleted managed memory `{entry_id}`, but the built-in memory update failed: "
-                f"{builtin_result.get('error') or 'unknown error'}"
+                f"Deleted memory: {entry.content}\n\n"
+                f"Some built-in memory updates failed: {'; '.join(errors)}"
             )
         return (
-            f"Deleted memory: {deleted.content}\n\n"
+            f"Deleted memory: {entry.content}\n\n"
             "Use /new if you need the current agent session to drop any old memory snapshot."
         )
 
@@ -6062,7 +6158,6 @@ class GatewayRunner:
             "/memory search <text>",
             "/memory add <memory>",
             "/memory delete <search text>",
-            "/remember <memory>",
         ])
 
     @staticmethod

@@ -9,6 +9,7 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 from gateway.user_memory import (
     GatewayUserMemoryStore,
+    gateway_builtin_memory_dir,
     load_builtin_gateway_memory,
 )
 
@@ -117,17 +118,17 @@ async def test_memory_search_and_delete_are_keyword_based(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_remember_and_memory_delete_by_search(tmp_path, monkeypatch):
+async def test_memory_add_and_delete_by_search(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     source = _make_source()
     runner = _make_runner(source)
 
-    remember_result = await runner._handle_remember_command(
-        MessageEvent(text="/remember 下周三提醒 Alex 发方案。", source=source, message_id="m1")
+    add_result = await runner._handle_memory_command(
+        MessageEvent(text="/memory add 下周三提醒 Alex 发方案。", source=source, message_id="m1")
     )
-    assert "Saved memory" in remember_result
-    assert "Alex" in remember_result
-    assert GatewayUserMemoryStore().list_entries(source)[0].id not in remember_result
+    assert "Saved memory" in add_result
+    assert "Alex" in add_result
+    assert GatewayUserMemoryStore().list_entries(source)[0].id not in add_result
 
     delete_result = await runner._handle_memory_command(
         MessageEvent(text="/memory delete Alex", source=source, message_id="m2")
@@ -140,6 +141,40 @@ async def test_remember_and_memory_delete_by_search(tmp_path, monkeypatch):
         session_key=build_session_key(source),
     )
     assert builtin_user == []
+
+
+@pytest.mark.asyncio
+async def test_memory_list_search_delete_include_builtin_memories(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    source = _make_source()
+    runner = _make_runner(source)
+    builtin_dir = gateway_builtin_memory_dir(source, session_key=build_session_key(source))
+    builtin_dir.mkdir(parents=True)
+    (builtin_dir / "USER.md").write_text("用户喜欢先看结论。", encoding="utf-8")
+    (builtin_dir / "MEMORY.md").write_text("飞书用户测试过内置记忆展示。", encoding="utf-8")
+
+    list_result = await runner._handle_memory_command(
+        MessageEvent(text="/memory list", source=source, message_id="m1")
+    )
+    assert "用户喜欢先看结论" in list_result
+    assert "飞书用户测试过内置记忆展示" in list_result
+
+    search_result = await runner._handle_memory_command(
+        MessageEvent(text="/memory search 内置记忆", source=source, message_id="m2")
+    )
+    assert "飞书用户测试过内置记忆展示" in search_result
+    assert "用户喜欢先看结论" not in search_result
+
+    delete_result = await runner._handle_memory_command(
+        MessageEvent(text="/memory delete 内置记忆", source=source, message_id="m3")
+    )
+    assert "Deleted memory" in delete_result
+    builtin_user, builtin_agent = load_builtin_gateway_memory(
+        source,
+        session_key=build_session_key(source),
+    )
+    assert builtin_user == ["用户喜欢先看结论。"]
+    assert builtin_agent == []
 
 
 @pytest.mark.asyncio
@@ -163,3 +198,11 @@ async def test_memory_command_is_scoped_by_gateway_user(tmp_path, monkeypatch):
         session_key=build_session_key(source_b),
     )
     assert builtin_b == []
+
+
+def test_mem_alias_resolves_to_memory_command():
+    from hermes_cli.commands import resolve_command
+
+    command = resolve_command("mem")
+    assert command is not None
+    assert command.name == "memory"
