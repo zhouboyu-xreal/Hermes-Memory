@@ -160,7 +160,7 @@ from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
-    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
+    MEMORY_GUIDANCE, SKILLS_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     build_nous_subscription_prompt,
 )
@@ -342,7 +342,6 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "ha_list_services",
     "read_file",
     "search_files",
-    "session_search",
     "skill_view",
     "skills_list",
     "vision_analyze",
@@ -1649,13 +1648,13 @@ class AIAgent:
                 )
             except Exception as e:
                 # Transient SQLite lock contention (e.g. CLI and gateway writing
-                # concurrently) must NOT permanently disable session_search for
+                # concurrently) must NOT permanently disable session DB for
                 # this agent.  Keep _session_db alive — subsequent message
-                # flushes and session_search calls will still work once the
+                # flushes will still work once the
                 # lock clears.  The session row may be missing from the index
                 # for this run, but that is recoverable (flushes upsert rows).
                 logger.warning(
-                    "Session DB create_session failed (session_search still available): %s", e
+                    "Session DB create_session failed (session DB still available): %s", e
                 )
         
         # In-memory todo list for task planning (one per agent/session)
@@ -1770,6 +1769,26 @@ class AIAgent:
             except Exception as _mpe:
                 logger.warning("Memory provider plugin init failed: %s", _mpe)
                 self._memory_manager = None
+
+        # ── Memory Node Manager (summarization + embedding + hybrid search) ──
+        self._memory_node_manager: Any = None
+        if not skip_memory and self._session_db is not None:
+            try:
+                _mem_node_cfg = mem_config or {}
+                from agent.memory_node_manager import MemoryNodeManager as _MNN
+                # Merge top-level ``embedding:`` config with nested ``memory.embedding:``
+                _top_emb_cfg = _agent_cfg.get("embedding", {})
+                _nested_emb_cfg = _mem_node_cfg.get("embedding", {})
+                _merged_emb_cfg = {**_top_emb_cfg, **_nested_emb_cfg}
+                self._memory_node_manager = _MNN(
+                    session_db=self._session_db,
+                    embedding_config=_merged_emb_cfg,
+                    enabled=True,
+                )
+                logger.info("MemoryNodeManager initialized (turn-based summarization + embedding)")
+            except Exception as _mne:
+                logger.debug("MemoryNodeManager init skipped: %s", _mne)
+                self._memory_node_manager = None
 
         # Inject memory provider tool schemas into the tool surface.
         # Skip tools whose names already exist (plugins may register the
@@ -4696,8 +4715,6 @@ class AIAgent:
         tool_guidance = []
         if "memory" in self.valid_tool_names:
             tool_guidance.append(MEMORY_GUIDANCE)
-        if "session_search" in self.valid_tool_names:
-            tool_guidance.append(SESSION_SEARCH_GUIDANCE)
         if "skill_manage" in self.valid_tool_names:
             tool_guidance.append(SKILLS_GUIDANCE)
         if tool_guidance:
@@ -8982,17 +8999,6 @@ class AIAgent:
                 merge=function_args.get("merge", False),
                 store=self._todo_store,
             )
-        elif function_name == "session_search":
-            if not self._session_db:
-                return json.dumps({"success": False, "error": "Session database not available."})
-            from tools.session_search_tool import session_search as _session_search
-            return _session_search(
-                query=function_args.get("query", ""),
-                role_filter=function_args.get("role_filter"),
-                limit=function_args.get("limit", 3),
-                db=self._session_db,
-                current_session_id=self.session_id,
-            )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
             from tools.memory_tool import memory_tool as _memory_tool
@@ -9520,21 +9526,6 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
-            elif function_name == "session_search":
-                if not self._session_db:
-                    function_result = json.dumps({"success": False, "error": "Session database not available."})
-                else:
-                    from tools.session_search_tool import session_search as _session_search
-                    function_result = _session_search(
-                        query=function_args.get("query", ""),
-                        role_filter=function_args.get("role_filter"),
-                        limit=function_args.get("limit", 3),
-                        db=self._session_db,
-                        current_session_id=self.session_id,
-                    )
-                tool_duration = time.time() - tool_start_time
-                if self._should_emit_quiet_tool_messages():
-                    self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
                 target = function_args.get("target", "memory")
                 from tools.memory_tool import memory_tool as _memory_tool
@@ -10329,6 +10320,19 @@ class AIAgent:
             try:
                 _query = original_user_message if isinstance(original_user_message, str) else ""
                 _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+            except Exception:
+                pass
+
+        # Memory Node Manager: also recall relevant past summarized turns
+        if self._memory_node_manager:
+            try:
+                _mem_node_query = original_user_message if isinstance(original_user_message, str) else ""
+                _mem_node_context = self._memory_node_manager.recall(_mem_node_query)
+                if _mem_node_context:
+                    if _ext_prefetch_cache:
+                        _ext_prefetch_cache += "\n\n" + _mem_node_context
+                    else:
+                        _ext_prefetch_cache = _mem_node_context
             except Exception:
                 pass
 
@@ -12742,7 +12746,7 @@ class AIAgent:
                         # (search_files, read_file, write_file, terminal, ...),
                         # keep output visible so the user sees progress.
                         _HOUSEKEEPING_TOOLS = frozenset({
-                            "memory", "todo", "skill_manage", "session_search",
+                            "memory", "todo", "skill_manage",
                         })
                         _all_housekeeping = all(
                             tc.function.name in _HOUSEKEEPING_TOOLS
@@ -13376,6 +13380,20 @@ class AIAgent:
             final_response=final_response,
             interrupted=interrupted,
         )
+
+        # Memory Node Manager: store this turn as a summarised memory node
+        # with embedding + causal linking for future hybrid retrieval.
+        if self._memory_node_manager and final_response and not interrupted:
+            try:
+                _store_msg = original_user_message if isinstance(original_user_message, str) else ""
+                _store_resp = final_response if isinstance(final_response, str) else ""
+                if _store_msg and _store_resp:
+                    self._memory_node_manager.store_turn(
+                        user_message=_store_msg,
+                        assistant_response=_store_resp,
+                    )
+            except Exception:
+                pass
 
         # Background memory/skill review — runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.

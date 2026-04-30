@@ -426,6 +426,29 @@ memory:
   flush_min_turns: 6        # Min user turns to trigger flush on exit/reset (0 = disabled)
 
 # =============================================================================
+# Embedding (for memory node vector search)
+# =============================================================================
+# Configures text embedding generation used by the memory node system
+# (SessionDB.memory_add_node / memory_search). Supports local and remote
+# embedding backends.
+#
+# Supported providers:
+#   "ollama" — Ollama's local /api/embeddings endpoint
+#   "openai" — Any OpenAI-compatible /v1/embeddings endpoint
+#
+# embedding:
+#   provider: "ollama"            # "ollama" | "openai"
+#   model: "qwen3-embedding:8b"  # Embedding model (EmbeddingClient)
+#   summary_model: "qwen3.5:9b"  # LLM model for turn summarization (MemoryNodeManager)
+#   base_url: "http://127.0.0.1:11434"  # Backend URL (Ollama default)
+#   api_key: ""                   # Only needed for OpenAI backends
+#   dimensions: 4096              # Vector dimension (auto-detected for known models)
+#   normalize: true               # L2-normalize embeddings
+#   timeout: 120                  # Request timeout in seconds
+#   retrieval_top_k: 8            # Max memory nodes to recall per query
+#   min_turns_before_store: 0     # Skip storing for first N turns (0 = store from turn 1)
+
+# =============================================================================
 # Session Reset Policy (Messaging Platforms)
 # =============================================================================
 # Controls when messaging sessions (Telegram, Discord, WhatsApp, Slack) are

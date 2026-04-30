@@ -27,6 +27,16 @@ from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
+import numpy as np
+
+# Optional FAISS — gracefully degrades to keyword-only search when unavailable
+try:
+    import faiss
+    _HAS_FAISS = True
+except ImportError:
+    faiss = None
+    _HAS_FAISS = False
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -34,6 +44,7 @@ T = TypeVar("T")
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
 SCHEMA_VERSION = 11
+EMBEDDING_DIM = 4096
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -155,6 +166,48 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON message
 END;
 """
 
+# ── Memory Nodes Schema (summarized event storage with vector search) ──
+
+MEMORY_NODES_SQL = """
+CREATE TABLE IF NOT EXISTS memory_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    time_key TEXT UNIQUE NOT NULL,
+    summary TEXT NOT NULL,
+    keywords TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_leaf_details (
+    node_id INTEGER PRIMARY KEY,
+    original_dialog TEXT,
+    causal_relation TEXT
+);
+"""
+
+MEMORY_NODES_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_nodes_fts USING fts5(
+    summary,
+    keywords,
+    content='memory_nodes',
+    content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS memory_nodes_ai AFTER INSERT ON memory_nodes BEGIN
+    INSERT INTO memory_nodes_fts(rowid, summary, keywords)
+    VALUES (new.id, new.summary, new.keywords);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_nodes_ad AFTER DELETE ON memory_nodes BEGIN
+    DELETE FROM memory_nodes_fts WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_nodes_au AFTER UPDATE ON memory_nodes BEGIN
+    UPDATE memory_nodes_fts
+    SET summary = new.summary,
+        keywords = new.keywords
+    WHERE rowid = new.id;
+END;
+"""
+
 
 class SessionDB:
     """
@@ -200,6 +253,20 @@ class SessionDB:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+
+        # ── Memory Nodes: FAISS index for vector search ──
+        self._memory_faiss_index = None
+        self._memory_faiss_id_map: List[int] = []
+        self._memory_faiss_save_path = self.db_path.with_suffix('.faiss')
+        self._memory_faiss_ids_path = self.db_path.with_suffix('.faiss_ids.json')
+        if _HAS_FAISS:
+            try:
+                self._memory_faiss_index = faiss.IndexFlatIP(EMBEDDING_DIM)
+                # Try to load persisted FAISS data from disk
+                self._memory_load_faiss()
+            except Exception as exc:
+                logger.warning("Failed to initialize FAISS index: %s", exc)
+                self._memory_faiss_index = None
 
         self._init_schema()
 
@@ -279,12 +346,16 @@ class SessionDB:
             pass  # Best effort — never fatal.
 
     def close(self):
-        """Close the database connection.
+        """Close the database connection and release FAISS resources.
 
         Attempts a PASSIVE WAL checkpoint first so that exiting processes
         help keep the WAL file from growing unbounded.
         """
         with self._lock:
+            # Release FAISS index
+            self._memory_faiss_index = None
+            self._memory_faiss_id_map = []
+
             if self._conn:
                 try:
                     self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
@@ -507,6 +578,13 @@ class SessionDB:
             cursor.execute("SELECT * FROM messages_fts_trigram LIMIT 0")
         except sqlite3.OperationalError:
             cursor.executescript(FTS_TRIGRAM_SQL)
+
+        # ── Memory Nodes tables + FTS5 ──
+        cursor.executescript(MEMORY_NODES_SQL)
+        try:
+            cursor.execute("SELECT * FROM memory_nodes_fts LIMIT 0")
+        except sqlite3.OperationalError:
+            cursor.executescript(MEMORY_NODES_FTS_SQL)
 
         self._conn.commit()
 
@@ -1793,6 +1871,320 @@ class SessionDB:
                     (limit, offset),
                 )
             return [dict(row) for row in cursor.fetchall()]
+
+    # =========================================================================
+    # Memory Nodes (summarized event storage with vector + keyword search)
+    # =========================================================================
+
+    MEMORY_TOP_K_CAUSAL = 5
+    MEMORY_UPDATE_CAUSAL_THRESHOLD = 0.60
+    MEMORY_QUERY_RETRIEVAL_THRESHOLD = 0.3
+    MEMORY_QUERY_TOP_K = 8
+
+    # ── Internal helpers ──────────────────────────────────────────────────
+
+    def _memory_get_node(self, node_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch a single memory node with its leaf details."""
+        cursor = self._conn.execute(
+            """SELECT n.id, n.time_key, n.summary, n.keywords,
+                      d.original_dialog, d.causal_relation
+               FROM memory_nodes n
+               JOIN memory_leaf_details d ON n.id = d.node_id
+               WHERE n.id = ?""",
+            (node_id,),
+        )
+        r = cursor.fetchone()
+        if not r:
+            return None
+        return {
+            "id": r[0],
+            "time_key": r[1],
+            "summary": r[2],
+            "keywords": r[3].split(" "),
+            "original_dialog": r[4],
+            "causal_relation": json.loads(r[5]) if r[5] else {},
+        }
+
+    def _memory_search_keyword(self, keyword: str, limit: int = 20) -> Dict[int, float]:
+        """Keyword search over memory nodes. Returns {rowid: score}.
+
+        Uses FTS5 MATCH for non-CJK queries (returns BM25 scores, lower = better).
+        Falls back to individual-term matching on summary/keywords for CJK queries.
+        """
+        if self._contains_cjk(keyword):
+            # Split CJK query into individual characters/terms and check each
+            # against both summary and keywords columns. Score = number of
+            # matched terms (higher = better, inverted to fit BM25 convention).
+            clean = keyword.replace('"', "").replace("*", "").strip()
+            terms = [t for t in clean if t.strip() and ord(t) > 0x2E80]
+            if not terms:
+                return {}
+
+            # Build a UNION ALL query that counts individual term matches.
+            # Each term gets its own SELECT: returns node id if it matches
+            # summary OR keywords.  Then GROUP BY + COUNT gives exact match count.
+            selects = []
+            params = []
+            bs = chr(92)  # backslash character for ESCAPE
+            for t in terms:
+                escaped = t.replace(bs, bs + bs).replace("%", bs + "%").replace("_", bs + "_")
+                pattern = f"%{escaped}%"
+                selects.append(
+                    f"SELECT id FROM memory_nodes WHERE summary LIKE ? ESCAPE '{bs}'"
+                )
+                params.append(pattern)
+                selects.append(
+                    f"SELECT id FROM memory_nodes WHERE keywords LIKE ? ESCAPE '{bs}'"
+                )
+                params.append(pattern)
+
+            union = " UNION ALL ".join(selects)
+            cursor = self._conn.execute(
+                f"""SELECT id, CAST(COUNT(*) AS REAL) AS score
+                    FROM ({union})
+                    GROUP BY id
+                    ORDER BY score DESC
+                    LIMIT ?""",
+                params + [limit],
+            )
+            return {row[0]: len(terms) * 2 - row[1] for row in cursor.fetchall()}
+
+        # Non-CJK: use FTS5 BM25
+        cursor = self._conn.execute(
+            """SELECT rowid, bm25(memory_nodes_fts) AS score
+               FROM memory_nodes_fts
+               WHERE memory_nodes_fts MATCH ?
+               ORDER BY score
+               LIMIT ?""",
+            (keyword, limit),
+        )
+        return {row[0]: row[1] for row in cursor.fetchall()}
+
+    def _memory_search_vector(self, query_embedding: np.ndarray, top_k: int = 20) -> Dict[int, float]:
+        """FAISS vector search over memory nodes. Returns {node_id: similarity} (higher = better)."""
+        if not _HAS_FAISS or self._memory_faiss_index is None or self._memory_faiss_index.ntotal == 0:
+            return {}
+        sims, indices = self._memory_faiss_index.search(query_embedding, top_k)
+        results: Dict[int, float] = {}
+        for sim, idx in zip(sims[0], indices[0]):
+            if idx == -1:
+                continue
+            node_id = self._memory_faiss_id_map[idx]
+            results[node_id] = sim
+        return results
+
+    def _memory_save_faiss(self) -> None:
+        """Persist FAISS index and id_map to disk next to the SQLite DB.
+
+        Saves to ``<db_path>.faiss`` (binary FAISS index) and
+        ``<db_path>.faiss_ids.json`` (id list).
+        Silently skips if FAISS is unavailable or the index is empty.
+        """
+        if not _HAS_FAISS or self._memory_faiss_index is None or self._memory_faiss_index.ntotal == 0:
+            return
+        try:
+            faiss.write_index(self._memory_faiss_index, str(self._memory_faiss_save_path))
+            with open(self._memory_faiss_ids_path, "w", encoding="utf-8") as f:
+                json.dump(self._memory_faiss_id_map, f)
+        except Exception as exc:
+            logger.debug("Failed to save FAISS index to disk: %s", exc)
+
+    def _memory_load_faiss(self) -> None:
+        """Load persisted FAISS index and id_map from disk.
+
+        If the saved files don't exist or are corrupt, the index starts
+        empty — new nodes will be added incrementally from that point.
+        """
+        idx_path = self._memory_faiss_save_path
+        ids_path = self._memory_faiss_ids_path
+        if not idx_path.exists() or not ids_path.exists():
+            logger.debug("No persisted FAISS data found at %s — starting fresh", idx_path)
+            return
+        try:
+            loaded_index = faiss.read_index(str(idx_path))
+            with open(ids_path, "r", encoding="utf-8") as f:
+                loaded_ids = json.load(f)
+            if not isinstance(loaded_ids, list) or loaded_index.ntotal != len(loaded_ids):
+                logger.debug(
+                    "FAISS index (%d vectors) / id_map (%d entries) mismatch — discarding",
+                    loaded_index.ntotal, len(loaded_ids),
+                )
+                return
+            self._memory_faiss_index = loaded_index
+            self._memory_faiss_id_map = loaded_ids
+            logger.debug(
+                "Loaded FAISS index with %d vectors and %d id_map entries",
+                loaded_index.ntotal, len(loaded_ids),
+            )
+        except Exception as exc:
+            logger.debug("Failed to load FAISS index from disk: %s — starting fresh", exc)
+
+    def _memory_fuse_scores(
+        self, keyword_results: Dict[int, float], vec_results: Dict[int, float]
+    ) -> List[int]:
+        """Fuse BM25 + vector scores with weighted combination. Returns sorted node IDs."""
+        all_ids = set(keyword_results.keys()) | set(vec_results.keys())
+        fused: Dict[int, float] = {}
+
+        for nid in all_ids:
+            bm25 = keyword_results.get(nid)
+            sim = vec_results.get(nid)
+
+            # BM25 → positive direction (lower BM25 = better match)
+            bm25_score = 1.0 / (1.0 + bm25) if bm25 is not None else 0.0
+            vec_score = sim if sim is not None else 0.0
+
+            final = 0.6 * bm25_score + 0.4 * vec_score
+            if final < self.MEMORY_QUERY_RETRIEVAL_THRESHOLD:
+                continue
+            fused[nid] = final
+
+        return sorted(fused.keys(), key=lambda x: fused[x], reverse=True)
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def memory_add_node(
+        self,
+        time_key: str,
+        summary: str,
+        keywords: List[str],
+        original_dialog: str,
+        query_embedding: np.ndarray,
+    ) -> int:
+        """Insert a new memory node (SQLite + FAISS). Returns the node ID.
+
+        *time_key* must be a unique timestamp string (e.g. ``"2026-04-20 10:00"``).
+        *query_embedding* should be a (1, EMBEDDING_DIM) float32 numpy array.
+        """
+
+        def _do(conn):
+            keywords_str = " ".join(keywords) if isinstance(keywords, list) else keywords
+            cursor = conn.execute(
+                """INSERT INTO memory_nodes (time_key, summary, keywords)
+                   VALUES (?, ?, ?)""",
+                (time_key, summary, keywords_str),
+            )
+            node_id = cursor.lastrowid
+            conn.execute(
+                """INSERT INTO memory_leaf_details (node_id, original_dialog, causal_relation)
+                   VALUES (?, ?, ?)""",
+                (node_id, original_dialog, json.dumps({}, ensure_ascii=False)),
+            )
+            return node_id
+
+        node_id = self._execute_write(_do)
+
+        # Insert FAISS vector (outside the write transaction)
+        if _HAS_FAISS and self._memory_faiss_index is not None:
+            with self._lock:
+                self._memory_faiss_index.add(query_embedding)
+                self._memory_faiss_id_map.append(node_id)
+            self._memory_save_faiss()
+
+        return node_id
+
+    def memory_update_causal(
+        self,
+        a_id: int,
+        b_id: int,
+        relation_ab: str,
+        relation_ba: Optional[str] = None,
+    ) -> None:
+        """Set or update a causal relation between two memory nodes.
+
+        *relation_ab* describes the relationship from node *a_id* → *b_id*.
+        *relation_ba* (optional) describes *b_id* → *a_id* (assumed same if omitted).
+        """
+
+        def _do(conn):
+            # a → b
+            cursor = conn.execute(
+                "SELECT causal_relation FROM memory_leaf_details WHERE node_id=?",
+                (a_id,),
+            )
+            row = cursor.fetchone()
+            a_map = json.loads(row[0]) if row and row[0] else {}
+            a_map[str(b_id)] = relation_ab
+            conn.execute(
+                "UPDATE memory_leaf_details SET causal_relation=? WHERE node_id=?",
+                (json.dumps(a_map, ensure_ascii=False), a_id),
+            )
+
+            # b → a (optional)
+            if relation_ba:
+                cursor = conn.execute(
+                    "SELECT causal_relation FROM memory_leaf_details WHERE node_id=?",
+                    (b_id,),
+                )
+                row = cursor.fetchone()
+                b_map = json.loads(row[0]) if row and row[0] else {}
+                b_map[str(a_id)] = relation_ba
+                conn.execute(
+                    "UPDATE memory_leaf_details SET causal_relation=? WHERE node_id=?",
+                    (json.dumps(b_map, ensure_ascii=False), b_id),
+                )
+
+        self._execute_write(_do)
+
+    def memory_search_relevant_nodes(
+        self, query_embedding: np.ndarray
+    ) -> tuple[List[Dict[str, Any]], List[int]]:
+        """Find memory nodes similar to *query_embedding* for causal relation extraction.
+
+        Returns ``(nodes, node_ids)`` for nodes above ``MEMORY_UPDATE_CAUSAL_THRESHOLD``.
+        Returns empty lists when FAISS is unavailable or index is empty.
+        """
+        if not _HAS_FAISS or self._memory_faiss_index is None or self._memory_faiss_index.ntotal == 0:
+            return [], []
+
+        sims, indices = self._memory_faiss_index.search(query_embedding, self.MEMORY_TOP_K_CAUSAL)
+
+        similar_nodes: List[Dict[str, Any]] = []
+        similar_node_ids: List[int] = []
+
+        for sim, idx in zip(sims[0], indices[0]):
+            if idx == -1:
+                continue
+            if sim < self.MEMORY_UPDATE_CAUSAL_THRESHOLD:
+                continue
+            old_node_id = self._memory_faiss_id_map[idx]
+            old_node = self._memory_get_node(old_node_id)
+            if not old_node:
+                continue
+            similar_nodes.append(old_node)
+            similar_node_ids.append(old_node_id)
+
+        return similar_nodes, similar_node_ids
+
+    def memory_search(
+        self, keyword: str, query_embedding: np.ndarray, top_k: int = None
+    ) -> List[Dict[str, Any]]:
+        """Hybrid search over memory nodes: keyword (FTS5) + vector (FAISS) with causal expansion.
+
+        *keyword* is passed to FTS5 MATCH (use ``" OR "``-joined terms for broad recall).
+        *query_embedding* is a (1, EMBEDDING_DIM) float32 numpy array.
+        *top_k* overrides ``MEMORY_QUERY_TOP_K`` (default).
+        """
+        if top_k is None:
+            top_k = self.MEMORY_QUERY_TOP_K
+
+        fts_results = self._memory_search_keyword(" OR ".join(keyword) if isinstance(keyword, list) else keyword)
+        vec_results = self._memory_search_vector(query_embedding)
+
+        ranked_ids = self._memory_fuse_scores(fts_results, vec_results)[:top_k]
+
+        # Causal expansion: include nodes causally linked to any ranked node
+        all_ids = set(ranked_ids)
+        for nid in ranked_ids:
+            node = self._memory_get_node(nid)
+            if node and node["causal_relation"]:
+                for rid in node["causal_relation"].keys():
+                    try:
+                        all_ids.add(int(rid))
+                    except (ValueError, TypeError):
+                        pass
+
+        return [self._memory_get_node(nid) for nid in all_ids if self._memory_get_node(nid)]
 
     # =========================================================================
     # Utility
