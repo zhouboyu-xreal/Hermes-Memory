@@ -439,14 +439,20 @@ memory:
 # embedding:
 #   provider: "ollama"            # "ollama" | "openai"
 #   model: "qwen3-embedding:8b"  # Embedding model (EmbeddingClient)
-#   summary_model: "qwen3.5:9b"  # LLM model for turn summarization (MemoryNodeManager)
-#   base_url: "http://127.0.0.1:11434"  # Backend URL (Ollama default)
-#   api_key: ""                   # Only needed for OpenAI backends
+#   base_url: "http://127.0.0.1:11434"  # Embedding backend URL (Ollama default)
+#   api_key: ""                   # Only needed for OpenAI embedding backends
 #   dimensions: 4096              # Vector dimension (auto-detected for known models)
 #   normalize: true               # L2-normalize embeddings
 #   timeout: 120                  # Request timeout in seconds
 #   retrieval_top_k: 8            # Max memory nodes to recall per query
 #   min_turns_before_store: 0     # Skip storing for first N turns (0 = store from turn 1)
+#
+#   # LLM API for summarization & causal relation extraction (MemoryNodeManager)
+#   # Supports OpenAI, OpenRouter, DeepSeek, vLLM, and any OpenAI-compatible provider.
+#   # Falls back to embedding base_url/api_key if llm_* keys are omitted.
+#   llm_base_url: "https://api.openai.com/v1"  # Chat completions API base URL
+#   llm_model: "gpt-4o-mini"        # Model for summarization & causal extraction
+#   llm_api_key: ""                 # API key for the LLM endpoint
 
 # =============================================================================
 # Session Reset Policy (Messaging Platforms)

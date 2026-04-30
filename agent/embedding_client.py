@@ -238,20 +238,44 @@ class _OpenAIBackend:
 class EmbeddingClient:
     """Text embedding generator with configurable backends.
 
+    When ``openai_client`` is provided, uses the project-wide OpenAI client's
+    ``.embeddings.create()`` — same connection pool, auth, and base URL as
+    the rest of Hermes Agent.
+
+    Otherwise falls back to a dedicated backend (``_OllamaBackend`` or
+    ``_OpenAIBackend``) using raw HTTP.
+
     Typical usage::
 
+        # With shared AIAgent client:
+        client = EmbeddingClient(config, openai_client=agent.client)
+
+        # Standalone (raw HTTP / Ollama):
         client = EmbeddingClient()
         vector = client.embed_text("用户喜欢喝美式咖啡")
         # → np.ndarray shape (1, 4096), float32, L2-normalized
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        openai_client: Any = None,  # OpenAI-compatible client instance
+    ) -> None:
         self._config = config or _load_config()
-        self._backend = self._build_backend()
 
-        # Re-check config for normalization and dimension override
+        self._client = openai_client
+        self._model = self._config.get("model", DEFAULT_CONFIG["model"])
         self._normalize = bool(self._config.get("normalize", True))
-        self._dim = int(self._config.get("dimensions", 0)) or self._backend.dimension
+        self._dim = int(self._config.get("dimensions", 0))
+
+        if self._client is None:
+            self._backend = self._build_backend()
+            if not self._dim:
+                self._dim = self._backend.dimension
+        else:
+            self._backend = None
+            if not self._dim:
+                self._dim = KNOWN_MODEL_DIMS.get(self._model, DEFAULT_CONFIG["dimensions"])
 
     def _build_backend(self) -> Any:
         provider = self._config.get("provider", "ollama").lower()
@@ -280,9 +304,20 @@ class EmbeddingClient:
             logger.debug("Empty text passed to embed_text")
             return None
 
-        raw = self._backend.embed(text.strip())
-        if raw is None:
-            return None
+        if self._client is not None:
+            try:
+                resp = self._client.embeddings.create(
+                    model=self._model,
+                    input=text.strip(),
+                )
+                raw = resp.data[0].embedding
+            except Exception as e:
+                logger.debug("Shared OpenAI client embedding failed: %s", e)
+                return None
+        else:
+            raw = self._backend.embed(text.strip())
+            if raw is None:
+                return None
 
         vec = np.asarray(raw, dtype=np.float32).reshape(1, -1)
 
@@ -302,9 +337,21 @@ class EmbeddingClient:
         if not valid:
             return None
 
-        raw_list = self._backend.embed_batch(valid)
-        if raw_list is None:
-            return None
+        if self._client is not None:
+            try:
+                resp = self._client.embeddings.create(
+                    model=self._model,
+                    input=valid,
+                )
+                sorted_data = sorted(resp.data, key=lambda x: x.index)
+                raw_list = [item.embedding for item in sorted_data]
+            except Exception as e:
+                logger.debug("Shared OpenAI client batch embedding failed: %s", e)
+                return None
+        else:
+            raw_list = self._backend.embed_batch(valid)
+            if raw_list is None:
+                return None
 
         vecs = np.asarray(raw_list, dtype=np.float32)
 

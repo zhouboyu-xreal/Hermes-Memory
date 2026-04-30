@@ -5,7 +5,7 @@ of conversation turns as structured memory nodes.
 
 Lifecycle:
   1. After each completed conversation turn:
-     - Summarize user + assistant exchange via Ollama (direct API call)
+     - Summarize user + assistant exchange via LLM API (OpenAI-compatible)
      - Extract keywords
      - Generate embedding via EmbeddingClient
      - Store as a memory node in SessionDB (SQLite + FAISS)
@@ -36,10 +36,10 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# ── Default Ollama endpoint ──────────────────────────────────────────────
+# ── Default LLM API endpoint ──────────────────────────────────────────────
 
-DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
-DEFAULT_SUMMARY_MODEL = "qwen3.5:9b"
+DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_LLM_MODEL = "gpt-4o-mini"
 
 # ── Summarisation prompt template ─────────────────────────────────────────
 
@@ -178,34 +178,58 @@ MEMORY_CONTEXT_BLOCK = """<memory-context>
 </memory-context>"""
 
 
-def _call_ollama_gen(prompt: str, model: str, base_url: str,
-                     timeout: int = 60) -> Optional[str]:
-    """Call Ollama's ``/api/generate`` with a single prompt.
+def _call_llm_api(prompt: str, model: str, base_url: str, api_key: str,
+                  timeout: int = 120) -> Optional[str]:
+    """Call an OpenAI-compatible chat completions API with a single user message.
 
-    Returns the response text, or None on failure.
+    Supports OpenAI, OpenRouter, DeepSeek, vLLM, and any provider that exposes
+    a ``/v1/chat/completions`` endpoint.
+
+    The entire *prompt* is sent as a ``user`` message (system instructions are
+    embedded directly in the prompt text).  Returns the response text, or
+    ``None`` on failure.
     """
-    url = f"{base_url.rstrip('/')}/api/generate"
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     data = {
         "model": model,
-        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 2048,
         "stream": False,
-        "options": {"num_ctx": 4096, "temperature": 0.3},
     }
     try:
-        resp = requests.post(url, json=data, timeout=timeout)
+        resp = requests.post(url, json=data, headers=headers, timeout=timeout)
         resp.raise_for_status()
-        return resp.json().get("response", "")
+        result = resp.json()
+        choices = result.get("choices", [])
+        if choices:
+            return choices[0].get("message", {}).get("content", "")
+        return None
     except requests.exceptions.RequestException as e:
-        logger.debug("Ollama generate call failed: %s", e)
+        logger.debug("LLM API call failed: %s", e)
         return None
 
 
 class MemoryNodeManager:
     """Manages automatic creation, storage, and retrieval of summarized memory nodes.
 
-    Summarisation uses direct Ollama API calls (like AI_Glass_Agent).
+    Summarisation uses the project-wide OpenAI client (``llm_client``) or
+    falls back to raw HTTP via ``_call_llm_api``.
     Embedding uses ``EmbeddingClient``.
     Storage/search uses ``SessionDB.memory_*`` methods.
+
+    Usage::
+
+        # With shared AIAgent client:
+        mgr = MemoryNodeManager(session_db, embedding_config, llm_client=agent.client)
+
+        # Standalone (raw HTTP):
+        mgr = MemoryNodeManager(session_db, embedding_config)
     """
 
     def __init__(
@@ -213,17 +237,22 @@ class MemoryNodeManager:
         session_db: Any,  # SessionDB instance
         embedding_config: Optional[Dict[str, Any]] = None,
         enabled: bool = True,
+        llm_client: Any = None,  # OpenAI-compatible client (shares the project's API infra)
     ) -> None:
         self._db = session_db
         self._enabled = enabled and bool(session_db)
         self._embedding_client: Any = None  # lazy init
+        self._llm_client = llm_client
 
         cfg = embedding_config or {}
 
-        # Ollama config for summarization
-        self._ollama_base_url = cfg.get("base_url", DEFAULT_OLLAMA_URL)
-        self._summary_model = cfg.get("summary_model", DEFAULT_SUMMARY_MODEL)
-        self._summary_timeout = int(cfg.get("timeout", 120))
+        # LLM model config (used regardless of client or raw HTTP)
+        self._llm_model = cfg.get("llm_model", cfg.get("summary_model", DEFAULT_LLM_MODEL))
+        self._llm_timeout = int(cfg.get("llm_timeout", cfg.get("timeout", 120)))
+
+        # Raw HTTP fallback config (only used when llm_client is None)
+        self._llm_base_url = cfg.get("llm_base_url", cfg.get("base_url", DEFAULT_LLM_BASE_URL))
+        self._llm_api_key = cfg.get("llm_api_key", cfg.get("api_key", ""))
 
         # Retrieval config
         self._top_k = int(cfg.get("retrieval_top_k", 8))
@@ -239,21 +268,55 @@ class MemoryNodeManager:
             return True
         try:
             from agent.embedding_client import EmbeddingClient
-            self._embedding_client = EmbeddingClient(self._embedding_cfg)
+            self._embedding_client = EmbeddingClient(
+                self._embedding_cfg,
+                openai_client=self._llm_client,
+            )
             return True
         except Exception as e:
             logger.debug("Failed to init EmbeddingClient: %s", e)
             self._enabled = False
             return False
 
-    # ── Summarisation (direct Ollama API) ─────────────────────────────────
+    # ── LLM call (shared client when available) ─────────────────────────
+
+    def _call_llm(self, prompt: str) -> Optional[str]:
+        """Call the LLM using the shared OpenAI client, falling back to raw HTTP.
+
+        When ``self._llm_client`` is set (passed from ``AIAgent``), uses the
+        project-wide OpenAI client — same connection pool, same API endpoint,
+        same authentication.  Otherwise falls back to ``_call_llm_api`` (raw
+        ``requests.post`` to an OpenAI-compatible ``/v1/chat/completions``).
+        """
+        if self._llm_client is not None:
+            try:
+                resp = self._llm_client.chat.completions.create(
+                    model=self._llm_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=2048,
+                    timeout=self._llm_timeout,
+                )
+                return getattr(resp.choices[0].message, "content", "") or ""
+            except Exception as e:
+                logger.debug("Shared LLM client call failed: %s", e)
+                return None
+        return _call_llm_api(
+            prompt,
+            model=self._llm_model,
+            base_url=self._llm_base_url,
+            api_key=self._llm_api_key,
+            timeout=self._llm_timeout,
+        )
+
+    # ── Summarisation ────────────────────────────────────────────────────
 
     def _summarize_turn(
         self, user_message: str, assistant_response: str
     ) -> Optional[Dict[str, Any]]:
-        """Summarise a conversation turn via direct Ollama API call.
+        """Summarise a conversation turn via LLM API call.
 
-        Retries once on parse failure to handle cold-start model loads.
+        Retries once on parse failure to handle transient API errors.
         """
         prompt = SUMMARY_SYSTEM_PROMPT.format(
             user_message=user_message,
@@ -261,12 +324,7 @@ class MemoryNodeManager:
         )
 
         for attempt in range(2):
-            result = _call_ollama_gen(
-                prompt,
-                model=self._summary_model,
-                base_url=self._ollama_base_url,
-                timeout=self._summary_timeout,
-            )
+            result = self._call_llm(prompt)
             if not result:
                 if attempt == 0:
                     logger.debug("Summarisation attempt %d returned empty, retrying...", attempt)
@@ -311,7 +369,7 @@ class MemoryNodeManager:
     ) -> List[Optional[str]]:
         """Determine causal relations between a new summary and similar existing nodes.
 
-        For each similar node, calls Ollama with the relation prompt template
+        For each similar node, calls the LLM API with the relation prompt template
         to determine the type of relation (Cause/Want/React/Changed/SameTopic/None).
 
         Follows the same approach as AI_Glass_Agent's ``_extract_causal_relations``.
@@ -336,12 +394,7 @@ class MemoryNodeManager:
                 summary2=node.get("summary", ""),
             )
 
-            result = _call_ollama_gen(
-                prompt,
-                model=self._summary_model,
-                base_url=self._ollama_base_url,
-                timeout=self._summary_timeout,
-            )
+            result = self._call_llm(prompt)
 
             if not result:
                 relations.append(None)
@@ -392,7 +445,7 @@ class MemoryNodeManager:
             return False
 
         try:
-            # 1. Summarize the turn via direct Ollama API
+            # 1. Summarize the turn via LLM API
             summary_data = self._summarize_turn(user_message, assistant_response)
             if not summary_data:
                 logger.debug("Skipping memory node — summarisation returned no data")

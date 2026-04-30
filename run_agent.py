@@ -1784,6 +1784,7 @@ class AIAgent:
                     session_db=self._session_db,
                     embedding_config=_merged_emb_cfg,
                     enabled=True,
+                    llm_client=self.client,
                 )
                 logger.info("MemoryNodeManager initialized (turn-based summarization + embedding)")
             except Exception as _mne:
