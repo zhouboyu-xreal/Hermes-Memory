@@ -268,13 +268,13 @@ class MemoryNodeManager:
             return True
         try:
             from agent.embedding_client import EmbeddingClient
-            self._embedding_client = EmbeddingClient(
-                self._embedding_cfg,
-                openai_client=self._llm_client,
-            )
+            # Don't pass llm_client — embedding backends use their own provider
+            # config, which may differ from the chat provider (e.g. DeepSeek
+            # doesn't support embeddings, but OpenRouter / OpenAI do).
+            self._embedding_client = EmbeddingClient(self._embedding_cfg)
             return True
         except Exception as e:
-            logger.debug("Failed to init EmbeddingClient: %s", e)
+            logger.error("Failed to init EmbeddingClient: %s", e)
             self._enabled = False
             return False
 
@@ -322,7 +322,7 @@ class MemoryNodeManager:
             user_message=user_message,
             assistant_response=assistant_response,
         )
-
+        
         for attempt in range(2):
             result = self._call_llm(prompt)
             if not result:
@@ -330,7 +330,6 @@ class MemoryNodeManager:
                     logger.debug("Summarisation attempt %d returned empty, retrying...", attempt)
                     continue
                 return None
-
             # Parse JSON from the response
             text = result.strip()
             # Strip code fences if present
@@ -458,9 +457,8 @@ class MemoryNodeManager:
             # 2. Generate embedding from the summary
             embedding = self._embedding_client.embed_text(summary)
             if embedding is None:
-                logger.debug("Skipping memory node — embedding generation failed")
+                logger.info("Skipping memory node — embedding generation failed")
                 return False
-
             # 3. Get similar existing nodes for causal linking
             similar_nodes, similar_ids = self._db.memory_search_relevant_nodes(embedding)
 
@@ -493,7 +491,7 @@ class MemoryNodeManager:
             return True
 
         except Exception as e:
-            logger.debug("Failed to store memory node (non-fatal): %s", e)
+            logger.info("Failed to store memory node (non-fatal): %s", e)
             return False
 
     # ── Recall relevant memory nodes ──────────────────────────────────────

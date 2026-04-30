@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -173,7 +174,15 @@ class _OpenAIBackend:
             base = "https://api.openai.com"
         self.url = f"{base}/v1/embeddings"
         self.model = config.get("model", "text-embedding-3-small")
-        self.api_key = config.get("api_key", "")
+        self.api_key = config.get("api_key", "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")
+        if not self.api_key:
+            # Fall back to environment variables so secrets stay out of
+            # config.yaml. Checks common embedding-provider env vars in order.
+            self.api_key = (
+                os.environ.get("OPENAI_API_KEY")
+                or os.environ.get("OPENROUTER_API_KEY")
+                or ""
+            )
         self.timeout = config.get("timeout", 60)
 
     def embed(self, text: str) -> Optional[List[float]]:
@@ -300,19 +309,22 @@ class EmbeddingClient:
 
         Returns ``None`` if embedding fails.
         """
+        logger.info("inside_embedding_text")
+        logger.info(text.strip())
         if not text or not text.strip():
-            logger.debug("Empty text passed to embed_text")
+            logger.info("Empty text passed to embed_text")
             return None
 
         if self._client is not None:
             try:
+                logger.info("try to get response from embedding model")
                 resp = self._client.embeddings.create(
                     model=self._model,
                     input=text.strip(),
                 )
                 raw = resp.data[0].embedding
             except Exception as e:
-                logger.debug("Shared OpenAI client embedding failed: %s", e)
+                logger.info("Shared OpenAI client embedding failed: %s", e)
                 return None
         else:
             raw = self._backend.embed(text.strip())

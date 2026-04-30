@@ -23,6 +23,8 @@ import threading
 import time
 from pathlib import Path
 
+import yaml
+
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
@@ -44,7 +46,16 @@ T = TypeVar("T")
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
 SCHEMA_VERSION = 11
-EMBEDDING_DIM = 4096
+def _get_embedding_dim_from_config() -> int:
+    """Read embedding dimension from config.yaml, falling back to 1536."""
+    config_path = get_hermes_home() / "config.yaml"
+    try:
+        cfg = yaml.safe_load(config_path.read_text()) or {}
+        return int(cfg.get("embedding", {}).get("dimensions", 1536))
+    except Exception:
+        return 1536
+
+EMBEDDING_DIM = _get_embedding_dim_from_config()
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
