@@ -468,7 +468,7 @@ class MemoryNodeManager:
             # 3. Get similar existing nodes for causal linking
             similar_nodes, similar_ids = self._db.memory_search_relevant_nodes(embedding)
 
-            # 4. Determine causal relations via Ollama
+            # 4. Determine causal relations
             relations = self._extract_causal_relations(summary, similar_nodes)
 
             # 5. Store the new node
