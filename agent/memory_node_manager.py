@@ -529,7 +529,6 @@ class MemoryNodeManager:
 
                 return ""
             # Generate summary for the query
-            logger.error(f"In MemoryNodeManager, query is {query}")
             summary_data = self._summarize_turn(query, "")
             if not summary_data:
                 logger.debug("Skipping memory node — summarisation returned no data")

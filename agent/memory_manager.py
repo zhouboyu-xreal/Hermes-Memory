@@ -177,9 +177,7 @@ def build_memory_context_block(raw_context: str) -> str:
     """Wrap prefetched memory in a fenced block with system note."""
     if not raw_context or not raw_context.strip():
         return ""
-    logger.error("before sanitize " + raw_context)
     clean = sanitize_context(raw_context)
-    logger.error("after sanitize " + clean)
     
     if clean != raw_context:
         logger.warning("memory provider returned pre-wrapped context; stripped")

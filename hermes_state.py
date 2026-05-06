@@ -2046,9 +2046,9 @@ class SessionDB:
             vec_score = sim if sim is not None else 0.0
 
             final = 0.6 * bm25_score + 0.4 * vec_score
-            logger.error(f"bm25_score is {bm25_score}")
-            logger.error(f"vec_score is {vec_score}")
-            logger.error(f"final is {final}")
+            # logger.error(f"bm25_score is {bm25_score}")
+            # logger.error(f"vec_score is {vec_score}")
+            # logger.error(f"final is {final}")
             
             if final < self.MEMORY_QUERY_RETRIEVAL_THRESHOLD:
                 continue
