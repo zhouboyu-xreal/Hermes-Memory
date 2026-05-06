@@ -518,11 +518,23 @@ class MemoryNodeManager:
             # Generate embedding from the query
             query_embedding = self._embedding_client.embed_text(query)
             if query_embedding is None:
-                return ""
+                logger.error("rquery_embedding is none")
 
+                return ""
+            # Generate summary for the query
+            logger.error(f"In MemoryNodeManager, query is {query}")
+            summary_data = self._summarize_turn(query, "")
+            if not summary_data:
+                logger.debug("Skipping memory node — summarisation returned no data")
+                return False
+            
+            summary = summary_data["summary"]
+            keywords = summary_data["keywords"]
             # Hybrid search: keyword + vector + causal expansion
-            nodes = self._db.memory_search(query, query_embedding, top_k=k)
+            nodes = self._db.memory_search(keywords, query_embedding, top_k=k)
             if not nodes:
+                logger.error("rnot nodes")
+
                 return ""
 
             # Format results
@@ -540,7 +552,7 @@ class MemoryNodeManager:
             return MEMORY_CONTEXT_BLOCK.format(memory_text=memory_text)
 
         except Exception as e:
-            logger.debug("Memory recall failed (non-fatal): %s", e)
+            logger.error("Memory recall failed (non-fatal): %s", e)
             return ""
 
     def turn_count(self) -> int:

@@ -10325,10 +10325,14 @@ class AIAgent:
                 pass
 
         # Memory Node Manager: also recall relevant past summarized turns
+        logger.error("_memory_node_manager")
         if self._memory_node_manager:
             try:
+                logger.error("begin recall memory")
                 _mem_node_query = original_user_message if isinstance(original_user_message, str) else ""
                 _mem_node_context = self._memory_node_manager.recall(_mem_node_query)
+                logger.error("cur_query is " + _mem_node_query)
+                logger.error("recall context " + _mem_node_context)
                 if _mem_node_context:
                     if _ext_prefetch_cache:
                         _ext_prefetch_cache += "\n\n" + _mem_node_context
@@ -10510,6 +10514,7 @@ class AIAgent:
                 # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
                 # The signature field helps maintain reasoning continuity
                 api_messages.append(api_msg)
+                logger.error(api_msg)
 
             # Build the final system message: cached prompt + ephemeral system prompt.
             # Ephemeral additions are API-call-time only (not persisted to session DB).

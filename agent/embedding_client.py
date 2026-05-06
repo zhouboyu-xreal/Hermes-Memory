@@ -309,8 +309,6 @@ class EmbeddingClient:
 
         Returns ``None`` if embedding fails.
         """
-        logger.info("inside_embedding_text")
-        logger.info(text.strip())
         if not text or not text.strip():
             logger.info("Empty text passed to embed_text")
             return None
