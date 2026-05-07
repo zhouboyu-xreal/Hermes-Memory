@@ -2320,21 +2320,18 @@ class SessionDB:
         *query_embedding* is a (1, EMBEDDING_DIM) float32 numpy array.
         *top_k* overrides ``MEMORY_QUERY_TOP_K`` (default).
         *budget* controls entity graph traversal depth: low=0, mid=1, high=3.
-        *time_start*, *time_end*: optional ISO timestamp strings (``"2026-04-20 10:00:00"``)
-            to filter memory nodes by time_key range. Only nodes with
-            ``time_start <= time_key <= time_end`` are returned.
+        *time_start*, *time_end*: optional ISO timestamp strings (``"2026-04-20 10:00:00"``).
+            When specified, time range is the PRIMARY filter — all nodes in range
+            are candidates, and the pool is padded with newest nodes if semantic
+            search returns too few results.
         """
         if top_k is None:
             top_k = self.MEMORY_QUERY_TOP_K
         
         logger.debug(" OR ".join(keyword))
         
-        fts_results = self._memory_search_keyword(" OR ".join(keyword) if isinstance(keyword, list) else keyword)
-        vec_results = self._memory_search_vector(query_embedding)
-
-        ranked_ids = self._memory_fuse_scores(fts_results, vec_results)[:top_k]
-
-        # Time range filter: intersect ranked_ids with time-filtered node IDs
+        # ── Step 1: Get time-range node IDs (if time filter active) ──
+        _time_ids: Optional[set] = None
         if time_start is not None or time_end is not None:
             _time_conditions = []
             _time_params = []
@@ -2345,14 +2342,43 @@ class SessionDB:
                 _time_conditions.append("time_key <= ?")
                 _time_params.append(time_end)
             _time_sql = " AND ".join(_time_conditions)
-            _time_cursor = self._conn.execute(
-                "SELECT id FROM memory_nodes WHERE {} AND id IN ({})".format(
-                    _time_sql, ",".join("?" for _ in ranked_ids) if ranked_ids else "0"
-                ),
-                _time_params + list(ranked_ids) if ranked_ids else [],
+            _tc = self._conn.execute(
+                "SELECT id FROM memory_nodes WHERE {}".format(_time_sql),
+                _time_params,
             )
-            _time_ids = {r[0] for r in _time_cursor.fetchall()}
-            ranked_ids = [nid for nid in ranked_ids if nid in _time_ids]
+            _time_ids = {r[0] for r in _tc.fetchall()}
+            if not _time_ids:
+                return []  # No nodes in the requested time range
+
+        # ── Step 2: Keyword + Vector search (global) ──
+        fts_results = self._memory_search_keyword(" OR ".join(keyword) if isinstance(keyword, list) else keyword)
+        vec_results = self._memory_search_vector(query_embedding)
+
+        # ── Step 3: Apply time filter to both result sets ──
+        if _time_ids is not None:
+            fts_results = {k: v for k, v in fts_results.items() if k in _time_ids}
+            vec_results = {k: v for k, v in vec_results.items() if k in _time_ids}
+
+        # ── Step 4: Fuse scores ──
+        ranked_ids = self._memory_fuse_scores(fts_results, vec_results)
+
+        # ── Step 5: Pad with time-range newest-first if too few results ──
+        if _time_ids is not None and len(ranked_ids) < top_k:
+            _existing = set(ranked_ids)
+            _needed = top_k - len(ranked_ids)
+            _tc2 = self._conn.execute(
+                "SELECT id FROM memory_nodes WHERE {} "
+                "ORDER BY time_key DESC LIMIT ?".format(_time_sql),
+                _time_params + [_needed * 2],  # fetch more, filter already-ranked
+            )
+            for _row in _tc2.fetchall():
+                if len(ranked_ids) >= top_k:
+                    break
+                if _row[0] not in _existing:
+                    ranked_ids.append(_row[0])
+                    _existing.add(_row[0])
+        else:
+            ranked_ids = ranked_ids[:top_k]
 
         # Node relation expansion: include nodes related to any ranked node
         all_ids = set(ranked_ids)
