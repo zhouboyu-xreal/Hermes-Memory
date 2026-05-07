@@ -686,6 +686,15 @@ class SessionDB:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # ── Index on time_key for time-range search ──
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_nodes_time "
+                "ON memory_nodes(time_key)"
+            )
+        except sqlite3.OperationalError:
+            pass
+
         # ── Causal relation migration: JSON → normalized memory_node_relations ──
         try:
             _migrated = cursor.execute(
@@ -2313,6 +2322,8 @@ class SessionDB:
         budget: str = "mid",
         time_start: Optional[str] = None,
         time_end: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        tags_match: str = "any",
     ) -> List[Dict[str, Any]]:
         """Hybrid search: keyword (FTS5) + vector (FAISS) + entity graph expansion.
 
@@ -2324,6 +2335,8 @@ class SessionDB:
             When specified, time range is the PRIMARY filter — all nodes in range
             are candidates, and the pool is padded with newest nodes if semantic
             search returns too few results.
+        *tags*: optional list of tags to filter by (matches against JSON array in ``tags`` column).
+        *tags_match*: ``"any"`` (default, node has at least one) or ``"all"`` (node has all).
         """
         if top_k is None:
             top_k = self.MEMORY_QUERY_TOP_K
@@ -2360,6 +2373,23 @@ class SessionDB:
         if _time_ids is not None:
             fts_results = {k: v for k, v in fts_results.items() if k in _time_ids}
             vec_results = {k: v for k, v in vec_results.items() if k in _time_ids}
+
+        # ── Step 3b: Apply tag filter ──
+        if tags:
+            _tag_conditions = []
+            _tag_params = []
+            for _t in tags:
+                _tag_conditions.append("tags LIKE ?")
+                _tag_params.append(f'%"{_t}"%')
+            _tag_connector = " OR " if tags_match == "any" else " AND "
+            _tag_sql = _tag_connector.join(_tag_conditions)
+            _tag_cursor = self._conn.execute(
+                "SELECT id FROM memory_nodes WHERE {}".format(_tag_sql),
+                _tag_params,
+            )
+            _tag_ids = {r[0] for r in _tag_cursor.fetchall()}
+            fts_results = {k: v for k, v in fts_results.items() if k in _tag_ids}
+            vec_results = {k: v for k, v in vec_results.items() if k in _tag_ids}
 
         # ── Step 4: Fuse scores ──
         ranked_ids = self._memory_fuse_scores(fts_results, vec_results)

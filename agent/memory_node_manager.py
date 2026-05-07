@@ -654,10 +654,11 @@ class MemoryNodeManager:
 
             keywords = summary_data["keywords"]
 
-            # Hybrid search: keyword + vector + entity graph + node relations + time range
+            # Hybrid search: keyword + vector + entity graph + node relations + time range + tags
             nodes = self._db.memory_search(
                 keywords, query_embedding, top_k=k, budget=b,
                 time_start=ts, time_end=te,
+                tags=tags,
             )
 
             if not nodes:
