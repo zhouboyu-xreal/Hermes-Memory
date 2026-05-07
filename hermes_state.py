@@ -2349,6 +2349,8 @@ class SessionDB:
             _time_ids = {r[0] for r in _tc.fetchall()}
             if not _time_ids:
                 return []  # No nodes in the requested time range
+            # Actual top-k is at most the number of nodes in time range
+            top_k = min(top_k, len(_time_ids))
 
         # ── Step 2: Keyword + Vector search (global) ──
         fts_results = self._memory_search_keyword(" OR ".join(keyword) if isinstance(keyword, list) else keyword)
@@ -2361,24 +2363,15 @@ class SessionDB:
 
         # ── Step 4: Fuse scores ──
         ranked_ids = self._memory_fuse_scores(fts_results, vec_results)
+        ranked_ids = ranked_ids[:top_k]
 
-        # ── Step 5: Pad with time-range newest-first if too few results ──
+        # ── Step 5: Pad with time-range newest-first if semantic returned too few ──
         if _time_ids is not None and len(ranked_ids) < top_k:
             _existing = set(ranked_ids)
-            _needed = top_k - len(ranked_ids)
-            _tc2 = self._conn.execute(
-                "SELECT id FROM memory_nodes WHERE {} "
-                "ORDER BY time_key DESC LIMIT ?".format(_time_sql),
-                _time_params + [_needed * 2],  # fetch more, filter already-ranked
-            )
-            for _row in _tc2.fetchall():
+            for _nid in sorted(_time_ids - _existing, reverse=True):
                 if len(ranked_ids) >= top_k:
                     break
-                if _row[0] not in _existing:
-                    ranked_ids.append(_row[0])
-                    _existing.add(_row[0])
-        else:
-            ranked_ids = ranked_ids[:top_k]
+                ranked_ids.append(_nid)
 
         # Node relation expansion: include nodes related to any ranked node
         all_ids = set(ranked_ids)
