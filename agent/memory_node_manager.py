@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""
-Memory Node Manager — automatic summarization, embedding, and hybrid retrieval
+"""Memory Node Manager — automatic summarization, embedding, and hybrid retrieval
 of conversation turns as structured memory nodes.
 
-Lifecycle:
-  1. After each completed conversation turn:
-     - Summarize user + assistant exchange via LLM API (OpenAI-compatible)
+Lifecycle (enhanced with HindSight-inspired features):
+  1. After each completed conversation turn (SYNC + ASYNC):
+     - Summarize user + assistant exchange via LLM API
      - Extract keywords
      - Generate embedding via EmbeddingClient
      - Store as a memory node in SessionDB (SQLite + FAISS)
+     - Start background thread for causal + entity extraction
 
-  2. Before each new turn:
+  2. Background (ASYNC, non-blocking):
+     - Extract causal relations to similar nodes
+     - Extract entities and relations -> knowledge graph
+     - Store in memory_node_relations + entity_nodes/edges
+
+  3. Before each new turn:
      - Embed the user's query
-     - Search for relevant memory nodes (keyword + vector + causal expansion)
+     - Search for relevant memory nodes (keyword + vector + entity graph + node relations)
      - Return formatted context for system prompt injection
 
 Usage::
@@ -22,12 +27,14 @@ Usage::
     mgr = MemoryNodeManager(session_db, embedding_config=None)
     mgr.store_turn("用户问了什么", "助手回答了什么")
     context = mgr.recall("用户当前问题")
+    reflection = mgr.reflect("总结用户偏好")
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -169,6 +176,8 @@ Step 2：若"有关联"，再判断关系类型
 【摘要B】：
 {summary2}"""
 
+# ── Reflect prompt template ───────────────────────────────────────────────
+
 # ── Memory node context block template ───────────────────────────────────
 # NOTE: recall() returns RAW text (no wrapper). Callers (run_agent.py) use
 # build_memory_context_block() from agent/memory_manager.py to wrap in
@@ -264,8 +273,17 @@ class MemoryNodeManager:
         self._top_k = int(cfg.get("retrieval_top_k", 8))
         self._min_turns_before_store = int(cfg.get("min_turns_before_store", 0))
 
+        # Default recall budget: "mid"
+        self._recall_budget = cfg.get("recall_budget", "mid")
+
+        # Enable entity extraction (default: True if session_db available)
+        self._enable_entity_extraction = cfg.get("enable_entity_extraction", True)
+
         self._turn_count = 0
         self._embedding_cfg = cfg
+
+        # Async background thread for non-critical work (causal + entity extraction)
+        self._async_thread: Optional[threading.Thread] = None
 
     # ── Lazy init ─────────────────────────────────────────────────────────
 
@@ -425,17 +443,41 @@ class MemoryNodeManager:
 
         return relations
 
+    # ── Entity extraction (lazy init) ─────────────────────────────────────
+
+    def _ensure_entity_extractor(self) -> Any:
+        """Lazy-init and return EntityExtractor, or None if unavailable."""
+        if not self._enable_entity_extraction or not self._db:
+            return None
+        try:
+            from agent.entity_extractor import EntityExtractor
+            return EntityExtractor(
+                session_db=self._db,
+                llm_client=self._llm_client,
+                llm_model=self._llm_model,
+                llm_base_url=self._llm_base_url,
+                llm_api_key=self._llm_api_key,
+                llm_timeout=self._llm_timeout,
+            )
+        except Exception as e:
+            logger.debug("EntityExtractor unavailable: %s", e)
+            return None
+
     # ── Store turn as memory node ─────────────────────────────────────────
 
     def store_turn(
         self,
         user_message: str,
         assistant_response: str,
+        tags: Optional[List[str]] = None,
     ) -> bool:
-        """Summarise, embed, and store a completed conversation turn.
+        """Summarise, embed, store a turn (sync), then start async work (causal+entity).
 
-        Returns True if a memory node was created, False otherwise.
-        All failures are non-fatal (logged at DEBUG).
+        The synchronous part is minimal: summarise → embed → store in DB.
+        Causal relation extraction and entity extraction run in a background
+        thread so they never block the conversation.
+
+        Returns True if the storage was queued, False otherwise.
         """
         if not self._enabled:
             return False
@@ -450,7 +492,7 @@ class MemoryNodeManager:
             return False
 
         try:
-            # 1. Summarize the turn via LLM API
+            # ── Step 1: Summarize the turn (SYNC) ──
             summary_data = self._summarize_turn(user_message, assistant_response)
             if not summary_data:
                 logger.debug("Skipping memory node — summarisation returned no data")
@@ -460,18 +502,13 @@ class MemoryNodeManager:
             keywords = summary_data["keywords"]
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
 
-            # 2. Generate embedding from the summary
+            # ── Step 2: Generate embedding (SYNC) ──
             embedding = self._embedding_client.embed_text(summary)
             if embedding is None:
                 logger.info("Skipping memory node — embedding generation failed")
                 return False
-            # 3. Get similar existing nodes for causal linking
-            similar_nodes, similar_ids = self._db.memory_search_relevant_nodes(embedding)
 
-            # 4. Determine causal relations
-            relations = self._extract_causal_relations(summary, similar_nodes)
-
-            # 5. Store the new node
+            # ── Step 3: Store the new node (SYNC) ──
             raw_dialog = f"用户：{user_message}\n助手：{assistant_response}"
             node_id = self._db.memory_add_node(
                 time_key=timestamp,
@@ -479,20 +516,22 @@ class MemoryNodeManager:
                 keywords=keywords,
                 original_dialog=raw_dialog,
                 query_embedding=embedding,
+                tags=tags,
             )
 
-            # 6. Link causally to similar nodes
-            for similar_id, relation in zip(similar_ids, relations):
-                if relation is not None:
-                    self._db.memory_update_causal(
-                        node_id, similar_id,
-                        relation_ab=relation,
-                        relation_ba=None,
-                    )
+            # ── Step 4: Start async background work ──
+            # (entity extraction + causal relation extraction)
+            self._start_async_work(
+                node_id=node_id,
+                summary=summary,
+                user_message=user_message,
+                assistant_response=assistant_response,
+                embedding=embedding,
+            )
 
             logger.debug(
-                "Memory node %d created: %.60s | keywords=%s | linked to %d similar node(s)",
-                node_id, summary, keywords, len(similar_ids),
+                "Memory node %d created: %.60s | keywords=%s",
+                node_id, summary, keywords,
             )
             return True
 
@@ -500,18 +539,90 @@ class MemoryNodeManager:
             logger.info("Failed to store memory node (non-fatal): %s", e)
             return False
 
+    def _start_async_work(
+        self,
+        node_id: int,
+        summary: str,
+        user_message: str,
+        assistant_response: str,
+        embedding: np.ndarray,
+    ) -> None:
+        """Start background thread for causal + entity extraction."""
+        def _run_async():
+            try:
+                # ── A. Causal relation extraction ──
+                similar_nodes, similar_ids = self._db.memory_search_relevant_nodes(embedding)
+                if similar_nodes:
+                    relations = self._extract_causal_relations(summary, similar_nodes)
+                    for similar_id, relation in zip(similar_ids, relations):
+                        if relation is not None:
+                            # Write to both normalized table + legacy JSON
+                            self._db.memory_update_causal(
+                                node_id, similar_id,
+                                relation_ab=relation,
+                                relation_ba=None,
+                            )
+                            self._db.memory_add_node_relation(
+                                source_node_id=node_id,
+                                target_node_id=similar_id,
+                                relation_type=relation,
+                            )
+                    logger.debug(
+                        "Async: linked node %d to %d similar node(s)",
+                        node_id, len(similar_ids),
+                    )
+
+                # ── B. Entity extraction ──
+                extractor = self._ensure_entity_extractor()
+                if extractor is not None:
+                    extractor.extract_from_turn(
+                        node_id=node_id,
+                        user_message=user_message,
+                        assistant_response=assistant_response,
+                    )
+
+            except Exception as e:
+                logger.debug("Async background work failed for node %d: %s", node_id, e)
+
+        # Wait for previous async thread to finish, then start new one
+        if self._async_thread and self._async_thread.is_alive():
+            self._async_thread.join(timeout=5.0)
+        self._async_thread = threading.Thread(
+            target=_run_async, daemon=True, name="memory-node-async"
+        )
+        self._async_thread.start()
+
     # ── Recall relevant memory nodes ──────────────────────────────────────
 
     def recall(
         self,
         query: str,
         top_k: int = None,
+        budget: str = None,
+        tags: Optional[List[str]] = None,
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
     ) -> str:
         """Search for memory nodes relevant to *query*.
 
-        Returns formatted markdown text (no ``<memory-context>`` wrapper — the
-        caller wraps it via ``build_memory_context_block()``), or empty string
-        if nothing relevant is found.
+        Uses hybrid search (keyword + vector + entity graph + node relations),
+        with budget controlling entity graph traversal depth.
+
+        Supports time range filtering:
+        - Pass *time_start* and/or *time_end* explicitly (ISO timestamp strings).
+        - If the *query* contains Chinese time expressions like "最近一周",
+          "上个月", "2025年3月到6月", they are automatically parsed and applied,
+          and the time expression is stripped from the search query.
+
+        Args:
+            query: The user's current query / context.
+            top_k: Override default retrieval count.
+            budget: "low", "mid" (default), or "high".
+            tags: Optional list of tags to filter by.
+            time_start: Optional ISO timestamp start filter.
+            time_end: Optional ISO timestamp end filter.
+
+        Returns formatted markdown text, or empty string if nothing relevant.
         """
         if not self._enabled or not query:
             return ""
@@ -521,35 +632,45 @@ class MemoryNodeManager:
 
         try:
             k = top_k or self._top_k
+            b = budget or self._recall_budget
 
-            # Generate embedding from the query
-            query_embedding = self._embedding_client.embed_text(query)
+            # Detect and extract time expressions from the query
+            _parsed_time_start, _parsed_time_end, clean_query = self._parse_time_expression(query)
+            ts = time_start or _parsed_time_start
+            te = time_end or _parsed_time_end
+            search_query = clean_query or query
+
+            # Generate embedding from the clean query
+            query_embedding = self._embedding_client.embed_text(search_query)
             if query_embedding is None:
-                logger.error("rquery_embedding is none")
-
+                logger.error("Query embedding is None")
                 return ""
-            # Generate summary for the query
-            summary_data = self._summarize_turn(query, "")
-            if not summary_data:
-                logger.debug("Skipping memory node — summarisation returned no data")
-                return False
-            
-            summary = summary_data["summary"]
-            keywords = summary_data["keywords"]
-            # Hybrid search: keyword + vector + causal expansion
-            nodes = self._db.memory_search(keywords, query_embedding, top_k=k)
-            if not nodes:
-                logger.error("rnot nodes")
 
+            # Generate summary for the query (for keyword extraction)
+            summary_data = self._summarize_turn(search_query, "")
+            if not summary_data:
+                logger.debug("Skipping recall — summarisation returned no data")
+                return ""
+
+            keywords = summary_data["keywords"]
+
+            # Hybrid search: keyword + vector + entity graph + node relations + time range
+            nodes = self._db.memory_search(
+                keywords, query_embedding, top_k=k, budget=b,
+                time_start=ts, time_end=te,
+            )
+
+            if not nodes:
+                logger.debug("No relevant memory nodes found for query")
                 return ""
 
             # Format results as raw text (no <memory-context> wrapper)
             lines: List[str] = []
             for i, node in enumerate(nodes, 1):
-                summary = node.get("summary", "")
+                node_summary = node.get("summary", "")
                 time_key = node.get("time_key", "")
                 kw = ", ".join(node.get("keywords", []))
-                line = f"{i}. [{time_key}] {summary}"
+                line = f"{i}. [{time_key}] {node_summary}"
                 if kw:
                     line += f"  (关键词: {kw})"
                 lines.append(line)
@@ -560,6 +681,157 @@ class MemoryNodeManager:
         except Exception as e:
             logger.debug("Memory recall failed (non-fatal): %s", e)
             return ""
+
+    # ── Time expression parser ───────────────────────────────────────────
+
+    @staticmethod
+    def _parse_time_expression(query: str) -> tuple:
+        """Parse Chinese time expressions from *query*.
+
+        Returns ``(time_start, time_end, clean_query)`` where *time_start* and
+        *time_end* are ISO timestamp strings (``\"2026-04-20 00:00:00\"`` format)
+        or ``None``, and *clean_query* is the query with the time expression
+        stripped.
+
+        Supported expressions:
+          - ``最近N天/周/月/年`` → last N days/weeks/months/years
+          - ``最近`` (alone) → last 7 days
+          - ``上个月/上周/昨天/前天/去年`` → relative periods
+          - ``本周/这个月/今年/今天`` → current periods
+          - ``2025年3月到6月``, ``2025年3月至6月``
+          - ``从2025年3月到2025年6月``
+          - ``过去N天``, ``近N天``, ``近N周``, ``近N个月``
+        """
+        import datetime
+        import re
+
+        now = datetime.datetime.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        time_start: Optional[str] = None
+        time_end: Optional[str] = None
+        clean_query = query
+
+        # Pattern: 最近N天/周/月/年  or  近N天/周/月  or  过去N天
+        m = re.search(r'(?:最近|近|过去)\s*(\d+)\s*(天|日|周|星期|个月|月|年)', query)
+        if m:
+            num = int(m.group(1))
+            unit = m.group(2)
+            if unit in ('天', '日'):
+                delta = datetime.timedelta(days=num)
+            elif unit in ('周', '星期'):
+                delta = datetime.timedelta(weeks=num)
+            elif unit in ('个月', '月'):
+                delta = datetime.timedelta(days=num * 30)
+            elif unit == '年':
+                delta = datetime.timedelta(days=num * 365)
+            else:
+                delta = datetime.timedelta(days=num)
+            time_start = (now - delta).strftime("%Y-%m-%d %H:%M:%S")
+            time_end = now.strftime("%Y-%m-%d %H:%M:%S")
+            clean_query = query[:m.start()] + query[m.end():]
+            return time_start, time_end, clean_query.strip()
+
+        # Pattern: 最近 (standalone) → last 7 days
+        m = re.search(r'最近\s*', query)
+        if m:
+            time_start = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+            time_end = now.strftime("%Y-%m-%d %H:%M:%S")
+            clean_query = query[:m.start()] + query[m.end():]
+            return time_start, time_end, clean_query.strip()
+
+        # Pattern: 从2025年3月到2025年6月  or  2025年3月到6月  or  2025年3月至6月
+        m = re.search(r'(?:从)?\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(?:到|至)\s*(?:(\d{4})\s*年)?\s*(\d{1,2})\s*月', query)
+        if m:
+            year1 = int(m.group(1))
+            month1 = int(m.group(2))
+            year2 = int(m.group(3)) if m.group(3) else year1
+            month2 = int(m.group(4))
+            try:
+                dt1 = datetime.datetime(year1, month1, 1)
+                dt2 = datetime.datetime(year2, month2 + 1, 1) - datetime.timedelta(days=1) if month2 < 12 else datetime.datetime(year2, 12, 31, 23, 59, 59)
+                time_start = dt1.strftime("%Y-%m-%d %H:%M:%S")
+                time_end = dt2.strftime("%Y-%m-%d %H:%M:%S")
+                clean_query = query[:m.start()] + query[m.end():]
+                return time_start, time_end, clean_query.strip()
+            except ValueError:
+                pass
+
+        # Pattern: 2025年3月 (specific month)
+        m = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月', query)
+        if m:
+            year = int(m.group(1))
+            month = int(m.group(2))
+            try:
+                dt1 = datetime.datetime(year, month, 1)
+                dt2 = datetime.datetime(year, month + 1, 1) - datetime.timedelta(days=1) if month < 12 else datetime.datetime(year, 12, 31, 23, 59, 59)
+                time_start = dt1.strftime("%Y-%m-%d %H:%M:%S")
+                time_end = dt2.strftime("%Y-%m-%d %H:%M:%S")
+                clean_query = query[:m.start()] + query[m.end():]
+                return time_start, time_end, clean_query.strip()
+            except ValueError:
+                pass
+
+        # Pattern: 上个月/上星期/上周 → last month/week
+        m = re.search(r'上(?:个)?(?:月|星期|周)', query)
+        if m:
+            unit = m.group()[1:]
+            if '月' in unit:
+                first_of_month = today_start.replace(day=1)
+                end_of_last_month = first_of_month - datetime.timedelta(days=1)
+                start_of_last_month = end_of_last_month.replace(day=1)
+                time_start = start_of_last_month.strftime("%Y-%m-%d %H:%M:%S")
+                time_end = end_of_last_month.strftime("%Y-%m-%d %H:%M:%S")
+            else:  # 周/星期
+                start_of_this_week = today_start - datetime.timedelta(days=today_start.weekday())
+                start_of_last_week = start_of_this_week - datetime.timedelta(days=7)
+                time_start = start_of_last_week.strftime("%Y-%m-%d %H:%M:%S")
+                time_end = start_of_this_week.strftime("%Y-%m-%d %H:%M:%S")
+            clean_query = query[:m.start()] + query[m.end():]
+            return time_start, time_end, clean_query.strip()
+
+        # Pattern: 这个月/本月 → this month
+        m = re.search(r'(?:这个月|本月)', query)
+        if m:
+            time_start = today_start.replace(day=1).strftime("%Y-%m-%d %H:%M:%S")
+            time_end = now.strftime("%Y-%m-%d %H:%M:%S")
+            clean_query = query[:m.start()] + query[m.end():]
+            return time_start, time_end, clean_query.strip()
+
+        # Pattern: 本周/这一周 → this week
+        m = re.search(r'(?:本周|这一周)', query)
+        if m:
+            time_start = (today_start - datetime.timedelta(days=today_start.weekday())).strftime("%Y-%m-%d %H:%M:%S")
+            time_end = now.strftime("%Y-%m-%d %H:%M:%S")
+            clean_query = query[:m.start()] + query[m.end():]
+            return time_start, time_end, clean_query.strip()
+
+        # Pattern: 昨天 → yesterday
+        m = re.search(r'昨天|昨日', query)
+        if m:
+            yesterday = today_start - datetime.timedelta(days=1)
+            time_start = yesterday.strftime("%Y-%m-%d %H:%M:%S")
+            time_end = (yesterday + datetime.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+            clean_query = query[:m.start()] + query[m.end():]
+            return time_start, time_end, clean_query.strip()
+
+        # Pattern: 前天 → day before yesterday
+        m = re.search(r'前天|前日', query)
+        if m:
+            day_before = today_start - datetime.timedelta(days=2)
+            time_start = day_before.strftime("%Y-%m-%d %H:%M:%S")
+            time_end = (day_before + datetime.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+            clean_query = query[:m.start()] + query[m.end():]
+            return time_start, time_end, clean_query.strip()
+
+        # Pattern: 今天 → today
+        m = re.search(r'今天|今日', query)
+        if m:
+            time_start = today_start.strftime("%Y-%m-%d %H:%M:%S")
+            time_end = now.strftime("%Y-%m-%d %H:%M:%S")
+            clean_query = query[:m.start()] + query[m.end():]
+            return time_start, time_end, clean_query.strip()
+
+        return None, None, query
 
     def turn_count(self) -> int:
         """Return the number of turns processed by this manager."""

@@ -219,6 +219,82 @@ CREATE TRIGGER IF NOT EXISTS memory_nodes_au AFTER UPDATE ON memory_nodes BEGIN
 END;
 """
 
+# ── Knowledge Graph Schema (entity extraction + relation graph) ──
+# Replicates HindSight's entity knowledge graph with lightweight SQLite storage.
+
+KNOWLEDGE_GRAPH_SQL = """
+CREATE TABLE IF NOT EXISTS entity_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    type TEXT NOT NULL DEFAULT 'CONCEPT',
+    embedding BLOB,
+    metadata TEXT DEFAULT '{}',
+    created_at REAL NOT NULL DEFAULT (strftime('%%s','now'))
+);
+
+CREATE TABLE IF NOT EXISTS entity_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_entity_id INTEGER NOT NULL REFERENCES entity_nodes(id),
+    target_entity_id INTEGER NOT NULL REFERENCES entity_nodes(id),
+    relation_type TEXT NOT NULL,
+    weight REAL DEFAULT 1.0,
+    metadata TEXT DEFAULT '{}',
+    created_at REAL NOT NULL DEFAULT (strftime('%%s','now')),
+    UNIQUE(source_entity_id, target_entity_id, relation_type)
+);
+
+CREATE TABLE IF NOT EXISTS memory_node_entities (
+    node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
+    entity_id INTEGER NOT NULL REFERENCES entity_nodes(id),
+    mention_count INTEGER DEFAULT 1,
+    PRIMARY KEY (node_id, entity_id)
+);
+
+-- Normalized memory node relation table (migrates from causal_relation JSON)
+CREATE TABLE IF NOT EXISTS memory_node_relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
+    target_node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
+    relation_type TEXT NOT NULL,
+    confidence REAL DEFAULT 1.0,
+    created_at REAL NOT NULL DEFAULT (strftime('%%s','now')),
+    UNIQUE(source_node_id, target_node_id, relation_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_edges_source ON entity_edges(source_entity_id);
+CREATE INDEX IF NOT EXISTS idx_entity_edges_target ON entity_edges(target_entity_id);
+CREATE INDEX IF NOT EXISTS idx_entity_edges_type ON entity_edges(relation_type);
+CREATE INDEX IF NOT EXISTS idx_memory_node_entities_node ON memory_node_entities(node_id);
+CREATE INDEX IF NOT EXISTS idx_memory_node_entities_entity ON memory_node_entities(entity_id);
+CREATE INDEX IF NOT EXISTS idx_memory_node_relations_source ON memory_node_relations(source_node_id);
+CREATE INDEX IF NOT EXISTS idx_memory_node_relations_target ON memory_node_relations(target_node_id);
+"""
+
+ENTITY_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS entity_nodes_fts USING fts5(
+    name,
+    type,
+    content='entity_nodes',
+    content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS entity_nodes_ai AFTER INSERT ON entity_nodes BEGIN
+    INSERT INTO entity_nodes_fts(rowid, name, type)
+    VALUES (new.id, new.name, new.type);
+END;
+
+CREATE TRIGGER IF NOT EXISTS entity_nodes_ad AFTER DELETE ON entity_nodes BEGIN
+    DELETE FROM entity_nodes_fts WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS entity_nodes_au AFTER UPDATE ON entity_nodes BEGIN
+    UPDATE entity_nodes_fts
+    SET name = new.name,
+        type = new.type
+    WHERE rowid = new.id;
+END;
+"""
+
 
 class SessionDB:
     """
@@ -596,6 +672,53 @@ class SessionDB:
             cursor.execute("SELECT * FROM memory_nodes_fts LIMIT 0")
         except sqlite3.OperationalError:
             cursor.executescript(MEMORY_NODES_FTS_SQL)
+
+        # ── Knowledge Graph tables + FTS5 ──
+        cursor.executescript(KNOWLEDGE_GRAPH_SQL)
+        try:
+            cursor.execute("SELECT * FROM entity_nodes_fts LIMIT 0")
+        except sqlite3.OperationalError:
+            cursor.executescript(ENTITY_FTS_SQL)
+
+        # ── Add tags column to memory_nodes if missing ──
+        try:
+            cursor.execute("ALTER TABLE memory_nodes ADD COLUMN tags TEXT DEFAULT '[]'")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # ── Causal relation migration: JSON → normalized memory_node_relations ──
+        try:
+            _migrated = cursor.execute(
+                "SELECT COUNT(*) FROM memory_node_relations"
+            ).fetchone()[0]
+            if _migrated == 0:
+                # Migrate existing causal_relation JSON to normalized relations
+                _rows = cursor.execute(
+                    "SELECT node_id, causal_relation FROM memory_leaf_details "
+                    "WHERE causal_relation IS NOT NULL AND causal_relation != '{}'"
+                ).fetchall()
+                _inserted = 0
+                for _rid, _causal_json in _rows:
+                    try:
+                        _causal = json.loads(_causal_json) if isinstance(_causal_json, str) else {}
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    for _target_str, _rel_type in _causal.items():
+                        try:
+                            _target = int(_target_str)
+                        except (ValueError, TypeError):
+                            continue
+                        cursor.execute(
+                            "INSERT OR IGNORE INTO memory_node_relations "
+                            "(source_node_id, target_node_id, relation_type, confidence) "
+                            "VALUES (?, ?, ?, 1.0)",
+                            (_rid, _target, _rel_type),
+                        )
+                        _inserted += 1
+                if _inserted:
+                    logger.info("Migrated %d causal relations to memory_node_relations", _inserted)
+        except Exception as _mig_err:
+            logger.debug("Causal relation migration skipped: %s", _mig_err)
 
         self._conn.commit()
 
@@ -1895,10 +2018,10 @@ class SessionDB:
     # ── Internal helpers ──────────────────────────────────────────────────
 
     def _memory_get_node(self, node_id: int) -> Optional[Dict[str, Any]]:
-        """Fetch a single memory node with its leaf details."""
+        """Fetch a single memory node with its leaf details, tags, and relations."""
         cursor = self._conn.execute(
             """SELECT n.id, n.time_key, n.summary, n.keywords,
-                      d.original_dialog, d.causal_relation
+                      d.original_dialog, d.causal_relation, n.tags
                FROM memory_nodes n
                JOIN memory_leaf_details d ON n.id = d.node_id
                WHERE n.id = ?""",
@@ -1907,6 +2030,16 @@ class SessionDB:
         r = cursor.fetchone()
         if not r:
             return None
+        # Fetch relations from normalized table
+        rel_cursor = self._conn.execute(
+            """SELECT target_node_id, relation_type, confidence
+               FROM memory_node_relations
+               WHERE source_node_id = ?""",
+            (node_id,),
+        )
+        node_relations = {}
+        for rel_row in rel_cursor.fetchall():
+            node_relations[str(rel_row[0])] = rel_row[1]
         return {
             "id": r[0],
             "time_key": r[1],
@@ -1914,6 +2047,8 @@ class SessionDB:
             "keywords": r[3].split(" "),
             "original_dialog": r[4],
             "causal_relation": json.loads(r[5]) if r[5] else {},
+            "tags": json.loads(r[6]) if r[6] else [],
+            "node_relations": node_relations,
         }
 
     def _memory_search_keyword(self, keyword: str, limit: int = 20) -> Dict[int, float]:
@@ -2065,6 +2200,7 @@ class SessionDB:
         keywords: List[str],
         original_dialog: str,
         query_embedding: np.ndarray,
+        tags: Optional[List[str]] = None,
     ) -> int:
         """Insert a new memory node (SQLite + FAISS). Returns the node ID.
 
@@ -2074,10 +2210,11 @@ class SessionDB:
 
         def _do(conn):
             keywords_str = " ".join(keywords) if isinstance(keywords, list) else keywords
+            tags_str = json.dumps(tags or [], ensure_ascii=False)
             cursor = conn.execute(
-                """INSERT INTO memory_nodes (time_key, summary, keywords)
-                   VALUES (?, ?, ?)""",
-                (time_key, summary, keywords_str),
+                """INSERT INTO memory_nodes (time_key, summary, keywords, tags)
+                   VALUES (?, ?, ?, ?)""",
+                (time_key, summary, keywords_str, tags_str),
             )
             node_id = cursor.lastrowid
             conn.execute(
@@ -2172,36 +2309,205 @@ class SessionDB:
         return similar_nodes, similar_node_ids
 
     def memory_search(
-        self, keyword: str, query_embedding: np.ndarray, top_k: int = None
+        self, keyword: str, query_embedding: np.ndarray, top_k: int = None,
+        budget: str = "mid",
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Hybrid search over memory nodes: keyword (FTS5) + vector (FAISS) with causal expansion.
+        """Hybrid search: keyword (FTS5) + vector (FAISS) + entity graph expansion.
 
-        *keyword* is passed to FTS5 MATCH (use ``" OR "``-joined terms for broad recall).
+        *keyword* is passed to FTS5 MATCH (use ``" OR "``-joined terms).
         *query_embedding* is a (1, EMBEDDING_DIM) float32 numpy array.
         *top_k* overrides ``MEMORY_QUERY_TOP_K`` (default).
+        *budget* controls entity graph traversal depth: low=0, mid=1, high=3.
+        *time_start*, *time_end*: optional ISO timestamp strings (``"2026-04-20 10:00:00"``)
+            to filter memory nodes by time_key range. Only nodes with
+            ``time_start <= time_key <= time_end`` are returned.
         """
         if top_k is None:
             top_k = self.MEMORY_QUERY_TOP_K
         
-        logger.error(" OR ".join(keyword))
+        logger.debug(" OR ".join(keyword))
         
         fts_results = self._memory_search_keyword(" OR ".join(keyword) if isinstance(keyword, list) else keyword)
         vec_results = self._memory_search_vector(query_embedding)
 
         ranked_ids = self._memory_fuse_scores(fts_results, vec_results)[:top_k]
 
-        # Causal expansion: include nodes causally linked to any ranked node
+        # Time range filter: intersect ranked_ids with time-filtered node IDs
+        if time_start is not None or time_end is not None:
+            _time_conditions = []
+            _time_params = []
+            if time_start is not None:
+                _time_conditions.append("time_key >= ?")
+                _time_params.append(time_start)
+            if time_end is not None:
+                _time_conditions.append("time_key <= ?")
+                _time_params.append(time_end)
+            _time_sql = " AND ".join(_time_conditions)
+            _time_cursor = self._conn.execute(
+                "SELECT id FROM memory_nodes WHERE {} AND id IN ({})".format(
+                    _time_sql, ",".join("?" for _ in ranked_ids) if ranked_ids else "0"
+                ),
+                _time_params + list(ranked_ids) if ranked_ids else [],
+            )
+            _time_ids = {r[0] for r in _time_cursor.fetchall()}
+            ranked_ids = [nid for nid in ranked_ids if nid in _time_ids]
+
+        # Node relation expansion: include nodes related to any ranked node
         all_ids = set(ranked_ids)
         for nid in ranked_ids:
-            node = self._memory_get_node(nid)
-            if node and node["causal_relation"]:
-                for rid in node["causal_relation"].keys():
-                    try:
-                        all_ids.add(int(rid))
-                    except (ValueError, TypeError):
-                        pass
+            rel_cursor = self._conn.execute(
+                "SELECT target_node_id FROM memory_node_relations WHERE source_node_id = ?",
+                (nid,),
+            )
+            for rel_row in rel_cursor.fetchall():
+                all_ids.add(rel_row[0])
+
+        # Entity graph traversal: expand via entity links (controlled by budget)
+        _graph_depth = {"low": 0, "mid": 1, "high": 3}.get(budget, 1)
+        if _graph_depth > 0:
+            _all_entity_ids = set()
+            _params = tuple(all_ids) if all_ids else (0,)
+            _placeholders = ",".join("?" for _ in _params)
+            ent_cursor = self._conn.execute(
+                "SELECT DISTINCT entity_id FROM memory_node_entities "
+                "WHERE node_id IN ({})".format(_placeholders),
+                _params,
+            )
+            for er in ent_cursor.fetchall():
+                _all_entity_ids.add(er[0])
+
+            if _all_entity_ids:
+                # BFS: traverse entity edges up to depth
+                _visited_entities = set(_all_entity_ids)
+                _frontier = set(_all_entity_ids)
+                for _depth in range(_graph_depth):
+                    if not _frontier:
+                        break
+                    _next_frontier = set()
+                    _f_params = tuple(_frontier)
+                    _f_placeholders = ",".join("?" for _ in _f_params)
+                    edge_cursor = self._conn.execute(
+                        "SELECT target_entity_id FROM entity_edges "
+                        "WHERE source_entity_id IN ({}) "
+                        "UNION "
+                        "SELECT source_entity_id FROM entity_edges "
+                        "WHERE target_entity_id IN ({})".format(
+                            _f_placeholders, _f_placeholders
+                        ),
+                        _f_params + _f_params,
+                    )
+                    for edge_row in edge_cursor.fetchall():
+                        eid = edge_row[0]
+                        if eid not in _visited_entities:
+                            _visited_entities.add(eid)
+                            _next_frontier.add(eid)
+                    _frontier = _next_frontier
+
+                # Find memory nodes linked to discovered entities
+                if _visited_entities:
+                    _ve_params = tuple(_visited_entities)
+                    _ve_placeholders = ",".join("?" for _ in _ve_params)
+                    mn_cursor = self._conn.execute(
+                        "SELECT DISTINCT node_id FROM memory_node_entities "
+                        "WHERE entity_id IN ({})".format(_ve_placeholders),
+                        _ve_params,
+                    )
+                    for mn_row in mn_cursor.fetchall():
+                        all_ids.add(mn_row[0])
 
         return [self._memory_get_node(nid) for nid in all_ids if self._memory_get_node(nid)]
+
+    # ── Entity / Knowledge Graph methods ──────────────────────────────────
+
+    def entity_add_entity(
+        self, name: str, entity_type: str = "CONCEPT",
+        embedding: Optional[np.ndarray] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Add or retrieve an entity node. Returns entity ID."""
+        def _do(conn):
+            emb_blob = embedding.tobytes() if embedding is not None else None
+            meta_str = json.dumps(metadata or {}, ensure_ascii=False)
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO entity_nodes (name, type, embedding, metadata) "
+                "VALUES (?, ?, ?, ?)",
+                (name, entity_type, emb_blob, meta_str),
+            )
+            if cursor.lastrowid:
+                return cursor.lastrowid
+            # Already exists — fetch existing id
+            return conn.execute(
+                "SELECT id FROM entity_nodes WHERE name = ?", (name,)
+            ).fetchone()[0]
+        return self._execute_write(_do)
+
+    def entity_add_edge(
+        self, source_entity_id: int, target_entity_id: int,
+        relation_type: str, weight: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Add a directed edge between two entities. Returns edge id."""
+        meta_str = json.dumps(metadata or {}, ensure_ascii=False)
+        def _do(conn):
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO entity_edges "
+                "(source_entity_id, target_entity_id, relation_type, weight, metadata) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (source_entity_id, target_entity_id, relation_type, weight, meta_str),
+            )
+            if cursor.lastrowid:
+                return cursor.lastrowid
+            r = conn.execute(
+                "SELECT id FROM entity_edges WHERE source_entity_id=? AND "
+                "target_entity_id=? AND relation_type=?",
+                (source_entity_id, target_entity_id, relation_type),
+            ).fetchone()
+            return r[0] if r else -1
+        return self._execute_write(_do)
+
+    def entity_link_node(self, node_id: int, entity_id: int, mention_count: int = 1) -> None:
+        """Link a memory node to an entity (upsert)."""
+        def _do(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_node_entities (node_id, entity_id, mention_count) "
+                "VALUES (?, ?, ?)",
+                (node_id, entity_id, mention_count),
+            )
+        self._execute_write(_do)
+
+    # ── Normalized memory node relations (migrated from causal_relation JSON) ──
+
+    def memory_add_node_relation(
+        self, source_node_id: int, target_node_id: int,
+        relation_type: str, confidence: float = 1.0,
+    ) -> None:
+        """Add a normalized relation between two memory nodes.
+        
+        Also mirrors to the legacy causal_relation JSON for backward compat.
+        """
+        def _do(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_node_relations "
+                "(source_node_id, target_node_id, relation_type, confidence) "
+                "VALUES (?, ?, ?, ?)",
+                (source_node_id, target_node_id, relation_type, confidence),
+            )
+            # Mirror to legacy causal_relation JSON
+            cursor = conn.execute(
+                "SELECT causal_relation FROM memory_leaf_details WHERE node_id=?",
+                (source_node_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                causal_map = json.loads(row[0]) if row[0] else {}
+                causal_map[str(target_node_id)] = relation_type
+                conn.execute(
+                    "UPDATE memory_leaf_details SET causal_relation=? WHERE node_id=?",
+                    (json.dumps(causal_map, ensure_ascii=False), source_node_id),
+                )
+        self._execute_write(_do)
 
     # =========================================================================
     # Utility

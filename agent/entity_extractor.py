@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Entity Extractor — LLM-driven entity and relation extraction for memory knowledge graph.
+
+Extracts structured entities (people, projects, concepts, technologies, etc.)
+and their relations from conversation turns, then stores them in SessionDB's
+knowledge graph tables (entity_nodes, entity_edges, memory_node_entities).
+
+Usage::
+
+    from agent.entity_extractor import EntityExtractor
+
+    extractor = EntityExtractor(session_db, llm_client=agent.client)
+    await extractor.extract_from_turn(
+        node_id=42,
+        user_message="帮我写一个FAISS向量搜索的代码",
+        assistant_response="好的，我来实现一个FAISS向量搜索...",
+    )
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# ── Prompt templates ─────────────────────────────────────────────────────
+
+ENTITY_EXTRACTION_PROMPT = """你是实体和关系提取助手。从对话中提取实体和它们之间的关系。
+
+实体类型:
+- PERSON(人): 对话中提到的具体人名、称呼
+- PROJECT(项目): 项目名、产品名
+- CONCEPT(概念): 抽象概念、方法论、理论
+- TECHNOLOGY(技术): 技术栈、框架、库、工具
+- LOCATION(地点): 地理位置、场所
+- TOPIC(主题): 讨论的话题领域
+- PREFERENCE(偏好): 用户的偏好、喜好、习惯
+
+关系类型:
+- works_on(从事): 某人从事某个项目
+- uses(使用): 某人使用某项技术
+- mentions(提及): 提到某个实体
+- prefers(偏好): 偏好某事物
+- relates_to(相关): 两个实体相关
+- is_a(是): 实体属于某个类别
+- has_property(具有属性): 实体具有某个属性
+
+规则:
+1. 仅提取明确提到的实体，不要过度推断
+2. 每个实体有且仅有一个 type
+3. 关系要有明确证据，不确定则不输出
+4. 只输出 JSON，不要包含其他内容
+
+对话内容:
+用户: {user_message}
+助手: {assistant_response}
+
+输出格式(严格 JSON):
+{{
+  "entities": [
+    {{"name": "实体名", "type": "实体类型"}}
+  ],
+  "relations": [
+    {{"source": "实体名A", "relation": "关系类型", "target": "实体名B"}}
+  ]
+}}"""
+
+# ── Entity type priorities for deduplication ─────────────────────────────
+_ENTITY_TYPE_PRIORITY = [
+    "PERSON", "PROJECT", "TECHNOLOGY", "LOCATION",
+    "PREFERENCE", "TOPIC", "CONCEPT",
+]
+
+
+class EntityExtractor:
+    """LLM-driven entity and relation extraction.
+
+    Extracts entities from conversation turns and persists them to
+    the knowledge graph tables in SessionDB.
+    """
+
+    def __init__(
+        self,
+        session_db: Any,
+        llm_client: Any = None,
+        llm_model: str = "gpt-4o-mini",
+        llm_base_url: str = "",
+        llm_api_key: str = "",
+        llm_timeout: int = 120,
+    ):
+        self._db = session_db
+        self._llm_client = llm_client
+        self._llm_model = llm_model
+        self._llm_base_url = llm_base_url
+        self._llm_api_key = llm_api_key
+        self._llm_timeout = llm_timeout
+
+    # ── Public API ───────────────────────────────────────────────────────
+
+    def extract_from_turn(
+        self,
+        node_id: int,
+        user_message: str,
+        assistant_response: str,
+    ) -> bool:
+        """Extract entities and relations from a conversation turn.
+
+        Calls the LLM to extract entities/relations, then persists them
+        to the knowledge graph tables linked to *node_id*.
+
+        Returns True if at least one entity was extracted, False otherwise.
+        All failures are logged and non-fatal.
+        """
+        if not self._db or not node_id:
+            return False
+
+        try:
+            raw = self._call_llm_for_extraction(user_message, assistant_response)
+            if not raw:
+                return False
+
+            data = self._parse_response(raw)
+            if not data:
+                return False
+
+            entities = data.get("entities", [])
+            relations = data.get("relations", [])
+
+            if not entities:
+                return False
+
+            # Store entities and build lookup
+            entity_id_map: Dict[str, int] = {}
+            for ent in entities:
+                name = ent.get("name", "").strip()
+                etype = ent.get("type", "CONCEPT").upper()
+                if not name:
+                    continue
+                eid = self._db.entity_add_entity(
+                    name=name,
+                    entity_type=etype if etype in _ENTITY_TYPE_PRIORITY else "CONCEPT",
+                )
+                entity_id_map[name] = eid
+                # Link memory node to entity
+                self._db.entity_link_node(node_id, eid)
+
+            # Store relations
+            for rel in relations:
+                source = rel.get("source", "").strip()
+                rtype = rel.get("relation", "").strip()
+                target = rel.get("target", "").strip()
+                if not source or not rtype or not target:
+                    continue
+                src_id = entity_id_map.get(source)
+                tgt_id = entity_id_map.get(target)
+                if src_id is not None and tgt_id is not None and src_id != tgt_id:
+                    self._db.entity_add_edge(
+                        source_entity_id=src_id,
+                        target_entity_id=tgt_id,
+                        relation_type=rtype,
+                    )
+
+            logger.debug(
+                "EntityExtractor: extracted %d entities, %d relations for node %d",
+                len(entities), len(relations), node_id,
+            )
+            return True
+
+        except Exception as e:
+            logger.debug("EntityExtractor failed for node %d: %s", node_id, e)
+            return False
+
+    # ── Internal ─────────────────────────────────────────────────────────
+
+    def _call_llm_for_extraction(
+        self, user_message: str, assistant_response: str,
+    ) -> Optional[str]:
+        """Call LLM for entity/relation extraction."""
+        prompt = ENTITY_EXTRACTION_PROMPT.format(
+            user_message=user_message,
+            assistant_response=assistant_response,
+        )
+
+        if self._llm_client is not None:
+            try:
+                resp = self._llm_client.chat.completions.create(
+                    model=self._llm_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=2048,
+                    timeout=self._llm_timeout,
+                )
+                return getattr(resp.choices[0].message, "content", "") or ""
+            except Exception as e:
+                logger.debug("Shared LLM client failed for entity extraction: %s", e)
+                return None
+
+        # Fallback to raw HTTP
+        return self._call_llm_api(prompt)
+
+    def _call_llm_api(self, prompt: str) -> Optional[str]:
+        """Raw HTTP fallback to OpenAI-compatible endpoint."""
+        import requests
+
+        base_url = self._llm_base_url or "https://api.openai.com/v1"
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self._llm_api_key:
+            headers["Authorization"] = f"Bearer {self._llm_api_key}"
+
+        data = {
+            "model": self._llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": 2048,
+            "stream": False,
+        }
+        try:
+            resp = requests.post(url, json=data, headers=headers, timeout=self._llm_timeout)
+            resp.raise_for_status()
+            result = resp.json()
+            choices = result.get("choices", [])
+            if choices:
+                return choices[0].get("message", {}).get("content", "")
+            return None
+        except Exception as e:
+            logger.debug("HTTP entity extraction call failed: %s", e)
+            return None
+
+    @staticmethod
+    def _parse_response(raw: str) -> Optional[Dict[str, Any]]:
+        """Parse LLM JSON response, stripping code fences if present."""
+        text = raw.strip()
+        if "```" in text:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1:
+                text = text[start:end + 1]
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            logger.debug("EntityExtractor: failed to parse LLM response: %.120s", raw)
+            return None
+        if not isinstance(data.get("entities"), list):
+            return None
+        return data
