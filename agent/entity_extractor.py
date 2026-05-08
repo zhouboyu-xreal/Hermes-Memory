@@ -23,20 +23,42 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
+from agent.temporal_entities import is_temporal_entity
+
 logger = logging.getLogger(__name__)
+
+# ── Shared entity extraction guidance ────────────────────────────────────
+
+ENTITY_TYPE_VALUES = (
+    "PERSON", "ORGANIZATION", "LOCATION", "PRODUCT", "PROJECT",
+    "TECHNOLOGY", "CONCEPT", "TOPIC", "PREFERENCE", "OTHER",
+)
+
+ENTITY_EXTRACTION_GUIDANCE = """实体提取规则:
+
+实体类型(type 可选值):
+- PERSON(人): 对话中提到的具体人名、称呼
+- ORGANIZATION(组织): 公司、团队、机构
+- LOCATION(地点): 地理位置、场所
+- PRODUCT(产品): 产品名、服务名
+- PROJECT(项目): 项目名、产品名
+- TECHNOLOGY(技术): 技术栈、框架、库、工具
+- CONCEPT(概念): 抽象概念、方法论、理论
+- TOPIC(主题): 讨论的话题领域
+- PREFERENCE(偏好): 用户的偏好、喜好、习惯
+- OTHER(其他): 明确提到但不适合上述类型的实体
+
+不要抽取普通时间表达作为实体，例如：今天、昨天、上周、最近三天、2026-05-07、10:30、三个月。
+时间应作为事实的时间元数据处理，不进入 entity graph。
+只有有语义身份的命名时间概念才可作为实体，例如：春节、Q3 财报季、Sprint 42。
+
+实体必须只来自对话中明确出现的内容，不要过度推断。"""
 
 # ── Prompt templates ─────────────────────────────────────────────────────
 
 ENTITY_EXTRACTION_PROMPT = """你是实体和关系提取助手。从对话中提取实体和它们之间的关系。
 
-实体类型:
-- PERSON(人): 对话中提到的具体人名、称呼
-- PROJECT(项目): 项目名、产品名
-- CONCEPT(概念): 抽象概念、方法论、理论
-- TECHNOLOGY(技术): 技术栈、框架、库、工具
-- LOCATION(地点): 地理位置、场所
-- TOPIC(主题): 讨论的话题领域
-- PREFERENCE(偏好): 用户的偏好、喜好、习惯
+""" + ENTITY_EXTRACTION_GUIDANCE + """
 
 关系类型:
 - works_on(从事): 某人从事某个项目
@@ -69,8 +91,7 @@ ENTITY_EXTRACTION_PROMPT = """你是实体和关系提取助手。从对话中�
 
 # ── Entity type priorities for deduplication ─────────────────────────────
 _ENTITY_TYPE_PRIORITY = [
-    "PERSON", "PROJECT", "TECHNOLOGY", "LOCATION",
-    "PREFERENCE", "TOPIC", "CONCEPT",
+    *ENTITY_TYPE_VALUES,
 ]
 
 
@@ -137,6 +158,8 @@ class EntityExtractor:
                 name = ent.get("name", "").strip()
                 etype = ent.get("type", "CONCEPT").upper()
                 if not name:
+                    continue
+                if is_temporal_entity(name, etype):
                     continue
                 eid = self._db.entity_add_entity(
                     name=name,

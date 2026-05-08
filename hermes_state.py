@@ -27,7 +27,7 @@ import yaml
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import numpy as np
 
@@ -2200,6 +2200,204 @@ class SessionDB:
 
         return sorted(fused.keys(), key=lambda x: fused[x], reverse=True)
 
+    def _memory_rank_scores(
+        self,
+        scores: Dict[int, float],
+        *,
+        higher_is_better: bool,
+    ) -> List[int]:
+        """Return node IDs sorted by a single retrieval channel."""
+        return [
+            node_id
+            for node_id, _ in sorted(
+                scores.items(),
+                key=lambda item: item[1],
+                reverse=higher_is_better,
+            )
+        ]
+
+    def _memory_rrf(
+        self,
+        rankings: List[Tuple[List[int], float]],
+        *,
+        rrf_k: int = 60,
+    ) -> List[int]:
+        """Reciprocal Rank Fusion over multiple ranked retrieval channels."""
+        fused: Dict[int, float] = {}
+        first_seen: Dict[int, int] = {}
+        order = 0
+        for ranking, weight in rankings:
+            for rank, node_id in enumerate(ranking, 1):
+                if node_id not in first_seen:
+                    first_seen[node_id] = order
+                    order += 1
+                fused[node_id] = fused.get(node_id, 0.0) + weight / (rrf_k + rank)
+        return sorted(
+            fused,
+            key=lambda node_id: (-fused[node_id], first_seen.get(node_id, 0)),
+        )
+
+    def _memory_filter_ranked_ids(
+        self,
+        ranked_ids: List[int],
+        *,
+        allowed_ids: Optional[set] = None,
+    ) -> List[int]:
+        """Apply an optional allow-list while preserving rank and uniqueness."""
+        out: List[int] = []
+        seen = set()
+        for node_id in ranked_ids:
+            if node_id in seen:
+                continue
+            if allowed_ids is not None and node_id not in allowed_ids:
+                continue
+            seen.add(node_id)
+            out.append(node_id)
+        return out
+
+    def _memory_graph_expand_ranked(
+        self,
+        seed_ids: List[int],
+        *,
+        depth: int,
+        allowed_ids: Optional[set] = None,
+        limit: int = 50,
+    ) -> List[int]:
+        """Rank graph-neighbor memory nodes from relation and entity edges.
+
+        This approximates HindSight's graph traversal channel using the local
+        tables we already maintain: explicit memory-node relations first, then
+        entity co-mentions and entity-edge BFS up to the recall budget depth.
+        """
+        if depth <= 0 or not seed_ids:
+            return []
+
+        ranked: List[int] = []
+        seen = set(seed_ids)
+
+        def _append(node_id: int) -> None:
+            if node_id in seen:
+                return
+            if allowed_ids is not None and node_id not in allowed_ids:
+                return
+            seen.add(node_id)
+            ranked.append(node_id)
+
+        # Explicit memory-node relations are the strongest graph signal.
+        for seed_id in seed_ids:
+            rel_cursor = self._conn.execute(
+                "SELECT target_node_id FROM memory_node_relations "
+                "WHERE source_node_id = ? "
+                "UNION "
+                "SELECT source_node_id FROM memory_node_relations "
+                "WHERE target_node_id = ?",
+                (seed_id, seed_id),
+            )
+            for row in rel_cursor.fetchall():
+                _append(row[0])
+                if len(ranked) >= limit:
+                    return ranked
+
+        seed_params = tuple(seed_ids)
+        placeholders = ",".join("?" for _ in seed_params)
+        ent_cursor = self._conn.execute(
+            "SELECT DISTINCT entity_id FROM memory_node_entities "
+            f"WHERE node_id IN ({placeholders})",
+            seed_params,
+        )
+        frontier = {row[0] for row in ent_cursor.fetchall()}
+        visited_entities = set(frontier)
+
+        for _ in range(depth):
+            if not frontier:
+                break
+
+            params = tuple(frontier)
+            ent_placeholders = ",".join("?" for _ in params)
+            mn_cursor = self._conn.execute(
+                "SELECT DISTINCT node_id FROM memory_node_entities "
+                f"WHERE entity_id IN ({ent_placeholders})",
+                params,
+            )
+            for row in mn_cursor.fetchall():
+                _append(row[0])
+                if len(ranked) >= limit:
+                    return ranked
+
+            edge_cursor = self._conn.execute(
+                "SELECT target_entity_id FROM entity_edges "
+                f"WHERE source_entity_id IN ({ent_placeholders}) "
+                "UNION "
+                "SELECT source_entity_id FROM entity_edges "
+                f"WHERE target_entity_id IN ({ent_placeholders})",
+                params + params,
+            )
+            next_frontier = set()
+            for row in edge_cursor.fetchall():
+                entity_id = row[0]
+                if entity_id not in visited_entities:
+                    visited_entities.add(entity_id)
+                    next_frontier.add(entity_id)
+            frontier = next_frontier
+
+        return ranked
+
+    def _memory_entity_overlap_ranked(
+        self,
+        node_id: int,
+        *,
+        allowed_ids: Optional[set] = None,
+        limit: int = 20,
+    ) -> List[int]:
+        """Rank prior nodes that mention entities from *node_id*."""
+        ent_cursor = self._conn.execute(
+            "SELECT entity_id FROM memory_node_entities WHERE node_id = ?",
+            (node_id,),
+        )
+        entity_ids = [row[0] for row in ent_cursor.fetchall()]
+        if not entity_ids:
+            return []
+        placeholders = ",".join("?" for _ in entity_ids)
+        cursor = self._conn.execute(
+            "SELECT node_id, COUNT(*) AS overlap_count "
+            "FROM memory_node_entities "
+            f"WHERE entity_id IN ({placeholders}) AND node_id != ? "
+            "GROUP BY node_id "
+            "ORDER BY overlap_count DESC, node_id DESC "
+            "LIMIT ?",
+            tuple(entity_ids) + (node_id, limit),
+        )
+        return self._memory_filter_ranked_ids(
+            [row[0] for row in cursor.fetchall()],
+            allowed_ids=allowed_ids,
+        )
+
+    def _memory_temporal_near_ranked(
+        self,
+        node_id: int,
+        *,
+        allowed_ids: Optional[set] = None,
+        limit: int = 20,
+    ) -> List[int]:
+        """Rank nearest prior memory nodes by timestamp."""
+        row = self._conn.execute(
+            "SELECT time_key FROM memory_nodes WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+        if not row:
+            return []
+        cursor = self._conn.execute(
+            "SELECT id FROM memory_nodes "
+            "WHERE id != ? AND time_key <= ? "
+            "ORDER BY time_key DESC, id DESC "
+            "LIMIT ?",
+            (node_id, row[0], limit),
+        )
+        return self._memory_filter_ranked_ids(
+            [r[0] for r in cursor.fetchall()],
+            allowed_ids=allowed_ids,
+        )
+
     # ── Public API ────────────────────────────────────────────────────────
 
     def memory_add_node(
@@ -2287,35 +2485,102 @@ class SessionDB:
 
         self._execute_write(_do)
 
-    def memory_search_relevant_nodes(
-        self, query_embedding: np.ndarray
+    def memory_relation_candidates(
+        self,
+        node_id: int,
+        query_embedding: np.ndarray,
+        keywords: Optional[List[str]] = None,
+        top_k: int = None,
+        budget: str = "mid",
     ) -> tuple[List[Dict[str, Any]], List[int]]:
-        """Find memory nodes similar to *query_embedding* for causal relation extraction.
+        """Find candidate prior nodes for cross-fact causal relation extraction.
 
-        Returns ``(nodes, node_ids)`` for nodes above ``MEMORY_UPDATE_CAUSAL_THRESHOLD``.
-        Returns empty lists when FAISS is unavailable or index is empty.
+        Uses HindSight-style multi-signal candidate generation instead of only
+        vector cosine similarity:
+        - semantic FAISS neighbors
+        - keyword / BM25 matches from fact keywords
+        - entity overlap
+        - nearby prior memories in time
+        - graph neighbors from explicit node relations and entity edges
+
+        The final candidate order is fused with Reciprocal Rank Fusion, then
+        the LLM relation classifier decides whether a real relation exists.
         """
-        if not _HAS_FAISS or self._memory_faiss_index is None or self._memory_faiss_index.ntotal == 0:
+        if top_k is None:
+            top_k = self.MEMORY_TOP_K_CAUSAL
+
+        current = self._memory_get_node(node_id)
+        if not current:
             return [], []
 
-        sims, indices = self._memory_faiss_index.search(query_embedding, self.MEMORY_TOP_K_CAUSAL)
+        search_limit = max(top_k * 4, 20)
+        current_time = current.get("time_key", "")
+        allowed_rows = self._conn.execute(
+            "SELECT id FROM memory_nodes WHERE id != ? AND time_key <= ?",
+            (node_id, current_time),
+        ).fetchall()
+        allowed_ids = {row[0] for row in allowed_rows}
+        if not allowed_ids:
+            return [], []
 
-        similar_nodes: List[Dict[str, Any]] = []
-        similar_node_ids: List[int] = []
+        keyword_query = " OR ".join(keywords or current.get("keywords", []))
+        keyword_scores = self._memory_search_keyword(keyword_query, limit=search_limit) if keyword_query else {}
+        keyword_ranking = self._memory_filter_ranked_ids(
+            self._memory_rank_scores(keyword_scores, higher_is_better=False),
+            allowed_ids=allowed_ids,
+        )
 
-        for sim, idx in zip(sims[0], indices[0]):
-            if idx == -1:
-                continue
-            if sim < self.MEMORY_UPDATE_CAUSAL_THRESHOLD:
-                continue
-            old_node_id = self._memory_faiss_id_map[idx]
-            old_node = self._memory_get_node(old_node_id)
-            if not old_node:
-                continue
-            similar_nodes.append(old_node)
-            similar_node_ids.append(old_node_id)
+        semantic_scores = self._memory_search_vector(query_embedding, top_k=search_limit)
+        semantic_ranking = self._memory_filter_ranked_ids(
+            self._memory_rank_scores(semantic_scores, higher_is_better=True),
+            allowed_ids=allowed_ids,
+        )
 
-        return similar_nodes, similar_node_ids
+        entity_ranking = self._memory_entity_overlap_ranked(
+            node_id,
+            allowed_ids=allowed_ids,
+            limit=search_limit,
+        )
+        temporal_ranking = self._memory_temporal_near_ranked(
+            node_id,
+            allowed_ids=allowed_ids,
+            limit=search_limit,
+        )
+
+        seed_ids = self._memory_filter_ranked_ids(
+            semantic_ranking[:top_k] + keyword_ranking[:top_k] + entity_ranking[:top_k] + temporal_ranking[:top_k],
+            allowed_ids=allowed_ids,
+        )
+        graph_depth = {"low": 0, "mid": 1, "high": 3}.get(budget, 1)
+        graph_ranking = self._memory_graph_expand_ranked(
+            seed_ids,
+            depth=graph_depth,
+            allowed_ids=allowed_ids,
+            limit=search_limit,
+        )
+
+        rankings: List[Tuple[List[int], float]] = []
+        if semantic_ranking:
+            rankings.append((semantic_ranking, 1.0))
+        if keyword_ranking:
+            rankings.append((keyword_ranking, 1.0))
+        if entity_ranking:
+            rankings.append((entity_ranking, 1.1))
+        if temporal_ranking:
+            rankings.append((temporal_ranking, 0.8))
+        if graph_ranking:
+            rankings.append((graph_ranking, 0.7))
+
+        ranked_ids = self._memory_rrf(rankings)[:top_k] if rankings else []
+        nodes: List[Dict[str, Any]] = []
+        node_ids: List[int] = []
+        for candidate_id in ranked_ids:
+            node = self._memory_get_node(candidate_id)
+            if not node:
+                continue
+            nodes.append(node)
+            node_ids.append(candidate_id)
+        return nodes, node_ids
 
     def memory_search(
         self, keyword: str, query_embedding: np.ndarray, top_k: int = None,
@@ -2325,7 +2590,7 @@ class SessionDB:
         tags: Optional[List[str]] = None,
         tags_match: str = "any",
     ) -> List[Dict[str, Any]]:
-        """Hybrid search: keyword (FTS5) + vector (FAISS) + entity graph expansion.
+        """Hybrid search: keyword + vector + temporal + graph retrieval with RRF.
 
         *keyword* is passed to FTS5 MATCH (use ``" OR "``-joined terms).
         *query_embedding* is a (1, EMBEDDING_DIM) float32 numpy array.
@@ -2340,11 +2605,13 @@ class SessionDB:
         """
         if top_k is None:
             top_k = self.MEMORY_QUERY_TOP_K
-        
-        logger.debug(" OR ".join(keyword))
-        
-        # ── Step 1: Get time-range node IDs (if time filter active) ──
+
+        search_limit = max(top_k * 4, 20)
+        keyword_query = " OR ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
+
+        # ── Step 1: Primary filters ──
         _time_ids: Optional[set] = None
+        _temporal_ranking: List[int] = []
         if time_start is not None or time_end is not None:
             _time_conditions = []
             _time_params = []
@@ -2356,25 +2623,17 @@ class SessionDB:
                 _time_params.append(time_end)
             _time_sql = " AND ".join(_time_conditions)
             _tc = self._conn.execute(
-                "SELECT id FROM memory_nodes WHERE {}".format(_time_sql),
+                "SELECT id FROM memory_nodes WHERE {} ORDER BY time_key DESC".format(_time_sql),
                 _time_params,
             )
-            _time_ids = {r[0] for r in _tc.fetchall()}
+            _temporal_ranking = [r[0] for r in _tc.fetchall()]
+            _time_ids = set(_temporal_ranking)
             if not _time_ids:
                 return []  # No nodes in the requested time range
             # Actual top-k is at most the number of nodes in time range
             top_k = min(top_k, len(_time_ids))
 
-        # ── Step 2: Keyword + Vector search (global) ──
-        fts_results = self._memory_search_keyword(" OR ".join(keyword) if isinstance(keyword, list) else keyword)
-        vec_results = self._memory_search_vector(query_embedding)
-
-        # ── Step 3: Apply time filter to both result sets ──
-        if _time_ids is not None:
-            fts_results = {k: v for k, v in fts_results.items() if k in _time_ids}
-            vec_results = {k: v for k, v in vec_results.items() if k in _time_ids}
-
-        # ── Step 3b: Apply tag filter ──
+        _tag_ids: Optional[set] = None
         if tags:
             _tag_conditions = []
             _tag_params = []
@@ -2388,85 +2647,78 @@ class SessionDB:
                 _tag_params,
             )
             _tag_ids = {r[0] for r in _tag_cursor.fetchall()}
-            fts_results = {k: v for k, v in fts_results.items() if k in _tag_ids}
-            vec_results = {k: v for k, v in vec_results.items() if k in _tag_ids}
+            if not _tag_ids:
+                return []
 
-        # ── Step 4: Fuse scores ──
-        ranked_ids = self._memory_fuse_scores(fts_results, vec_results)
-        ranked_ids = ranked_ids[:top_k]
+        allowed_ids: Optional[set] = None
+        if _time_ids is not None:
+            allowed_ids = set(_time_ids)
+        if _tag_ids is not None:
+            allowed_ids = _tag_ids if allowed_ids is None else allowed_ids & _tag_ids
+            if not allowed_ids:
+                return []
 
-        # ── Step 5: Pad with time-range newest-first if semantic returned too few ──
+        # ── Step 2: Independent retrieval channels ──
+        fts_results = self._memory_search_keyword(keyword_query, limit=search_limit) if keyword_query else {}
+        vec_results = self._memory_search_vector(query_embedding, top_k=search_limit)
+
+        keyword_ranking = self._memory_filter_ranked_ids(
+            self._memory_rank_scores(fts_results, higher_is_better=False),
+            allowed_ids=allowed_ids,
+        )
+        semantic_ranking = self._memory_filter_ranked_ids(
+            self._memory_rank_scores(vec_results, higher_is_better=True),
+            allowed_ids=allowed_ids,
+        )
+        temporal_ranking = self._memory_filter_ranked_ids(
+            _temporal_ranking,
+            allowed_ids=allowed_ids,
+        )
+
+        seed_ids = self._memory_filter_ranked_ids(
+            semantic_ranking[:top_k] + keyword_ranking[:top_k] + temporal_ranking[:top_k],
+            allowed_ids=allowed_ids,
+        )
+
+        _graph_depth = {"low": 0, "mid": 1, "high": 3}.get(budget, 1)
+        graph_ranking = self._memory_graph_expand_ranked(
+            seed_ids,
+            depth=_graph_depth,
+            allowed_ids=allowed_ids,
+            limit=search_limit,
+        )
+
+        # ── Step 3: Reciprocal Rank Fusion ──
+        rankings: List[Tuple[List[int], float]] = []
+        if semantic_ranking:
+            rankings.append((semantic_ranking, 1.0))
+        if keyword_ranking:
+            rankings.append((keyword_ranking, 1.0))
+        if temporal_ranking:
+            rankings.append((temporal_ranking, 0.9))
+        if graph_ranking:
+            rankings.append((graph_ranking, 0.7))
+
+        ranked_ids = self._memory_rrf(rankings) if rankings else []
+
+        # Time-filtered recall should still return memories in the requested
+        # interval even when semantic/keyword channels are sparse.
         if _time_ids is not None and len(ranked_ids) < top_k:
-            _existing = set(ranked_ids)
-            for _nid in sorted(_time_ids - _existing, reverse=True):
+            existing = set(ranked_ids)
+            for node_id in temporal_ranking:
+                if node_id in existing:
+                    continue
+                ranked_ids.append(node_id)
+                existing.add(node_id)
                 if len(ranked_ids) >= top_k:
                     break
-                ranked_ids.append(_nid)
 
-        # Node relation expansion: include nodes related to any ranked node
-        all_ids = set(ranked_ids)
-        for nid in ranked_ids:
-            rel_cursor = self._conn.execute(
-                "SELECT target_node_id FROM memory_node_relations WHERE source_node_id = ?",
-                (nid,),
-            )
-            for rel_row in rel_cursor.fetchall():
-                all_ids.add(rel_row[0])
-
-        # Entity graph traversal: expand via entity links (controlled by budget)
-        _graph_depth = {"low": 0, "mid": 1, "high": 3}.get(budget, 1)
-        if _graph_depth > 0:
-            _all_entity_ids = set()
-            _params = tuple(all_ids) if all_ids else (0,)
-            _placeholders = ",".join("?" for _ in _params)
-            ent_cursor = self._conn.execute(
-                "SELECT DISTINCT entity_id FROM memory_node_entities "
-                "WHERE node_id IN ({})".format(_placeholders),
-                _params,
-            )
-            for er in ent_cursor.fetchall():
-                _all_entity_ids.add(er[0])
-
-            if _all_entity_ids:
-                # BFS: traverse entity edges up to depth
-                _visited_entities = set(_all_entity_ids)
-                _frontier = set(_all_entity_ids)
-                for _depth in range(_graph_depth):
-                    if not _frontier:
-                        break
-                    _next_frontier = set()
-                    _f_params = tuple(_frontier)
-                    _f_placeholders = ",".join("?" for _ in _f_params)
-                    edge_cursor = self._conn.execute(
-                        "SELECT target_entity_id FROM entity_edges "
-                        "WHERE source_entity_id IN ({}) "
-                        "UNION "
-                        "SELECT source_entity_id FROM entity_edges "
-                        "WHERE target_entity_id IN ({})".format(
-                            _f_placeholders, _f_placeholders
-                        ),
-                        _f_params + _f_params,
-                    )
-                    for edge_row in edge_cursor.fetchall():
-                        eid = edge_row[0]
-                        if eid not in _visited_entities:
-                            _visited_entities.add(eid)
-                            _next_frontier.add(eid)
-                    _frontier = _next_frontier
-
-                # Find memory nodes linked to discovered entities
-                if _visited_entities:
-                    _ve_params = tuple(_visited_entities)
-                    _ve_placeholders = ",".join("?" for _ in _ve_params)
-                    mn_cursor = self._conn.execute(
-                        "SELECT DISTINCT node_id FROM memory_node_entities "
-                        "WHERE entity_id IN ({})".format(_ve_placeholders),
-                        _ve_params,
-                    )
-                    for mn_row in mn_cursor.fetchall():
-                        all_ids.add(mn_row[0])
-
-        return [self._memory_get_node(nid) for nid in all_ids if self._memory_get_node(nid)]
+        nodes: List[Dict[str, Any]] = []
+        for node_id in ranked_ids[:top_k]:
+            node = self._memory_get_node(node_id)
+            if node:
+                nodes.append(node)
+        return nodes
 
     # ── Entity / Knowledge Graph methods ──────────────────────────────────
 
@@ -2484,7 +2736,7 @@ class SessionDB:
                 "VALUES (?, ?, ?, ?)",
                 (name, entity_type, emb_blob, meta_str),
             )
-            if cursor.lastrowid:
+            if cursor.rowcount:
                 return cursor.lastrowid
             # Already exists — fetch existing id
             return conn.execute(
@@ -2506,7 +2758,7 @@ class SessionDB:
                 "VALUES (?, ?, ?, ?, ?)",
                 (source_entity_id, target_entity_id, relation_type, weight, meta_str),
             )
-            if cursor.lastrowid:
+            if cursor.rowcount:
                 return cursor.lastrowid
             r = conn.execute(
                 "SELECT id FROM entity_edges WHERE source_entity_id=? AND "
@@ -2855,4 +3107,3 @@ class SessionDB:
             result["error"] = str(exc)
 
         return result
-

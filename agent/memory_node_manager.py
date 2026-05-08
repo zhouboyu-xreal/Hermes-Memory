@@ -4,10 +4,10 @@ of conversation turns as structured memory nodes.
 
 Lifecycle (enhanced with HindSight-inspired features):
   1. After each completed conversation turn (SYNC + ASYNC):
-     - Summarize user + assistant exchange via LLM API
+     - Extract HindSight-style narrative facts via LLM API
      - Extract keywords
      - Generate embedding via EmbeddingClient
-     - Store as a memory node in SessionDB (SQLite + FAISS)
+     - Store each fact as a memory node in SessionDB (SQLite + FAISS)
      - Start background thread for causal + entity extraction
 
   2. Background (ASYNC, non-blocking):
@@ -35,11 +35,14 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
+
+from agent.entity_extractor import ENTITY_EXTRACTION_GUIDANCE
+from agent.temporal_entities import is_temporal_entity
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,67 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
+
+# ── Shared causal relation guidance ───────────────────────────────────────
+
+CAUSAL_RELATION_TYPES = ("Cause", "Want", "React", "Changed", "SameTopic", "None")
+CAUSAL_RELATION_TYPE_TEXT = "/".join(CAUSAL_RELATION_TYPES)
+
+CAUSAL_RELATION_GUIDANCE = """【causal_relation 关系类型定义（必须共用）】
+
+Step 1：先判断是否存在明确关联
+
+仅当满足以下任一条件，才认为"有关联"：
+- 存在明确因果触发（如：因为A所以B）
+- 存在明确行为/请求延续（如：A后提出需求B）
+- 存在明确情绪或意愿变化
+
+否则：
+→ relation 必须为 None
+
+若不确定，一律选择 None，禁止猜测。
+
+Step 2：若有关联，再按优先级选择一个关系类型：
+
+1. Cause（因果）最高优先级
+   条件：
+   - A直接导致B发生
+   - 常见模式：
+     偏好 -> 行为
+     行为 -> 请求
+   示例：
+     "喜欢英超" -> "请求推送英超新闻"
+
+2. Want（意愿）
+   条件：
+   - A引发B中的需求/请求
+   - 关键词：
+     想 / 希望 / 帮我 / 推送 / 能不能
+
+3. React（反应）
+   条件：
+   - A引发情绪/态度变化
+   - 如：开心 / 失望 / 觉得好
+
+4. Changed（变化）
+   条件：
+   - B明确改变A中的状态/偏好
+
+5. SameTopic（同主题）
+   条件：
+   - 仅主题相同，无因果/意图关系
+
+6. None
+   条件：
+   - 无明确证据、不确定、仅语义相似、需要脑补中间步骤
+
+严格规则：
+1. 默认输出 None，除非有明确证据
+2. 禁止基于"语义相似"判断因果
+3. 禁止跨步推理（不能脑补中间步骤）
+4. 后发生的事实不可能导致先发生的事实
+5. 优先识别：偏好 -> 请求
+"""
 
 # ── Summarisation prompt template ─────────────────────────────────────────
 
@@ -59,6 +123,51 @@ SUMMARY_SYSTEM_PROMPT = """你是一个对话摘要助手。请总结以下对�
 
 输出格式：
 {{"summary": "对话的核心内容概括", "keywords": ["关键词1", "关键词2"]}}
+
+对话内容：
+用户：{user_message}
+助手：{assistant_response}"""
+
+# ── HindSight-style retain prompt template ────────────────────────────────
+
+RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请把下面一轮对话转成 1-3 条自包含的叙事事实，用于 AI agent 的长期记忆。
+
+要求：
+1. 不要按句子碎片化；每条 fact 必须能独立说明 who/what/when/where/why
+2. 尽量保留用户偏好、约束、决定、失败经验、助手建议和明确原因
+3. 区分 fact_type:
+   - world: 客观世界/用户/项目事实
+   - experience: 助手自己的行为、建议、推荐、执行经历
+   - opinion: 助手形成的主观判断或偏好性观点
+4. occurred_start/occurred_end 如果对话没有明确日期，填空字符串
+5. entities 遵守下方统一实体提取规则；普通时间表达应写入 occurred_start/occurred_end，不进入 entities
+6. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
+7. 只返回 JSON，不要 markdown，不要额外解释
+
+""" + ENTITY_EXTRACTION_GUIDANCE + """
+
+""" + CAUSAL_RELATION_GUIDANCE + """
+
+输出格式：
+{{
+  "facts": [
+    {{
+      "text": "完整叙事事实",
+      "keywords": ["关键词1", "关键词2"],
+      "fact_type": "world/experience/opinion",
+      "fact_kind": "preference/decision/request/recommendation/action/error/context/other",
+      "occurred_start": "",
+      "occurred_end": "",
+      "where": "",
+      "entities": [
+        {{"name": "实体名", "type": "CONCEPT"}}
+      ]
+    }}
+  ],
+  "causal_relations": [
+    {{"source_index": 0, "target_index": 1, "relation": \"""" + CAUSAL_RELATION_TYPE_TEXT + """\", "confidence": 0.0}}
+  ]
+}}
 
 对话内容：
 用户：{user_message}
@@ -77,72 +186,14 @@ RELATION_PROMPT_TEMPLATE = """你是"AI眼镜记忆关系抽取模块"。
 - 目标：服务于"用户偏好建模 + 主动推送"
 
 --------------------------------------------------
-【任务流程（必须严格按顺序执行）】
-
-Step 1：判断是否"存在明确关联"
-
-仅当满足以下任一条件，才认为"有关联"：
-- 存在明确因果触发（如：因为A所以B）
-- 存在明确行为/请求延续（如：A后提出需求B）
-- 存在明确情绪或意愿变化
-
-否则：
-→ 直接判定为 None
-
-⚠️ 若不确定，一律选择 None（禁止猜测）
-
---------------------------------------------------
-Step 2：若"有关联"，再判断关系类型
-
-按优先级判断（只能选一个）：
-
-1. Cause（因果）⭐最高优先级
-   条件：
-   - A直接导致B发生
-   - 常见模式：
-     偏好 → 行为
-     行为 → 请求
-   示例：
-     "喜欢英超" → "请求推送英超新闻"
-
-2. Want（意愿）
-   条件：
-   - A引发B中的"需求/请求"
-   - 关键词：
-     想 / 希望 / 帮我 / 推送 / 能不能
-
-3. React（反应）
-   条件：
-   - A引发情绪/态度变化
-   - 如：开心 / 失望 / 觉得好
-
-4. Changed（变化）
-   条件：
-   - B明确改变A中的状态/偏好
-
-5. SameTopic（同主题）
-   条件：
-   - 仅主题相同，无因果/意图关系
-
-6. 其他情况：
-   → None
-
---------------------------------------------------
-【严格规则】
-
-1. 默认输出 None，除非有明确证据
-2. 禁止基于"语义相似"判断因果
-3. 禁止跨步推理（不能脑补中间步骤）
-4. B 不可能导致 A
-5. 优先识别：
-   偏好 → 请求（最重要）
+""" + CAUSAL_RELATION_GUIDANCE + """
 
 --------------------------------------------------
 
 【输出格式（极其重要）】
 
 {{
-  "relation": "Changed/Cause/Reason/HinderedBy/React/Want/SameTopic/None",
+  "relation": \"""" + CAUSAL_RELATION_TYPE_TEXT + """\",
   "confidence": 0.0-1.0,
   "reason": ""
 }}
@@ -162,7 +213,7 @@ Step 2：若"有关联"，再判断关系类型
 在输出前，请确认：
 
 - 是否严格是 JSON（无多余字符）
-- relation 是否在8种类型中
+- relation 是否在候选类型中：""" + CAUSAL_RELATION_TYPE_TEXT + """
 - 是否存在过度推断
 - 若不确定 → 改为 None
 
@@ -383,6 +434,169 @@ class MemoryNodeManager:
 
         return None
 
+    @staticmethod
+    def _json_object_from_llm_text(text: str) -> Optional[Dict[str, Any]]:
+        """Parse a JSON object from an LLM response, tolerating code fences."""
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        if "```" in raw:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start != -1 and end != -1:
+                raw = raw[start:end + 1]
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _normalize_keywords(value: Any) -> List[str]:
+        if isinstance(value, str):
+            raw = value.split(",")
+        elif isinstance(value, list):
+            raw = value
+        else:
+            raw = []
+        out: List[str] = []
+        seen = set()
+        for item in raw:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+        return out
+
+    @staticmethod
+    def _normalize_fact_entities(value: Any) -> List[Dict[str, str]]:
+        if not isinstance(value, list):
+            return []
+        entities: List[Dict[str, str]] = []
+        seen = set()
+        for item in value:
+            if isinstance(item, str):
+                name = item.strip()
+                etype = "CONCEPT"
+            elif isinstance(item, dict):
+                name = str(item.get("name", "")).strip()
+                etype = str(item.get("type", "CONCEPT")).strip().upper() or "CONCEPT"
+            else:
+                continue
+            if not name or name in seen:
+                continue
+            if is_temporal_entity(name, etype):
+                continue
+            seen.add(name)
+            entities.append({"name": name, "type": etype})
+        return entities
+
+    def _fallback_fact_from_summary(
+        self,
+        summary_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        keywords = self._normalize_keywords(summary_data.get("keywords", []))
+        return {
+            "text": str(summary_data.get("summary", "")).strip(),
+            "keywords": keywords,
+            "fact_type": "world",
+            "fact_kind": "conversation_summary",
+            "occurred_start": "",
+            "occurred_end": "",
+            "where": "",
+            "entities": [],
+        }
+
+    def _extract_retain_facts(
+        self,
+        user_message: str,
+        assistant_response: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Extract HindSight-style narrative facts for retain.
+
+        The preferred path asks the LLM for structured narrative facts. If the
+        model fails or returns malformed JSON, we fall back to the older single
+        summary so memory retention remains best-effort instead of all-or-none.
+        """
+        prompt = RETAIN_FACT_EXTRACTION_PROMPT.format(
+            user_message=user_message,
+            assistant_response=assistant_response,
+        )
+
+        data: Optional[Dict[str, Any]] = None
+        for attempt in range(2):
+            result = self._call_llm(prompt)
+            logger.error("output from LLM \n" + result)
+            data = self._json_object_from_llm_text(result or "")
+            if data is not None:
+                break
+            if attempt == 0:
+                logger.debug("Retain fact extraction parse failed, retrying")
+
+        facts: List[Dict[str, Any]] = []
+        if data is not None and isinstance(data.get("facts"), list):
+            for raw_fact in data.get("facts", []):
+                if not isinstance(raw_fact, dict):
+                    continue
+                text = str(raw_fact.get("text") or raw_fact.get("summary") or "").strip()
+                if not text:
+                    continue
+                entities = self._normalize_fact_entities(raw_fact.get("entities", []))
+                keywords = self._normalize_keywords(raw_fact.get("keywords", []))
+                if not keywords:
+                    keywords = [e["name"] for e in entities[:5]]
+                facts.append({
+                    "text": text,
+                    "keywords": keywords,
+                    "fact_type": str(raw_fact.get("fact_type", "world") or "world").strip().lower(),
+                    "fact_kind": str(raw_fact.get("fact_kind", "other") or "other").strip().lower(),
+                    "occurred_start": str(raw_fact.get("occurred_start", "") or "").strip(),
+                    "occurred_end": str(raw_fact.get("occurred_end", "") or "").strip(),
+                    "where": str(raw_fact.get("where", "") or "").strip(),
+                    "entities": entities,
+                })
+
+        if not facts:
+            summary_data = self._summarize_turn(user_message, assistant_response)
+            if not summary_data:
+                return None
+            fallback = self._fallback_fact_from_summary(summary_data)
+            if not fallback["text"]:
+                return None
+            facts = [fallback]
+            relations: List[Dict[str, Any]] = []
+        else:
+            relations = []
+            if data is not None and isinstance(data.get("causal_relations"), list):
+                for item in data.get("causal_relations", []):
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        source_index = int(item.get("source_index"))
+                        target_index = int(item.get("target_index"))
+                    except (TypeError, ValueError):
+                        continue
+                    relation = str(item.get("relation", "") or "").strip()
+                    if not relation or relation == "None":
+                        continue
+                    if source_index == target_index:
+                        continue
+                    if not (0 <= source_index < len(facts) and 0 <= target_index < len(facts)):
+                        continue
+                    try:
+                        confidence = float(item.get("confidence", 1.0) or 1.0)
+                    except (TypeError, ValueError):
+                        confidence = 1.0
+                    relations.append({
+                        "source_index": source_index,
+                        "target_index": target_index,
+                        "relation": relation,
+                        "confidence": confidence,
+                    })
+
+        return {"facts": facts, "causal_relations": relations}
+
     # ── Causal relation extraction ───────────────────────────────────────
 
     def _extract_causal_relations(
@@ -463,6 +677,94 @@ class MemoryNodeManager:
             logger.debug("EntityExtractor unavailable: %s", e)
             return None
 
+    @staticmethod
+    def _memory_time_key(fact_index: int = 0) -> str:
+        """Return a lexicographically sortable, unique-ish timestamp key."""
+        now = datetime.now(timezone.utc)
+        base = now.strftime("%Y-%m-%d %H:%M:%S.%f")
+        return f"{base}+00:00#{fact_index:02d}"
+
+    @staticmethod
+    def _original_dialog_payload(
+        user_message: str,
+        assistant_response: str,
+        fact: Dict[str, Any],
+    ) -> str:
+        """Store source dialog plus structured retain metadata in one field.
+
+        The current DB schema has no dedicated metadata column for memory
+        nodes, so retain metadata is encoded alongside the source transcript in
+        a JSON payload. Existing readers treat this as opaque text.
+        """
+        payload = {
+            "source_dialog": {
+                "user": user_message,
+                "assistant": assistant_response,
+            },
+            "retain_fact": {
+                "text": fact.get("text", ""),
+                "fact_type": fact.get("fact_type", "world"),
+                "fact_kind": fact.get("fact_kind", "other"),
+                "occurred_start": fact.get("occurred_start", ""),
+                "occurred_end": fact.get("occurred_end", ""),
+                "where": fact.get("where", ""),
+                "entities": fact.get("entities", []),
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _fact_tags(
+        self,
+        fact: Dict[str, Any],
+        tags: Optional[List[str]] = None,
+    ) -> List[str]:
+        out: List[str] = []
+        for tag in tags or []:
+            if tag and tag not in out:
+                out.append(tag)
+        for tag in (
+            f"fact_type:{fact.get('fact_type', 'world')}",
+            f"fact_kind:{fact.get('fact_kind', 'other')}",
+            "source:memory_node_manager",
+        ):
+            if tag not in out:
+                out.append(tag)
+        return out
+
+    def _link_fact_entities(self, node_id: int, entities: List[Dict[str, str]]) -> None:
+        if not entities or not self._db:
+            return
+        for entity in entities:
+            name = entity.get("name", "").strip()
+            if not name:
+                continue
+            etype = entity.get("type", "CONCEPT").strip().upper() or "CONCEPT"
+            try:
+                entity_id = self._db.entity_add_entity(name=name, entity_type=etype)
+                self._db.entity_link_node(node_id, entity_id)
+            except Exception as exc:
+                logger.debug("Failed to link retain entity %r to node %d: %s", name, node_id, exc)
+
+    def _link_retain_relations(
+        self,
+        node_ids: List[int],
+        relations: List[Dict[str, Any]],
+    ) -> None:
+        for relation in relations:
+            try:
+                source_id = node_ids[int(relation["source_index"])]
+                target_id = node_ids[int(relation["target_index"])]
+                relation_type = str(relation["relation"])
+                confidence = float(relation.get("confidence", 1.0) or 1.0)
+                self._db.memory_add_node_relation(
+                    source_node_id=source_id,
+                    target_node_id=target_id,
+                    relation_type=relation_type,
+                    confidence=confidence,
+                )
+            except Exception as exc:
+                logger.debug("Failed to link retain relation %s: %s", relation, exc)
+
     # ── Store turn as memory node ─────────────────────────────────────────
 
     def store_turn(
@@ -471,13 +773,14 @@ class MemoryNodeManager:
         assistant_response: str,
         tags: Optional[List[str]] = None,
     ) -> bool:
-        """Summarise, embed, store a turn (sync), then start async work (causal+entity).
+        """Retain a turn as one or more narrative memory nodes.
 
-        The synchronous part is minimal: summarise → embed → store in DB.
-        Causal relation extraction and entity extraction run in a background
-        thread so they never block the conversation.
+        The synchronous part follows the HindSight retain shape:
+        extract narrative facts → embed each fact → store nodes → link
+        entities and explicit intra-retain causal relations. Additional
+        cross-turn causal extraction still runs in the background.
 
-        Returns True if the storage was queued, False otherwise.
+        Returns True if at least one fact was stored, False otherwise.
         """
         if not self._enabled:
             return False
@@ -492,46 +795,72 @@ class MemoryNodeManager:
             return False
 
         try:
-            # ── Step 1: Summarize the turn (SYNC) ──
-            summary_data = self._summarize_turn(user_message, assistant_response)
-            if not summary_data:
-                logger.debug("Skipping memory node — summarisation returned no data")
+            # ── Step 1: Extract narrative facts (SYNC) ──
+            retain_data = self._extract_retain_facts(user_message, assistant_response)
+            if not retain_data:
+                logger.debug("Skipping memory node — retain extraction returned no data")
                 return False
 
-            summary = summary_data["summary"]
-            keywords = summary_data["keywords"]
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+            facts = retain_data.get("facts", [])
+            stored_nodes: List[Tuple[int, str, np.ndarray, bool, List[str]]] = []
+            node_ids: List[int] = []
 
-            # ── Step 2: Generate embedding (SYNC) ──
-            embedding = self._embedding_client.embed_text(summary)
-            if embedding is None:
-                logger.info("Skipping memory node — embedding generation failed")
+            for idx, fact in enumerate(facts):
+                summary = str(fact.get("text", "")).strip()
+                if not summary:
+                    continue
+                keywords = self._normalize_keywords(fact.get("keywords", []))
+
+                # ── Step 2: Generate embedding (SYNC) ──
+                embedding = self._embedding_client.embed_text(summary)
+                if embedding is None:
+                    logger.info("Skipping memory fact — embedding generation failed")
+                    continue
+
+                # ── Step 3: Store the new node (SYNC) ──
+                node_id = self._db.memory_add_node(
+                    time_key=self._memory_time_key(idx),
+                    summary=summary,
+                    keywords=keywords,
+                    original_dialog=self._original_dialog_payload(
+                        user_message=user_message,
+                        assistant_response=assistant_response,
+                        fact=fact,
+                    ),
+                    query_embedding=embedding,
+                    tags=self._fact_tags(fact, tags),
+                )
+                fact_entities = fact.get("entities", [])
+                self._link_fact_entities(node_id, fact_entities)
+                # If retain extraction already produced structured entities,
+                # trust that output and avoid a second whole-turn extraction.
+                run_entity_extraction = not bool(fact_entities)
+                stored_nodes.append((node_id, summary, embedding, run_entity_extraction, keywords))
+                node_ids.append(node_id)
+
+            if not stored_nodes:
                 return False
 
-            # ── Step 3: Store the new node (SYNC) ──
-            raw_dialog = f"用户：{user_message}\n助手：{assistant_response}"
-            node_id = self._db.memory_add_node(
-                time_key=timestamp,
-                summary=summary,
-                keywords=keywords,
-                original_dialog=raw_dialog,
-                query_embedding=embedding,
-                tags=tags,
-            )
+            # ── Step 4: Link explicit relations between newly retained facts ──
+            self._link_retain_relations(node_ids, retain_data.get("causal_relations", []))
 
-            # ── Step 4: Start async background work ──
-            # (entity extraction + causal relation extraction)
-            self._start_async_work(
-                node_id=node_id,
-                summary=summary,
-                user_message=user_message,
-                assistant_response=assistant_response,
-                embedding=embedding,
-            )
+            # ── Step 5: Start async background work ──
+            # (cross-turn causal relation extraction + legacy whole-turn entity extraction)
+            for node_id, summary, embedding, run_entity_extraction, keywords in stored_nodes:
+                self._start_async_work(
+                    node_id=node_id,
+                    summary=summary,
+                    user_message=user_message,
+                    assistant_response=assistant_response,
+                    embedding=embedding,
+                    keywords=keywords,
+                    wait_previous=False,
+                    run_entity_extraction=run_entity_extraction,
+                )
 
             logger.debug(
-                "Memory node %d created: %.60s | keywords=%s",
-                node_id, summary, keywords,
+                "Retained %d memory fact node(s) from turn",
+                len(stored_nodes),
             )
             return True
 
@@ -546,12 +875,21 @@ class MemoryNodeManager:
         user_message: str,
         assistant_response: str,
         embedding: np.ndarray,
+        keywords: Optional[List[str]] = None,
+        wait_previous: bool = True,
+        run_entity_extraction: bool = True,
     ) -> None:
         """Start background thread for causal + entity extraction."""
         def _run_async():
             try:
                 # ── A. Causal relation extraction ──
-                similar_nodes, similar_ids = self._db.memory_search_relevant_nodes(embedding)
+                similar_nodes, similar_ids = self._db.memory_relation_candidates(
+                    node_id=node_id,
+                    query_embedding=embedding,
+                    keywords=keywords or [],
+                    top_k=getattr(self._db, "MEMORY_TOP_K_CAUSAL", 5),
+                    budget=self._recall_budget,
+                )
                 if similar_nodes:
                     relations = self._extract_causal_relations(summary, similar_nodes)
                     for similar_id, relation in zip(similar_ids, relations):
@@ -573,7 +911,7 @@ class MemoryNodeManager:
                     )
 
                 # ── B. Entity extraction ──
-                extractor = self._ensure_entity_extractor()
+                extractor = self._ensure_entity_extractor() if run_entity_extraction else None
                 if extractor is not None:
                     extractor.extract_from_turn(
                         node_id=node_id,
@@ -585,7 +923,7 @@ class MemoryNodeManager:
                 logger.debug("Async background work failed for node %d: %s", node_id, e)
 
         # Wait for previous async thread to finish, then start new one
-        if self._async_thread and self._async_thread.is_alive():
+        if wait_previous and self._async_thread and self._async_thread.is_alive():
             self._async_thread.join(timeout=5.0)
         self._async_thread = threading.Thread(
             target=_run_async, daemon=True, name="memory-node-async"
@@ -643,7 +981,7 @@ class MemoryNodeManager:
             # Generate embedding from the clean query
             query_embedding = self._embedding_client.embed_text(search_query)
             if query_embedding is None:
-                logger.error("Query embedding is None")
+                logger.debug("Query embedding is None")
                 return ""
 
             # Generate summary for the query (for keyword extraction)
