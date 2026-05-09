@@ -8,10 +8,10 @@ Lifecycle (enhanced with HindSight-inspired features):
      - Extract keywords
      - Generate embedding via EmbeddingClient
      - Store each fact as a memory node in SessionDB (SQLite + FAISS)
-     - Start background thread for causal + entity extraction
+     - Start background thread for relation graph + entity extraction
 
   2. Background (ASYNC, non-blocking):
-     - Extract causal relations to similar nodes
+     - Build temporal + semantic relation graph edges to prior nodes
      - Extract entities and relations -> knowledge graph
      - Store in memory_node_relations + entity_nodes/edges
 
@@ -50,6 +50,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
+
+# ── Memory graph relation defaults ────────────────────────────────────────
+
+SEMANTIC_RELATION_TYPE = "semantic"
+TEMPORAL_RELATION_TYPE = "temporal"
+CAUSAL_RELATION_GRAPH_TYPE = "causal"
+SEMANTIC_RELATION_THRESHOLD = 0.82
 
 # ── Shared causal relation guidance ───────────────────────────────────────
 
@@ -338,7 +345,7 @@ class MemoryNodeManager:
         self._turn_count = 0
         self._embedding_cfg = cfg
 
-        # Async background thread for non-critical work (causal + entity extraction)
+        # Async background thread for non-critical work (relation graph + entity extraction)
         self._async_thread: Optional[threading.Thread] = None
 
     # ── Lazy init ─────────────────────────────────────────────────────────
@@ -750,7 +757,7 @@ class MemoryNodeManager:
             except Exception as exc:
                 logger.debug("Failed to link retain entity %r to node %d: %s", name, node_id, exc)
 
-    def _link_retain_relations(
+    def _link_fact_relations(
         self,
         node_ids: List[int],
         relations: List[Dict[str, Any]],
@@ -769,6 +776,89 @@ class MemoryNodeManager:
                 )
             except Exception as exc:
                 logger.debug("Failed to link retain relation %s: %s", relation, exc)
+
+    def _link_temporal_relations(self, node_id: int) -> int:
+        """Link the new node to all prior nodes from the same calendar day."""
+        prior_ids = self._db.memory_prior_node_ids(node_id, same_day=True)
+        linked = 0
+        for prior_id in prior_ids:
+            try:
+                self._db.memory_add_node_relation(
+                    source_node_id=node_id,
+                    target_node_id=prior_id,
+                    relation_type=TEMPORAL_RELATION_TYPE,
+                    confidence=1.0,
+                )
+                linked += 1
+            except Exception as exc:
+                logger.debug(
+                    "Failed to link temporal relation %d -> %d: %s",
+                    node_id, prior_id, exc,
+                )
+        return linked
+
+    def _link_semantic_relations(self, node_id: int, embedding: np.ndarray) -> int:
+        """Link the new node to all prior nodes above semantic similarity threshold."""
+        prior_ids = set(self._db.memory_prior_node_ids(node_id))
+        if not prior_ids:
+            return 0
+        neighbors = self._db.memory_semantic_neighbors(
+            embedding,
+            exclude_node_id=node_id,
+            allowed_ids=prior_ids,
+            threshold=SEMANTIC_RELATION_THRESHOLD,
+        )
+        linked = 0
+        for prior_id, similarity in neighbors.items():
+            try:
+                self._db.memory_add_node_relation(
+                    source_node_id=node_id,
+                    target_node_id=prior_id,
+                    relation_type=SEMANTIC_RELATION_TYPE,
+                    confidence=float(similarity),
+                )
+                linked += 1
+            except Exception as exc:
+                logger.debug(
+                    "Failed to link semantic relation %d -> %d: %s",
+                    node_id, prior_id, exc,
+                )
+        return linked
+
+    def _link_causal_relations(
+        self,
+        node_id: int,
+        summary: str,
+        embedding: np.ndarray,
+        keywords: Optional[List[str]] = None,
+    ) -> int:
+        """Future extension point for LLM-classified causal graph edges.
+
+        HindSight-style causal relation classification is intentionally left
+        disabled for now.  Keep this method as the single place to plug it
+        back in when causal relation quality and cost controls are ready.
+        """
+        return 0
+
+    def _build_relation_graph(
+        self,
+        node_id: int,
+        summary: str,
+        embedding: np.ndarray,
+        keywords: Optional[List[str]] = None,
+    ) -> None:
+        temporal_count = self._link_temporal_relations(node_id)
+        semantic_count = self._link_semantic_relations(node_id, embedding)
+        causal_count = self._link_causal_relations(
+            node_id=node_id,
+            summary=summary,
+            embedding=embedding,
+            keywords=keywords,
+        )
+        logger.debug(
+            "Async: graph linked node %d temporal=%d semantic=%d causal=%d",
+            node_id, temporal_count, semantic_count, causal_count,
+        )
 
     # ── Store turn as memory node ─────────────────────────────────────────
 
@@ -807,7 +897,7 @@ class MemoryNodeManager:
                 return False
 
             facts = retain_data.get("facts", [])
-            stored_nodes: List[Tuple[int, str, np.ndarray, bool, List[str]]] = []
+            stored_nodes: List[Tuple[int, str, np.ndarray, List[str]]] = []
             node_ids: List[int] = []
 
             for idx, fact in enumerate(facts):
@@ -838,30 +928,23 @@ class MemoryNodeManager:
                 )
                 fact_entities = fact.get("entities", [])
                 self._link_fact_entities(node_id, fact_entities)
-                # If retain extraction already produced structured entities,
-                # trust that output and avoid a second whole-turn extraction.
-                run_entity_extraction = not bool(fact_entities)
-                stored_nodes.append((node_id, summary, embedding, run_entity_extraction, keywords))
+                stored_nodes.append((node_id, summary, embedding, keywords))
                 node_ids.append(node_id)
 
             if not stored_nodes:
                 return False
 
             # ── Step 4: Link explicit relations between newly retained facts ──
-            self._link_retain_relations(node_ids, retain_data.get("causal_relations", []))
+            self._link_fact_relations(node_ids, retain_data.get("causal_relations", []))
 
-            # ── Step 5: Start async background work ──
-            # (cross-turn causal relation extraction + legacy whole-turn entity extraction)
-            for node_id, summary, embedding, run_entity_extraction, keywords in stored_nodes:
+            # ── Step 5: Start async background relation graph work ──
+            for node_id, summary, embedding, keywords in stored_nodes:
                 self._start_async_work(
                     node_id=node_id,
                     summary=summary,
-                    user_message=user_message,
-                    assistant_response=assistant_response,
                     embedding=embedding,
                     keywords=keywords,
                     wait_previous=False,
-                    run_entity_extraction=run_entity_extraction,
                 )
 
             logger.debug(
@@ -878,53 +961,20 @@ class MemoryNodeManager:
         self,
         node_id: int,
         summary: str,
-        user_message: str,
-        assistant_response: str,
         embedding: np.ndarray,
         keywords: Optional[List[str]] = None,
         wait_previous: bool = True,
-        run_entity_extraction: bool = True,
     ) -> None:
-        """Start background thread for causal + entity extraction."""
+        """Start background thread for relation graph construction."""
         def _run_async():
             try:
-                # ── A. Causal relation extraction ──
-                similar_nodes, similar_ids = self._db.memory_relation_candidates(
+                # ── A. Relation graph construction ──
+                self._build_relation_graph(
                     node_id=node_id,
-                    query_embedding=embedding,
+                    summary=summary,
+                    embedding=embedding,
                     keywords=keywords or [],
-                    top_k=getattr(self._db, "MEMORY_TOP_K_CAUSAL", 5),
-                    budget=self._recall_budget,
                 )
-                if similar_nodes:
-                    logger.error("cur_chosen_node, summary, " + summary)
-                    relations = self._extract_causal_relations(summary, similar_nodes)
-                    for similar_id, relation in zip(similar_ids, relations):                        
-                        if relation is not None:
-                            # Write to both normalized table + legacy JSON
-                            self._db.memory_update_causal(
-                                node_id, similar_id,
-                                relation_ab=relation,
-                                relation_ba=None,
-                            )
-                            self._db.memory_add_node_relation(
-                                source_node_id=node_id,
-                                target_node_id=similar_id,
-                                relation_type=relation,
-                            )
-                    logger.debug(
-                        "Async: linked node %d to %d similar node(s)",
-                        node_id, len(similar_ids),
-                    )
-
-                # ── B. Entity extraction ──
-                extractor = self._ensure_entity_extractor() if run_entity_extraction else None
-                if extractor is not None:
-                    extractor.extract_from_turn(
-                        node_id=node_id,
-                        user_message=user_message,
-                        assistant_response=assistant_response,
-                    )
 
             except Exception as e:
                 logger.debug("Async background work failed for node %d: %s", node_id, e)

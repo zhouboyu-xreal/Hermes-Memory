@@ -185,13 +185,8 @@ CREATE TABLE IF NOT EXISTS memory_nodes (
     time_key TEXT UNIQUE NOT NULL,
     summary TEXT NOT NULL,
     keywords TEXT NOT NULL,
-    fact_type TEXT NOT NULL DEFAULT 'world'
-);
-
-CREATE TABLE IF NOT EXISTS memory_leaf_details (
-    node_id INTEGER PRIMARY KEY,
-    original_dialog TEXT,
-    causal_relation TEXT
+    fact_type TEXT NOT NULL DEFAULT 'world',
+    original_dialog TEXT
 );
 """
 
@@ -251,7 +246,7 @@ CREATE TABLE IF NOT EXISTS memory_node_entities (
     PRIMARY KEY (node_id, entity_id)
 );
 
--- Normalized memory node relation table (migrates from causal_relation JSON)
+-- Normalized memory node relation table
 CREATE TABLE IF NOT EXISTS memory_node_relations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
@@ -667,12 +662,21 @@ class SessionDB:
         except sqlite3.OperationalError:
             cursor.executescript(FTS_TRIGRAM_SQL)
 
-        # ── Memory Nodes tables + FTS5 ──
+        # ── Memory Nodes tables ──
         cursor.executescript(MEMORY_NODES_SQL)
+
+        # Rebuild memory-node FTS after all memory_nodes migrations below.
+        # Existing triggers would fire while we move legacy detail columns onto
+        # memory_nodes, so drop them first and recreate/backfill at the end.
+        for _trig in ("memory_nodes_ai", "memory_nodes_ad", "memory_nodes_au"):
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {_trig}")
+            except sqlite3.OperationalError:
+                pass
         try:
-            cursor.execute("SELECT * FROM memory_nodes_fts LIMIT 0")
+            cursor.execute("DROP TABLE IF EXISTS memory_nodes_fts")
         except sqlite3.OperationalError:
-            cursor.executescript(MEMORY_NODES_FTS_SQL)
+            pass
 
         # ── Knowledge Graph tables + FTS5 ──
         cursor.executescript(KNOWLEDGE_GRAPH_SQL)
@@ -690,6 +694,12 @@ class SessionDB:
         # ── Add explicit fact_type column to memory_nodes if missing ──
         try:
             cursor.execute("ALTER TABLE memory_nodes ADD COLUMN fact_type TEXT NOT NULL DEFAULT 'world'")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # ── Memory node detail fields live directly on memory_nodes ──
+        try:
+            cursor.execute("ALTER TABLE memory_nodes ADD COLUMN original_dialog TEXT")
         except sqlite3.OperationalError:
             pass  # Column already exists
 
@@ -725,39 +735,15 @@ class SessionDB:
         except sqlite3.OperationalError:
             pass
 
-        # ── Causal relation migration: JSON → normalized memory_node_relations ──
+        # ── Memory Nodes FTS5 ──
         try:
-            _migrated = cursor.execute(
-                "SELECT COUNT(*) FROM memory_node_relations"
-            ).fetchone()[0]
-            if _migrated == 0:
-                # Migrate existing causal_relation JSON to normalized relations
-                _rows = cursor.execute(
-                    "SELECT node_id, causal_relation FROM memory_leaf_details "
-                    "WHERE causal_relation IS NOT NULL AND causal_relation != '{}'"
-                ).fetchall()
-                _inserted = 0
-                for _rid, _causal_json in _rows:
-                    try:
-                        _causal = json.loads(_causal_json) if isinstance(_causal_json, str) else {}
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-                    for _target_str, _rel_type in _causal.items():
-                        try:
-                            _target = int(_target_str)
-                        except (ValueError, TypeError):
-                            continue
-                        cursor.execute(
-                            "INSERT OR IGNORE INTO memory_node_relations "
-                            "(source_node_id, target_node_id, relation_type, confidence) "
-                            "VALUES (?, ?, ?, 1.0)",
-                            (_rid, _target, _rel_type),
-                        )
-                        _inserted += 1
-                if _inserted:
-                    logger.info("Migrated %d causal relations to memory_node_relations", _inserted)
-        except Exception as _mig_err:
-            logger.debug("Causal relation migration skipped: %s", _mig_err)
+            cursor.executescript(MEMORY_NODES_FTS_SQL)
+            cursor.execute(
+                "INSERT INTO memory_nodes_fts(rowid, summary, keywords) "
+                "SELECT id, summary, keywords FROM memory_nodes"
+            )
+        except sqlite3.OperationalError as _fts_err:
+            logger.debug("Memory node FTS setup skipped: %s", _fts_err)
 
         self._conn.commit()
 
@@ -2081,13 +2067,12 @@ class SessionDB:
         return "world"
 
     def _memory_get_node(self, node_id: int) -> Optional[Dict[str, Any]]:
-        """Fetch a single memory node with its leaf details, tags, and relations."""
+        """Fetch a single memory node with tags and relations."""
         cursor = self._conn.execute(
-            """SELECT n.id, n.time_key, n.summary, n.keywords,
-                      d.original_dialog, d.causal_relation, n.tags, n.fact_type
-               FROM memory_nodes n
-               JOIN memory_leaf_details d ON n.id = d.node_id
-               WHERE n.id = ?""",
+            """SELECT id, time_key, summary, keywords, original_dialog,
+                      tags, fact_type
+               FROM memory_nodes
+               WHERE id = ?""",
             (node_id,),
         )
         r = cursor.fetchone()
@@ -2103,15 +2088,14 @@ class SessionDB:
         node_relations = {}
         for rel_row in rel_cursor.fetchall():
             node_relations[str(rel_row[0])] = rel_row[1]
-        tags = json.loads(r[6]) if r[6] else []
-        fact_type = self._normalize_memory_fact_type(r[7] or self._memory_fact_type_from_tags(tags))
+        tags = json.loads(r[5]) if r[5] else []
+        fact_type = self._normalize_memory_fact_type(r[6] or self._memory_fact_type_from_tags(tags))
         return {
             "id": r[0],
             "time_key": r[1],
             "summary": r[2],
             "keywords": r[3].split(" "),
             "original_dialog": r[4],
-            "causal_relation": json.loads(r[5]) if r[5] else {},
             "tags": tags,
             "fact_type": fact_type,
             "node_relations": node_relations,
@@ -2184,6 +2168,40 @@ class SessionDB:
             node_id = self._memory_faiss_id_map[idx]
             results[node_id] = sim
         return results
+
+    def memory_semantic_neighbors(
+        self,
+        query_embedding: np.ndarray,
+        *,
+        exclude_node_id: Optional[int] = None,
+        allowed_ids: Optional[set] = None,
+        threshold: float = 0.82,
+    ) -> Dict[int, float]:
+        """Return all FAISS neighbors whose cosine similarity meets threshold.
+
+        Embeddings are L2-normalized by ``EmbeddingClient`` by default and the
+        memory FAISS index is ``IndexFlatIP``, so inner product is cosine
+        similarity for normal Hermes memory nodes.
+        """
+        if not _HAS_FAISS or self._memory_faiss_index is None or self._memory_faiss_index.ntotal == 0:
+            return {}
+        top_k = int(self._memory_faiss_index.ntotal)
+        if top_k <= 0:
+            return {}
+        scores = self._memory_search_vector(query_embedding, top_k=top_k)
+        out: Dict[int, float] = {}
+        for node_id, score in scores.items():
+            if exclude_node_id is not None and node_id == exclude_node_id:
+                continue
+            if allowed_ids is not None and node_id not in allowed_ids:
+                continue
+            try:
+                similarity = float(score)
+            except (TypeError, ValueError):
+                continue
+            if similarity >= threshold:
+                out[node_id] = similarity
+        return out
 
     def _memory_save_faiss(self) -> None:
         """Persist FAISS index and id_map to disk next to the SQLite DB.
@@ -2455,6 +2473,28 @@ class SessionDB:
             allowed_ids=allowed_ids,
         )
 
+    def memory_prior_node_ids(
+        self,
+        node_id: int,
+        *,
+        same_day: bool = False,
+    ) -> List[int]:
+        """Return prior memory node ids for relation graph construction."""
+        current = self._memory_get_node(node_id)
+        if not current:
+            return []
+        current_time = str(current.get("time_key", ""))
+        params: List[Any] = [node_id, current_time]
+        where = "id != ? AND time_key <= ?"
+        if same_day and len(current_time) >= 10:
+            where += " AND substr(time_key, 1, 10) = ?"
+            params.append(current_time[:10])
+        cursor = self._conn.execute(
+            f"SELECT id FROM memory_nodes WHERE {where} ORDER BY time_key DESC, id DESC",
+            params,
+        )
+        return [row[0] for row in cursor.fetchall()]
+
     # ── Public API ────────────────────────────────────────────────────────
 
     def memory_add_node(
@@ -2480,16 +2520,19 @@ class SessionDB:
                 fact_type or self._memory_fact_type_from_tags(tags or [])
             )
             cursor = conn.execute(
-                """INSERT INTO memory_nodes (time_key, summary, keywords, tags, fact_type)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (time_key, summary, keywords_str, tags_str, normalized_fact_type),
+                """INSERT INTO memory_nodes
+                   (time_key, summary, keywords, tags, fact_type, original_dialog)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    time_key,
+                    summary,
+                    keywords_str,
+                    tags_str,
+                    normalized_fact_type,
+                    original_dialog,
+                ),
             )
             node_id = cursor.lastrowid
-            conn.execute(
-                """INSERT INTO memory_leaf_details (node_id, original_dialog, causal_relation)
-                   VALUES (?, ?, ?)""",
-                (node_id, original_dialog, json.dumps({}, ensure_ascii=False)),
-            )
             return node_id
 
         node_id = self._execute_write(_do)
@@ -2502,50 +2545,7 @@ class SessionDB:
             self._memory_save_faiss()
 
         return node_id
-
-    def memory_update_causal(
-        self,
-        a_id: int,
-        b_id: int,
-        relation_ab: str,
-        relation_ba: Optional[str] = None,
-    ) -> None:
-        """Set or update a causal relation between two memory nodes.
-
-        *relation_ab* describes the relationship from node *a_id* → *b_id*.
-        *relation_ba* (optional) describes *b_id* → *a_id* (assumed same if omitted).
-        """
-
-        def _do(conn):
-            # a → b
-            cursor = conn.execute(
-                "SELECT causal_relation FROM memory_leaf_details WHERE node_id=?",
-                (a_id,),
-            )
-            row = cursor.fetchone()
-            a_map = json.loads(row[0]) if row and row[0] else {}
-            a_map[str(b_id)] = relation_ab
-            conn.execute(
-                "UPDATE memory_leaf_details SET causal_relation=? WHERE node_id=?",
-                (json.dumps(a_map, ensure_ascii=False), a_id),
-            )
-
-            # b → a (optional)
-            if relation_ba:
-                cursor = conn.execute(
-                    "SELECT causal_relation FROM memory_leaf_details WHERE node_id=?",
-                    (b_id,),
-                )
-                row = cursor.fetchone()
-                b_map = json.loads(row[0]) if row and row[0] else {}
-                b_map[str(a_id)] = relation_ba
-                conn.execute(
-                    "UPDATE memory_leaf_details SET causal_relation=? WHERE node_id=?",
-                    (json.dumps(b_map, ensure_ascii=False), b_id),
-                )
-
-        self._execute_write(_do)
-    
+        
     def memory_relation_candidates(
         self,
         node_id: int,
@@ -2863,36 +2863,23 @@ class SessionDB:
             )
         self._execute_write(_do)
 
-    # ── Normalized memory node relations (migrated from causal_relation JSON) ──
+    # ── Normalized memory node relations ─────────────────────────────────
 
     def memory_add_node_relation(
         self, source_node_id: int, target_node_id: int,
         relation_type: str, confidence: float = 1.0,
     ) -> None:
         """Add a normalized relation between two memory nodes.
-        
-        Also mirrors to the legacy causal_relation JSON for backward compat.
         """
+        relation_text = str(relation_type or "")
+
         def _do(conn):
             conn.execute(
                 "INSERT OR IGNORE INTO memory_node_relations "
                 "(source_node_id, target_node_id, relation_type, confidence) "
                 "VALUES (?, ?, ?, ?)",
-                (source_node_id, target_node_id, relation_type, confidence),
+                (source_node_id, target_node_id, relation_text, confidence),
             )
-            # Mirror to legacy causal_relation JSON
-            cursor = conn.execute(
-                "SELECT causal_relation FROM memory_leaf_details WHERE node_id=?",
-                (source_node_id,),
-            )
-            row = cursor.fetchone()
-            if row:
-                causal_map = json.loads(row[0]) if row[0] else {}
-                causal_map[str(target_node_id)] = relation_type
-                conn.execute(
-                    "UPDATE memory_leaf_details SET causal_relation=? WHERE node_id=?",
-                    (json.dumps(causal_map, ensure_ascii=False), source_node_id),
-                )
         self._execute_write(_do)
 
     # =========================================================================

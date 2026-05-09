@@ -1,5 +1,4 @@
 import json
-
 import numpy as np
 import pytest
 
@@ -92,7 +91,7 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert "fact_type:experience" in json.loads(rows[1]["tags"])
 
     detail = db._conn.execute(
-        "SELECT original_dialog FROM memory_leaf_details WHERE node_id = ?",
+        "SELECT original_dialog FROM memory_nodes WHERE id = ?",
         (rows[0]["id"],),
     ).fetchone()
     original_payload = json.loads(detail["original_dialog"])
@@ -117,9 +116,21 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert relation["relation_type"] == "Cause"
     assert relation["confidence"] == pytest.approx(0.8)
     assert len(mgr.async_calls) == 2
-    assert mgr.async_calls[0]["run_entity_extraction"] is False
-    assert mgr.async_calls[1]["run_entity_extraction"] is False
+    assert "run_entity_extraction" not in mgr.async_calls[0]
+    assert "run_entity_extraction" not in mgr.async_calls[1]
     assert mgr.async_calls[0]["keywords"] == ["Alice", "Slack", "email"]
+
+
+def test_memory_node_details_live_on_memory_nodes_table(db):
+    tables = {
+        row["name"]
+        for row in db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+
+    assert "memory_nodes" in tables
+    assert "memory_leaf_details" not in tables
 
 
 def test_store_turn_falls_back_to_summary_when_retain_json_is_bad(db):
@@ -141,7 +152,7 @@ def test_store_turn_falls_back_to_summary_when_retain_json_is_bad(db):
     assert row["summary"] == summary_payload["summary"]
     assert row["keywords"] == "PostgreSQL project"
     assert "fact_kind:conversation_summary" in json.loads(row["tags"])
-    assert mgr.async_calls[0]["run_entity_extraction"] is True
+    assert "run_entity_extraction" not in mgr.async_calls[0]
 
 
 def test_retain_and_relation_prompts_share_relation_type_contract():
@@ -428,3 +439,62 @@ def test_memory_relation_candidates_stay_within_same_fact_type(db, monkeypatch):
 
     assert world_prior in ids
     assert experience_prior not in ids
+
+
+def test_relation_graph_links_temporal_same_day_and_semantic_prior_nodes(db, monkeypatch):
+    previous_same_day = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+    )
+    previous_other_day = _add_memory_node(
+        db,
+        time_key="2026-04-30 10:00:00",
+        summary="Alice likes concise status reports.",
+        keywords=["Alice", "reports"],
+    )
+    current = _add_memory_node(
+        db,
+        time_key="2026-05-01 12:00:00",
+        summary="Alice wants Slack alerts for incidents.",
+        keywords=["Alice", "Slack"],
+    )
+    seen = {}
+
+    def fake_semantic_neighbors(embedding, *, exclude_node_id=None, allowed_ids=None, threshold=0.0):
+        seen["exclude_node_id"] = exclude_node_id
+        seen["allowed_ids"] = set(allowed_ids or [])
+        seen["threshold"] = threshold
+        return {previous_other_day: 0.91}
+
+    monkeypatch.setattr(db, "memory_semantic_neighbors", fake_semantic_neighbors)
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    mgr._build_relation_graph(
+        node_id=current,
+        summary="Alice wants Slack alerts for incidents.",
+        embedding=np.ones((1, 1536), dtype=np.float32),
+        keywords=["Alice", "Slack"],
+    )
+
+    rows = db._conn.execute(
+        "SELECT source_node_id, target_node_id, relation_type, confidence "
+        "FROM memory_node_relations ORDER BY relation_type, target_node_id"
+    ).fetchall()
+    relations = {
+        (row["source_node_id"], row["target_node_id"], row["relation_type"])
+        for row in rows
+    }
+    assert (current, previous_same_day, "temporal") in relations
+    assert (current, previous_other_day, "semantic") in relations
+    assert seen["exclude_node_id"] == current
+    assert seen["allowed_ids"] == {previous_same_day, previous_other_day}
+    assert seen["threshold"] == pytest.approx(0.82)
+
+    causal_edges = db._conn.execute(
+        "SELECT relation_type FROM memory_node_relations "
+        "WHERE source_node_id = ? AND relation_type NOT IN ('semantic', 'temporal')",
+        (current,),
+    ).fetchall()
+    assert causal_edges == []
