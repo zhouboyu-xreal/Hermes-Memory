@@ -184,7 +184,8 @@ CREATE TABLE IF NOT EXISTS memory_nodes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     time_key TEXT UNIQUE NOT NULL,
     summary TEXT NOT NULL,
-    keywords TEXT NOT NULL
+    keywords TEXT NOT NULL,
+    fact_type TEXT NOT NULL DEFAULT 'world'
 );
 
 CREATE TABLE IF NOT EXISTS memory_leaf_details (
@@ -686,11 +687,40 @@ class SessionDB:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # ── Add explicit fact_type column to memory_nodes if missing ──
+        try:
+            cursor.execute("ALTER TABLE memory_nodes ADD COLUMN fact_type TEXT NOT NULL DEFAULT 'world'")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Backfill fact_type from legacy tags for existing retain facts.
+        try:
+            cursor.execute(
+                "UPDATE memory_nodes SET fact_type = 'experience' "
+                "WHERE tags LIKE ?",
+                ('%"fact_type:experience"%',),
+            )
+            cursor.execute(
+                "UPDATE memory_nodes SET fact_type = 'world' "
+                "WHERE fact_type IS NULL OR fact_type = '' OR fact_type NOT IN ('world', 'experience')"
+            )
+        except sqlite3.OperationalError:
+            pass
+
         # ── Index on time_key for time-range search ──
         try:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_nodes_time "
                 "ON memory_nodes(time_key)"
+            )
+        except sqlite3.OperationalError:
+            pass
+
+        # ── Index on fact_type for typed memory recall ──
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_nodes_fact_type "
+                "ON memory_nodes(fact_type)"
             )
         except sqlite3.OperationalError:
             pass
@@ -2026,11 +2056,35 @@ class SessionDB:
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
+    @staticmethod
+    def _normalize_memory_fact_type(value: Any) -> str:
+        """Normalize retained memory fact types to the two recall buckets."""
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if text in {"experience", "experience_fact"}:
+            return "experience"
+        return "world"
+
+    @classmethod
+    def _memory_fact_type_from_tags(cls, tags: Any) -> str:
+        """Infer fact_type from legacy tag arrays."""
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except json.JSONDecodeError:
+                tags = [tags]
+        if not isinstance(tags, list):
+            return "world"
+        for tag in tags:
+            text = str(tag or "").strip().lower()
+            if text.startswith("fact_type:"):
+                return cls._normalize_memory_fact_type(text.split(":", 1)[1])
+        return "world"
+
     def _memory_get_node(self, node_id: int) -> Optional[Dict[str, Any]]:
         """Fetch a single memory node with its leaf details, tags, and relations."""
         cursor = self._conn.execute(
             """SELECT n.id, n.time_key, n.summary, n.keywords,
-                      d.original_dialog, d.causal_relation, n.tags
+                      d.original_dialog, d.causal_relation, n.tags, n.fact_type
                FROM memory_nodes n
                JOIN memory_leaf_details d ON n.id = d.node_id
                WHERE n.id = ?""",
@@ -2049,6 +2103,8 @@ class SessionDB:
         node_relations = {}
         for rel_row in rel_cursor.fetchall():
             node_relations[str(rel_row[0])] = rel_row[1]
+        tags = json.loads(r[6]) if r[6] else []
+        fact_type = self._normalize_memory_fact_type(r[7] or self._memory_fact_type_from_tags(tags))
         return {
             "id": r[0],
             "time_key": r[1],
@@ -2056,7 +2112,8 @@ class SessionDB:
             "keywords": r[3].split(" "),
             "original_dialog": r[4],
             "causal_relation": json.loads(r[5]) if r[5] else {},
-            "tags": json.loads(r[6]) if r[6] else [],
+            "tags": tags,
+            "fact_type": fact_type,
             "node_relations": node_relations,
         }
 
@@ -2408,6 +2465,7 @@ class SessionDB:
         original_dialog: str,
         query_embedding: np.ndarray,
         tags: Optional[List[str]] = None,
+        fact_type: str = "world",
     ) -> int:
         """Insert a new memory node (SQLite + FAISS). Returns the node ID.
 
@@ -2418,10 +2476,13 @@ class SessionDB:
         def _do(conn):
             keywords_str = " ".join(keywords) if isinstance(keywords, list) else keywords
             tags_str = json.dumps(tags or [], ensure_ascii=False)
+            normalized_fact_type = self._normalize_memory_fact_type(
+                fact_type or self._memory_fact_type_from_tags(tags or [])
+            )
             cursor = conn.execute(
-                """INSERT INTO memory_nodes (time_key, summary, keywords, tags)
-                   VALUES (?, ?, ?, ?)""",
-                (time_key, summary, keywords_str, tags_str),
+                """INSERT INTO memory_nodes (time_key, summary, keywords, tags, fact_type)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (time_key, summary, keywords_str, tags_str, normalized_fact_type),
             )
             node_id = cursor.lastrowid
             conn.execute(
@@ -2484,7 +2545,7 @@ class SessionDB:
                 )
 
         self._execute_write(_do)
-
+    
     def memory_relation_candidates(
         self,
         node_id: int,
@@ -2515,9 +2576,10 @@ class SessionDB:
 
         search_limit = max(top_k * 4, 20)
         current_time = current.get("time_key", "")
+        current_fact_type = self._normalize_memory_fact_type(current.get("fact_type", "world"))
         allowed_rows = self._conn.execute(
-            "SELECT id FROM memory_nodes WHERE id != ? AND time_key <= ?",
-            (node_id, current_time),
+            "SELECT id FROM memory_nodes WHERE id != ? AND time_key <= ? AND fact_type = ?",
+            (node_id, current_time, current_fact_type),
         ).fetchall()
         allowed_ids = {row[0] for row in allowed_rows}
         if not allowed_ids:
@@ -2589,6 +2651,7 @@ class SessionDB:
         time_end: Optional[str] = None,
         tags: Optional[List[str]] = None,
         tags_match: str = "any",
+        fact_types: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Hybrid search: keyword + vector + temporal + graph retrieval with RRF.
 
@@ -2602,6 +2665,7 @@ class SessionDB:
             search returns too few results.
         *tags*: optional list of tags to filter by (matches against JSON array in ``tags`` column).
         *tags_match*: ``"any"`` (default, node has at least one) or ``"all"`` (node has all).
+        *fact_types*: optional list of normalized fact buckets (``world``/``experience``).
         """
         if top_k is None:
             top_k = self.MEMORY_QUERY_TOP_K
@@ -2650,11 +2714,32 @@ class SessionDB:
             if not _tag_ids:
                 return []
 
+        _fact_type_ids: Optional[set] = None
+        if fact_types:
+            normalized_types = sorted({
+                self._normalize_memory_fact_type(fact_type)
+                for fact_type in fact_types
+                if str(fact_type or "").strip()
+            })
+            if normalized_types:
+                placeholders = ",".join("?" for _ in normalized_types)
+                _type_cursor = self._conn.execute(
+                    f"SELECT id FROM memory_nodes WHERE fact_type IN ({placeholders})",
+                    normalized_types,
+                )
+                _fact_type_ids = {r[0] for r in _type_cursor.fetchall()}
+                if not _fact_type_ids:
+                    return []
+
         allowed_ids: Optional[set] = None
         if _time_ids is not None:
             allowed_ids = set(_time_ids)
         if _tag_ids is not None:
             allowed_ids = _tag_ids if allowed_ids is None else allowed_ids & _tag_ids
+            if not allowed_ids:
+                return []
+        if _fact_type_ids is not None:
+            allowed_ids = _fact_type_ids if allowed_ids is None else allowed_ids & _fact_type_ids
             if not allowed_ids:
                 return []
 

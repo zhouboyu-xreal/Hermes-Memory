@@ -190,13 +190,14 @@ def test_store_turn_filters_plain_time_expressions_from_fact_entities(db):
     assert "最近三天" not in names
 
 
-def _add_memory_node(db, *, time_key, summary, keywords):
+def _add_memory_node(db, *, time_key, summary, keywords, fact_type="world"):
     return db.memory_add_node(
         time_key=time_key,
         summary=summary,
         keywords=keywords,
         original_dialog="{}",
         query_embedding=np.ones((1, 1536), dtype=np.float32),
+        fact_type=fact_type,
     )
 
 
@@ -271,6 +272,74 @@ def test_memory_search_rrf_includes_graph_neighbors(db, monkeypatch):
     assert unrelated not in ids
 
 
+def test_memory_search_filters_by_fact_type(db, monkeypatch):
+    world = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+        fact_type="world",
+    )
+    experience = _add_memory_node(
+        db,
+        time_key="2026-05-01 11:00:00",
+        summary="Hermes recommended Slack alert routing for Alice.",
+        keywords=["Alice", "Slack"],
+        fact_type="experience",
+    )
+    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+
+    world_nodes = db.memory_search(
+        ["Alice", "Slack"],
+        np.ones((1, 1536), dtype=np.float32),
+        top_k=5,
+        fact_types=["world"],
+    )
+    experience_nodes = db.memory_search(
+        ["Alice", "Slack"],
+        np.ones((1, 1536), dtype=np.float32),
+        top_k=5,
+        fact_types=["experience"],
+    )
+
+    assert [n["id"] for n in world_nodes] == [world]
+    assert [n["id"] for n in experience_nodes] == [experience]
+    assert world_nodes[0]["fact_type"] == "world"
+    assert experience_nodes[0]["fact_type"] == "experience"
+
+
+def test_recall_formats_world_and_experience_sections(db, monkeypatch):
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+        fact_type="world",
+    )
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 11:00:00",
+        summary="Hermes recommended Slack alert routing for Alice.",
+        keywords=["Alice", "Slack"],
+        fact_type="experience",
+    )
+    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps({"summary": "Alice Slack alerts", "keywords": ["Alice", "Slack"]})],
+    )
+
+    context = mgr.recall("Alice Slack alerts")
+
+    assert "[World facts" in context
+    assert "[Experience memories" in context
+    assert "durable world facts" in context
+    assert "prior assistant experiences" in context
+    assert "Alice prefers Slack for urgent alerts." in context
+    assert "Hermes recommended Slack alert routing for Alice." in context
+
+
 def test_memory_relation_candidates_use_entity_keyword_and_temporal_signals(db, monkeypatch):
     preference = _add_memory_node(
         db,
@@ -320,3 +389,42 @@ def test_memory_relation_candidates_use_entity_keyword_and_temporal_signals(db, 
     assert recent_context in ids
     assert later not in ids
     assert [node["id"] for node in nodes] == ids
+
+
+def test_memory_relation_candidates_stay_within_same_fact_type(db, monkeypatch):
+    world_prior = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+        fact_type="world",
+    )
+    experience_prior = _add_memory_node(
+        db,
+        time_key="2026-05-01 11:00:00",
+        summary="Hermes recommended Slack alert routing for Alice.",
+        keywords=["Alice", "Slack"],
+        fact_type="experience",
+    )
+    current_world = _add_memory_node(
+        db,
+        time_key="2026-05-01 12:00:00",
+        summary="Alice wants urgent alerts in Slack.",
+        keywords=["Alice", "Slack"],
+        fact_type="world",
+    )
+    alice_id = db.entity_add_entity("Alice", "PERSON")
+    for node_id in (world_prior, experience_prior, current_world):
+        db.entity_link_node(node_id, alice_id)
+    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+
+    _nodes, ids = db.memory_relation_candidates(
+        node_id=current_world,
+        query_embedding=np.ones((1, 1536), dtype=np.float32),
+        keywords=["Alice", "Slack"],
+        top_k=5,
+        budget="mid",
+    )
+
+    assert world_prior in ids
+    assert experience_prior not in ids

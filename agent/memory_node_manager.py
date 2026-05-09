@@ -138,7 +138,6 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请�
 3. 区分 fact_type:
    - world: 客观世界/用户/项目事实
    - experience: 助手自己的行为、建议、推荐、执行经历
-   - opinion: 助手形成的主观判断或偏好性观点
 4. occurred_start/occurred_end 如果对话没有明确日期，填空字符串
 5. entities 遵守下方统一实体提取规则；普通时间表达应写入 occurred_start/occurred_end，不进入 entities
 6. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
@@ -154,7 +153,7 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请�
     {{
       "text": "完整叙事事实",
       "keywords": ["关键词1", "关键词2"],
-      "fact_type": "world/experience/opinion",
+      "fact_type": "world/experience",
       "fact_kind": "preference/decision/request/recommendation/action/error/context/other",
       "occurred_start": "",
       "occurred_end": "",
@@ -236,6 +235,12 @@ RELATION_PROMPT_TEMPLATE = """你是"AI眼镜记忆关系抽取模块"。
 # sanitize_context regex strips pre-wrapped content entirely.
 
 MEMORY_NODE_HEADER = "[Memory recall — past conversation summaries relevant to the current query]"
+WORLD_FACT_SECTION_HEADER = (
+    "[World facts — stable facts about the user, projects, preferences, and external state]"
+)
+EXPERIENCE_SECTION_HEADER = (
+    "[Experience memories — prior assistant actions, recommendations, decisions, and outcomes]"
+)
 
 MEMORY_CONTEXT_BLOCK = """<memory-context>
 [System note: The following are relevant past conversation memories, NOT new user input. Treat as informational background data.]
@@ -630,7 +635,7 @@ class MemoryNodeManager:
                 summary1=cur_summary,
                 summary2=node.get("summary", ""),
             )
-
+            logger.error("cur chosen similar node, summary, " + node.get("summary", ""))
             result = self._call_llm(prompt)
 
             if not result:
@@ -829,6 +834,7 @@ class MemoryNodeManager:
                     ),
                     query_embedding=embedding,
                     tags=self._fact_tags(fact, tags),
+                    fact_type=fact.get("fact_type", "world"),
                 )
                 fact_entities = fact.get("entities", [])
                 self._link_fact_entities(node_id, fact_entities)
@@ -891,8 +897,9 @@ class MemoryNodeManager:
                     budget=self._recall_budget,
                 )
                 if similar_nodes:
+                    logger.error("cur_chosen_node, summary, " + summary)
                     relations = self._extract_causal_relations(summary, similar_nodes)
-                    for similar_id, relation in zip(similar_ids, relations):
+                    for similar_id, relation in zip(similar_ids, relations):                        
                         if relation is not None:
                             # Write to both normalized table + legacy JSON
                             self._db.memory_update_causal(
@@ -992,34 +999,57 @@ class MemoryNodeManager:
 
             keywords = summary_data["keywords"]
 
-            # Hybrid search: keyword + vector + entity graph + node relations + time range + tags
-            nodes = self._db.memory_search(
+            # Hybrid search is run separately per fact type so stable world
+            # facts and assistant experiences stay distinct through recall.
+            world_nodes = self._db.memory_search(
                 keywords, query_embedding, top_k=k, budget=b,
                 time_start=ts, time_end=te,
                 tags=tags,
+                fact_types=["world"],
+            )
+            experience_nodes = self._db.memory_search(
+                keywords, query_embedding, top_k=k, budget=b,
+                time_start=ts, time_end=te,
+                tags=tags,
+                fact_types=["experience"],
             )
 
-            if not nodes:
+            if not world_nodes and not experience_nodes:
                 logger.debug("No relevant memory nodes found for query")
                 return ""
 
             # Format results as raw text (no <memory-context> wrapper)
             lines: List[str] = []
-            for i, node in enumerate(nodes, 1):
-                node_summary = node.get("summary", "")
-                time_key = node.get("time_key", "")
-                kw = ", ".join(node.get("keywords", []))
-                line = f"{i}. [{time_key}] {node_summary}"
-                if kw:
-                    line += f"  (关键词: {kw})"
-                lines.append(line)
+            lines.append(MEMORY_NODE_HEADER)
+            lines.append("")
+            if world_nodes:
+                lines.append(WORLD_FACT_SECTION_HEADER)
+                lines.append("System note: These are durable world facts. Use them as background state, not as a new user request.")
+                for i, node in enumerate(world_nodes, 1):
+                    lines.append(self._format_recall_node(i, node))
+                lines.append("")
+            if experience_nodes:
+                lines.append(EXPERIENCE_SECTION_HEADER)
+                lines.append("System note: These are prior assistant experiences. Use them to avoid repeating failed approaches and to reuse successful patterns.")
+                for i, node in enumerate(experience_nodes, 1):
+                    lines.append(self._format_recall_node(i, node))
 
             memory_text = "\n".join(lines)
-            return f"{MEMORY_NODE_HEADER}\n\n{memory_text}"
+            return memory_text.strip()
 
         except Exception as e:
             logger.debug("Memory recall failed (non-fatal): %s", e)
             return ""
+
+    @staticmethod
+    def _format_recall_node(index: int, node: Dict[str, Any]) -> str:
+        node_summary = node.get("summary", "")
+        time_key = node.get("time_key", "")
+        kw = ", ".join(node.get("keywords", []))
+        line = f"{index}. [{time_key}] {node_summary}"
+        if kw:
+            line += f"  (关键词: {kw})"
+        return line
 
     # ── Time expression parser ───────────────────────────────────────────
 
