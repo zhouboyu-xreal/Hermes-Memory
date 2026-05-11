@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -147,8 +148,10 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请�
    - experience: 助手自己的行为、建议、推荐、执行经历
 4. occurred_start/occurred_end 如果对话没有明确日期，填空字符串
 5. entities 遵守下方统一实体提取规则；普通时间表达应写入 occurred_start/occurred_end，不进入 entities
-6. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
-7. 只返回 JSON，不要 markdown，不要额外解释
+6. keywords 是用于检索这条 fact 的关键词，保留关键实体、产品、技术、动作和约束
+7. topic 是这条 fact 归属的主题词列表，用于后续 observation 分桶；不要把 entity name 本身当作唯一 topic
+8. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
+9. 只返回 JSON，不要 markdown，不要额外解释
 
 """ + ENTITY_EXTRACTION_GUIDANCE + """
 
@@ -160,6 +163,7 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请�
     {{
       "text": "完整叙事事实",
       "keywords": ["关键词1", "关键词2"],
+      "topic": ["主题1", "主题2"],
       "fact_type": "world/experience",
       "fact_kind": "preference/decision/request/recommendation/action/error/context/other",
       "occurred_start": "",
@@ -233,6 +237,64 @@ RELATION_PROMPT_TEMPLATE = """你是"AI眼镜记忆关系抽取模块"。
 【摘要B】：
 {summary2}"""
 
+# ── Observation consolidation prompt template ────────────────────────────
+
+OBSERVATION_CONSOLIDATION_PROMPT = """你是长期记忆 consolidation 模块。
+
+请基于同一个 entity/topic 下的 world facts 和 experience memories，生成一条高阶 observation。
+
+要求：
+1. observation 不是简单复述 facts，而是归纳稳定模式、偏好、策略、约束、成功/失败经验或状态变化。
+2. 必须忠于 source facts，不要添加没有依据的信息。
+3. 如果证据不足以形成强结论，也要用谨慎措辞。
+4. 只返回 JSON，不要 markdown，不要额外解释。
+
+entity: {entity_name}
+topic: {topic_label}
+
+source facts:
+{source_facts}
+
+输出格式：
+{{
+  "summary": "一条可用于未来决策的 consolidated observation",
+  "observation_type": "preference/workflow/strategy/failure/success/change/constraint/context",
+  "keywords": ["关键词1", "关键词2"],
+  "confidence": 0.0
+}}"""
+
+OBSERVATION_UPDATE_PROMPT = """你是长期记忆 consolidation 模块。
+
+请基于已有 observation 和新增 source facts，决定如何更新这条 observation。
+
+要求：
+1. 不要简单追加 facts；输出一条更新后的高阶 observation。
+2. 如果新增 facts 只是支持旧 observation，请保留旧结论并适度提高确定性。
+3. 如果新增 facts 细化或改变旧 observation，请改写 summary，使它同时覆盖旧结论和新增证据。
+4. 如果新增 facts 与旧 observation 冲突，请用谨慎措辞反映变化，不要忽略冲突。
+5. 必须忠于给定内容，不要添加没有依据的信息。
+6. 只返回 JSON，不要 markdown，不要额外解释。
+
+entity: {entity_name}
+topic: {topic_label}
+
+existing observation:
+summary: {existing_summary}
+type: {existing_type}
+keywords: {existing_keywords}
+confidence: {existing_confidence}
+
+new source facts:
+{source_facts}
+
+输出格式：
+{{
+  "summary": "更新后可用于未来决策的 consolidated observation",
+  "observation_type": "preference/workflow/strategy/failure/success/change/constraint/context",
+  "keywords": ["关键词1", "关键词2"],
+  "confidence": 0.0
+}}"""
+
 # ── Reflect prompt template ───────────────────────────────────────────────
 
 # ── Memory node context block template ───────────────────────────────────
@@ -247,6 +309,12 @@ WORLD_FACT_SECTION_HEADER = (
 )
 EXPERIENCE_SECTION_HEADER = (
     "[Experience memories — prior assistant actions, recommendations, decisions, and outcomes]"
+)
+OBSERVATION_SECTION_HEADER = (
+    "[Observations — consolidated patterns inferred from related facts and experiences]"
+)
+OBSERVATION_SUPPORT_SECTION_HEADER = (
+    "[Supporting facts for observations]"
 )
 
 MEMORY_CONTEXT_BLOCK = """<memory-context>
@@ -512,6 +580,7 @@ class MemoryNodeManager:
         return {
             "text": str(summary_data.get("summary", "")).strip(),
             "keywords": keywords,
+            "topic": keywords,
             "fact_type": "world",
             "fact_kind": "conversation_summary",
             "occurred_start": "",
@@ -558,11 +627,17 @@ class MemoryNodeManager:
                     continue
                 entities = self._normalize_fact_entities(raw_fact.get("entities", []))
                 keywords = self._normalize_keywords(raw_fact.get("keywords", []))
+                topic = self._normalize_keywords(raw_fact.get("topic", []))
+                if not keywords:
+                    keywords = topic[:]
                 if not keywords:
                     keywords = [e["name"] for e in entities[:5]]
+                if not topic:
+                    topic = keywords[:]
                 facts.append({
                     "text": text,
                     "keywords": keywords,
+                    "topic": topic,
                     "fact_type": str(raw_fact.get("fact_type", "world") or "world").strip().lower(),
                     "fact_kind": str(raw_fact.get("fact_kind", "other") or "other").strip().lower(),
                     "occurred_start": str(raw_fact.get("occurred_start", "") or "").strip(),
@@ -719,6 +794,7 @@ class MemoryNodeManager:
                 "text": fact.get("text", ""),
                 "fact_type": fact.get("fact_type", "world"),
                 "fact_kind": fact.get("fact_kind", "other"),
+                "topic": fact.get("topic", fact.get("keywords", [])),
                 "occurred_start": fact.get("occurred_start", ""),
                 "occurred_end": fact.get("occurred_end", ""),
                 "where": fact.get("where", ""),
@@ -745,9 +821,10 @@ class MemoryNodeManager:
                 out.append(tag)
         return out
 
-    def _link_fact_entities(self, node_id: int, entities: List[Dict[str, str]]) -> None:
+    def _link_fact_entities(self, node_id: int, entities: List[Dict[str, str]]) -> List[Tuple[int, str]]:
+        linked_entities: List[Tuple[int, str]] = []
         if not entities or not self._db:
-            return
+            return linked_entities
         for entity in entities:
             name = entity.get("name", "").strip()
             if not name:
@@ -756,8 +833,161 @@ class MemoryNodeManager:
             try:
                 entity_id = self._db.entity_add_entity(name=name, entity_type=etype)
                 self._db.entity_link_node(node_id, entity_id)
+                linked_entities.append((entity_id, name))
             except Exception as exc:
                 logger.debug("Failed to link retain entity %r to node %d: %s", name, node_id, exc)
+        return linked_entities
+
+    @classmethod
+    def _topic_buckets_for_fact(cls, topics: List[str], entity_name: str) -> List[Tuple[str, str, List[str]]]:
+        entity_text = str(entity_name or "").strip().lower()
+        buckets: List[Tuple[str, str, List[str]]] = []
+        seen = set()
+        for topic in topics:
+            text = str(topic or "").strip()
+            if not text:
+                continue
+            low = text.lower()
+            if low == entity_text or low in entity_text or entity_text in low:
+                continue
+            if low in seen:
+                continue
+            seen.add(low)
+            topic_key = cls._topic_key([text])
+            buckets.append((topic_key, text, [text]))
+        return buckets or [("general", "general", ["general"])]
+
+    @staticmethod
+    def _topic_key(topic_terms: List[str]) -> str:
+        text = "-".join(str(term or "").strip().lower() for term in topic_terms if str(term or "").strip())
+        text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "-", text).strip("-")
+        return text or "general"
+
+    def _generate_observation(
+        self,
+        *,
+        entity_name: str,
+        topic_label: str,
+        source_nodes: List[Dict[str, Any]],
+        existing_observation: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Generate a consolidated observation from source facts via LLM."""
+        fact_lines = []
+        for index, node in enumerate(source_nodes[:8], 1):
+            fact_type = str(node.get("fact_type") or "world")
+            summary = str(node.get("summary") or "").strip()
+            if not summary:
+                continue
+            fact_lines.append(f"{index}. [{fact_type}] {summary}")
+        if not fact_lines:
+            return None
+
+        if existing_observation:
+            prompt = OBSERVATION_UPDATE_PROMPT.format(
+                entity_name=entity_name,
+                topic_label=topic_label,
+                existing_summary=existing_observation.get("summary", ""),
+                existing_type=existing_observation.get("observation_type", "context"),
+                existing_keywords=existing_observation.get("keywords", ""),
+                existing_confidence=existing_observation.get("confidence", 0.7),
+                source_facts="\n".join(fact_lines),
+            )
+        else:
+            prompt = OBSERVATION_CONSOLIDATION_PROMPT.format(
+                entity_name=entity_name,
+                topic_label=topic_label,
+                source_facts="\n".join(fact_lines),
+            )
+        result = self._call_llm(prompt)
+        data = self._json_object_from_llm_text(result or "")
+        if not data:
+            logger.debug("Observation consolidation returned invalid JSON")
+            return None
+
+        summary = str(data.get("summary", "")).strip()
+        if not summary:
+            return None
+        observation_type = str(data.get("observation_type", "context") or "context").strip().lower()
+        allowed_types = {
+            "preference", "workflow", "strategy", "failure",
+            "success", "change", "constraint", "context",
+        }
+        if observation_type not in allowed_types:
+            observation_type = "context"
+        keywords = self._normalize_keywords(data.get("keywords", []))
+        try:
+            confidence = float(data.get("confidence", 0.7) or 0.7)
+        except (TypeError, ValueError):
+            confidence = 0.7
+        return {
+            "summary": summary,
+            "observation_type": observation_type,
+            "keywords": keywords,
+            "confidence": max(0.0, min(1.0, confidence)),
+        }
+
+    def _maybe_consolidate_observations(
+        self,
+        *,
+        node_id: int,
+        topics: List[str],
+        linked_entities: List[Tuple[int, str]],
+        min_sources: int = 3,
+        min_new_sources: int = 2,
+    ) -> None:
+        if not self._db or not linked_entities:
+            return
+        for entity_id, entity_name in linked_entities:
+            for topic_key, topic_label, topic_terms in self._topic_buckets_for_fact(topics, entity_name):
+                try:
+                    source_nodes = self._db.memory_observation_source_nodes(
+                        entity_id=entity_id,
+                        topic_terms=topic_terms,
+                        limit=12,
+                    )
+                    source_ids = [int(node["id"]) for node in source_nodes]
+                    if node_id not in source_ids:
+                        continue
+                    existing_observation, pending_source_ids = self._db.memory_observation_pending_sources(
+                        entity_id=entity_id,
+                        topic_key=topic_key,
+                        candidate_node_ids=source_ids,
+                    )
+                    if existing_observation is None and len(source_ids) < min_sources:
+                        continue
+                    if existing_observation is not None and len(pending_source_ids) < min_new_sources:
+                        continue
+                    nodes_for_llm = source_nodes
+                    if existing_observation is not None:
+                        pending_set = set(pending_source_ids)
+                        nodes_for_llm = [node for node in source_nodes if int(node["id"]) in pending_set]
+                    observation = self._generate_observation(
+                        entity_name=entity_name,
+                        topic_label=topic_label,
+                        source_nodes=nodes_for_llm,
+                        existing_observation=existing_observation,
+                    )
+                    if not observation:
+                        continue
+                    self._db.memory_upsert_observation(
+                        entity_id=entity_id,
+                        topic_key=topic_key,
+                        topic_label=topic_label,
+                        observation_type=observation["observation_type"],
+                        summary=observation["summary"],
+                        keywords=observation["keywords"] or topic_terms,
+                        source_node_ids=source_ids,
+                        confidence=observation["confidence"],
+                        metadata={"source": "memory_node_manager"},
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to consolidate observation for node %d entity %s topic %s: %s",
+                        node_id,
+                        entity_name,
+                        topic_key,
+                        exc,
+                    )
 
     def _link_fact_relations(
         self,
@@ -907,6 +1137,7 @@ class MemoryNodeManager:
                 if not summary:
                     continue
                 keywords = self._normalize_keywords(fact.get("keywords", []))
+                topics = self._normalize_keywords(fact.get("topic", keywords))
 
                 # ── Step 2: Generate embedding (SYNC) ──
                 embedding = self._embedding_client.embed_text(summary)
@@ -919,6 +1150,7 @@ class MemoryNodeManager:
                     time_key=self._memory_time_key(idx),
                     summary=summary,
                     keywords=keywords,
+                    topic=topics,
                     original_dialog=self._original_dialog_payload(
                         user_message=user_message,
                         assistant_response=assistant_response,
@@ -929,7 +1161,12 @@ class MemoryNodeManager:
                     fact_type=fact.get("fact_type", "world"),
                 )
                 fact_entities = fact.get("entities", [])
-                self._link_fact_entities(node_id, fact_entities)
+                linked_entities = self._link_fact_entities(node_id, fact_entities)
+                self._maybe_consolidate_observations(
+                    node_id=node_id,
+                    topics=topics,
+                    linked_entities=linked_entities,
+                )
                 stored_nodes.append((node_id, summary, embedding, keywords))
                 node_ids.append(node_id)
 
@@ -1050,6 +1287,15 @@ class MemoryNodeManager:
                 return ""
 
             keywords = summary_data["keywords"]
+            observation_nodes = self._db.memory_search_observations(
+                keywords,
+                top_k=max(2, min(4, k // 2)),
+            )
+            logger.error()
+            supporting_by_observation = self._db.memory_observation_supporting_nodes(
+                [int(obs["id"]) for obs in observation_nodes],
+                per_observation=2,
+            ) if observation_nodes else {}
 
             # Hybrid search is run separately per fact type so stable world
             # facts and assistant experiences stay distinct through recall.
@@ -1066,7 +1312,15 @@ class MemoryNodeManager:
                 fact_types=["experience"],
             )
 
-            if not world_nodes and not experience_nodes:
+            supporting_ids = {
+                node["id"]
+                for nodes in supporting_by_observation.values()
+                for node in nodes
+            }
+            world_nodes = [node for node in world_nodes if node.get("id") not in supporting_ids]
+            experience_nodes = [node for node in experience_nodes if node.get("id") not in supporting_ids]
+
+            if not observation_nodes and not world_nodes and not experience_nodes:
                 logger.debug("No relevant memory nodes found for query")
                 return ""
 
@@ -1074,6 +1328,26 @@ class MemoryNodeManager:
             lines: List[str] = []
             lines.append(MEMORY_NODE_HEADER)
             lines.append("")
+            if observation_nodes:
+                lines.append(OBSERVATION_SECTION_HEADER)
+                lines.append("System note: These are consolidated long-term patterns. Treat them as high-level guidance supported by the facts below.")
+                for i, observation in enumerate(observation_nodes, 1):
+                    lines.append(self._format_observation(i, observation))
+                lines.append("")
+                support_lines: List[str] = []
+                seen_support = set()
+                support_index = 1
+                for observation in observation_nodes:
+                    for node in supporting_by_observation.get(int(observation["id"]), []):
+                        if node.get("id") in seen_support:
+                            continue
+                        seen_support.add(node.get("id"))
+                        support_lines.append(self._format_recall_node(support_index, node))
+                        support_index += 1
+                if support_lines:
+                    lines.append(OBSERVATION_SUPPORT_SECTION_HEADER)
+                    lines.extend(support_lines)
+                    lines.append("")
             if world_nodes:
                 lines.append(WORLD_FACT_SECTION_HEADER)
                 lines.append("System note: These are durable world facts. Use them as background state, not as a new user request.")
@@ -1101,6 +1375,21 @@ class MemoryNodeManager:
         line = f"{index}. [{time_key}] {node_summary}"
         if kw:
             line += f"  (关键词: {kw})"
+        return line
+
+    @staticmethod
+    def _format_observation(index: int, observation: Dict[str, Any]) -> str:
+        summary = observation.get("summary", "")
+        entity = observation.get("entity_name", "")
+        topic = observation.get("topic_label", "")
+        updated = observation.get("last_supported_at") or observation.get("updated_at") or ""
+        prefix = f"{entity} / {topic}".strip(" /")
+        line = f"{index}. "
+        if prefix:
+            line += f"[{prefix}] "
+        line += summary
+        if updated:
+            line += f"  (last supported: {updated})"
         return line
 
     # ── Time expression parser ───────────────────────────────────────────

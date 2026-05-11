@@ -23,7 +23,7 @@ import re
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -188,6 +188,7 @@ CREATE TABLE IF NOT EXISTS memory_nodes (
     time_key TEXT UNIQUE NOT NULL,
     summary TEXT NOT NULL,
     keywords TEXT NOT NULL,
+    topic TEXT NOT NULL,
     fact_type TEXT NOT NULL DEFAULT 'world',
     original_dialog TEXT
 );
@@ -298,6 +299,43 @@ CREATE TRIGGER IF NOT EXISTS entity_nodes_au AFTER UPDATE ON entity_nodes BEGIN
         type = new.type
     WHERE rowid = new.id;
 END;
+"""
+
+MEMORY_OBSERVATIONS_SQL = """
+CREATE TABLE IF NOT EXISTS memory_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id INTEGER NOT NULL REFERENCES entity_nodes(id),
+    topic_key TEXT NOT NULL,
+    topic_label TEXT NOT NULL,
+    observation_type TEXT NOT NULL DEFAULT 'context',
+    summary TEXT NOT NULL,
+    keywords TEXT NOT NULL,
+    confidence REAL DEFAULT 1.0,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_supported_at TEXT,
+    source_time_start TEXT,
+    source_time_end TEXT,
+    metadata TEXT DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS memory_observation_sources (
+    observation_id INTEGER NOT NULL REFERENCES memory_observations(id),
+    node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
+    role TEXT NOT NULL DEFAULT 'supporting',
+    confidence REAL DEFAULT 1.0,
+    PRIMARY KEY (observation_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_observations_entity_topic
+ON memory_observations(entity_id, topic_key, status);
+
+CREATE INDEX IF NOT EXISTS idx_memory_observations_status
+ON memory_observations(status);
+
+CREATE INDEX IF NOT EXISTS idx_memory_observation_sources_node
+ON memory_observation_sources(node_id);
 """
 
 
@@ -707,6 +745,7 @@ class SessionDB:
             cursor.execute("SELECT * FROM entity_nodes_fts LIMIT 0")
         except sqlite3.OperationalError:
             cursor.executescript(ENTITY_FTS_SQL)
+        cursor.executescript(MEMORY_OBSERVATIONS_SQL)
 
         # ── Add tags column to memory_nodes if missing ──
         try:
@@ -2092,7 +2131,7 @@ class SessionDB:
     def _memory_get_node(self, node_id: int) -> Optional[Dict[str, Any]]:
         """Fetch a single memory node with tags and relations."""
         cursor = self._conn.execute(
-            """SELECT id, time_key, summary, keywords, original_dialog,
+            """SELECT id, time_key, summary, keywords, topic, original_dialog,
                       tags, fact_type
                FROM memory_nodes
                WHERE id = ?""",
@@ -2111,14 +2150,15 @@ class SessionDB:
         node_relations = {}
         for rel_row in rel_cursor.fetchall():
             node_relations[str(rel_row[0])] = rel_row[1]
-        tags = json.loads(r[5]) if r[5] else []
-        fact_type = self._normalize_memory_fact_type(r[6] or self._memory_fact_type_from_tags(tags))
+        tags = json.loads(r[6]) if r[6] else []
+        fact_type = self._normalize_memory_fact_type(r[7] or self._memory_fact_type_from_tags(tags))
         return {
             "id": r[0],
             "time_key": r[1],
             "summary": r[2],
             "keywords": r[3].split(" "),
-            "original_dialog": r[4],
+            "topic": r[4].split(" "),
+            "original_dialog": r[5],
             "tags": tags,
             "fact_type": fact_type,
             "node_relations": node_relations,
@@ -2588,6 +2628,7 @@ class SessionDB:
         time_key: str,
         summary: str,
         keywords: List[str],
+        topic: List[str],
         original_dialog: str,
         query_embedding: np.ndarray,
         tags: Optional[List[str]] = None,
@@ -2601,18 +2642,20 @@ class SessionDB:
 
         def _do(conn):
             keywords_str = " ".join(keywords) if isinstance(keywords, list) else keywords
+            topic_str = " ".join(topic) if isinstance(topic, list) else topic
             tags_str = json.dumps(tags or [], ensure_ascii=False)
             normalized_fact_type = self._normalize_memory_fact_type(
                 fact_type or self._memory_fact_type_from_tags(tags or [])
             )
             cursor = conn.execute(
                 """INSERT INTO memory_nodes
-                   (time_key, summary, keywords, tags, fact_type, original_dialog)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   (time_key, summary, keywords, topic, tags, fact_type, original_dialog)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     time_key,
                     summary,
                     keywords_str,
+                    topic_str,
                     tags_str,
                     normalized_fact_type,
                     original_dialog,
@@ -3089,6 +3132,264 @@ class SessionDB:
             return datetime.fromisoformat(text)
         except ValueError:
             return None
+
+    # ── Consolidated observations ───────────────────────────────────────
+
+    def memory_observation_source_nodes(
+        self,
+        *,
+        entity_id: int,
+        topic_terms: List[str],
+        limit: int = 12,
+    ) -> List[Dict[str, Any]]:
+        """Return fact nodes for an entity/topic bucket."""
+        rows = self._conn.execute(
+            "SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, mn.fact_type "
+            "FROM memory_nodes mn "
+            "JOIN memory_node_entities mne ON mne.node_id = mn.id "
+            "WHERE mne.entity_id = ? "
+            "ORDER BY mn.time_key DESC, mn.id DESC "
+            "LIMIT ?",
+            (entity_id, max(limit * 4, limit)),
+        ).fetchall()
+        terms = [str(term or "").strip().lower() for term in topic_terms if str(term or "").strip()]
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            haystack = f"{row['topic']}".lower()
+            if terms and not any(term in haystack for term in terms):
+                continue
+            out.append(dict(row))
+            if len(out) >= limit:
+                break
+        return out
+
+    def memory_upsert_observation(
+        self,
+        *,
+        entity_id: int,
+        topic_key: str,
+        topic_label: str,
+        observation_type: str,
+        summary: str,
+        keywords: List[str],
+        source_node_ids: List[int],
+        confidence: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Create or update the active observation for an entity/topic/type."""
+        clean_source_ids = []
+        seen = set()
+        for node_id in source_node_ids:
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            clean_source_ids.append(node_id)
+        if not clean_source_ids:
+            raise ValueError("memory observation requires at least one source node")
+
+        placeholders = ",".join("?" for _ in clean_source_ids)
+        time_rows = self._conn.execute(
+            f"SELECT MIN(time_key) AS start_time, MAX(time_key) AS end_time FROM memory_nodes "
+            f"WHERE id IN ({placeholders})",
+            clean_source_ids,
+        ).fetchone()
+        source_time_start = time_rows["start_time"] if time_rows else None
+        source_time_end = time_rows["end_time"] if time_rows else None
+        now_text = datetime.now(timezone.utc).isoformat()
+        keywords_str = " ".join(keywords) if isinstance(keywords, list) else str(keywords or "")
+        metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
+        confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT id FROM memory_observations "
+                "WHERE entity_id = ? AND topic_key = ? AND observation_type = ? AND status = 'active' "
+                "ORDER BY updated_at DESC, id DESC LIMIT 1",
+                (entity_id, topic_key, observation_type),
+            ).fetchone()
+            if existing:
+                observation_id = existing["id"] if isinstance(existing, sqlite3.Row) else existing[0]
+                conn.execute(
+                    "UPDATE memory_observations SET "
+                    "topic_label = ?, summary = ?, keywords = ?, confidence = ?, "
+                    "updated_at = ?, last_supported_at = ?, source_time_start = ?, "
+                    "source_time_end = ?, metadata = ? "
+                    "WHERE id = ?",
+                    (
+                        topic_label,
+                        summary,
+                        keywords_str,
+                        confidence_value,
+                        now_text,
+                        now_text,
+                        source_time_start,
+                        source_time_end,
+                        metadata_str,
+                        observation_id,
+                    ),
+                )
+            else:
+                cursor = conn.execute(
+                    "INSERT INTO memory_observations "
+                    "(entity_id, topic_key, topic_label, observation_type, summary, keywords, "
+                    "confidence, status, created_at, updated_at, last_supported_at, "
+                    "source_time_start, source_time_end, metadata) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+                    (
+                        entity_id,
+                        topic_key,
+                        topic_label,
+                        observation_type,
+                        summary,
+                        keywords_str,
+                        confidence_value,
+                        now_text,
+                        now_text,
+                        now_text,
+                        source_time_start,
+                        source_time_end,
+                        metadata_str,
+                    ),
+                )
+                observation_id = cursor.lastrowid
+            for node_id in clean_source_ids:
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_observation_sources "
+                    "(observation_id, node_id, role, confidence) VALUES (?, ?, 'supporting', ?)",
+                    (observation_id, node_id, confidence_value),
+                )
+            return observation_id
+
+        return self._execute_write(_do)
+
+    def memory_observation_pending_sources(
+        self,
+        *,
+        entity_id: int,
+        topic_key: str,
+        observation_type: Optional[str] = None,
+        candidate_node_ids: List[int],
+    ) -> Tuple[Optional[Dict[str, Any]], List[int]]:
+        """Return active observation and candidate source ids not yet attached."""
+        if not candidate_node_ids:
+            return None, []
+        if observation_type:
+            observation = self._conn.execute(
+                "SELECT * FROM memory_observations "
+                "WHERE entity_id = ? AND topic_key = ? AND observation_type = ? AND status = 'active' "
+                "ORDER BY updated_at DESC, id DESC LIMIT 1",
+                (entity_id, topic_key, observation_type),
+            ).fetchone()
+        else:
+            observation = self._conn.execute(
+                "SELECT * FROM memory_observations "
+                "WHERE entity_id = ? AND topic_key = ? AND status = 'active' "
+                "ORDER BY updated_at DESC, id DESC LIMIT 1",
+                (entity_id, topic_key),
+            ).fetchone()
+        if not observation:
+            return None, list(dict.fromkeys(candidate_node_ids))
+        observation_dict = dict(observation)
+        observation_id = observation_dict["id"]
+        placeholders = ",".join("?" for _ in candidate_node_ids)
+        rows = self._conn.execute(
+            f"SELECT node_id FROM memory_observation_sources "
+            f"WHERE observation_id = ? AND node_id IN ({placeholders})",
+            [observation_id] + candidate_node_ids,
+        ).fetchall()
+        attached = {row["node_id"] for row in rows}
+        pending = [node_id for node_id in dict.fromkeys(candidate_node_ids) if node_id not in attached]
+        return observation_dict, pending
+
+    def memory_observation_pending_source_count(
+        self,
+        *,
+        entity_id: int,
+        topic_key: str,
+        observation_type: Optional[str] = None,
+        candidate_node_ids: List[int],
+    ) -> Tuple[Optional[int], int]:
+        """Return active observation id and candidate source count not yet attached."""
+        observation, pending = self.memory_observation_pending_sources(
+            entity_id=entity_id,
+            topic_key=topic_key,
+            observation_type=observation_type,
+            candidate_node_ids=candidate_node_ids,
+        )
+        return (observation["id"] if observation else None), len(pending)
+
+    def memory_search_observations(
+        self,
+        keyword: Any,
+        *,
+        top_k: int = 3,
+        entity_ids: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search active observations by keyword/topic/entity."""
+        keyword_query = " ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
+        terms = [term.strip().lower() for term in re.split(r"\s+|OR", keyword_query) if term.strip()]
+        params: List[Any] = []
+        where = ["status = 'active'"]
+        if entity_ids:
+            placeholders = ",".join("?" for _ in entity_ids)
+            where.append(f"entity_id IN ({placeholders})")
+            params.extend(entity_ids)
+        rows = self._conn.execute(
+            "SELECT mo.*, en.name AS entity_name "
+            "FROM memory_observations mo "
+            "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
+            f"WHERE {' AND '.join(where)}",
+            params,
+        ).fetchall()
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for row in rows:
+            item = dict(row)
+            haystack = f"{item.get('summary', '')} {item.get('keywords', '')} {item.get('topic_label', '')} {item.get('entity_name', '')}".lower()
+            if terms:
+                matches = sum(1 for term in terms if term in haystack)
+                if matches <= 0:
+                    continue
+            else:
+                matches = 1
+            score = matches + float(item.get("confidence") or 0.0)
+            scored.append((score, item))
+        scored.sort(key=lambda pair: (pair[0], pair[1].get("last_supported_at") or ""), reverse=True)
+        return [item for _, item in scored[:top_k]]
+
+    def memory_observation_supporting_nodes(
+        self,
+        observation_ids: List[int],
+        *,
+        per_observation: int = 2,
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        """Fetch supporting fact nodes for observation ids."""
+        out: Dict[int, List[Dict[str, Any]]] = {}
+        for observation_id in observation_ids:
+            rows = self._conn.execute(
+                "SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.original_dialog, "
+                "mn.tags, mn.fact_type "
+                "FROM memory_observation_sources mos "
+                "JOIN memory_nodes mn ON mn.id = mos.node_id "
+                "WHERE mos.observation_id = ? "
+                "ORDER BY mn.time_key DESC, mn.id DESC "
+                "LIMIT ?",
+                (observation_id, per_observation),
+            ).fetchall()
+            nodes = []
+            for row in rows:
+                tags = json.loads(row["tags"]) if row["tags"] else []
+                nodes.append({
+                    "id": row["id"],
+                    "time_key": row["time_key"],
+                    "summary": row["summary"],
+                    "keywords": row["keywords"].split(" ") if row["keywords"] else [],
+                    "original_dialog": row["original_dialog"],
+                    "tags": tags,
+                    "fact_type": self._normalize_memory_fact_type(row["fact_type"]),
+                    "node_relations": {},
+                })
+            out[observation_id] = nodes
+        return out
 
     # =========================================================================
     # Utility

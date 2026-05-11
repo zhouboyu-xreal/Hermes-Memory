@@ -23,9 +23,11 @@ class _NoAsyncMemoryNodeManager(MemoryNodeManager):
         super().__init__(*args, **kwargs)
         self._embedding_client = _FakeEmbeddingClient()
         self._llm_outputs = list(llm_outputs or [])
+        self.llm_prompts = []
         self.async_calls = []
 
     def _call_llm(self, prompt):
+        self.llm_prompts.append(prompt)
         if self._llm_outputs:
             return self._llm_outputs.pop(0)
         return None
@@ -47,6 +49,7 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
             {
                 "text": "Alice prefers Slack over email for urgent team communication.",
                 "keywords": ["Alice", "Slack", "email"],
+                "topic": ["urgent", "team", "communication"],
                 "fact_type": "world",
                 "fact_kind": "preference",
                 "occurred_start": "2026-05-01 00:00:00",
@@ -60,6 +63,7 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
             {
                 "text": "Hermes recommended configuring alerts to notify Alice in Slack.",
                 "keywords": ["Hermes", "alerts", "Slack"],
+                "topic": ["alert", "routing"],
                 "fact_type": "experience",
                 "fact_kind": "recommendation",
                 "entities": [
@@ -81,12 +85,13 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert mgr.store_turn("Alice hates email for urgent alerts", "Use Slack alerts.") is True
 
     rows = db._conn.execute(
-        "SELECT id, summary, keywords, tags FROM memory_nodes ORDER BY id"
+        "SELECT id, summary, keywords, topic, tags FROM memory_nodes ORDER BY id"
     ).fetchall()
     assert len(rows) == 2
     assert rows[0]["summary"] == retain_payload["facts"][0]["text"]
     assert rows[1]["summary"] == retain_payload["facts"][1]["text"]
     assert "Alice Slack email" == rows[0]["keywords"]
+    assert "urgent team communication" == rows[0]["topic"]
     assert "fact_type:world" in json.loads(rows[0]["tags"])
     assert "fact_type:experience" in json.loads(rows[1]["tags"])
 
@@ -147,10 +152,11 @@ def test_store_turn_falls_back_to_summary_when_retain_json_is_bad(db):
     assert mgr.store_turn("Use PostgreSQL 16", "Good choice.") is True
 
     row = db._conn.execute(
-        "SELECT summary, keywords, tags FROM memory_nodes"
+        "SELECT summary, keywords, topic, tags FROM memory_nodes"
     ).fetchone()
     assert row["summary"] == summary_payload["summary"]
     assert row["keywords"] == "PostgreSQL project"
+    assert row["topic"] == "PostgreSQL project"
     assert "fact_kind:conversation_summary" in json.loads(row["tags"])
     assert "run_entity_extraction" not in mgr.async_calls[0]
 
@@ -160,6 +166,8 @@ def test_retain_and_relation_prompts_share_relation_type_contract():
     assert CAUSAL_RELATION_TYPE_TEXT in RELATION_PROMPT_TEMPLATE
     assert "Reason/HinderedBy" not in RETAIN_FACT_EXTRACTION_PROMPT
     assert "Reason/HinderedBy" not in RELATION_PROMPT_TEMPLATE
+    assert '"keywords": ["关键词1", "关键词2"]' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert '"topic": ["主题1", "主题2"]' in RETAIN_FACT_EXTRACTION_PROMPT
 
 
 def test_store_turn_filters_plain_time_expressions_from_fact_entities(db):
@@ -168,6 +176,7 @@ def test_store_turn_filters_plain_time_expressions_from_fact_entities(db):
             {
                 "text": "Alice wants Slack alerts during the Spring Festival launch window.",
                 "keywords": ["Alice", "Slack", "春节"],
+                "topic": ["launch", "alerts"],
                 "fact_type": "world",
                 "fact_kind": "preference",
                 "occurred_start": "2026-05-07 00:00:00",
@@ -206,6 +215,7 @@ def _add_memory_node(db, *, time_key, summary, keywords, fact_type="world"):
         time_key=time_key,
         summary=summary,
         keywords=keywords,
+        topic=keywords,
         original_dialog="{}",
         query_embedding=np.ones((1, 1536), dtype=np.float32),
         fact_type=fact_type,
@@ -350,6 +360,172 @@ def test_recall_formats_world_and_experience_sections(db, monkeypatch):
     assert "prior assistant experiences" in context
     assert "Alice prefers Slack for urgent alerts." in context
     assert "Hermes recommended Slack alert routing for Alice." in context
+
+
+def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
+    retain_payload = {
+        "facts": [
+            {
+                "text": "Alice prefers Slack for urgent alerts.",
+                "keywords": ["Alice", "Slack", "alerts"],
+                "topic": ["Slack alerts"],
+                "fact_type": "world",
+                "entities": [{"name": "Alice", "type": "PERSON"}],
+            },
+            {
+                "text": "Alice dislikes email for urgent alerts.",
+                "keywords": ["Alice", "email", "alerts"],
+                "topic": ["Slack alerts"],
+                "fact_type": "world",
+                "entities": [{"name": "Alice", "type": "PERSON"}],
+            },
+            {
+                "text": "Hermes previously recommended Slack alert routing for Alice.",
+                "keywords": ["Hermes", "Slack", "routing", "Alice"],
+                "topic": ["Slack alerts"],
+                "fact_type": "experience",
+                "entities": [{"name": "Alice", "type": "PERSON"}],
+            },
+        ],
+        "causal_relations": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps(retain_payload),
+            json.dumps({
+                "summary": "Alice's urgent alert workflow is Slack-centered.",
+                "observation_type": "workflow",
+                "keywords": ["Slack", "alerts"],
+                "confidence": 0.86,
+            }),
+        ],
+    )
+
+    assert mgr.store_turn("Alice urgent alerts", "Use Slack.") is True
+
+    observation = db._conn.execute(
+        "SELECT mo.summary, mo.topic_key, en.name AS entity_name "
+        "FROM memory_observations mo "
+        "JOIN entity_nodes en ON en.id = mo.entity_id"
+    ).fetchone()
+    assert observation["entity_name"] == "Alice"
+    assert observation["topic_key"] == "slack-alerts"
+    assert observation["summary"] == "Alice's urgent alert workflow is Slack-centered."
+    sources = db._conn.execute("SELECT node_id FROM memory_observation_sources").fetchall()
+    assert len(sources) == 3
+
+
+def test_recall_includes_observations_and_supporting_facts(db, monkeypatch):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    source_ids = []
+    for idx, summary in enumerate(
+        [
+            "Alice prefers Slack for urgent alerts.",
+            "Alice dislikes email for urgent alerts.",
+            "Hermes recommended Slack alert routing for Alice.",
+        ],
+        1,
+    ):
+        node_id = _add_memory_node(
+            db,
+            time_key=f"2026-05-0{idx} 10:00:00",
+            summary=summary,
+            keywords=["Slack alerts"],
+            fact_type="world" if idx < 3 else "experience",
+        )
+        db.entity_link_node(node_id, alice)
+        source_ids.append(node_id)
+    db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="slack-alerts",
+        topic_label="Slack alerts",
+        observation_type="context",
+        summary="Alice's urgent alert workflow is Slack-centered.",
+        keywords=["Slack", "alerts"],
+        source_node_ids=source_ids,
+    )
+    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps({"summary": "Alice Slack alerts", "keywords": ["Alice", "Slack", "alerts"]})],
+    )
+
+    context = mgr.recall("Alice Slack alerts")
+
+    assert "[Observations" in context
+    assert "Alice's urgent alert workflow is Slack-centered." in context
+    assert "[Supporting facts for observations]" in context
+    assert "Alice prefers Slack for urgent alerts." in context
+
+
+def test_observation_consolidation_waits_for_incremental_sources(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "summary": "Alice's urgent alert workflow is Slack-centered.",
+                "observation_type": "workflow",
+                "keywords": ["Slack", "alerts"],
+                "confidence": 0.86,
+            }),
+            json.dumps({
+                "summary": "Alice continues to prefer Slack for urgent alert routing.",
+                "observation_type": "workflow",
+                "keywords": ["Slack", "alerts"],
+                "confidence": 0.9,
+            }),
+        ],
+    )
+
+    def add_source(idx):
+        node_id = _add_memory_node(
+            db,
+            time_key=f"2026-05-0{idx} 10:00:00",
+            summary=f"Alice Slack alert fact {idx}.",
+            keywords=["Slack alerts"],
+        )
+        db.entity_link_node(node_id, alice)
+        mgr._maybe_consolidate_observations(
+            node_id=node_id,
+            keywords=["Slack alerts"],
+            linked_entities=[(alice, "Alice")],
+        )
+        return node_id
+
+    for idx in range(1, 4):
+        add_source(idx)
+    first_summary = db._conn.execute("SELECT summary FROM memory_observations").fetchone()["summary"]
+    assert first_summary == "Alice's urgent alert workflow is Slack-centered."
+
+    add_source(4)
+    second_summary = db._conn.execute("SELECT summary FROM memory_observations").fetchone()["summary"]
+    assert second_summary == first_summary
+
+    add_source(5)
+    updated_summary = db._conn.execute("SELECT summary FROM memory_observations").fetchone()["summary"]
+    assert updated_summary == "Alice continues to prefer Slack for urgent alert routing."
+    update_prompt = mgr.llm_prompts[-1]
+    assert "existing observation:" in update_prompt
+    assert "Alice's urgent alert workflow is Slack-centered." in update_prompt
+    assert "Alice Slack alert fact 4." in update_prompt
+    assert "Alice Slack alert fact 5." in update_prompt
+    assert "Alice Slack alert fact 1." not in update_prompt
+    assert "Alice Slack alert fact 2." not in update_prompt
+    assert "Alice Slack alert fact 3." not in update_prompt
+
+
+def test_topic_list_creates_separate_observation_buckets(db):
+    buckets = MemoryNodeManager._topic_buckets_for_fact(["Slack", "alerts"], "Alice")
+
+    assert buckets == [
+        ("slack", "Slack", ["Slack"]),
+        ("alerts", "alerts", ["alerts"]),
+    ]
 
 
 def test_memory_relation_candidates_use_entity_keyword_and_temporal_signals(db, monkeypatch):
