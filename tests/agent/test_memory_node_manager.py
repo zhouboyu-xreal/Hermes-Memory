@@ -267,6 +267,7 @@ def test_memory_search_rrf_includes_graph_neighbors(db, monkeypatch):
     alice_id = db.entity_add_entity("Alice", "PERSON")
     db.entity_link_node(slack, alice_id)
     db.entity_link_node(calendar, alice_id)
+    db.memory_add_node_relation(slack, calendar, "semantic", confidence=0.9)
     charlie_id = db.entity_add_entity("Charlie", "PERSON")
     db.entity_link_node(unrelated, charlie_id)
     monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
@@ -439,6 +440,80 @@ def test_memory_relation_candidates_stay_within_same_fact_type(db, monkeypatch):
 
     assert world_prior in ids
     assert experience_prior not in ids
+
+
+def test_memory_node_relations_store_multidimensional_scores(db):
+    source = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+    )
+    target = _add_memory_node(
+        db,
+        time_key="2026-05-01 12:00:00",
+        summary="Alice wants Slack incident routing.",
+        keywords=["Alice", "Slack"],
+    )
+    alice_id = db.entity_add_entity("Alice", "PERSON")
+    db.entity_link_node(source, alice_id)
+    db.entity_link_node(target, alice_id)
+
+    db.memory_add_node_relation(
+        source_node_id=source,
+        target_node_id=target,
+        relation_type="semantic",
+        confidence=0.91,
+    )
+
+    relation = db._conn.execute(
+        "SELECT semantic_score, causal_score, temporal_score, entity_score, weight "
+        "FROM memory_node_relations"
+    ).fetchone()
+    assert relation["semantic_score"] == pytest.approx(0.91)
+    assert relation["causal_score"] == pytest.approx(0.0)
+    assert relation["temporal_score"] > 0.0
+    assert relation["entity_score"] == pytest.approx(1.0)
+    assert relation["weight"] > relation["temporal_score"] * 0.15
+
+
+def test_memory_graph_expand_uses_priority_beam_search(db):
+    seed = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Seed memory.",
+        keywords=["seed"],
+    )
+    weak_direct = _add_memory_node(
+        db,
+        time_key="2026-05-01 11:00:00",
+        summary="Weak direct neighbor.",
+        keywords=["weak"],
+    )
+    strong_bridge = _add_memory_node(
+        db,
+        time_key="2026-05-01 12:00:00",
+        summary="Strong bridge neighbor.",
+        keywords=["bridge"],
+    )
+    strong_second_hop = _add_memory_node(
+        db,
+        time_key="2026-05-01 13:00:00",
+        summary="Strong second-hop neighbor.",
+        keywords=["target"],
+    )
+
+    db.memory_add_node_relation(seed, weak_direct, "semantic", confidence=0.2, weight=0.2)
+    db.memory_add_node_relation(seed, strong_bridge, "semantic", confidence=0.9, weight=0.9)
+    db.memory_add_node_relation(strong_bridge, strong_second_hop, "semantic", confidence=0.9, weight=0.9)
+
+    ranked = db._memory_graph_expand_ranked(
+        [seed],
+        depth=2,
+        limit=3,
+    )
+
+    assert ranked == [strong_bridge, strong_second_hop, weak_direct]
 
 
 def test_relation_graph_links_temporal_same_day_and_semantic_prior_nodes(db, monkeypatch):

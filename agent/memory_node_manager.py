@@ -538,6 +538,8 @@ class MemoryNodeManager:
 
         data: Optional[Dict[str, Any]] = None
         for attempt in range(2):
+            logger.error("input user_message: " + user_message)
+            logger.error("input assistant_response: " + assistant_response)
             result = self._call_llm(prompt)
             logger.error("output from LLM \n" + result)
             data = self._json_object_from_llm_text(result or "")

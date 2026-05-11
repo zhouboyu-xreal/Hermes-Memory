@@ -15,12 +15,15 @@ Key design decisions:
 """
 
 import json
+import heapq
 import logging
+import math
 import random
 import re
 import sqlite3
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -253,6 +256,12 @@ CREATE TABLE IF NOT EXISTS memory_node_relations (
     target_node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
     relation_type TEXT NOT NULL,
     confidence REAL DEFAULT 1.0,
+    semantic_score REAL DEFAULT 0.0,
+    causal_score REAL DEFAULT 0.0,
+    temporal_score REAL DEFAULT 0.0,
+    entity_score REAL DEFAULT 0.0,
+    weight REAL DEFAULT 1.0,
+    metadata TEXT DEFAULT '{}',
     created_at REAL NOT NULL DEFAULT (strftime('%%s','now')),
     UNIQUE(source_node_id, target_node_id, relation_type)
 );
@@ -680,6 +689,20 @@ class SessionDB:
 
         # ── Knowledge Graph tables + FTS5 ──
         cursor.executescript(KNOWLEDGE_GRAPH_SQL)
+        for col_name, col_type in {
+            "semantic_score": "REAL DEFAULT 0.0",
+            "causal_score": "REAL DEFAULT 0.0",
+            "temporal_score": "REAL DEFAULT 0.0",
+            "entity_score": "REAL DEFAULT 0.0",
+            "weight": "REAL DEFAULT 1.0",
+            "metadata": "TEXT DEFAULT '{}'",
+        }.items():
+            try:
+                cursor.execute(
+                    f"ALTER TABLE memory_node_relations ADD COLUMN {col_name} {col_type}"
+                )
+            except sqlite3.OperationalError:
+                pass
         try:
             cursor.execute("SELECT * FROM entity_nodes_fts LIMIT 0")
         except sqlite3.OperationalError:
@@ -2338,84 +2361,147 @@ class SessionDB:
         allowed_ids: Optional[set] = None,
         limit: int = 50,
     ) -> List[int]:
-        """Rank graph-neighbor memory nodes from relation and entity edges.
+        """Rank graph-neighbor memory nodes with priority-guided beam search.
 
-        This approximates HindSight's graph traversal channel using the local
-        tables we already maintain: explicit memory-node relations first, then
-        entity co-mentions and entity-edge BFS up to the recall budget depth.
+        Graph edges provide reachability.  Edge scores decide expansion order:
+        explicit memory-node relations use their semantic / causal / temporal
+        components plus the entity overlap score between the two connected
+        memory nodes.  This is intentionally best-first rather than plain BFS
+        so a strong two-hop path can outrank weak same-depth neighbors.
         """
         if depth <= 0 or not seed_ids:
             return []
 
         ranked: List[int] = []
-        seen = set(seed_ids)
+        seed_set = set(seed_ids)
+        visited = set(seed_ids)
+        best_scores: Dict[int, float] = {}
+        frontier: List[Tuple[float, int, int, int]] = []
+        order = 0
 
-        def _append(node_id: int) -> None:
-            if node_id in seen:
-                return
-            if allowed_ids is not None and node_id not in allowed_ids:
-                return
-            seen.add(node_id)
-            ranked.append(node_id)
+        for rank, seed_id in enumerate(seed_ids, 1):
+            seed_score = 1.0 / rank
+            for neighbor_id, edge_score in self._memory_graph_neighbors(seed_id, allowed_ids=allowed_ids):
+                if neighbor_id in seed_set:
+                    continue
+                candidate_score = self._memory_graph_path_score(seed_score, edge_score, 1)
+                if candidate_score <= best_scores.get(neighbor_id, -1.0):
+                    continue
+                best_scores[neighbor_id] = candidate_score
+                heapq.heappush(frontier, (-candidate_score, 1, order, neighbor_id))
+                order += 1
 
-        # Explicit memory-node relations are the strongest graph signal.
-        for seed_id in seed_ids:
-            rel_cursor = self._conn.execute(
-                "SELECT target_node_id FROM memory_node_relations "
-                "WHERE source_node_id = ? "
-                "UNION "
-                "SELECT source_node_id FROM memory_node_relations "
-                "WHERE target_node_id = ?",
-                (seed_id, seed_id),
-            )
-            for row in rel_cursor.fetchall():
-                _append(row[0])
-                if len(ranked) >= limit:
-                    return ranked
+        beam_size = max(limit * 2, len(seed_ids) * 4, 8)
+        while frontier and len(ranked) < limit:
+            neg_score, node_depth, _, node_id = heapq.heappop(frontier)
+            score = -neg_score
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+            if allowed_ids is None or node_id in allowed_ids:
+                ranked.append(node_id)
 
-        seed_params = tuple(seed_ids)
-        placeholders = ",".join("?" for _ in seed_params)
-        ent_cursor = self._conn.execute(
-            "SELECT DISTINCT entity_id FROM memory_node_entities "
-            f"WHERE node_id IN ({placeholders})",
-            seed_params,
-        )
-        frontier = {row[0] for row in ent_cursor.fetchall()}
-        visited_entities = set(frontier)
+            if node_depth >= depth:
+                continue
+            for neighbor_id, edge_score in self._memory_graph_neighbors(node_id, allowed_ids=allowed_ids):
+                if neighbor_id in visited or neighbor_id in seed_set:
+                    continue
+                next_depth = node_depth + 1
+                candidate_score = self._memory_graph_path_score(score, edge_score, next_depth)
+                if candidate_score <= best_scores.get(neighbor_id, -1.0):
+                    continue
+                best_scores[neighbor_id] = candidate_score
+                heapq.heappush(frontier, (-candidate_score, next_depth, order, neighbor_id))
+                order += 1
 
-        for _ in range(depth):
-            if not frontier:
-                break
-
-            params = tuple(frontier)
-            ent_placeholders = ",".join("?" for _ in params)
-            mn_cursor = self._conn.execute(
-                "SELECT DISTINCT node_id FROM memory_node_entities "
-                f"WHERE entity_id IN ({ent_placeholders})",
-                params,
-            )
-            for row in mn_cursor.fetchall():
-                _append(row[0])
-                if len(ranked) >= limit:
-                    return ranked
-
-            edge_cursor = self._conn.execute(
-                "SELECT target_entity_id FROM entity_edges "
-                f"WHERE source_entity_id IN ({ent_placeholders}) "
-                "UNION "
-                "SELECT source_entity_id FROM entity_edges "
-                f"WHERE target_entity_id IN ({ent_placeholders})",
-                params + params,
-            )
-            next_frontier = set()
-            for row in edge_cursor.fetchall():
-                entity_id = row[0]
-                if entity_id not in visited_entities:
-                    visited_entities.add(entity_id)
-                    next_frontier.add(entity_id)
-            frontier = next_frontier
+            if len(frontier) > beam_size:
+                frontier = heapq.nsmallest(beam_size, frontier)
+                heapq.heapify(frontier)
 
         return ranked
+
+    @staticmethod
+    def _memory_graph_path_score(current_score: float, edge_score: float, depth: int) -> float:
+        """Blend inherited path relevance with the next edge score."""
+        return max(0.0, 0.60 * current_score + 0.40 * edge_score - 0.06 * depth)
+
+    @staticmethod
+    def _memory_relation_edge_score(
+        *,
+        confidence: Any = None,
+        semantic_score: Any = 0.0,
+        causal_score: Any = 0.0,
+        temporal_score: Any = 0.0,
+        entity_score: Any = 0.0,
+        weight: Any = None,
+    ) -> float:
+        """Normalize stored edge components into one traversal score."""
+        def _f(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        stored_weight = _f(weight, -1.0)
+        if stored_weight > 0:
+            return max(0.0, min(1.0, stored_weight))
+
+        confidence_value = _f(confidence, 1.0)
+        semantic_value = _f(semantic_score)
+        causal_value = _f(causal_score)
+        temporal_value = _f(temporal_score)
+        entity_value = _f(entity_score)
+        combined = (
+            0.30 * semantic_value
+            + 0.35 * causal_value
+            + 0.20 * temporal_value
+            + 0.15 * entity_value
+        )
+        if combined <= 0:
+            combined = confidence_value
+        return max(0.0, min(1.0, combined))
+
+    def _memory_graph_neighbors(
+        self,
+        node_id: int,
+        *,
+        allowed_ids: Optional[set] = None,
+    ) -> List[Tuple[int, float]]:
+        """Return graph neighbors ranked by edge strength."""
+        scores: Dict[int, float] = {}
+
+        rel_cursor = self._conn.execute(
+            "SELECT target_node_id, confidence, semantic_score, causal_score, "
+            "temporal_score, entity_score, weight "
+            "FROM memory_node_relations WHERE source_node_id = ? "
+            "UNION ALL "
+            "SELECT source_node_id, confidence, semantic_score, causal_score, "
+            "temporal_score, entity_score, weight "
+            "FROM memory_node_relations WHERE target_node_id = ?",
+            (node_id, node_id),
+        )
+        for row in rel_cursor.fetchall():
+            neighbor_id = row[0]
+            if allowed_ids is not None and neighbor_id not in allowed_ids:
+                continue
+            entity_score = row[5]
+            try:
+                entity_value = float(entity_score or 0.0)
+            except (TypeError, ValueError):
+                entity_value = 0.0
+            if entity_value <= 0.0:
+                entity_score = self._memory_relation_entity_score(node_id, neighbor_id)
+            edge_score = self._memory_relation_edge_score(
+                confidence=row[1],
+                semantic_score=row[2],
+                causal_score=row[3],
+                temporal_score=row[4],
+                entity_score=entity_score,
+                weight=row[6],
+            )
+            scores[neighbor_id] = max(scores.get(neighbor_id, 0.0), edge_score)
+
+        return sorted(scores.items(), key=lambda item: item[1], reverse=True)
 
     def _memory_entity_overlap_ranked(
         self,
@@ -2868,19 +2954,141 @@ class SessionDB:
     def memory_add_node_relation(
         self, source_node_id: int, target_node_id: int,
         relation_type: str, confidence: float = 1.0,
+        semantic_score: Optional[float] = None,
+        causal_score: Optional[float] = None,
+        temporal_score: Optional[float] = None,
+        entity_score: Optional[float] = None,
+        weight: Optional[float] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Add a normalized relation between two memory nodes.
-        """
+        """Add a normalized relation between two memory nodes."""
         relation_text = str(relation_type or "")
+        relation_key = relation_text.strip().lower()
+        confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
+
+        if semantic_score is None:
+            semantic_score = confidence_value if relation_key == "semantic" else 0.0
+        if causal_score is None:
+            causal_score = 0.0 if relation_key in {"semantic", "temporal"} else confidence_value
+        if temporal_score is None:
+            temporal_score = self._memory_relation_temporal_score(source_node_id, target_node_id)
+            if relation_key != "temporal":
+                temporal_score *= 0.5
+        if entity_score is None:
+            entity_score = self._memory_relation_entity_score(source_node_id, target_node_id)
+
+        semantic_value = max(0.0, min(1.0, float(semantic_score or 0.0)))
+        causal_value = max(0.0, min(1.0, float(causal_score or 0.0)))
+        temporal_value = max(0.0, min(1.0, float(temporal_score or 0.0)))
+        entity_value = max(0.0, min(1.0, float(entity_score or 0.0)))
+        weight_value = (
+            max(0.0, min(1.0, float(weight)))
+            if weight is not None
+            else self._memory_relation_weight_for_type(
+                relation_key=relation_key,
+                confidence=confidence_value,
+                semantic_score=semantic_value,
+                causal_score=causal_value,
+                temporal_score=temporal_value,
+                entity_score=entity_value,
+            )
+        )
+        metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
 
         def _do(conn):
             conn.execute(
                 "INSERT OR IGNORE INTO memory_node_relations "
-                "(source_node_id, target_node_id, relation_type, confidence) "
-                "VALUES (?, ?, ?, ?)",
-                (source_node_id, target_node_id, relation_text, confidence),
+                "(source_node_id, target_node_id, relation_type, confidence, "
+                "semantic_score, causal_score, temporal_score, entity_score, weight, metadata) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    source_node_id,
+                    target_node_id,
+                    relation_text,
+                    confidence_value,
+                    semantic_value,
+                    causal_value,
+                    temporal_value,
+                    entity_value,
+                    weight_value,
+                    metadata_str,
+                ),
             )
         self._execute_write(_do)
+
+    def _memory_relation_temporal_score(self, source_node_id: int, target_node_id: int) -> float:
+        """Score two memory nodes by timestamp proximity."""
+        rows = self._conn.execute(
+            "SELECT id, time_key FROM memory_nodes WHERE id IN (?, ?)",
+            (source_node_id, target_node_id),
+        ).fetchall()
+        by_id = {row[0]: row[1] for row in rows}
+        source_time = self._parse_memory_time_key(by_id.get(source_node_id))
+        target_time = self._parse_memory_time_key(by_id.get(target_node_id))
+        if source_time is None or target_time is None:
+            return 0.0
+        delta_days = abs((source_time - target_time).total_seconds()) / 86400.0
+        return max(0.0, min(1.0, math.exp(-delta_days / 30.0)))
+
+    @staticmethod
+    def _memory_relation_weight_for_type(
+        *,
+        relation_key: str,
+        confidence: float,
+        semantic_score: float,
+        causal_score: float,
+        temporal_score: float,
+        entity_score: float,
+    ) -> float:
+        """Precompute traversal strength with relation-specific weights."""
+        if relation_key == "semantic":
+            value = 0.75 * semantic_score + 0.15 * temporal_score + 0.10 * entity_score
+        elif relation_key == "temporal":
+            value = 0.80 * temporal_score + 0.20 * entity_score
+        else:
+            value = (
+                0.70 * causal_score
+                + 0.15 * semantic_score
+                + 0.10 * temporal_score
+                + 0.05 * entity_score
+            )
+        if value <= 0:
+            value = confidence
+        return max(0.0, min(1.0, value))
+
+    def _memory_relation_entity_score(self, source_node_id: int, target_node_id: int) -> float:
+        """Score two memory nodes by normalized entity overlap."""
+        cursor = self._conn.execute(
+            "SELECT node_id, entity_id FROM memory_node_entities WHERE node_id IN (?, ?)",
+            (source_node_id, target_node_id),
+        )
+        entities: Dict[int, set] = {}
+        for row in cursor.fetchall():
+            entities.setdefault(row[0], set()).add(row[1])
+        source_entities = entities.get(source_node_id, set())
+        target_entities = entities.get(target_node_id, set())
+        if not source_entities or not target_entities:
+            return 0.0
+        return len(source_entities & target_entities) / len(source_entities | target_entities)
+
+    @staticmethod
+    def _parse_memory_time_key(value: Any) -> Optional[datetime]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        for fmt, length in (
+            ("%Y-%m-%d %H:%M:%S", 19),
+            ("%Y-%m-%d %H:%M", 16),
+            ("%Y-%m-%d", 10),
+        ):
+            try:
+                return datetime.strptime(text[:length], fmt)
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            return None
 
     # =========================================================================
     # Utility
