@@ -330,6 +330,31 @@ def test_memory_search_filters_by_fact_type(db, monkeypatch):
     assert experience_nodes[0]["fact_type"] == "experience"
 
 
+def test_memory_keyword_search_keeps_cjk_terms_intact(db):
+    exact = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="用户喜欢简洁回答。",
+        keywords=["简洁回答"],
+    )
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 11:00:00",
+        summary="助手需要回答详细问题。",
+        keywords=["回答"],
+    )
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 12:00:00",
+        summary="用户喜欢简洁的摘要。",
+        keywords=["简洁"],
+    )
+
+    results = db._memory_search_keyword("简洁回答", limit=10)
+
+    assert list(results) == [exact]
+
+
 def test_recall_formats_world_and_experience_sections(db, monkeypatch):
     _add_memory_node(
         db,

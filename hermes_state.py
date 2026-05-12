@@ -2168,18 +2168,28 @@ class SessionDB:
         """Keyword search over memory nodes. Returns {rowid: score}.
 
         Uses FTS5 MATCH for non-CJK queries (returns BM25 scores, lower = better).
-        Falls back to individual-term matching on summary/keywords for CJK queries.
+        Falls back to complete-term matching on summary/keywords for CJK queries.
         """
         if self._contains_cjk(keyword):
-            # Split CJK query into individual characters/terms and check each
-            # against both summary and keywords columns. Score = number of
-            # matched terms (higher = better, inverted to fit BM25 convention).
+            # Keep CJK words/phrases intact. Splitting Chinese queries into
+            # individual characters makes recall noisy ("简洁回答" matching any
+            # row that merely contains "答"), while memory keywords are already
+            # word-like terms extracted by the memory summarizer.
             clean = keyword.replace('"', "").replace("*", "").strip()
-            terms = [t for t in clean if t.strip() and ord(t) > 0x2E80]
+            raw_terms = re.split(r"\s+OR\s+|\s+", clean, flags=re.IGNORECASE)
+            terms = []
+            seen_terms = set()
+            for raw_term in raw_terms:
+                term = raw_term.strip()
+                if not term or term.upper() in {"AND", "OR", "NOT"}:
+                    continue
+                if term not in seen_terms:
+                    terms.append(term)
+                    seen_terms.add(term)
             if not terms:
                 return {}
 
-            # Build a UNION ALL query that counts individual term matches.
+            # Build a UNION ALL query that counts complete-term matches.
             # Each term gets its own SELECT: returns node id if it matches
             # summary OR keywords.  Then GROUP BY + COUNT gives exact match count.
             selects = []
