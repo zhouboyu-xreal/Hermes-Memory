@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from agent.temporal_entities import is_temporal_entity
@@ -52,7 +53,27 @@ ENTITY_EXTRACTION_GUIDANCE = """实体提取规则:
 时间应作为事实的时间元数据处理，不进入 entity graph。
 只有有语义身份的命名时间概念才可作为实体，例如：春节、Q3 财报季、Sprint 42。
 
+不要抽取属性、约束、形容词短语或活动特征作为实体；它们应保留在 fact text、keywords、topic 或 observation 中。
+例如：低场地依赖、低强度户外活动、高优先级、低成本、强隐私约束、轻量级方案。
+
 实体必须只来自对话中明确出现的内容，不要过度推断。"""
+
+_ATTRIBUTE_ENTITY_PATTERNS = (
+    re.compile(r"^(低|高|中|中等|较低|较高|轻|重|强|弱|少|多).{0,12}(依赖|强度|成本|优先级|门槛|复杂度|风险|约束|要求|活动|方案)$"),
+    re.compile(r".*(依赖|强度|成本|优先级|门槛|复杂度|风险|约束|要求|特征|属性)$"),
+)
+
+
+def is_attribute_entity(name: str, entity_type: str = "") -> bool:
+    """Return True when an extracted entity is really an attribute phrase."""
+    text = str(name or "").strip()
+    if not text:
+        return False
+    etype = str(entity_type or "").strip().upper()
+    if etype in {"PERSON", "ORGANIZATION", "LOCATION", "PRODUCT", "PROJECT", "TECHNOLOGY"}:
+        return False
+    compact = re.sub(r"[\s\-_/]+", "", text)
+    return any(pattern.match(compact) for pattern in _ATTRIBUTE_ENTITY_PATTERNS)
 
 # ── Prompt templates ─────────────────────────────────────────────────────
 
@@ -160,6 +181,8 @@ class EntityExtractor:
                 if not name:
                     continue
                 if is_temporal_entity(name, etype):
+                    continue
+                if is_attribute_entity(name, etype):
                     continue
                 eid = self._db.entity_add_entity(
                     name=name,
