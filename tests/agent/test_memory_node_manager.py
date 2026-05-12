@@ -210,6 +210,49 @@ def test_store_turn_filters_plain_time_expressions_from_fact_entities(db):
     assert "最近三天" not in names
 
 
+def test_store_turn_filters_attribute_phrases_from_fact_entities(db):
+    retain_payload = {
+        "facts": [
+            {
+                "text": "Alice prefers low-intensity outdoor activities with low venue dependency.",
+                "keywords": ["Alice", "户外活动", "低场地依赖"],
+                "topic": ["户外活动"],
+                "fact_type": "world",
+                "entities": [
+                    {"name": "Alice", "type": "PERSON"},
+                    {"name": "低场地依赖", "type": "CONCEPT"},
+                    {"name": "低强度户外活动", "type": "TOPIC"},
+                ],
+            }
+        ],
+        "causal_relations": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps(retain_payload)],
+    )
+
+    assert mgr.store_turn("Alice wants low-intensity outdoor activities.", "ok") is True
+
+    names = {
+        row["name"]
+        for row in db._conn.execute("SELECT name FROM entity_nodes").fetchall()
+    }
+    assert "Alice" in names
+    assert "低场地依赖" not in names
+    assert "低强度户外活动" not in names
+
+
+def test_memory_time_key_uses_local_timezone_offset():
+    key = MemoryNodeManager._memory_time_key(0)
+    local_offset = __import__("datetime").datetime.now().astimezone().strftime("%z")
+    local_offset = f"{local_offset[:3]}:{local_offset[3:]}"
+
+    assert key.endswith("#00")
+    assert local_offset in key
+
+
 def _add_memory_node(db, *, time_key, summary, keywords, fact_type="world"):
     return db.memory_add_node(
         time_key=time_key,
@@ -353,6 +396,109 @@ def test_memory_keyword_search_keeps_cjk_terms_intact(db):
     results = db._memory_search_keyword("简洁回答", limit=10)
 
     assert list(results) == [exact]
+
+
+def test_memory_keyword_search_cjk_falls_back_to_all_characters(db):
+    expected = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="用户喜欢先给结论再给依据。",
+        keywords=["结论", "依据"],
+    )
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 11:00:00",
+        summary="用户喜欢简洁回答。",
+        keywords=["简洁回答"],
+    )
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 12:00:00",
+        summary="助手需要回答详细问题。",
+        keywords=["回答"],
+    )
+
+    results = db._memory_search_keyword("喜欢结论", limit=10)
+
+    assert list(results) == [expected]
+
+
+def test_summarize_turn_returns_entities(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "summary": "Alice wants Slack alerts.",
+                "keywords": ["Slack", "alerts"],
+                "entities": [
+                    {"name": "Alice", "type": "PERSON"},
+                    {"name": "今天", "type": "TIME"},
+                ],
+            })
+        ],
+    )
+
+    summary = mgr._summarize_turn("Alice wants Slack alerts", "")
+
+    assert summary["keywords"] == ["Slack", "alerts"]
+    assert summary["entities"] == [{"name": "Alice", "type": "PERSON"}]
+
+
+def test_memory_search_observations_uses_entities(db):
+    node_id = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack alerts.",
+        keywords=["Slack"],
+    )
+    alice = db.entity_add_entity("Alice", "PERSON")
+    db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="alerts",
+        topic_label="alerts",
+        observation_type="preference",
+        summary="The user prefers concise escalation notes.",
+        keywords=["escalation"],
+        source_node_ids=[node_id],
+        confidence=0.8,
+    )
+
+    results = db.memory_search_observations(
+        ["unrelated"],
+        entities=[{"name": "Alice", "type": "PERSON"}],
+        top_k=3,
+    )
+
+    assert [row["entity_name"] for row in results] == ["Alice"]
+
+
+def test_memory_search_observations_rejects_weak_family_term_entity_mismatch(db):
+    node_id = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="小明父亲退休后保留了自驾游偏好。",
+        keywords=["小明父亲", "退休", "自驾游"],
+    )
+    xiaoming_father = db.entity_add_entity("小明父亲", "PERSON")
+    db.memory_upsert_observation(
+        entity_id=xiaoming_father,
+        topic_key="家庭",
+        topic_label="家庭",
+        observation_type="preference",
+        summary="小明父亲退休后保留了对开车自驾游和苹果的偏好。",
+        keywords=["退休", "自驾游", "苹果"],
+        source_node_ids=[node_id],
+        confidence=0.7,
+    )
+
+    results = db.memory_search_observations(
+        ["父亲", "中学", "校长"],
+        entities=[{"name": "小张父亲", "type": "PERSON"}],
+        top_k=3,
+    )
+
+    assert results == []
 
 
 def test_entity_link_records_co_entities(db):

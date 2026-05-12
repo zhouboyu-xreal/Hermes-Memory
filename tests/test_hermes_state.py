@@ -1,6 +1,7 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
 import time
+import numpy as np
 import pytest
 from pathlib import Path
 
@@ -1316,7 +1317,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 11
+        assert version == 12
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -1372,12 +1373,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v9
+        # Open with SessionDB — should migrate to the current schema
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 11
+        assert cursor.fetchone()[0] == 12
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
@@ -2388,6 +2389,208 @@ class TestFTS5ToolCallIndexing:
         assert len(db.search_messages("RENAMEDTOOL")) == 1
 
 
+class TestKnowledgeGraphCreatedAtMigration:
+    """v12 migration: repair graph created_at values stored as literal '%s'."""
+
+    def test_v11_to_v12_repairs_graph_created_at_placeholders(self, tmp_path):
+        import sqlite3
+
+        db_path = tmp_path / "legacy_graph.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (11);
+
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                user_id TEXT,
+                model TEXT,
+                model_config TEXT,
+                system_prompt TEXT,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL
+            );
+
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                timestamp REAL NOT NULL
+            );
+
+            CREATE TABLE memory_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time_key TEXT UNIQUE NOT NULL,
+                summary TEXT NOT NULL,
+                keywords TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                fact_type TEXT NOT NULL DEFAULT 'world',
+                original_dialog TEXT
+            );
+
+            CREATE TABLE entity_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                type TEXT NOT NULL DEFAULT 'CONCEPT',
+                embedding BLOB,
+                metadata TEXT DEFAULT '{}',
+                co_entities TEXT DEFAULT '{}',
+                created_at REAL NOT NULL DEFAULT '%s'
+            );
+
+            CREATE TABLE memory_node_entities (
+                node_id INTEGER NOT NULL,
+                entity_id INTEGER NOT NULL,
+                mention_count INTEGER DEFAULT 1,
+                PRIMARY KEY (node_id, entity_id)
+            );
+
+            CREATE TABLE entity_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_entity_id INTEGER NOT NULL,
+                target_entity_id INTEGER NOT NULL,
+                relation_type TEXT NOT NULL,
+                weight REAL DEFAULT 1.0,
+                metadata TEXT DEFAULT '{}',
+                created_at REAL NOT NULL DEFAULT '%s',
+                UNIQUE(source_entity_id, target_entity_id, relation_type)
+            );
+
+            CREATE TABLE memory_node_relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_node_id INTEGER NOT NULL,
+                target_node_id INTEGER NOT NULL,
+                relation_type TEXT NOT NULL,
+                confidence REAL DEFAULT 1.0,
+                created_at REAL NOT NULL DEFAULT '%s',
+                UNIQUE(source_node_id, target_node_id, relation_type)
+            );
+        """)
+        conn.execute(
+            "INSERT INTO memory_nodes (time_key, summary, keywords, topic) VALUES (?, ?, ?, ?)",
+            ("2026-05-12 07:43:55.985681+00:00#00", "summary", "kw", "topic"),
+        )
+        conn.execute(
+            "INSERT INTO memory_nodes (time_key, summary, keywords, topic) VALUES (?, ?, ?, ?)",
+            ("2026-05-12 07:44:55.985681+00:00#00", "summary2", "kw", "topic"),
+        )
+        conn.execute(
+            "INSERT INTO entity_nodes (id, name, type, created_at) VALUES (?, ?, ?, ?)",
+            (1, "Alice", "PERSON", "%s"),
+        )
+        conn.execute(
+            "INSERT INTO entity_nodes (id, name, type, created_at) VALUES (?, ?, ?, ?)",
+            (2, "Slack", "PRODUCT", "%s"),
+        )
+        conn.execute(
+            "INSERT INTO memory_node_entities (node_id, entity_id) VALUES (?, ?)",
+            (1, 1),
+        )
+        conn.execute(
+            "INSERT INTO entity_edges (source_entity_id, target_entity_id, relation_type, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (1, 2, "uses", "%s"),
+        )
+        conn.execute(
+            "INSERT INTO memory_node_relations (source_node_id, target_node_id, relation_type, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (2, 1, "semantic", "%s"),
+        )
+        conn.commit()
+        conn.close()
+
+        migrated_db = SessionDB(db_path=db_path)
+        try:
+            version = migrated_db._conn.execute(
+                "SELECT version FROM schema_version LIMIT 1"
+            ).fetchone()[0]
+            assert version == 12
+            entity_created_at = migrated_db._conn.execute(
+                "SELECT created_at FROM entity_nodes WHERE id = 1"
+            ).fetchone()[0]
+            edge_created_at = migrated_db._conn.execute(
+                "SELECT created_at FROM entity_edges LIMIT 1"
+            ).fetchone()[0]
+            relation_created_at = migrated_db._conn.execute(
+                "SELECT created_at FROM memory_node_relations LIMIT 1"
+            ).fetchone()[0]
+            assert entity_created_at != "%s"
+            assert edge_created_at != "%s"
+            assert relation_created_at != "%s"
+            assert float(entity_created_at) > 0
+            assert float(edge_created_at) > 0
+            assert float(relation_created_at) > 0
+        finally:
+            migrated_db.close()
+
+    def test_current_schema_still_repairs_late_placeholder_rows(self, tmp_path):
+        import sqlite3
+
+        db_path = tmp_path / "current_with_placeholders.db"
+        session_db = SessionDB(db_path=db_path)
+        session_db.close()
+
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "INSERT INTO entity_nodes (name, type, created_at) VALUES (?, ?, ?)",
+            ("LateEntity", "CONCEPT", "%s"),
+        )
+        conn.commit()
+        conn.close()
+
+        repaired_db = SessionDB(db_path=db_path)
+        try:
+            created_at = repaired_db._conn.execute(
+                "SELECT created_at FROM entity_nodes WHERE name = ?",
+                ("LateEntity",),
+            ).fetchone()[0]
+            assert created_at != "%s"
+            assert float(created_at) > 0
+        finally:
+            repaired_db.close()
+
+    def test_graph_writes_set_created_at_explicitly(self, db):
+        alice = db.entity_add_entity("Alice", "PERSON")
+        slack = db.entity_add_entity("Slack", "PRODUCT")
+        db.entity_add_edge(alice, slack, "uses")
+        first = db.memory_add_node(
+            time_key="2026-05-12 16:00:00+08:00#00",
+            summary="Alice uses Slack.",
+            keywords=["Alice", "Slack"],
+            topic=["work"],
+            original_dialog="{}",
+            query_embedding=np.ones((1, 1536), dtype=np.float32),
+        )
+        second = db.memory_add_node(
+            time_key="2026-05-12 16:01:00+08:00#00",
+            summary="Alice still uses Slack.",
+            keywords=["Alice", "Slack"],
+            topic=["work"],
+            original_dialog="{}",
+            query_embedding=np.ones((1, 1536), dtype=np.float32),
+        )
+        db.memory_add_node_relation(second, first, "semantic")
+
+        entity_created_at = db._conn.execute(
+            "SELECT created_at FROM entity_nodes WHERE id = ?",
+            (alice,),
+        ).fetchone()[0]
+        edge_created_at = db._conn.execute(
+            "SELECT created_at FROM entity_edges LIMIT 1",
+        ).fetchone()[0]
+        relation_created_at = db._conn.execute(
+            "SELECT created_at FROM memory_node_relations LIMIT 1",
+        ).fetchone()[0]
+        assert entity_created_at != "%s"
+        assert edge_created_at != "%s"
+        assert relation_created_at != "%s"
+        assert float(entity_created_at) > 0
+        assert float(edge_created_at) > 0
+        assert float(relation_created_at) > 0
+
+
 class TestFTS5ToolCallMigration:
     """v11 migration: pre-existing state.db with old external-content FTS tables
     must be re-indexed so tool_name / tool_calls become searchable after upgrade."""
@@ -2481,7 +2684,6 @@ class TestFTS5ToolCallMigration:
                 "SELECT version FROM schema_version LIMIT 1"
             ).fetchone()
             version = row["version"] if hasattr(row, "keys") else row[0]
-            assert version == 11
+            assert version == 12
         finally:
             session_db.close()
-

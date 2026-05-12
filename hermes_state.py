@@ -49,7 +49,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 def _get_embedding_dim_from_config() -> int:
     """Read embedding dimension from config.yaml, falling back to 1536."""
     config_path = get_hermes_home() / "config.yaml"
@@ -231,7 +231,7 @@ CREATE TABLE IF NOT EXISTS entity_nodes (
     embedding BLOB,
     metadata TEXT DEFAULT '{}',
     co_entities TEXT DEFAULT '{}',
-    created_at REAL NOT NULL DEFAULT (strftime('%%s','now'))
+    created_at REAL NOT NULL DEFAULT (strftime('%s','now'))
 );
 
 CREATE TABLE IF NOT EXISTS entity_edges (
@@ -241,7 +241,7 @@ CREATE TABLE IF NOT EXISTS entity_edges (
     relation_type TEXT NOT NULL,
     weight REAL DEFAULT 1.0,
     metadata TEXT DEFAULT '{}',
-    created_at REAL NOT NULL DEFAULT (strftime('%%s','now')),
+    created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
     UNIQUE(source_entity_id, target_entity_id, relation_type)
 );
 
@@ -265,7 +265,7 @@ CREATE TABLE IF NOT EXISTS memory_node_relations (
     entity_score REAL DEFAULT 0.0,
     weight REAL DEFAULT 1.0,
     metadata TEXT DEFAULT '{}',
-    created_at REAL NOT NULL DEFAULT (strftime('%%s','now')),
+    created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
     UNIQUE(source_node_id, target_node_id, relation_type)
 );
 
@@ -684,6 +684,11 @@ class SessionDB:
                     "COALESCE(tool_calls, '') "
                     "FROM messages"
                 )
+            if current_version < 12:
+                # v12: fix knowledge-graph created_at defaults. The original
+                # schema used strftime('%%s','now'), which SQLite stores as the
+                # literal string "%s" instead of a Unix timestamp.
+                self._repair_graph_created_at_placeholders(cursor)
             if current_version < SCHEMA_VERSION:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -757,6 +762,7 @@ class SessionDB:
         except sqlite3.OperationalError:
             cursor.executescript(ENTITY_FTS_SQL)
         cursor.executescript(MEMORY_OBSERVATIONS_SQL)
+        self._repair_graph_created_at_placeholders(cursor)
 
         # ── Add tags column to memory_nodes if missing ──
         try:
@@ -819,6 +825,42 @@ class SessionDB:
             logger.debug("Memory node FTS setup skipped: %s", _fts_err)
 
         self._conn.commit()
+
+    def _repair_graph_created_at_placeholders(self, cursor: sqlite3.Cursor) -> None:
+        """Repair graph rows that inherited the legacy literal '%s' default."""
+        try:
+            cursor.execute(
+                """UPDATE entity_nodes
+                   SET created_at = COALESCE(
+                       (
+                           SELECT MIN(CAST(strftime('%s', substr(mn.time_key, 1, 19)) AS REAL))
+                           FROM memory_node_entities mne
+                           JOIN memory_nodes mn ON mn.id = mne.node_id
+                           WHERE mne.entity_id = entity_nodes.id
+                       ),
+                       CAST(strftime('%s','now') AS REAL)
+                   )
+                   WHERE created_at = '%s'"""
+            )
+            cursor.execute(
+                """UPDATE entity_edges
+                   SET created_at = CAST(strftime('%s','now') AS REAL)
+                   WHERE created_at = '%s'"""
+            )
+            cursor.execute(
+                """UPDATE memory_node_relations
+                   SET created_at = COALESCE(
+                       (
+                           SELECT CAST(strftime('%s', substr(mn.time_key, 1, 19)) AS REAL)
+                           FROM memory_nodes mn
+                           WHERE mn.id = memory_node_relations.source_node_id
+                       ),
+                       CAST(strftime('%s','now') AS REAL)
+                   )
+                   WHERE created_at = '%s'"""
+            )
+        except sqlite3.OperationalError:
+            pass
 
     # =========================================================================
     # Session lifecycle
@@ -2185,7 +2227,10 @@ class SessionDB:
             # Keep CJK words/phrases intact. Splitting Chinese queries into
             # individual characters makes recall noisy ("简洁回答" matching any
             # row that merely contains "答"), while memory keywords are already
-            # word-like terms extracted by the memory summarizer.
+            # word-like terms extracted by the memory summarizer. If a complete
+            # term has no contiguous match, fall back to requiring all CJK
+            # characters in the term so "喜欢结论" can match "喜欢先给结论"
+            # without letting partial single-character hits dominate.
             clean = keyword.replace('"', "").replace("*", "").strip()
             raw_terms = re.split(r"\s+OR\s+|\s+", clean, flags=re.IGNORECASE)
             terms = []
@@ -2227,7 +2272,46 @@ class SessionDB:
                     LIMIT ?""",
                 params + [limit],
             )
-            return {row[0]: len(terms) * 2 - row[1] for row in cursor.fetchall()}
+            results = {row[0]: len(terms) * 2 - row[1] for row in cursor.fetchall()}
+            if results:
+                return results
+
+            fallback_selects = []
+            fallback_params = []
+            for term in terms:
+                cjk_chars = []
+                seen_chars = set()
+                for ch in term:
+                    if not self._is_cjk_codepoint(ord(ch)) or ch in seen_chars:
+                        continue
+                    cjk_chars.append(ch)
+                    seen_chars.add(ch)
+                if len(cjk_chars) < 2:
+                    continue
+                term_clauses = []
+                for ch in cjk_chars:
+                    escaped = ch.replace(bs, bs + bs).replace("%", bs + "%").replace("_", bs + "_")
+                    pattern = f"%{escaped}%"
+                    term_clauses.append(
+                        "(summary LIKE ? ESCAPE ? OR keywords LIKE ? ESCAPE ?)"
+                    )
+                    fallback_params.extend([pattern, bs, pattern, bs])
+                fallback_selects.append(
+                    f"SELECT id, {len(cjk_chars)} AS score FROM memory_nodes "
+                    f"WHERE {' AND '.join(term_clauses)}"
+                )
+            if not fallback_selects:
+                return {}
+            fallback_union = " UNION ALL ".join(fallback_selects)
+            fallback_cursor = self._conn.execute(
+                f"""SELECT id, CAST(SUM(score) AS REAL) AS score
+                    FROM ({fallback_union})
+                    GROUP BY id
+                    ORDER BY score DESC
+                    LIMIT ?""",
+                fallback_params + [limit],
+            )
+            return {row[0]: max(0.0, len(terms) * 2 - row[1]) for row in fallback_cursor.fetchall()}
 
         # Non-CJK: use FTS5 BM25
         cursor = self._conn.execute(
@@ -2966,10 +3050,11 @@ class SessionDB:
         def _do(conn):
             emb_blob = embedding.tobytes() if embedding is not None else None
             meta_str = json.dumps(metadata or {}, ensure_ascii=False)
+            created_at = time.time()
             cursor = conn.execute(
-                "INSERT OR IGNORE INTO entity_nodes (name, type, embedding, metadata) "
-                "VALUES (?, ?, ?, ?)",
-                (name, entity_type, emb_blob, meta_str),
+                "INSERT OR IGNORE INTO entity_nodes (name, type, embedding, metadata, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, entity_type, emb_blob, meta_str, created_at),
             )
             if cursor.rowcount:
                 return cursor.lastrowid
@@ -2987,11 +3072,12 @@ class SessionDB:
         """Add a directed edge between two entities. Returns edge id."""
         meta_str = json.dumps(metadata or {}, ensure_ascii=False)
         def _do(conn):
+            created_at = time.time()
             cursor = conn.execute(
                 "INSERT OR IGNORE INTO entity_edges "
-                "(source_entity_id, target_entity_id, relation_type, weight, metadata) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (source_entity_id, target_entity_id, relation_type, weight, meta_str),
+                "(source_entity_id, target_entity_id, relation_type, weight, metadata, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (source_entity_id, target_entity_id, relation_type, weight, meta_str, created_at),
             )
             if cursor.rowcount:
                 return cursor.lastrowid
@@ -3301,7 +3387,7 @@ class SessionDB:
                 "merged_entity_name": duplicate["name"],
                 "reason": reason,
                 "confidence": confidence,
-                "merged_at": datetime.now(timezone.utc).isoformat(),
+                "merged_at": datetime.now().astimezone().isoformat(),
             })
             canonical_meta["merge_history"] = merge_history
 
@@ -3426,11 +3512,12 @@ class SessionDB:
         metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
 
         def _do(conn):
+            created_at = time.time()
             conn.execute(
                 "INSERT OR IGNORE INTO memory_node_relations "
                 "(source_node_id, target_node_id, relation_type, confidence, "
-                "semantic_score, causal_score, temporal_score, entity_score, weight, metadata) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "semantic_score, causal_score, temporal_score, entity_score, weight, metadata, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     source_node_id,
                     target_node_id,
@@ -3442,6 +3529,7 @@ class SessionDB:
                     entity_value,
                     weight_value,
                     metadata_str,
+                    created_at,
                 ),
             )
         self._execute_write(_do)
@@ -3582,7 +3670,7 @@ class SessionDB:
         ).fetchone()
         source_time_start = time_rows["start_time"] if time_rows else None
         source_time_end = time_rows["end_time"] if time_rows else None
-        now_text = datetime.now(timezone.utc).isoformat()
+        now_text = datetime.now().astimezone().isoformat()
         keywords_str = " ".join(keywords) if isinstance(keywords, list) else str(keywords or "")
         metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
         confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
@@ -3709,12 +3797,22 @@ class SessionDB:
         self,
         keyword: Any,
         *,
+        entities: Optional[List[Any]] = None,
         top_k: int = 3,
         entity_ids: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
         """Search active observations by keyword/topic/entity."""
         keyword_query = " ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
         terms = [term.strip().lower() for term in re.split(r"\s+|OR", keyword_query) if term.strip()]
+        weak_terms = {"父亲", "母亲", "爸爸", "妈妈", "家人", "家庭", "用户", "偏好", "喜欢", "信息", "记录"}
+        entity_terms: List[str] = []
+        for entity in entities or []:
+            if isinstance(entity, dict):
+                name = str(entity.get("name", "")).strip()
+            else:
+                name = str(entity or "").strip()
+            if name:
+                entity_terms.append(name.lower())
         params: List[Any] = []
         where = ["status = 'active'"]
         if entity_ids:
@@ -3731,14 +3829,30 @@ class SessionDB:
         scored: List[Tuple[float, Dict[str, Any]]] = []
         for row in rows:
             item = dict(row)
-            haystack = f"{item.get('summary', '')} {item.get('keywords', '')} {item.get('topic_label', '')} {item.get('entity_name', '')}".lower()
-            if terms:
-                matches = sum(1 for term in terms if term in haystack)
-                if matches <= 0:
+            entity_name_text = str(item.get("entity_name", "") or "").lower()
+            haystack = f"{item.get('summary', '')} {item.get('keywords', '')} {item.get('topic_label', '')} {entity_name_text}".lower()
+            matched_terms = [term for term in terms if term in haystack]
+            strong_keyword_matches = sum(1 for term in matched_terms if term not in weak_terms)
+            weak_keyword_matches = len(matched_terms) - strong_keyword_matches
+            entity_matches = sum(
+                1
+                for term in entity_terms
+                if term in entity_name_text or term in haystack
+            )
+            if terms or entity_terms:
+                if entity_terms:
+                    if entity_matches <= 0 and strong_keyword_matches < 2:
+                        continue
+                elif strong_keyword_matches <= 0 and len(matched_terms) < 2:
                     continue
             else:
-                matches = 1
-            score = matches + float(item.get("confidence") or 0.0)
+                strong_keyword_matches = 1
+            score = (
+                strong_keyword_matches
+                + (weak_keyword_matches * 0.25)
+                + (entity_matches * 1.5)
+                + float(item.get("confidence") or 0.0)
+            )
             scored.append((score, item))
         scored.sort(key=lambda pair: (pair[0], pair[1].get("last_supported_at") or ""), reverse=True)
         return [item for _, item in scored[:top_k]]
@@ -3852,7 +3966,7 @@ class SessionDB:
             f"WHERE id IN ({placeholders})",
             clean_source_ids,
         ).fetchone()
-        now_text = datetime.now(timezone.utc).isoformat()
+        now_text = datetime.now().astimezone().isoformat()
         keywords_str = " ".join(keywords) if isinstance(keywords, list) else str(keywords or "")
         confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
         metadata_str = json.dumps(metadata or {}, ensure_ascii=False)

@@ -50,3 +50,24 @@ def test_entity_extractor_filters_plain_time_entities():
 
     assert set(extractor._db.entities) == {"Alice", "Sprint 42"}
     assert extractor._db.edges == [(1, 2, "mentions")]
+
+
+def test_entity_extractor_filters_attribute_phrase_entities():
+    raw = json.dumps({
+        "entities": [
+            {"name": "Alice", "type": "PERSON"},
+            {"name": "低场地依赖", "type": "CONCEPT"},
+            {"name": "低强度户外活动", "type": "TOPIC"},
+            {"name": "Slack", "type": "PRODUCT"},
+        ],
+        "relations": [
+            {"source": "Alice", "relation": "prefers", "target": "低场地依赖"},
+            {"source": "Alice", "relation": "uses", "target": "Slack"},
+        ],
+    })
+    extractor = _FakeExtractor(raw)
+
+    assert extractor.extract_from_turn(1, "Alice 提到低场地依赖和 Slack", "ok") is True
+
+    assert set(extractor._db.entities) == {"Alice", "Slack"}
+    assert extractor._db.edges == [(1, 2, "uses")]

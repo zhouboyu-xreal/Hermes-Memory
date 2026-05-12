@@ -42,7 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import requests
 
-from agent.entity_extractor import ENTITY_EXTRACTION_GUIDANCE
+from agent.entity_extractor import ENTITY_EXTRACTION_GUIDANCE, is_attribute_entity
 from agent.temporal_entities import is_temporal_entity
 
 logger = logging.getLogger(__name__)
@@ -127,10 +127,13 @@ SUMMARY_SYSTEM_PROMPT = """你是一个对话摘要助手。请总结以下对�
 要求：
 1. 用一句话精炼概括对话的核心内容
 2. 提取2-5个关键词（用逗号分隔）
-3. 仅返回JSON格式，不要包含其他内容
+3. 提取对召回有用的实体，遵守实体抽取规则；普通时间表达不要作为实体
+4. 仅返回JSON格式，不要包含其他内容
+
+""" + ENTITY_EXTRACTION_GUIDANCE + """
 
 输出格式：
-{{"summary": "对话的核心内容概括", "keywords": ["关键词1", "关键词2"]}}
+{{"summary": "对话的核心内容概括", "keywords": ["关键词1", "关键词2"], "entities": [{{"name": "实体名", "type": "CONCEPT"}}]}}
 
 对话内容：
 用户：{user_message}
@@ -534,11 +537,12 @@ class MemoryNodeManager:
             keywords = data.get("keywords", [])
             if isinstance(keywords, str):
                 keywords = [k.strip() for k in keywords.split(",") if k.strip()]
+            entities = self._normalize_fact_entities(data.get("entities", []))
             if not summary:
                 if attempt == 0:
                     continue
                 return None
-            return {"summary": summary, "keywords": keywords}
+            return {"summary": summary, "keywords": keywords, "entities": entities}
 
         return None
 
@@ -595,6 +599,8 @@ class MemoryNodeManager:
             if not name or name in seen:
                 continue
             if is_temporal_entity(name, etype):
+                continue
+            if is_attribute_entity(name, etype):
                 continue
             seen.add(name)
             entities.append({"name": name, "type": etype})
@@ -796,10 +802,13 @@ class MemoryNodeManager:
 
     @staticmethod
     def _memory_time_key(fact_index: int = 0) -> str:
-        """Return a lexicographically sortable, unique-ish timestamp key."""
-        now = datetime.now(timezone.utc)
+        """Return a lexicographically sortable, unique-ish local timestamp key."""
+        now = datetime.now().astimezone()
         base = now.strftime("%Y-%m-%d %H:%M:%S.%f")
-        return f"{base}+00:00#{fact_index:02d}"
+        offset = now.strftime("%z")
+        if len(offset) == 5:
+            offset = f"{offset[:3]}:{offset[3:]}"
+        return f"{base}{offset}#{fact_index:02d}"
 
     @staticmethod
     def _original_dialog_payload(
@@ -1155,7 +1164,7 @@ class MemoryNodeManager:
             if not retain_data:
                 logger.debug("Skipping memory node — retain extraction returned no data")
                 return False
-
+            logger.error("finish store: facts extracing")
             facts = retain_data.get("facts", [])
             stored_nodes: List[Tuple[int, str, np.ndarray, List[str]]] = []
             node_ids: List[int] = []
@@ -1172,7 +1181,8 @@ class MemoryNodeManager:
                 if embedding is None:
                     logger.info("Skipping memory fact — embedding generation failed")
                     continue
-
+                logger.error("finish store: query embedding")
+                
                 # ── Step 3: Store the new node (SYNC) ──
                 node_id = self._db.memory_add_node(
                     time_key=self._memory_time_key(idx),
@@ -1188,6 +1198,8 @@ class MemoryNodeManager:
                     tags=self._fact_tags(fact, tags),
                     fact_type=fact.get("fact_type", "world"),
                 )
+                logger.error("finish store: memory node construction")
+
                 fact_entities = fact.get("entities", [])
                 linked_entities = self._link_fact_entities(node_id, fact_entities)
                 self._maybe_consolidate_observations(
@@ -1195,6 +1207,8 @@ class MemoryNodeManager:
                     topics=topics,
                     linked_entities=linked_entities,
                 )
+                logger.error("finish store: observation generation")
+                
                 stored_nodes.append((node_id, summary, embedding, keywords))
                 node_ids.append(node_id)
 
@@ -1430,16 +1444,21 @@ class MemoryNodeManager:
 
             # Generate summary for the query (for keyword extraction)
             summary_data = self._summarize_turn(search_query, "")
+            logger.error("finish recall: query summary")
+            
             if not summary_data:
                 logger.debug("Skipping recall — summarisation returned no data")
                 return ""
 
             keywords = summary_data["keywords"]
+            entities = summary_data.get("entities", [])
             observation_nodes = self._db.memory_search_observations(
                 keywords,
+                entities=entities,
                 top_k=max(2, min(4, k // 2)),
             )
-            logger.error()
+            logger.error("finish recall: observations searching")
+
             supporting_by_observation = self._db.memory_observation_supporting_nodes(
                 [int(obs["id"]) for obs in observation_nodes],
                 per_observation=2,
@@ -1453,12 +1472,15 @@ class MemoryNodeManager:
                 tags=tags,
                 fact_types=["world"],
             )
+            logger.error("finish recall: world_nodes searching")
+
             experience_nodes = self._db.memory_search(
                 keywords, query_embedding, top_k=k, budget=b,
                 time_start=ts, time_end=te,
                 tags=tags,
                 fact_types=["experience"],
             )
+            logger.error("finish recall: experience_nodes searching")
 
             supporting_ids = {
                 node["id"]
