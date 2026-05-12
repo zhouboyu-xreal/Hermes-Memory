@@ -423,6 +423,69 @@ def test_memory_keyword_search_cjk_falls_back_to_all_characters(db):
     assert list(results) == [expected]
 
 
+def test_memory_keyword_search_applies_time_range_before_ranking(db):
+    in_range = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+    )
+    _add_memory_node(
+        db,
+        time_key="2026-04-01 10:00:00",
+        summary="Alice also mentioned Slack before the requested window.",
+        keywords=["Alice", "Slack"],
+    )
+    _add_memory_node(
+        db,
+        time_key="2026-06-01 10:00:00",
+        summary="Alice also mentioned Slack after the requested window.",
+        keywords=["Alice", "Slack"],
+    )
+
+    results = db._memory_search_keyword(
+        "Slack",
+        limit=10,
+        time_start="2026-05-01 00:00:00",
+        time_end="2026-05-31 23:59:59",
+    )
+
+    assert list(results) == [in_range]
+
+
+def test_memory_search_pushes_time_candidate_ids_to_vector_channel(db, monkeypatch):
+    in_range = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+    )
+    out_of_range = _add_memory_node(
+        db,
+        time_key="2026-04-01 10:00:00",
+        summary="Alice mentioned Slack before the requested window.",
+        keywords=["Alice", "Slack"],
+    )
+    seen = {}
+
+    def fake_vector_search(*args, **kwargs):
+        seen["allowed_ids"] = set(kwargs.get("allowed_ids") or [])
+        return {out_of_range: 1.0, in_range: 0.9}
+
+    monkeypatch.setattr(db, "_memory_search_vector", fake_vector_search)
+
+    nodes = db.memory_search(
+        "Slack",
+        np.ones((1, 1536), dtype=np.float32),
+        top_k=5,
+        time_start="2026-05-01 00:00:00",
+        time_end="2026-05-31 23:59:59",
+    )
+
+    assert seen["allowed_ids"] == {in_range}
+    assert [node["id"] for node in nodes] == [in_range]
+
+
 def test_summarize_turn_returns_entities(db):
     mgr = _NoAsyncMemoryNodeManager(
         db,

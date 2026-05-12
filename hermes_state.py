@@ -363,6 +363,7 @@ class SessionDB:
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 20
+    _MEMORY_VECTOR_FILTER_BRUTE_FORCE_LIMIT = 5000
 
     def __init__(self, db_path: Path = None):
         self.db_path = db_path or DEFAULT_DB_PATH
@@ -2217,11 +2218,51 @@ class SessionDB:
             "node_relations": node_relations,
         }
 
-    def _memory_search_keyword(self, keyword: str, limit: int = 20) -> Dict[int, float]:
+    @staticmethod
+    def _memory_node_filter_sql(
+        *,
+        table_alias: str = "",
+        allowed_ids: Optional[set] = None,
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
+    ) -> Tuple[str, List[Any]]:
+        """Build SQL predicates for memory-node candidate narrowing."""
+        prefix = f"{table_alias}." if table_alias else ""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if time_start is not None:
+            clauses.append(f"{prefix}time_key >= ?")
+            params.append(time_start)
+        if time_end is not None:
+            clauses.append(f"{prefix}time_key <= ?")
+            params.append(time_end)
+        if allowed_ids is not None:
+            ids = sorted(int(node_id) for node_id in allowed_ids)
+            if not ids:
+                clauses.append("0")
+            else:
+                placeholders = ",".join("?" for _ in ids)
+                clauses.append(f"{prefix}id IN ({placeholders})")
+                params.extend(ids)
+        if not clauses:
+            return "", []
+        return " AND " + " AND ".join(clauses), params
+
+    def _memory_search_keyword(
+        self,
+        keyword: str,
+        limit: int = 20,
+        *,
+        allowed_ids: Optional[set] = None,
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
+    ) -> Dict[int, float]:
         """Keyword search over memory nodes. Returns {rowid: score}.
 
         Uses FTS5 MATCH for non-CJK queries (returns BM25 scores, lower = better).
         Falls back to complete-term matching on summary/keywords for CJK queries.
+        Optional candidate filters are pushed into the SQL query so time-limited
+        recall does not first search the full memory table.
         """
         if self._contains_cjk(keyword):
             # Keep CJK words/phrases intact. Splitting Chinese queries into
@@ -2245,6 +2286,12 @@ class SessionDB:
             if not terms:
                 return {}
 
+            filter_sql, filter_params = self._memory_node_filter_sql(
+                allowed_ids=allowed_ids,
+                time_start=time_start,
+                time_end=time_end,
+            )
+
             # Build a UNION ALL query that counts complete-term matches.
             # Each term gets its own SELECT: returns node id if it matches
             # summary OR keywords.  Then GROUP BY + COUNT gives exact match count.
@@ -2255,13 +2302,13 @@ class SessionDB:
                 escaped = t.replace(bs, bs + bs).replace("%", bs + "%").replace("_", bs + "_")
                 pattern = f"%{escaped}%"
                 selects.append(
-                    f"SELECT id FROM memory_nodes WHERE summary LIKE ? ESCAPE '{bs}'"
+                    f"SELECT id FROM memory_nodes WHERE summary LIKE ? ESCAPE '{bs}'{filter_sql}"
                 )
-                params.append(pattern)
+                params.extend([pattern] + filter_params)
                 selects.append(
-                    f"SELECT id FROM memory_nodes WHERE keywords LIKE ? ESCAPE '{bs}'"
+                    f"SELECT id FROM memory_nodes WHERE keywords LIKE ? ESCAPE '{bs}'{filter_sql}"
                 )
-                params.append(pattern)
+                params.extend([pattern] + filter_params)
 
             union = " UNION ALL ".join(selects)
             cursor = self._conn.execute(
@@ -2298,8 +2345,9 @@ class SessionDB:
                     fallback_params.extend([pattern, bs, pattern, bs])
                 fallback_selects.append(
                     f"SELECT id, {len(cjk_chars)} AS score FROM memory_nodes "
-                    f"WHERE {' AND '.join(term_clauses)}"
+                    f"WHERE {' AND '.join(term_clauses)}{filter_sql}"
                 )
+                fallback_params.extend(filter_params)
             if not fallback_selects:
                 return {}
             fallback_union = " UNION ALL ".join(fallback_selects)
@@ -2314,27 +2362,87 @@ class SessionDB:
             return {row[0]: max(0.0, len(terms) * 2 - row[1]) for row in fallback_cursor.fetchall()}
 
         # Non-CJK: use FTS5 BM25
+        filter_sql, filter_params = self._memory_node_filter_sql(
+            table_alias="mn",
+            allowed_ids=allowed_ids,
+            time_start=time_start,
+            time_end=time_end,
+        )
         cursor = self._conn.execute(
-            """SELECT rowid, bm25(memory_nodes_fts) AS score
+            f"""SELECT memory_nodes_fts.rowid, bm25(memory_nodes_fts) AS score
                FROM memory_nodes_fts
+               JOIN memory_nodes mn ON mn.id = memory_nodes_fts.rowid
                WHERE memory_nodes_fts MATCH ?
+               {filter_sql}
                ORDER BY score
                LIMIT ?""",
-            (keyword, limit),
+            [keyword] + filter_params + [limit],
         )
         return {row[0]: row[1] for row in cursor.fetchall()}
 
-    def _memory_search_vector(self, query_embedding: np.ndarray, top_k: int = 20) -> Dict[int, float]:
-        """FAISS vector search over memory nodes. Returns {node_id: similarity} (higher = better)."""
+    def _memory_search_vector(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int = 20,
+        *,
+        allowed_ids: Optional[set] = None,
+    ) -> Dict[int, float]:
+        """FAISS vector search over memory nodes. Returns {node_id: similarity} (higher = better).
+
+        When a bounded candidate set is supplied, small windows are scored
+        directly by reconstructing only those vectors from the flat FAISS index.
+        Large windows fall back to overfetching from the global index and then
+        filtering, which avoids reconstructing very large historical ranges.
+        """
         if not _HAS_FAISS or self._memory_faiss_index is None or self._memory_faiss_index.ntotal == 0:
             return {}
-        sims, indices = self._memory_faiss_index.search(query_embedding, top_k)
+        ntotal = int(self._memory_faiss_index.ntotal)
+        if allowed_ids is not None:
+            allowed = {int(node_id) for node_id in allowed_ids}
+            max_pos = min(ntotal, len(self._memory_faiss_id_map))
+            allowed_positions = [
+                (idx, self._memory_faiss_id_map[idx])
+                for idx in range(max_pos)
+                if self._memory_faiss_id_map[idx] in allowed
+            ]
+            if not allowed_positions:
+                return {}
+            if len(allowed_positions) <= self._MEMORY_VECTOR_FILTER_BRUTE_FORCE_LIMIT:
+                query_vec = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+                scored: List[Tuple[int, float]] = []
+                for idx, node_id in allowed_positions:
+                    try:
+                        vector = self._memory_faiss_index.reconstruct(int(idx))
+                    except TypeError:
+                        vector = np.empty((query_vec.shape[0],), dtype=np.float32)
+                        self._memory_faiss_index.reconstruct(int(idx), vector)
+                    except Exception:
+                        vector = None
+                    if vector is None:
+                        continue
+                    candidate = np.asarray(vector, dtype=np.float32).reshape(-1)
+                    if candidate.shape != query_vec.shape:
+                        continue
+                    scored.append((node_id, float(np.dot(query_vec, candidate))))
+                scored.sort(key=lambda item: item[1], reverse=True)
+                return dict(scored[:top_k])
+
+            density = len(allowed_positions) / max(ntotal, 1)
+            overfetch = int(math.ceil(top_k / max(density, 0.01)) * 2)
+            search_k = min(ntotal, max(top_k * 8, overfetch, top_k))
+            sims, indices = self._memory_faiss_index.search(query_embedding, search_k)
+        else:
+            sims, indices = self._memory_faiss_index.search(query_embedding, top_k)
         results: Dict[int, float] = {}
         for sim, idx in zip(sims[0], indices[0]):
             if idx == -1:
                 continue
             node_id = self._memory_faiss_id_map[idx]
+            if allowed_ids is not None and node_id not in allowed_ids:
+                continue
             results[node_id] = sim
+            if len(results) >= top_k:
+                break
         return results
 
     def memory_semantic_neighbors(
@@ -2820,13 +2928,20 @@ class SessionDB:
             return [], []
 
         keyword_query = " OR ".join(keywords or current.get("keywords", []))
-        keyword_scores = self._memory_search_keyword(keyword_query, limit=search_limit) if keyword_query else {}
+        keyword_scores = (
+            self._memory_search_keyword(keyword_query, limit=search_limit, allowed_ids=allowed_ids)
+            if keyword_query else {}
+        )
         keyword_ranking = self._memory_filter_ranked_ids(
             self._memory_rank_scores(keyword_scores, higher_is_better=False),
             allowed_ids=allowed_ids,
         )
 
-        semantic_scores = self._memory_search_vector(query_embedding, top_k=search_limit)
+        semantic_scores = self._memory_search_vector(
+            query_embedding,
+            top_k=search_limit,
+            allowed_ids=allowed_ids,
+        )
         semantic_ranking = self._memory_filter_ranked_ids(
             self._memory_rank_scores(semantic_scores, higher_is_better=True),
             allowed_ids=allowed_ids,
@@ -2978,8 +3093,27 @@ class SessionDB:
                 return []
 
         # ── Step 2: Independent retrieval channels ──
-        fts_results = self._memory_search_keyword(keyword_query, limit=search_limit) if keyword_query else {}
-        vec_results = self._memory_search_vector(query_embedding, top_k=search_limit)
+        keyword_allowed_ids = allowed_ids
+        if _time_ids is not None and _tag_ids is None and _fact_type_ids is None:
+            # Time-only searches are cheaper as range predicates than as a
+            # potentially huge IN-list.  The vector channel still receives
+            # allowed_ids because FAISS has no native time predicate.
+            keyword_allowed_ids = None
+        fts_results = (
+            self._memory_search_keyword(
+                keyword_query,
+                limit=search_limit,
+                allowed_ids=keyword_allowed_ids,
+                time_start=time_start,
+                time_end=time_end,
+            )
+            if keyword_query else {}
+        )
+        vec_results = self._memory_search_vector(
+            query_embedding,
+            top_k=search_limit,
+            allowed_ids=allowed_ids,
+        )
 
         keyword_ranking = self._memory_filter_ranked_ids(
             self._memory_rank_scores(fts_results, higher_is_better=False),
