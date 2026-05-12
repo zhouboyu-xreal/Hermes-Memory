@@ -23,6 +23,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -229,6 +230,7 @@ CREATE TABLE IF NOT EXISTS entity_nodes (
     type TEXT NOT NULL DEFAULT 'CONCEPT',
     embedding BLOB,
     metadata TEXT DEFAULT '{}',
+    co_entities TEXT DEFAULT '{}',
     created_at REAL NOT NULL DEFAULT (strftime('%%s','now'))
 );
 
@@ -727,6 +729,15 @@ class SessionDB:
 
         # ── Knowledge Graph tables + FTS5 ──
         cursor.executescript(KNOWLEDGE_GRAPH_SQL)
+        for col_name, col_type in {
+            "co_entities": "TEXT DEFAULT '{}'",
+        }.items():
+            try:
+                cursor.execute(
+                    f"ALTER TABLE entity_nodes ADD COLUMN {col_name} {col_type}"
+                )
+            except sqlite3.OperationalError:
+                pass
         for col_name, col_type in {
             "semantic_score": "REAL DEFAULT 0.0",
             "causal_score": "REAL DEFAULT 0.0",
@@ -2992,14 +3003,380 @@ class SessionDB:
             return r[0] if r else -1
         return self._execute_write(_do)
 
+    @staticmethod
+    def _entity_load_co_entities(raw_value: Any) -> Dict[str, Dict[str, Any]]:
+        try:
+            data = json.loads(raw_value or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @classmethod
+    def _entity_record_co_entity(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        entity_id: int,
+        other_id: int,
+        other_name: str,
+        other_type: str,
+        count: int = 1,
+    ) -> None:
+        if entity_id == other_id:
+            return
+        row = conn.execute(
+            "SELECT co_entities FROM entity_nodes WHERE id = ?",
+            (entity_id,),
+        ).fetchone()
+        if not row:
+            return
+        co_entities = cls._entity_load_co_entities(row["co_entities"])
+        key = str(other_id)
+        current = co_entities.get(key, {})
+        try:
+            current_count = int(current.get("count", 0) or 0)
+        except (TypeError, ValueError):
+            current_count = 0
+        co_entities[key] = {
+            "name": other_name,
+            "type": other_type,
+            "count": current_count + max(1, int(count or 1)),
+        }
+        conn.execute(
+            "UPDATE entity_nodes SET co_entities = ? WHERE id = ?",
+            (json.dumps(co_entities, ensure_ascii=False, sort_keys=True), entity_id),
+        )
+
     def entity_link_node(self, node_id: int, entity_id: int, mention_count: int = 1) -> None:
         """Link a memory node to an entity (upsert)."""
         def _do(conn):
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT OR IGNORE INTO memory_node_entities (node_id, entity_id, mention_count) "
                 "VALUES (?, ?, ?)",
                 (node_id, entity_id, mention_count),
             )
+            if not cursor.rowcount:
+                return
+            rows = conn.execute(
+                "SELECT en.id, en.name, en.type "
+                "FROM memory_node_entities mne "
+                "JOIN entity_nodes en ON en.id = mne.entity_id "
+                "WHERE mne.node_id = ?",
+                (node_id,),
+            ).fetchall()
+            by_id = {int(row["id"]): row for row in rows}
+            linked = by_id.get(int(entity_id))
+            if not linked:
+                return
+            for other_id, other in by_id.items():
+                if other_id == entity_id:
+                    continue
+                self._entity_record_co_entity(
+                    conn,
+                    entity_id=entity_id,
+                    other_id=other_id,
+                    other_name=other["name"],
+                    other_type=other["type"],
+                    count=mention_count,
+                )
+                self._entity_record_co_entity(
+                    conn,
+                    entity_id=other_id,
+                    other_id=entity_id,
+                    other_name=linked["name"],
+                    other_type=linked["type"],
+                    count=mention_count,
+                )
+        self._execute_write(_do)
+
+    @staticmethod
+    def _entity_normalized_name(name: str) -> str:
+        text = unicodedata.normalize("NFKC", str(name or "")).casefold().strip()
+        return re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
+
+    @staticmethod
+    def _entity_name_tokens(name: str) -> List[str]:
+        return [
+            token
+            for token in re.split(r"[\s\-_/.,:;(){}\[\]\"']+", unicodedata.normalize("NFKC", str(name or "")).casefold())
+            if token
+        ]
+
+    @classmethod
+    def _entity_name_similarity(cls, left_name: str, right_name: str) -> Tuple[float, str, str]:
+        left_norm = cls._entity_normalized_name(left_name)
+        right_norm = cls._entity_normalized_name(right_name)
+        if not left_norm or not right_norm:
+            return 0.0, "empty_name", "high"
+        if left_norm == right_norm:
+            return 1.0, "normalized_name_match", "low"
+
+        left_tokens = set(cls._entity_name_tokens(left_name))
+        right_tokens = set(cls._entity_name_tokens(right_name))
+        if left_tokens and right_tokens and (left_tokens <= right_tokens or right_tokens <= left_tokens):
+            return 0.82, "token_subset", "medium"
+
+        shorter, longer = sorted((left_norm, right_norm), key=len)
+        if len(shorter) >= 2 and shorter in longer:
+            return 0.76, "name_substring", "medium"
+
+        return 0.0, "name_mismatch", "high"
+
+    @staticmethod
+    def _entity_type_compatible(left_type: str, right_type: str) -> Tuple[bool, float]:
+        left = str(left_type or "CONCEPT").upper()
+        right = str(right_type or "CONCEPT").upper()
+        if left == right:
+            return True, 1.0
+        weak_pairs = {
+            frozenset(("ORG", "PRODUCT")),
+            frozenset(("ORGANIZATION", "PRODUCT")),
+            frozenset(("CONCEPT", "PRODUCT")),
+            frozenset(("CONCEPT", "ORG")),
+            frozenset(("CONCEPT", "ORGANIZATION")),
+        }
+        if frozenset((left, right)) in weak_pairs:
+            return True, 0.7
+        return False, 0.0
+
+    @classmethod
+    def _entity_cooccurrence_similarity(cls, left_raw: Any, right_raw: Any) -> float:
+        left = cls._entity_load_co_entities(left_raw)
+        right = cls._entity_load_co_entities(right_raw)
+        if not left or not right:
+            return 0.0
+        left_ids = set(left)
+        right_ids = set(right)
+        union = left_ids | right_ids
+        if not union:
+            return 0.0
+        return len(left_ids & right_ids) / len(union)
+
+    @staticmethod
+    def _entity_reflection_action(
+        *,
+        confidence: float,
+        reason: str,
+        risk: str,
+        type_compatible: bool,
+    ) -> str:
+        if not type_compatible:
+            return "skip"
+        if reason == "normalized_name_match" and risk == "low":
+            return "merge"
+        return "candidate"
+
+    def _entity_reflection_candidates(self, limit: int = 100) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT id, name, type, co_entities FROM entity_nodes ORDER BY id"
+        ).fetchall()
+        candidates: List[Dict[str, Any]] = []
+        for i, left in enumerate(rows):
+            for right in rows[i + 1:]:
+                type_compatible, type_score = self._entity_type_compatible(left["type"], right["type"])
+                if type_score <= 0.7:
+                    continue
+                name_score, reason, risk = self._entity_name_similarity(left["name"], right["name"])
+                if name_score <= 0:
+                    continue
+                co_score = self._entity_cooccurrence_similarity(left["co_entities"], right["co_entities"])
+                confidence = max(0.0, min(1.0, (name_score * 0.72) + (type_score * 0.20) + (co_score * 0.08)))
+                action = self._entity_reflection_action(
+                    confidence=confidence,
+                    reason=reason,
+                    risk=risk,
+                    type_compatible=type_compatible,
+                )
+                if action == "skip":
+                    continue
+                canonical, duplicate = self._entity_choose_canonical(left, right)
+                candidates.append({
+                    "canonical_id": int(canonical["id"]),
+                    "canonical_name": canonical["name"],
+                    "duplicate_id": int(duplicate["id"]),
+                    "duplicate_name": duplicate["name"],
+                    "type_compatible": type_compatible,
+                    "type_score": round(type_score, 4),
+                    "name_score": round(name_score, 4),
+                    "co_entities_score": round(co_score, 4),
+                    "confidence": round(confidence, 4),
+                    "reason": reason,
+                    "risk": risk,
+                    "action": action,
+                })
+        candidates.sort(key=lambda item: (-item["confidence"], item["risk"], item["canonical_id"]))
+        return candidates[:limit]
+
+    @staticmethod
+    def _entity_choose_canonical(left: sqlite3.Row, right: sqlite3.Row) -> Tuple[sqlite3.Row, sqlite3.Row]:
+        left_name = str(left["name"] or "")
+        right_name = str(right["name"] or "")
+        left_display = left_name.strip()
+        right_display = right_name.strip()
+        left_norm = SessionDB._entity_normalized_name(left_name)
+        right_norm = SessionDB._entity_normalized_name(right_name)
+        if left_norm and left_norm == right_norm:
+            if len(left_display) < len(right_display):
+                return left, right
+            if len(right_display) < len(left_display):
+                return right, left
+            return (left, right) if int(left["id"]) <= int(right["id"]) else (right, left)
+        if len(right_name) > len(left_name):
+            return right, left
+        if len(left_name) > len(right_name):
+            return left, right
+        return (left, right) if int(left["id"]) <= int(right["id"]) else (right, left)
+
+    def memory_reflect_entities(self, *, dry_run: bool = True, limit: int = 100) -> Dict[str, Any]:
+        """Reflect on the entity graph and merge high-confidence duplicate entities.
+
+        Entity merge confidence is driven by normalized name similarity, gated
+        by compatible entity types, and lightly adjusted by overlap in
+        co-occurring entity profiles. Only low-risk normalized-name matches are
+        merged automatically; other similar names are reported as candidates.
+        """
+        candidates = self._entity_reflection_candidates(limit=limit)
+        merged: List[Dict[str, Any]] = []
+        if not dry_run:
+            for candidate in candidates:
+                if candidate["action"] != "merge":
+                    continue
+                self.entity_merge(
+                    canonical_id=candidate["canonical_id"],
+                    duplicate_id=candidate["duplicate_id"],
+                    reason=candidate["reason"],
+                    confidence=float(candidate["confidence"]),
+                )
+                merged.append(candidate)
+        return {
+            "dry_run": dry_run,
+            "candidates": candidates,
+            "merged": len(merged),
+            "merge_candidates": sum(1 for candidate in candidates if candidate["action"] == "merge"),
+            "candidate_count": len(candidates),
+            "rules": {
+                "auto_merge": "same/compatible type + normalized name match",
+                "candidate_only": "token subset or substring names, even with co-entity overlap",
+                "score_weights": {"name": 0.72, "type": 0.20, "co_entities": 0.08},
+            },
+        }
+
+    def entity_merge(
+        self,
+        *,
+        canonical_id: int,
+        duplicate_id: int,
+        reason: str,
+        confidence: float,
+    ) -> None:
+        """Merge a duplicate entity into a canonical entity."""
+        if canonical_id == duplicate_id:
+            return
+
+        def _do(conn):
+            canonical = conn.execute(
+                "SELECT id, name, type, metadata, co_entities FROM entity_nodes WHERE id = ?",
+                (canonical_id,),
+            ).fetchone()
+            duplicate = conn.execute(
+                "SELECT id, name, type, metadata, co_entities FROM entity_nodes WHERE id = ?",
+                (duplicate_id,),
+            ).fetchone()
+            if not canonical or not duplicate:
+                return
+
+            canonical_meta = json.loads(canonical["metadata"] or "{}")
+            aliases = canonical_meta.get("aliases", [])
+            if not isinstance(aliases, list):
+                aliases = []
+            for alias in (duplicate["name"], *(json.loads(duplicate["metadata"] or "{}").get("aliases", []) or [])):
+                if alias and alias not in aliases and alias != canonical["name"]:
+                    aliases.append(alias)
+            canonical_meta["aliases"] = aliases
+            merge_history = canonical_meta.get("merge_history", [])
+            if not isinstance(merge_history, list):
+                merge_history = []
+            merge_history.append({
+                "merged_entity_id": duplicate_id,
+                "merged_entity_name": duplicate["name"],
+                "reason": reason,
+                "confidence": confidence,
+                "merged_at": datetime.now(timezone.utc).isoformat(),
+            })
+            canonical_meta["merge_history"] = merge_history
+
+            duplicate_co = self._entity_load_co_entities(duplicate["co_entities"])
+            canonical_co = self._entity_load_co_entities(canonical["co_entities"])
+            duplicate_key = str(duplicate_id)
+            canonical_key = str(canonical_id)
+            canonical_co.pop(duplicate_key, None)
+            for other_key, other_value in duplicate_co.items():
+                if other_key in {duplicate_key, canonical_key}:
+                    continue
+                current = canonical_co.get(other_key, {})
+                current_count = int(current.get("count", 0) or 0) if isinstance(current, dict) else 0
+                other_count = int(other_value.get("count", 0) or 0) if isinstance(other_value, dict) else 0
+                canonical_co[other_key] = {
+                    "name": other_value.get("name", ""),
+                    "type": other_value.get("type", "CONCEPT"),
+                    "count": current_count + other_count,
+                }
+
+            conn.execute(
+                "UPDATE entity_nodes SET metadata = ?, co_entities = ? WHERE id = ?",
+                (
+                    json.dumps(canonical_meta, ensure_ascii=False, sort_keys=True),
+                    json.dumps(canonical_co, ensure_ascii=False, sort_keys=True),
+                    canonical_id,
+                ),
+            )
+            for row in conn.execute("SELECT id, co_entities FROM entity_nodes").fetchall():
+                entity_id = int(row["id"])
+                if entity_id == duplicate_id:
+                    continue
+                co_entities = self._entity_load_co_entities(row["co_entities"])
+                duplicate_entry = co_entities.pop(duplicate_key, None)
+                if duplicate_entry:
+                    existing = co_entities.get(canonical_key, {})
+                    existing_count = int(existing.get("count", 0) or 0) if isinstance(existing, dict) else 0
+                    duplicate_count = (
+                        int(duplicate_entry.get("count", 0) or 0)
+                        if isinstance(duplicate_entry, dict)
+                        else 0
+                    )
+                    co_entities[canonical_key] = {
+                        "name": canonical["name"],
+                        "type": canonical["type"],
+                        "count": existing_count + duplicate_count,
+                    }
+                    conn.execute(
+                        "UPDATE entity_nodes SET co_entities = ? WHERE id = ?",
+                        (json.dumps(co_entities, ensure_ascii=False, sort_keys=True), entity_id),
+                    )
+            conn.execute(
+                "UPDATE OR IGNORE memory_node_entities SET entity_id = ? WHERE entity_id = ?",
+                (canonical_id, duplicate_id),
+            )
+            conn.execute("DELETE FROM memory_node_entities WHERE entity_id = ?", (duplicate_id,))
+            conn.execute(
+                "UPDATE OR IGNORE entity_edges SET source_entity_id = ? WHERE source_entity_id = ?",
+                (canonical_id, duplicate_id),
+            )
+            conn.execute(
+                "UPDATE OR IGNORE entity_edges SET target_entity_id = ? WHERE target_entity_id = ?",
+                (canonical_id, duplicate_id),
+            )
+            conn.execute(
+                "DELETE FROM entity_edges WHERE source_entity_id = target_entity_id "
+                "OR source_entity_id = ? OR target_entity_id = ?",
+                (duplicate_id, duplicate_id),
+            )
+            conn.execute(
+                "UPDATE memory_observations SET entity_id = ? WHERE entity_id = ?",
+                (canonical_id, duplicate_id),
+            )
+            conn.execute("DELETE FROM entity_nodes WHERE id = ?", (duplicate_id,))
+
         self._execute_write(_do)
 
     # ── Normalized memory node relations ─────────────────────────────────
@@ -3400,6 +3777,130 @@ class SessionDB:
                 })
             out[observation_id] = nodes
         return out
+
+    def memory_duplicate_observation_groups(
+        self,
+        entity_ids: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return active same-entity/topic observation groups that need reflection."""
+        params: List[Any] = []
+        where = ["mo.status = 'active'"]
+        if entity_ids:
+            placeholders = ",".join("?" for _ in entity_ids)
+            where.append(f"mo.entity_id IN ({placeholders})")
+            params.extend(entity_ids)
+        rows = self._conn.execute(
+            "SELECT mo.*, en.name AS entity_name "
+            "FROM memory_observations mo "
+            "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY mo.entity_id, mo.topic_key, mo.updated_at DESC, mo.id DESC",
+            params,
+        ).fetchall()
+        grouped: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+        for row in rows:
+            item = dict(row)
+            grouped.setdefault((int(item["entity_id"]), str(item["topic_key"])), []).append(item)
+
+        groups: List[Dict[str, Any]] = []
+        for (_entity_id, _topic_key), observations in grouped.items():
+            if len(observations) < 2:
+                continue
+            observation_ids = [int(obs["id"]) for obs in observations]
+            source_rows = self._conn.execute(
+                "SELECT DISTINCT mn.id, mn.time_key, mn.summary, mn.keywords, mn.fact_type "
+                "FROM memory_observation_sources mos "
+                "JOIN memory_nodes mn ON mn.id = mos.node_id "
+                f"WHERE mos.observation_id IN ({','.join('?' for _ in observation_ids)}) "
+                "ORDER BY mn.time_key DESC, mn.id DESC",
+                observation_ids,
+            ).fetchall()
+            groups.append({
+                "entity_id": int(observations[0]["entity_id"]),
+                "entity_name": observations[0].get("entity_name") or "",
+                "topic_key": observations[0]["topic_key"],
+                "topic_label": observations[0]["topic_label"],
+                "observations": observations,
+                "source_nodes": [dict(row) for row in source_rows],
+            })
+        return groups
+
+    def memory_replace_observation_group(
+        self,
+        *,
+        keep_observation_id: int,
+        remove_observation_ids: List[int],
+        observation_type: str,
+        summary: str,
+        keywords: List[str],
+        confidence: float,
+        source_node_ids: List[int],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Replace a duplicate observation group with one reflected observation."""
+        clean_remove_ids = [
+            int(obs_id)
+            for obs_id in dict.fromkeys(remove_observation_ids)
+            if int(obs_id) != keep_observation_id
+        ]
+        clean_source_ids = [int(node_id) for node_id in dict.fromkeys(source_node_ids)]
+        if not clean_source_ids:
+            raise ValueError("reflected observation requires at least one source node")
+        placeholders = ",".join("?" for _ in clean_source_ids)
+        time_rows = self._conn.execute(
+            f"SELECT MIN(time_key) AS start_time, MAX(time_key) AS end_time FROM memory_nodes "
+            f"WHERE id IN ({placeholders})",
+            clean_source_ids,
+        ).fetchone()
+        now_text = datetime.now(timezone.utc).isoformat()
+        keywords_str = " ".join(keywords) if isinstance(keywords, list) else str(keywords or "")
+        confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
+        metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
+        source_time_start = time_rows["start_time"] if time_rows else None
+        source_time_end = time_rows["end_time"] if time_rows else None
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE memory_observations SET "
+                "observation_type = ?, summary = ?, keywords = ?, confidence = ?, "
+                "updated_at = ?, last_supported_at = ?, source_time_start = ?, "
+                "source_time_end = ?, metadata = ? "
+                "WHERE id = ?",
+                (
+                    observation_type,
+                    summary,
+                    keywords_str,
+                    confidence_value,
+                    now_text,
+                    now_text,
+                    source_time_start,
+                    source_time_end,
+                    metadata_str,
+                    keep_observation_id,
+                ),
+            )
+            if clean_remove_ids:
+                remove_placeholders = ",".join("?" for _ in clean_remove_ids)
+                conn.execute(
+                    f"DELETE FROM memory_observation_sources WHERE observation_id IN ({remove_placeholders})",
+                    clean_remove_ids,
+                )
+                conn.execute(
+                    f"DELETE FROM memory_observations WHERE id IN ({remove_placeholders})",
+                    clean_remove_ids,
+                )
+            conn.execute(
+                "DELETE FROM memory_observation_sources WHERE observation_id = ?",
+                (keep_observation_id,),
+            )
+            for node_id in clean_source_ids:
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_observation_sources "
+                    "(observation_id, node_id, role, confidence) VALUES (?, ?, 'supporting', ?)",
+                    (keep_observation_id, node_id, confidence_value),
+                )
+
+        self._execute_write(_do)
 
     # =========================================================================
     # Utility

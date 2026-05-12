@@ -355,6 +355,170 @@ def test_memory_keyword_search_keeps_cjk_terms_intact(db):
     assert list(results) == [exact]
 
 
+def test_entity_link_records_co_entities(db):
+    node_id = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack alerts.",
+        keywords=["Alice", "Slack"],
+    )
+    alice = db.entity_add_entity("Alice", "PERSON")
+    slack = db.entity_add_entity("Slack", "PRODUCT")
+
+    db.entity_link_node(node_id, alice)
+    db.entity_link_node(node_id, slack)
+
+    rows = {
+        row["name"]: json.loads(row["co_entities"])
+        for row in db._conn.execute(
+            "SELECT name, co_entities FROM entity_nodes WHERE id IN (?, ?)",
+            (alice, slack),
+        ).fetchall()
+    }
+    assert rows["Alice"][str(slack)]["name"] == "Slack"
+    assert rows["Alice"][str(slack)]["count"] == 1
+    assert rows["Slack"][str(alice)]["name"] == "Alice"
+
+
+def test_memory_reflect_reports_entity_merge_conditions(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    alice_spaced = db.entity_add_entity(" alice ", "PERSON")
+    hermes = db.entity_add_entity("Hermes", "PRODUCT")
+    hermes_agent = db.entity_add_entity("Hermes Agent", "PRODUCT")
+    _ = alice
+    _ = hermes
+
+    report = db.memory_reflect_entities(dry_run=True, limit=10)
+
+    by_duplicate = {item["duplicate_id"]: item for item in report["candidates"]}
+    assert by_duplicate[alice_spaced]["action"] == "merge"
+    assert by_duplicate[alice_spaced]["reason"] == "normalized_name_match"
+    hermes_candidates = [
+        item for item in report["candidates"]
+        if {item["canonical_id"], item["duplicate_id"]} == {hermes, hermes_agent}
+    ]
+    assert hermes_candidates
+    assert hermes_candidates[0]["action"] == "candidate"
+    assert hermes_candidates[0]["reason"] in {"token_subset", "name_substring"}
+    assert report["rules"]["score_weights"]["co_entities"] > 0
+
+
+def test_memory_node_manager_reflect_delegates_to_db(db):
+    db.entity_add_entity("Alice", "PERSON")
+    db.entity_add_entity(" alice ", "PERSON")
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    report = mgr.reflect(dry_run=True, limit=5)
+
+    assert report["dry_run"] is True
+    assert report["merge_candidates"] == 1
+
+
+def test_memory_reflect_can_merge_normalized_entity_duplicates(db):
+    node_id = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack alerts.",
+        keywords=["Alice", "Slack"],
+    )
+    alice = db.entity_add_entity("Alice", "PERSON")
+    alice_spaced = db.entity_add_entity(" alice ", "PERSON")
+    db.entity_link_node(node_id, alice_spaced)
+
+    report = db.memory_reflect_entities(dry_run=False, limit=10)
+
+    assert report["merged"] == 1
+    assert db._conn.execute(
+        "SELECT COUNT(*) FROM entity_nodes WHERE id = ?",
+        (alice_spaced,),
+    ).fetchone()[0] == 0
+    link = db._conn.execute(
+        "SELECT entity_id FROM memory_node_entities WHERE node_id = ?",
+        (node_id,),
+    ).fetchone()
+    assert link["entity_id"] == alice
+    metadata = json.loads(db._conn.execute(
+        "SELECT metadata FROM entity_nodes WHERE id = ?",
+        (alice,),
+    ).fetchone()["metadata"])
+    assert " alice " in metadata["aliases"]
+
+
+def test_reflect_merges_same_topic_observations_with_llm(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    alice_spaced = db.entity_add_entity(" alice ", "PERSON")
+    first_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Slack", "alerts"],
+    )
+    second_node = _add_memory_node(
+        db,
+        time_key="2026-05-02 10:00:00",
+        summary="Alice wants incident notifications in Slack.",
+        keywords=["Slack", "notifications"],
+    )
+    db.entity_link_node(first_node, alice)
+    db.entity_link_node(second_node, alice_spaced)
+    first_observation = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="alerts",
+        topic_label="alerts",
+        observation_type="preference",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Slack", "alerts"],
+        source_node_ids=[first_node],
+        confidence=0.8,
+    )
+    second_observation = db.memory_upsert_observation(
+        entity_id=alice_spaced,
+        topic_key="alerts",
+        topic_label="alerts",
+        observation_type="workflow",
+        summary="Alice routes incident notifications through Slack.",
+        keywords=["Slack", "notifications"],
+        source_node_ids=[second_node],
+        confidence=0.75,
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "summary": "Alice consistently wants urgent and incident alerts routed through Slack.",
+                "observation_type": "preference",
+                "keywords": ["Slack", "alerts", "notifications"],
+                "confidence": 0.9,
+            })
+        ],
+    )
+
+    report = mgr.reflect(dry_run=False, limit=10)
+
+    assert report["merged"] == 1
+    assert report["observation_groups_merged"] == 1
+    rows = db._conn.execute(
+        "SELECT id, entity_id, topic_key, observation_type, summary, keywords "
+        "FROM memory_observations ORDER BY id"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["id"] in {first_observation, second_observation}
+    assert rows[0]["entity_id"] == alice
+    assert rows[0]["topic_key"] == "alerts"
+    assert rows[0]["observation_type"] == "preference"
+    assert "urgent and incident alerts" in rows[0]["summary"]
+    assert "notifications" in rows[0]["keywords"]
+    source_ids = {
+        row["node_id"]
+        for row in db._conn.execute(
+            "SELECT node_id FROM memory_observation_sources WHERE observation_id = ?",
+            (rows[0]["id"],),
+        ).fetchall()
+    }
+    assert source_ids == {first_node, second_node}
+
+
 def test_recall_formats_world_and_experience_sections(db, monkeypatch):
     _add_memory_node(
         db,

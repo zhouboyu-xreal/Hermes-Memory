@@ -295,6 +295,34 @@ new source facts:
   "confidence": 0.0
 }}"""
 
+OBSERVATION_MERGE_PROMPT = """你是长期记忆 reflection 模块。
+
+两个 entity 已经被判断为同一个实体。请把同一 entity/topic 下的多条 observation 合并成一条新的高阶 observation。
+
+要求：
+1. 输出一条统一 observation，不要简单拼接原文。
+2. 必须保留所有 observation 中仍然成立的稳定模式、偏好、策略、约束、成功/失败经验或状态变化。
+3. 如果多条 observation 有细微差异或冲突，请用谨慎措辞综合，不要忽略冲突。
+4. 必须忠于给定内容，不要添加没有依据的信息。
+5. 只返回 JSON，不要 markdown，不要额外解释。
+
+entity: {entity_name}
+topic: {topic_label}
+
+observations to merge:
+{observations}
+
+supporting facts:
+{source_facts}
+
+输出格式：
+{{
+  "summary": "合并后可用于未来决策的 consolidated observation",
+  "observation_type": "preference/workflow/strategy/failure/success/change/constraint/context",
+  "keywords": ["关键词1", "关键词2"],
+  "confidence": 0.0
+}}"""
+
 # ── Reflect prompt template ───────────────────────────────────────────────
 
 # ── Memory node context block template ───────────────────────────────────
@@ -1226,8 +1254,128 @@ class MemoryNodeManager:
         )
         self._async_thread.start()
 
-    # ── Recall relevant memory nodes ──────────────────────────────────────
+    def _merge_duplicate_observation_group(self, group: Dict[str, Any]) -> bool:
+        observations = group.get("observations") or []
+        source_nodes = group.get("source_nodes") or []
+        if len(observations) < 2:
+            return False
 
+        observation_lines = []
+        for index, observation in enumerate(observations, 1):
+            summary = str(observation.get("summary") or "").strip()
+            if not summary:
+                continue
+            observation_lines.append(
+                f"{index}. [{observation.get('observation_type', 'context')}; "
+                f"confidence={observation.get('confidence', 0.0)}] {summary}"
+            )
+        if not observation_lines:
+            return False
+
+        source_lines = []
+        for index, node in enumerate(source_nodes[:12], 1):
+            summary = str(node.get("summary") or "").strip()
+            if not summary:
+                continue
+            source_lines.append(f"{index}. [{node.get('fact_type', 'world')}] {summary}")
+
+        prompt = OBSERVATION_MERGE_PROMPT.format(
+            entity_name=group.get("entity_name", ""),
+            topic_label=group.get("topic_label", group.get("topic_key", "")),
+            observations="\n".join(observation_lines),
+            source_facts="\n".join(source_lines) or "(no supporting facts found)",
+        )
+        result = self._call_llm(prompt)
+        data = self._json_object_from_llm_text(result or "")
+        if not data:
+            logger.debug("Observation reflection returned invalid JSON")
+            return False
+
+        summary = str(data.get("summary", "")).strip()
+        if not summary:
+            return False
+        observation_type = str(data.get("observation_type", "context") or "context").strip().lower()
+        allowed_types = {
+            "preference", "workflow", "strategy", "failure",
+            "success", "change", "constraint", "context",
+        }
+        if observation_type not in allowed_types:
+            observation_type = "context"
+        keywords = self._normalize_keywords(data.get("keywords", []))
+        if not keywords:
+            for observation in observations:
+                keywords.extend(self._normalize_keywords(str(observation.get("keywords", "")).split()))
+            keywords = list(dict.fromkeys(keywords))
+        try:
+            confidence = float(data.get("confidence", 0.7) or 0.7)
+        except (TypeError, ValueError):
+            confidence = 0.7
+
+        source_ids = [int(node["id"]) for node in source_nodes]
+        if not source_ids:
+            return False
+        keep_observation = observations[0]
+        remove_ids = [int(observation["id"]) for observation in observations[1:]]
+        self._db.memory_replace_observation_group(
+            keep_observation_id=int(keep_observation["id"]),
+            remove_observation_ids=remove_ids,
+            observation_type=observation_type,
+            summary=summary,
+            keywords=keywords,
+            confidence=max(0.0, min(1.0, confidence)),
+            source_node_ids=source_ids,
+            metadata={"source": "memory_reflect_observation_merge"},
+        )
+        return True
+
+    def _merge_duplicate_observations_for_entities(self, entity_ids: List[int]) -> int:
+        if not entity_ids:
+            return 0
+        merged = 0
+        for group in self._db.memory_duplicate_observation_groups(entity_ids=entity_ids):
+            try:
+                if self._merge_duplicate_observation_group(group):
+                    merged += 1
+            except Exception as exc:
+                logger.debug(
+                    "Failed to merge observations for entity %s topic %s: %s",
+                    group.get("entity_id"),
+                    group.get("topic_key"),
+                    exc,
+                )
+        return merged
+
+    def reflect(self, *, dry_run: bool = True, limit: int = 100) -> Dict[str, Any]:
+        """Run memory reflection maintenance.
+
+        First scope: entity reflection. It identifies duplicate entity
+        candidates using name similarity, type compatibility, and
+        co-occurring entity profiles. The method is intentionally explicit
+        and is not called from ``run_agent.py`` yet.
+        """
+        if not self._db:
+            return {
+                "dry_run": dry_run,
+                "candidates": [],
+                "merged": 0,
+                "candidate_count": 0,
+                "error": "memory database unavailable",
+            }
+        report = self._db.memory_reflect_entities(dry_run=dry_run, limit=limit)
+        report["observation_groups_merged"] = 0
+        if not dry_run and report.get("merged"):
+            canonical_ids = [
+                int(candidate["canonical_id"])
+                for candidate in report.get("candidates", [])
+                if candidate.get("action") == "merge"
+            ]
+            report["observation_groups_merged"] = self._merge_duplicate_observations_for_entities(
+                list(dict.fromkeys(canonical_ids))
+            )
+        return report
+
+    # ── Recall relevant memory nodes ──────────────────────────────────────
+    
     def recall(
         self,
         query: str,
