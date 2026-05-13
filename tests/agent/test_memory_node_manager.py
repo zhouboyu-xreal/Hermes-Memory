@@ -555,7 +555,7 @@ def test_memory_search_observations_uses_entities(db):
         entity_id=alice,
         topic_key="alerts",
         topic_label="alerts",
-        observation_type="preference",
+        observation_type="insight",
         summary="The user prefers concise escalation notes.",
         keywords=["escalation"],
         source_node_ids=[node_id],
@@ -583,7 +583,7 @@ def test_memory_search_observations_rejects_weak_family_term_entity_mismatch(db)
         entity_id=xiaoming_father,
         topic_key="家庭",
         topic_label="家庭",
-        observation_type="preference",
+        observation_type="insight",
         summary="小明父亲退休后保留了对开车自驾游和苹果的偏好。",
         keywords=["退休", "自驾游", "苹果"],
         source_node_ids=[node_id],
@@ -709,7 +709,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         entity_id=alice,
         topic_key="alerts",
         topic_label="alerts",
-        observation_type="preference",
+        observation_type="insight",
         summary="Alice prefers Slack for urgent alerts.",
         keywords=["Slack", "alerts"],
         source_node_ids=[first_node],
@@ -719,7 +719,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         entity_id=alice_spaced,
         topic_key="alerts",
         topic_label="alerts",
-        observation_type="workflow",
+        observation_type="insight",
         summary="Alice routes incident notifications through Slack.",
         keywords=["Slack", "notifications"],
         source_node_ids=[second_node],
@@ -730,10 +730,11 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         embedding_config={},
         llm_outputs=[
             json.dumps({
+                "category": "insight",
                 "summary": "Alice consistently wants urgent and incident alerts routed through Slack.",
-                "observation_type": "preference",
                 "keywords": ["Slack", "alerts", "notifications"],
                 "confidence": 0.9,
+                "metadata": {"insight_type": "preference"},
             })
         ],
     )
@@ -742,6 +743,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
 
     assert report["merged"] == 1
     assert report["observation_groups_merged"] == 1
+    assert "current_category: insight" in mgr.llm_prompts[-1]
     rows = db._conn.execute(
         "SELECT id, entity_id, topic_key, observation_type, summary, keywords "
         "FROM memory_observations ORDER BY id"
@@ -750,7 +752,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
     assert rows[0]["id"] in {first_observation, second_observation}
     assert rows[0]["entity_id"] == alice
     assert rows[0]["topic_key"] == "alerts"
-    assert rows[0]["observation_type"] == "preference"
+    assert rows[0]["observation_type"] == "insight"
     assert "urgent and incident alerts" in rows[0]["summary"]
     assert "notifications" in rows[0]["keywords"]
     source_ids = {
@@ -761,6 +763,59 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         ).fetchall()
     }
     assert source_ids == {first_node, second_node}
+
+
+def test_reflect_keeps_insight_and_task_observations_separate(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    node_ids = []
+    for idx, summary in enumerate(
+        [
+            "Alice prefers Slack for urgent alerts.",
+            "Alice is actively implementing Slack alert routing.",
+        ],
+        1,
+    ):
+        node_id = _add_memory_node(
+            db,
+            time_key=f"2026-05-0{idx} 10:00:00",
+            summary=summary,
+            keywords=["Slack", "alerts"],
+        )
+        db.entity_link_node(node_id, alice)
+        node_ids.append(node_id)
+    insight_id = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="alerts",
+        topic_label="alerts",
+        observation_type="insight",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Slack", "alerts"],
+        source_node_ids=[node_ids[0]],
+    )
+    task_id = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="alerts",
+        topic_label="alerts",
+        observation_type="task",
+        summary="Alice is actively implementing Slack alert routing.",
+        keywords=["Slack", "alerts", "routing"],
+        source_node_ids=[node_ids[1]],
+        metadata={
+            "task_status": "active",
+            "task_source": "inferred_from_observation",
+        },
+    )
+
+    groups = db.memory_duplicate_observation_groups(entity_ids=[alice])
+
+    assert groups == []
+    rows = db._conn.execute(
+        "SELECT id, observation_type FROM memory_observations ORDER BY id"
+    ).fetchall()
+    assert [(row["id"], row["observation_type"]) for row in rows] == [
+        (insight_id, "insight"),
+        (task_id, "task"),
+    ]
 
 
 def test_reflect_observation_decay_uses_fact_type_half_lives(db):
@@ -783,7 +838,7 @@ def test_reflect_observation_decay_uses_fact_type_half_lives(db):
         entity_id=alice,
         topic_key="world-alerts",
         topic_label="world alerts",
-        observation_type="preference",
+        observation_type="insight",
         summary="Alice prefers Slack for urgent alerts.",
         keywords=["Slack", "alerts"],
         source_node_ids=[world_node],
@@ -792,7 +847,7 @@ def test_reflect_observation_decay_uses_fact_type_half_lives(db):
         entity_id=alice,
         topic_key="experience-alerts",
         topic_label="experience alerts",
-        observation_type="context",
+        observation_type="insight",
         summary="Hermes has prior Slack alert routing experience for Alice.",
         keywords=["Slack", "alerts"],
         source_node_ids=[experience_node],
@@ -849,7 +904,7 @@ def test_memory_search_observations_ignores_inactive_observations(db):
         entity_id=alice,
         topic_key="slack-alerts",
         topic_label="Slack alerts",
-        observation_type="preference",
+        observation_type="insight",
         summary="Alice currently prefers Slack for urgent alerts.",
         keywords=["Slack", "alerts"],
         source_node_ids=[active_node],
@@ -858,7 +913,7 @@ def test_memory_search_observations_ignores_inactive_observations(db):
         entity_id=alice,
         topic_key="email-alerts",
         topic_label="email alerts",
-        observation_type="preference",
+        observation_type="insight",
         summary="Alice once preferred email alerts.",
         keywords=["email", "alerts"],
         source_node_ids=[stale_node],
@@ -886,7 +941,7 @@ def test_memory_node_manager_reflect_inactivates_stale_observations(db):
         entity_id=alice,
         topic_key="email-alerts",
         topic_label="email alerts",
-        observation_type="context",
+        observation_type="insight",
         summary="Alice used email alerts long ago.",
         keywords=["email", "alerts"],
         source_node_ids=[old_node],
@@ -978,10 +1033,11 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
         llm_outputs=[
             json.dumps(retain_payload),
             json.dumps({
+                "category": "insight",
                 "summary": "Alice's urgent alert workflow is Slack-centered.",
-                "observation_type": "workflow",
                 "keywords": ["Slack", "alerts"],
                 "confidence": 0.86,
+                "metadata": {"insight_type": "workflow"},
             }),
         ],
     )
@@ -989,15 +1045,77 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
     assert mgr.store_turn("Alice urgent alerts", "Use Slack.") is True
 
     observation = db._conn.execute(
-        "SELECT mo.summary, mo.topic_key, en.name AS entity_name "
+        "SELECT mo.summary, mo.topic_key, mo.observation_type, mo.metadata, en.name AS entity_name "
         "FROM memory_observations mo "
         "JOIN entity_nodes en ON en.id = mo.entity_id"
     ).fetchone()
     assert observation["entity_name"] == "Alice"
     assert observation["topic_key"] == "slack-alerts"
+    assert observation["observation_type"] == "insight"
+    assert json.loads(observation["metadata"])["insight_type"] == "workflow"
     assert observation["summary"] == "Alice's urgent alert workflow is Slack-centered."
     sources = db._conn.execute("SELECT node_id FROM memory_observation_sources").fetchall()
     assert len(sources) == 3
+
+
+def test_store_turn_can_consolidate_task_observation(db):
+    retain_payload = {
+        "facts": [
+            {
+                "text": "用户正在排查 Hermes memory recall 的匹配问题。",
+                "keywords": ["Hermes", "memory", "recall", "排查"],
+                "topic": ["memory recall"],
+                "fact_type": "world",
+                "entities": [{"name": "Hermes Agent", "type": "PROJECT"}],
+            },
+            {
+                "text": "用户计划修改 observation 生成逻辑以区分 insight 和 task。",
+                "keywords": ["observation", "insight", "task", "修改"],
+                "topic": ["memory recall"],
+                "fact_type": "world",
+                "entities": [{"name": "Hermes Agent", "type": "PROJECT"}],
+            },
+            {
+                "text": "助手帮助用户实现记忆系统 reflect 和 observation decay 相关改动。",
+                "keywords": ["reflect", "observation", "decay", "实现"],
+                "topic": ["memory recall"],
+                "fact_type": "experience",
+                "entities": [{"name": "Hermes Agent", "type": "PROJECT"}],
+            },
+        ],
+        "causal_relations": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps(retain_payload),
+            json.dumps({
+                "category": "task",
+                "summary": "用户正在迭代 Hermes Agent 的记忆系统，当前聚焦 recall、reflect 与 observation 生成逻辑。",
+                "keywords": ["Hermes Agent", "memory", "recall", "observation"],
+                "confidence": 0.82,
+                "metadata": {
+                    "task_status": "active",
+                    "task_source": "inferred_from_observation",
+                    "evidence": ["排查 memory recall", "修改 observation 生成逻辑"],
+                    "next_action": "继续验证 observation 分类逻辑",
+                },
+            }),
+        ],
+    )
+
+    assert mgr.store_turn("继续改记忆系统", "我们来调整 observation 分类。") is True
+
+    observation = db._conn.execute(
+        "SELECT observation_type, summary, metadata FROM memory_observations"
+    ).fetchone()
+    metadata = json.loads(observation["metadata"])
+    assert observation["observation_type"] == "task"
+    assert "正在迭代 Hermes Agent" in observation["summary"]
+    assert metadata["task_status"] == "active"
+    assert metadata["task_source"] == "inferred_from_observation"
+    assert metadata["evidence"] == ["排查 memory recall", "修改 observation 生成逻辑"]
 
 
 def test_observation_source_nodes_match_topic_key_exactly(db):
@@ -1052,7 +1170,7 @@ def test_recall_includes_observations_and_supporting_facts(db, monkeypatch):
         entity_id=alice,
         topic_key="slack-alerts",
         topic_label="Slack alerts",
-        observation_type="context",
+        observation_type="insight",
         summary="Alice's urgent alert workflow is Slack-centered.",
         keywords=["Slack", "alerts"],
         source_node_ids=source_ids,
@@ -1079,16 +1197,18 @@ def test_observation_consolidation_waits_for_incremental_sources(db):
         embedding_config={},
         llm_outputs=[
             json.dumps({
+                "category": "insight",
                 "summary": "Alice's urgent alert workflow is Slack-centered.",
-                "observation_type": "workflow",
                 "keywords": ["Slack", "alerts"],
                 "confidence": 0.86,
+                "metadata": {"insight_type": "workflow"},
             }),
             json.dumps({
+                "category": "insight",
                 "summary": "Alice continues to prefer Slack for urgent alert routing.",
-                "observation_type": "workflow",
                 "keywords": ["Slack", "alerts"],
                 "confidence": 0.9,
+                "metadata": {"insight_type": "workflow"},
             }),
         ],
     )
@@ -1121,7 +1241,7 @@ def test_observation_consolidation_waits_for_incremental_sources(db):
     updated_summary = db._conn.execute("SELECT summary FROM memory_observations").fetchone()["summary"]
     assert updated_summary == "Alice continues to prefer Slack for urgent alert routing."
     update_prompt = mgr.llm_prompts[-1]
-    assert "existing observation:" in update_prompt
+    assert "已有 observation" in update_prompt
     assert "Alice's urgent alert workflow is Slack-centered." in update_prompt
     assert "Alice Slack alert fact 4." in update_prompt
     assert "Alice Slack alert fact 5." in update_prompt

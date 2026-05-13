@@ -4140,7 +4140,7 @@ class SessionDB:
         self,
         entity_ids: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
-        """Return active same-entity/topic observation groups that need reflection."""
+        """Return active same-entity/topic/category observation groups that need reflection."""
         params: List[Any] = []
         where = ["mo.status = 'active'"]
         if entity_ids:
@@ -4152,16 +4152,20 @@ class SessionDB:
             "FROM memory_observations mo "
             "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
             f"WHERE {' AND '.join(where)} "
-            "ORDER BY mo.entity_id, mo.topic_key, mo.updated_at DESC, mo.id DESC",
+            "ORDER BY mo.entity_id, mo.topic_key, mo.observation_type, mo.updated_at DESC, mo.id DESC",
             params,
         ).fetchall()
-        grouped: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+        grouped: Dict[Tuple[int, str, str], List[Dict[str, Any]]] = {}
         for row in rows:
             item = dict(row)
-            grouped.setdefault((int(item["entity_id"]), str(item["topic_key"])), []).append(item)
+            category = str(item.get("observation_type") or "insight")
+            grouped.setdefault(
+                (int(item["entity_id"]), str(item["topic_key"]), category),
+                [],
+            ).append(item)
 
         groups: List[Dict[str, Any]] = []
-        for (_entity_id, _topic_key), observations in grouped.items():
+        for (_entity_id, _topic_key, _category), observations in grouped.items():
             if len(observations) < 2:
                 continue
             observation_ids = [int(obs["id"]) for obs in observations]
@@ -4178,6 +4182,7 @@ class SessionDB:
                 "entity_name": observations[0].get("entity_name") or "",
                 "topic_key": observations[0]["topic_key"],
                 "topic_label": observations[0]["topic_label"],
+                "observation_type": observations[0]["observation_type"],
                 "observations": observations,
                 "source_nodes": [dict(row) for row in source_rows],
             })

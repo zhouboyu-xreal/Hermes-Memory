@@ -244,13 +244,7 @@ RELATION_PROMPT_TEMPLATE = """你是"AI眼镜记忆关系抽取模块"。
 
 OBSERVATION_CONSOLIDATION_PROMPT = """你是长期记忆 consolidation 模块。
 
-请基于同一个 entity/topic 下的 world facts 和 experience memories，生成一条高阶 observation。
-
-要求：
-1. observation 不是简单复述 facts，而是归纳稳定模式、偏好、策略、约束、成功/失败经验或状态变化。
-2. 必须忠于 source facts，不要添加没有依据的信息。
-3. 如果证据不足以形成强结论，也要用谨慎措辞。
-4. 只返回 JSON，不要 markdown，不要额外解释。
+你需要把同一 entity/topic 下的 world facts 和 experience memories，整合成一条长期可用的 observation。
 
 entity: {entity_name}
 topic: {topic_label}
@@ -258,59 +252,133 @@ topic: {topic_label}
 source facts:
 {source_facts}
 
-输出格式：
+请判断这些事实应该形成哪一类 observation：
+
+1. insight
+表示关于用户、实体、偏好、约束、工作流、背景、经验、关系、模式或稳定上下文的洞察。
+
+2. task
+表示这些事实能够推断出用户正在持续推进某个具体任务、项目、排查、实现、计划、交付物或待完成目标。
+
+只有在来源事实中出现重复的行动、推进、计划、修改、排查、设计、实现、跟进或阶段性进展时，才允许使用 category="task"。
+
+不要把以下情况判断为 task：
+- 一次性问题
+- 静态偏好
+- 人物背景
+- 家庭关系
+- 单次兴趣表达
+- 泛泛讨论某个主题，但没有持续行动或进展
+- 关于他人的事实，除非用户正在围绕该对象执行某项任务
+- 单纯的属性、条件、限制、标签或分类
+
+如果是 insight：
+- 总结这些事实中长期有用的稳定信息。
+- 可以描述偏好、约束、工作方式、反复出现的模式、成功/失败经验或上下文。
+- 不要编造任务状态、下一步行动或截止时间。
+
+如果是 task：
+- summary 应描述用户正在做什么，以及这个任务的目标或当前焦点。
+- task_status 只能是 active、blocked、paused、stale 之一。
+- task_source 固定为 inferred_from_observation。
+- evidence 使用简短短语概括来源事实中的证据，不要逐字长引用。
+- next_action 只有在来源事实明确暗示时才填写；否则省略。
+- 不要标记为 done，除非来源事实明确表示任务已经完成。
+
+只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
-  "summary": "一条可用于未来决策的 consolidated observation",
-  "observation_type": "preference/workflow/strategy/failure/success/change/constraint/context",
+  "category": "insight | task",
+  "summary": "一句简洁、长期可用的 observation。如果是 task，说明用户正在推进的任务。",
   "keywords": ["关键词1", "关键词2"],
-  "confidence": 0.0
-}}"""
+  "confidence": 0.0,
+  "metadata": {{
+    "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context",
+    "task_status": "active | blocked | paused | stale",
+    "task_source": "inferred_from_observation",
+    "evidence": ["简短证据短语1", "简短证据短语2"],
+    "next_action": "可选，只有明确时填写"
+  }}
+}}
+
+如果 category 是 insight：metadata 中只填写 insight_type，不要填写 task_status、task_source、next_action。
+如果 category 是 task：metadata 中填写 task_status、task_source、evidence；next_action 可选；不要填写 insight_type。"""
 
 OBSERVATION_UPDATE_PROMPT = """你是长期记忆 consolidation 模块。
 
-请基于已有 observation 和新增 source facts，决定如何更新这条 observation。
-
-要求：
-1. 不要简单追加 facts；输出一条更新后的高阶 observation。
-2. 如果新增 facts 只是支持旧 observation，请保留旧结论并适度提高确定性。
-3. 如果新增 facts 细化或改变旧 observation，请改写 summary，使它同时覆盖旧结论和新增证据。
-4. 如果新增 facts 与旧 observation 冲突，请用谨慎措辞反映变化，不要忽略冲突。
-5. 必须忠于给定内容，不要添加没有依据的信息。
-6. 只返回 JSON，不要 markdown，不要额外解释。
+你需要根据新的记忆事实，更新同一 entity/topic 下已有的 observation。
 
 entity: {entity_name}
 topic: {topic_label}
 
-existing observation:
-summary: {existing_summary}
-type: {existing_type}
-keywords: {existing_keywords}
-confidence: {existing_confidence}
+已有 observation：
+当前类别：{existing_type}
+置信度：{existing_confidence}
+内容：{existing_summary}
 
-new source facts:
+已有关键词：
+{existing_keywords}
+
+新的来源事实：
 {source_facts}
 
-输出格式：
+请基于已有 observation 和新的来源事实，输出更新后的 observation，并判断它应该属于哪一类：
+
+默认保持当前类别；只有当新事实明确支持类别变化时，才改变 category。
+
+1. insight
+表示关于用户、实体、偏好、约束、工作流、背景、经验、关系、模式或稳定上下文的洞察。
+
+2. task
+表示这些事实能够推断出用户正在持续推进某个具体任务、项目、排查、实现、计划、交付物或待完成目标。
+
+只有在已有 observation 和新事实共同表明用户正在持续行动、推进、计划、修改、排查、设计、实现、跟进或产生阶段性进展时，才允许使用 category="task"。
+
+不要把以下情况判断为 task：
+- 一次性问题
+- 静态偏好
+- 人物背景
+- 家庭关系
+- 单次兴趣表达
+- 泛泛讨论某个主题，但没有持续行动或进展
+- 关于他人的事实，除非用户正在围绕该对象执行某项任务
+- 单纯的属性、条件、限制、标签或分类
+
+如果已有 observation 是 task：
+- 如果新事实表示任务仍在继续、推进、受阻、暂停或变得陈旧，可以继续保持 task。
+- task_status 只能是 active、blocked、paused、stale。
+- 只有事实明确说明完成时，才可以在 summary 中说明已完成；否则不要推断完成。
+- next_action 只有在新事实明确暗示时才填写；否则省略。
+
+如果输出 insight：
+- 总结长期有用的稳定信息。
+- 可以描述偏好、约束、工作方式、反复出现的模式、成功/失败经验或上下文。
+- 不要编造任务状态、下一步行动或截止时间。
+
+只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
-  "summary": "更新后可用于未来决策的 consolidated observation",
-  "observation_type": "preference/workflow/strategy/failure/success/change/constraint/context",
+  "category": "insight | task",
+  "summary": "更新后的一句简洁 observation。",
   "keywords": ["关键词1", "关键词2"],
-  "confidence": 0.0
-}}"""
+  "confidence": 0.0,
+  "metadata": {{
+    "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context",
+    "task_status": "active | blocked | paused | stale",
+    "task_source": "inferred_from_observation",
+    "evidence": ["简短证据短语1", "简短证据短语2"],
+    "next_action": "可选，只有明确时填写"
+  }}
+}}
+
+如果 category 是 insight：metadata 中只填写 insight_type，不要填写 task_status、task_source、next_action。
+如果 category 是 task：metadata 中填写 task_status、task_source、evidence；next_action 可选；不要填写 insight_type。"""
 
 OBSERVATION_MERGE_PROMPT = """你是长期记忆 reflection 模块。
 
 两个 entity 已经被判断为同一个实体。请把同一 entity/topic 下的多条 observation 合并成一条新的高阶 observation。
 
-要求：
-1. 输出一条统一 observation，不要简单拼接原文。
-2. 必须保留所有 observation 中仍然成立的稳定模式、偏好、策略、约束、成功/失败经验或状态变化。
-3. 如果多条 observation 有细微差异或冲突，请用谨慎措辞综合，不要忽略冲突。
-4. 必须忠于给定内容，不要添加没有依据的信息。
-5. 只返回 JSON，不要 markdown，不要额外解释。
-
 entity: {entity_name}
 topic: {topic_label}
+current_category: {current_category}
 
 observations to merge:
 {observations}
@@ -318,12 +386,30 @@ observations to merge:
 supporting facts:
 {source_facts}
 
-输出格式：
+这些 observation 已经按 current_category 分组。合并结果必须保持 current_category，不要在 merge 阶段把 insight 改成 task，或把 task 改成 insight。
+
+要求：
+1. 输出一条统一 observation，不要简单拼接原文。
+2. 必须保留所有 observation 中仍然成立的信息。
+3. 如果多条 observation 有细微差异或冲突，请用谨慎措辞综合，不要忽略冲突。
+4. 必须忠于给定内容，不要添加没有依据的信息。
+5. 如果是 insight，不要编造任务状态、下一步行动或截止时间。
+6. 如果是 task，task_status 只能是 active、blocked、paused、stale；task_source 固定为 inferred_from_observation。
+7. 只返回 JSON，不要 markdown，不要额外解释。
+
+只返回合法 JSON。格式如下：
 {{
-  "summary": "合并后可用于未来决策的 consolidated observation",
-  "observation_type": "preference/workflow/strategy/failure/success/change/constraint/context",
+  "category": "{current_category}",
+  "summary": "合并后可用于未来决策的 observation",
   "keywords": ["关键词1", "关键词2"],
-  "confidence": 0.0
+  "confidence": 0.0,
+  "metadata": {{
+    "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context",
+    "task_status": "active | blocked | paused | stale",
+    "task_source": "inferred_from_observation",
+    "evidence": ["简短证据短语1", "简短证据短语2"],
+    "next_action": "可选，只有明确时填写"
+  }}
 }}"""
 
 # ── Reflect prompt template ───────────────────────────────────────────────
@@ -917,7 +1003,7 @@ class MemoryNodeManager:
                 entity_name=entity_name,
                 topic_label=topic_label,
                 existing_summary=existing_observation.get("summary", ""),
-                existing_type=existing_observation.get("observation_type", "context"),
+                existing_type=existing_observation.get("observation_type", "insight"),
                 existing_keywords=existing_observation.get("keywords", ""),
                 existing_confidence=existing_observation.get("confidence", 0.7),
                 source_facts="\n".join(fact_lines),
@@ -937,13 +1023,46 @@ class MemoryNodeManager:
         summary = str(data.get("summary", "")).strip()
         if not summary:
             return None
-        observation_type = str(data.get("observation_type", "context") or "context").strip().lower()
-        allowed_types = {
+        category = str(data.get("category", "") or "").strip().lower()
+        allowed_categories = {"insight", "task"}
+        allowed_insight_types = {
             "preference", "workflow", "strategy", "failure",
             "success", "change", "constraint", "context",
         }
-        if observation_type not in allowed_types:
-            observation_type = "context"
+        if category not in allowed_categories:
+            category = "insight"
+        metadata = data.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata = dict(metadata)
+        if category == "task":
+            task_status = str(metadata.get("task_status", "active") or "active").strip().lower()
+            if task_status not in {"active", "blocked", "paused", "stale"}:
+                task_status = "active"
+            metadata = {
+                key: value
+                for key, value in metadata.items()
+                if key in {"task_status", "task_source", "evidence", "next_action"}
+            }
+            metadata["task_status"] = task_status
+            metadata["task_source"] = "inferred_from_observation"
+            evidence = metadata.get("evidence", [])
+            if isinstance(evidence, str):
+                evidence = [evidence]
+            if not isinstance(evidence, list):
+                evidence = []
+            metadata["evidence"] = [
+                str(item).strip()
+                for item in evidence
+                if str(item or "").strip()
+            ][:5]
+        else:
+            insight_type = str(
+                metadata.get("insight_type", "context") or "context"
+            ).strip().lower()
+            if insight_type not in allowed_insight_types:
+                insight_type = "context"
+            metadata = {"insight_type": insight_type}
         keywords = self._normalize_keywords(data.get("keywords", []))
         try:
             confidence = float(data.get("confidence", 0.7) or 0.7)
@@ -951,9 +1070,10 @@ class MemoryNodeManager:
             confidence = 0.7
         return {
             "summary": summary,
-            "observation_type": observation_type,
+            "observation_type": category,
             "keywords": keywords,
             "confidence": max(0.0, min(1.0, confidence)),
+            "metadata": metadata,
         }
 
     def _maybe_consolidate_observations(
@@ -1001,17 +1121,33 @@ class MemoryNodeManager:
                     )
                     if not observation:
                         continue
-                    self._db.memory_upsert_observation(
-                        entity_id=entity_id,
-                        topic_key=topic_key,
-                        topic_label=topic_label,
-                        observation_type=observation["observation_type"],
-                        summary=observation["summary"],
-                        keywords=observation["keywords"] or topic_terms,
-                        source_node_ids=source_ids,
-                        confidence=observation["confidence"],
-                        metadata={"source": "memory_node_manager"},
-                    )
+                    observation_metadata = {
+                        "source": "memory_node_manager",
+                        **(observation.get("metadata") or {}),
+                    }
+                    if existing_observation is not None:
+                        self._db.memory_replace_observation_group(
+                            keep_observation_id=int(existing_observation["id"]),
+                            remove_observation_ids=[],
+                            observation_type=observation["observation_type"],
+                            summary=observation["summary"],
+                            keywords=observation["keywords"] or topic_terms,
+                            confidence=observation["confidence"],
+                            source_node_ids=source_ids,
+                            metadata=observation_metadata,
+                        )
+                    else:
+                        self._db.memory_upsert_observation(
+                            entity_id=entity_id,
+                            topic_key=topic_key,
+                            topic_label=topic_label,
+                            observation_type=observation["observation_type"],
+                            summary=observation["summary"],
+                            keywords=observation["keywords"] or topic_terms,
+                            source_node_ids=source_ids,
+                            confidence=observation["confidence"],
+                            metadata=observation_metadata,
+                        )
                 except Exception as exc:
                     logger.debug(
                         "Failed to consolidate observation for node %d entity %s topic %s: %s",
@@ -1276,7 +1412,7 @@ class MemoryNodeManager:
             if not summary:
                 continue
             observation_lines.append(
-                f"{index}. [{observation.get('observation_type', 'context')}; "
+                f"{index}. [{observation.get('observation_type', 'insight')}; "
                 f"confidence={observation.get('confidence', 0.0)}] {summary}"
             )
         if not observation_lines:
@@ -1289,9 +1425,14 @@ class MemoryNodeManager:
                 continue
             source_lines.append(f"{index}. [{node.get('fact_type', 'world')}] {summary}")
 
+        current_category = str(group.get("observation_type") or "insight").strip().lower()
+        if current_category not in {"insight", "task"}:
+            current_category = "insight"
+
         prompt = OBSERVATION_MERGE_PROMPT.format(
             entity_name=group.get("entity_name", ""),
             topic_label=group.get("topic_label", group.get("topic_key", "")),
+            current_category=current_category,
             observations="\n".join(observation_lines),
             source_facts="\n".join(source_lines) or "(no supporting facts found)",
         )
@@ -1304,13 +1445,41 @@ class MemoryNodeManager:
         summary = str(data.get("summary", "")).strip()
         if not summary:
             return False
-        observation_type = str(data.get("observation_type", "context") or "context").strip().lower()
-        allowed_types = {
-            "preference", "workflow", "strategy", "failure",
-            "success", "change", "constraint", "context",
-        }
-        if observation_type not in allowed_types:
-            observation_type = "context"
+        category = current_category
+        metadata = data.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata = dict(metadata)
+        if category == "task":
+            task_status = str(metadata.get("task_status", "active") or "active").strip().lower()
+            if task_status not in {"active", "blocked", "paused", "stale"}:
+                task_status = "active"
+            metadata = {
+                key: value
+                for key, value in metadata.items()
+                if key in {"task_status", "task_source", "evidence", "next_action"}
+            }
+            metadata["task_status"] = task_status
+            metadata["task_source"] = "inferred_from_observation"
+            evidence = metadata.get("evidence", [])
+            if isinstance(evidence, str):
+                evidence = [evidence]
+            if not isinstance(evidence, list):
+                evidence = []
+            metadata["evidence"] = [
+                str(item).strip()
+                for item in evidence
+                if str(item or "").strip()
+            ][:5]
+        else:
+            allowed_insight_types = {
+                "preference", "workflow", "strategy", "failure",
+                "success", "change", "constraint", "context",
+            }
+            insight_type = str(metadata.get("insight_type", "context") or "context").strip().lower()
+            if insight_type not in allowed_insight_types:
+                insight_type = "context"
+            metadata = {"insight_type": insight_type}
         keywords = self._normalize_keywords(data.get("keywords", []))
         if not keywords:
             for observation in observations:
@@ -1329,12 +1498,15 @@ class MemoryNodeManager:
         self._db.memory_replace_observation_group(
             keep_observation_id=int(keep_observation["id"]),
             remove_observation_ids=remove_ids,
-            observation_type=observation_type,
+            observation_type=category,
             summary=summary,
             keywords=keywords,
             confidence=max(0.0, min(1.0, confidence)),
             source_node_ids=source_ids,
-            metadata={"source": "memory_reflect_observation_merge"},
+            metadata={
+                "source": "memory_reflect_observation_merge",
+                **metadata,
+            },
         )
         return True
 
