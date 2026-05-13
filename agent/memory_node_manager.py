@@ -875,30 +875,23 @@ class MemoryNodeManager:
                 logger.debug("Failed to link retain entity %r to node %d: %s", name, node_id, exc)
         return linked_entities
 
-    @classmethod
-    def _topic_buckets_for_fact(cls, topics: List[str], entity_name: str) -> List[Tuple[str, str, List[str]]]:
-        entity_text = str(entity_name or "").strip().lower()
-        buckets: List[Tuple[str, str, List[str]]] = []
-        seen = set()
-        for topic in topics:
-            text = str(topic or "").strip()
-            if not text:
-                continue
-            low = text.lower()
-            if low == entity_text or low in entity_text or entity_text in low:
-                continue
-            if low in seen:
-                continue
-            seen.add(low)
-            topic_key = cls._topic_key([text])
-            buckets.append((topic_key, text, [text]))
-        return buckets or [("general", "general", ["general"])]
-
     @staticmethod
-    def _topic_key(topic_terms: List[str]) -> str:
-        text = "-".join(str(term or "").strip().lower() for term in topic_terms if str(term or "").strip())
+    def _topic_key(topic: Any) -> str:
+        text = str(topic or "").strip().lower()
         text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "-", text).strip("-")
         return text or "general"
+
+    @classmethod
+    def _topic_keys(cls, topics: List[str]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for topic in topics:
+            topic_key = cls._topic_key(topic)
+            if not topic_key or topic_key in seen:
+                continue
+            seen.add(topic_key)
+            out.append(topic_key)
+        return out or ["general"]
 
     def _generate_observation(
         self,
@@ -975,11 +968,13 @@ class MemoryNodeManager:
         if not self._db or not linked_entities:
             return
         for entity_id, entity_name in linked_entities:
-            for topic_key, topic_label, topic_terms in self._topic_buckets_for_fact(topics, entity_name):
+            for topic_key in topics:
+                topic_label = topic_key
+                topic_terms = [topic_key]
                 try:
                     source_nodes = self._db.memory_observation_source_nodes(
                         entity_id=entity_id,
-                        topic_terms=topic_terms,
+                        topic_key=topic_key,
                         limit=12,
                     )
                     source_ids = [int(node["id"]) for node in source_nodes]
@@ -1174,7 +1169,8 @@ class MemoryNodeManager:
                 if not summary:
                     continue
                 keywords = self._normalize_keywords(fact.get("keywords", []))
-                topics = self._normalize_keywords(fact.get("topic", keywords))
+                raw_topics = self._normalize_keywords(fact.get("topic", keywords))
+                topics = self._topic_keys(raw_topics)
 
                 # ── Step 2: Generate embedding (SYNC) ──
                 embedding = self._embedding_client.embed_text(summary)
@@ -1359,7 +1355,15 @@ class MemoryNodeManager:
                 )
         return merged
 
-    def reflect(self, *, dry_run: bool = True, limit: int = 100) -> Dict[str, Any]:
+    def reflect(
+        self,
+        *,
+        dry_run: bool = True,
+        limit: int = 100,
+        fact_half_life_days: Optional[float] = None,
+        experience_half_life_days: Optional[float] = None,
+        observation_decay_threshold: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """Run memory reflection maintenance.
 
         First scope: entity reflection. It identifies duplicate entity
@@ -1386,6 +1390,22 @@ class MemoryNodeManager:
             report["observation_groups_merged"] = self._merge_duplicate_observations_for_entities(
                 list(dict.fromkeys(canonical_ids))
             )
+        reflect_now = datetime.now().astimezone()
+        node_decay_report = self._db.memory_reflect_node_decay(
+            dry_run=dry_run,
+            fact_half_life_days=fact_half_life_days,
+            experience_half_life_days=experience_half_life_days,
+            now=reflect_now,
+        )
+        decay_report = self._db.memory_reflect_observation_decay(
+            dry_run=dry_run,
+            threshold=observation_decay_threshold,
+            now=reflect_now,
+        )
+        report["node_decay"] = node_decay_report
+        report["observation_decay"] = decay_report
+        report["observations_inactivated"] = decay_report.get("inactivated", 0)
+        report["observations_would_inactivate"] = decay_report.get("would_inactivate", 0)
         return report
 
     # ── Recall relevant memory nodes ──────────────────────────────────────

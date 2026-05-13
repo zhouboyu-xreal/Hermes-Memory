@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 import numpy as np
 import pytest
 
@@ -156,7 +157,7 @@ def test_store_turn_falls_back_to_summary_when_retain_json_is_bad(db):
     ).fetchone()
     assert row["summary"] == summary_payload["summary"]
     assert row["keywords"] == "PostgreSQL project"
-    assert row["topic"] == "PostgreSQL project"
+    assert row["topic"] == "postgresql project"
     assert "fact_kind:conversation_summary" in json.loads(row["tags"])
     assert "run_entity_extraction" not in mgr.async_calls[0]
 
@@ -486,6 +487,40 @@ def test_memory_search_pushes_time_candidate_ids_to_vector_channel(db, monkeypat
     assert [node["id"] for node in nodes] == [in_range]
 
 
+def test_memory_search_reranks_final_candidates_by_decay_score(db, monkeypatch):
+    stale = _add_memory_node(
+        db,
+        time_key="2025-01-01 10:00:00",
+        summary="Alice once preferred email alerts.",
+        keywords=["Alice", "alerts"],
+    )
+    fresh = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice now prefers Slack alerts.",
+        keywords=["Alice", "alerts"],
+    )
+    db._conn.execute(
+        "UPDATE memory_nodes SET decay_score = CASE id WHEN ? THEN 0.0 WHEN ? THEN 1.0 ELSE decay_score END",
+        (stale, fresh),
+    )
+    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        db,
+        "_memory_search_keyword",
+        lambda *args, **kwargs: {stale: 0.01, fresh: 0.02},
+    )
+
+    nodes = db.memory_search(
+        "Alice alerts",
+        np.ones((1, 1536), dtype=np.float32),
+        top_k=2,
+    )
+
+    assert [node["id"] for node in nodes] == [fresh, stale]
+    assert nodes[0]["decay_score"] == 1.0
+
+
 def test_summarize_turn_returns_entities(db):
     mgr = _NoAsyncMemoryNodeManager(
         db,
@@ -728,6 +763,156 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
     assert source_ids == {first_node, second_node}
 
 
+def test_reflect_observation_decay_uses_fact_type_half_lives(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    world_node = _add_memory_node(
+        db,
+        time_key="2026-01-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+        fact_type="world",
+    )
+    experience_node = _add_memory_node(
+        db,
+        time_key="2026-01-01 11:00:00",
+        summary="Hermes previously routed Alice's alerts through Slack.",
+        keywords=["Alice", "Slack"],
+        fact_type="experience",
+    )
+    world_observation = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="world-alerts",
+        topic_label="world alerts",
+        observation_type="preference",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Slack", "alerts"],
+        source_node_ids=[world_node],
+    )
+    experience_observation = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="experience-alerts",
+        topic_label="experience alerts",
+        observation_type="context",
+        summary="Hermes has prior Slack alert routing experience for Alice.",
+        keywords=["Slack", "alerts"],
+        source_node_ids=[experience_node],
+    )
+
+    node_report = db.memory_reflect_node_decay(
+        dry_run=False,
+        fact_half_life_days=365,
+        experience_half_life_days=30,
+        now=datetime(2026, 4, 1, 0, 0, 0),
+    )
+    report = db.memory_reflect_observation_decay(
+        dry_run=False,
+        threshold=0.3,
+        now=datetime(2026, 4, 1, 0, 0, 0),
+    )
+
+    rows = {
+        row["id"]: row["status"]
+        for row in db._conn.execute(
+            "SELECT id, status FROM memory_observations WHERE id IN (?, ?)",
+            (world_observation, experience_observation),
+        ).fetchall()
+    }
+    node_scores = {
+        row["id"]: row["decay_score"]
+        for row in db._conn.execute(
+            "SELECT id, decay_score FROM memory_nodes WHERE id IN (?, ?)",
+            (world_node, experience_node),
+        ).fetchall()
+    }
+    assert node_report["updated"] == 2
+    assert node_scores[world_node] > node_scores[experience_node]
+    assert report["inactivated"] == 1
+    assert rows[world_observation] == "active"
+    assert rows[experience_observation] == "inactive"
+
+
+def test_memory_search_observations_ignores_inactive_observations(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    active_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice currently prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+    )
+    stale_node = _add_memory_node(
+        db,
+        time_key="2000-01-01 10:00:00",
+        summary="Alice once preferred email alerts.",
+        keywords=["Alice", "email"],
+    )
+    active_observation = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="slack-alerts",
+        topic_label="Slack alerts",
+        observation_type="preference",
+        summary="Alice currently prefers Slack for urgent alerts.",
+        keywords=["Slack", "alerts"],
+        source_node_ids=[active_node],
+    )
+    inactive_observation = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="email-alerts",
+        topic_label="email alerts",
+        observation_type="preference",
+        summary="Alice once preferred email alerts.",
+        keywords=["email", "alerts"],
+        source_node_ids=[stale_node],
+    )
+    db._conn.execute(
+        "UPDATE memory_observations SET status = 'inactive' WHERE id = ?",
+        (inactive_observation,),
+    )
+
+    results = db.memory_search_observations(["Alice", "alerts"], top_k=5)
+
+    assert [item["id"] for item in results] == [active_observation]
+
+
+def test_memory_node_manager_reflect_inactivates_stale_observations(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    old_node = _add_memory_node(
+        db,
+        time_key="2000-01-01 10:00:00",
+        summary="Alice used email alerts long ago.",
+        keywords=["Alice", "email"],
+        fact_type="experience",
+    )
+    observation_id = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="email-alerts",
+        topic_label="email alerts",
+        observation_type="context",
+        summary="Alice used email alerts long ago.",
+        keywords=["email", "alerts"],
+        source_node_ids=[old_node],
+    )
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    report = mgr.reflect(
+        dry_run=False,
+        experience_half_life_days=7,
+        observation_decay_threshold=0.9,
+    )
+
+    row = db._conn.execute(
+        "SELECT mo.status, mn.decay_score "
+        "FROM memory_observations mo "
+        "JOIN memory_observation_sources mos ON mos.observation_id = mo.id "
+        "JOIN memory_nodes mn ON mn.id = mos.node_id "
+        "WHERE mo.id = ?",
+        (observation_id,),
+    ).fetchone()
+    assert report["node_decay"]["updated"] == 1
+    assert report["observations_inactivated"] == 1
+    assert row["status"] == "inactive"
+    assert row["decay_score"] < 0.9
+
+
 def test_recall_formats_world_and_experience_sections(db, monkeypatch):
     _add_memory_node(
         db,
@@ -815,6 +1000,34 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
     assert len(sources) == 3
 
 
+def test_observation_source_nodes_match_topic_key_exactly(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    outdoor = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice wants outdoor activities.",
+        keywords=["户外活动"],
+    )
+    low_intensity = db.memory_add_node(
+        time_key="2026-05-01 11:00:00",
+        summary="Alice wants low-intensity outdoor activities.",
+        keywords=["低强度户外活动"],
+        topic=["低强度户外活动"],
+        original_dialog="{}",
+        query_embedding=np.ones((1, 1536), dtype=np.float32),
+    )
+    db.entity_link_node(outdoor, alice)
+    db.entity_link_node(low_intensity, alice)
+
+    source_nodes = db.memory_observation_source_nodes(
+        entity_id=alice,
+        topic_key="户外活动",
+        limit=12,
+    )
+
+    assert [node["id"] for node in source_nodes] == [outdoor]
+
+
 def test_recall_includes_observations_and_supporting_facts(db, monkeypatch):
     alice = db.entity_add_entity("Alice", "PERSON")
     source_ids = []
@@ -890,7 +1103,7 @@ def test_observation_consolidation_waits_for_incremental_sources(db):
         db.entity_link_node(node_id, alice)
         mgr._maybe_consolidate_observations(
             node_id=node_id,
-            keywords=["Slack alerts"],
+            topics=["slack-alerts"],
             linked_entities=[(alice, "Alice")],
         )
         return node_id
@@ -917,13 +1130,10 @@ def test_observation_consolidation_waits_for_incremental_sources(db):
     assert "Alice Slack alert fact 3." not in update_prompt
 
 
-def test_topic_list_creates_separate_observation_buckets(db):
-    buckets = MemoryNodeManager._topic_buckets_for_fact(["Slack", "alerts"], "Alice")
+def test_topic_list_creates_standardized_topic_keys(db):
+    topic_keys = MemoryNodeManager._topic_keys(["Slack", "alerts"])
 
-    assert buckets == [
-        ("slack", "Slack", ["Slack"]),
-        ("alerts", "alerts", ["alerts"]),
-    ]
+    assert topic_keys == ["slack", "alerts"]
 
 
 def test_memory_relation_candidates_use_entity_keyword_and_temporal_signals(db, monkeypatch):

@@ -49,7 +49,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 def _get_embedding_dim_from_config() -> int:
     """Read embedding dimension from config.yaml, falling back to 1536."""
     config_path = get_hermes_home() / "config.yaml"
@@ -191,7 +191,10 @@ CREATE TABLE IF NOT EXISTS memory_nodes (
     keywords TEXT NOT NULL,
     topic TEXT NOT NULL,
     fact_type TEXT NOT NULL DEFAULT 'world',
-    original_dialog TEXT
+    original_dialog TEXT,
+    decay_score REAL DEFAULT 1.0,
+    decay_updated_at TEXT,
+    decay_half_life_days REAL
 );
 """
 
@@ -364,6 +367,10 @@ class SessionDB:
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 20
     _MEMORY_VECTOR_FILTER_BRUTE_FORCE_LIMIT = 5000
+    _MEMORY_OBSERVATION_FACT_HALF_LIFE_DAYS = 365.0
+    _MEMORY_OBSERVATION_EXPERIENCE_HALF_LIFE_DAYS = 90.0
+    _MEMORY_OBSERVATION_DECAY_THRESHOLD = 0.25
+    _MEMORY_RECALL_DECAY_FLOOR = 0.25
 
     def __init__(self, db_path: Path = None):
         self.db_path = db_path or DEFAULT_DB_PATH
@@ -782,6 +789,18 @@ class SessionDB:
             cursor.execute("ALTER TABLE memory_nodes ADD COLUMN original_dialog TEXT")
         except sqlite3.OperationalError:
             pass  # Column already exists
+
+        for col_name, col_type in {
+            "decay_score": "REAL DEFAULT 1.0",
+            "decay_updated_at": "TEXT",
+            "decay_half_life_days": "REAL",
+        }.items():
+            try:
+                cursor.execute(
+                    f"ALTER TABLE memory_nodes ADD COLUMN {col_name} {col_type}"
+                )
+            except sqlite3.OperationalError:
+                pass
 
         # Backfill fact_type from legacy tags for existing retain facts.
         try:
@@ -2186,7 +2205,8 @@ class SessionDB:
         """Fetch a single memory node with tags and relations."""
         cursor = self._conn.execute(
             """SELECT id, time_key, summary, keywords, topic, original_dialog,
-                      tags, fact_type
+                      tags, fact_type, decay_score, decay_updated_at,
+                      decay_half_life_days
                FROM memory_nodes
                WHERE id = ?""",
             (node_id,),
@@ -2215,6 +2235,9 @@ class SessionDB:
             "original_dialog": r[5],
             "tags": tags,
             "fact_type": fact_type,
+            "decay_score": float(r[8]) if r[8] is not None else 1.0,
+            "decay_updated_at": r[9],
+            "decay_half_life_days": r[10],
             "node_relations": node_relations,
         }
 
@@ -2574,6 +2597,19 @@ class SessionDB:
         rrf_k: int = 60,
     ) -> List[int]:
         """Reciprocal Rank Fusion over multiple ranked retrieval channels."""
+        fused, first_seen = self._memory_rrf_scores(rankings, rrf_k=rrf_k)
+        return sorted(
+            fused,
+            key=lambda node_id: (-fused[node_id], first_seen.get(node_id, 0)),
+        )
+
+    def _memory_rrf_scores(
+        self,
+        rankings: List[Tuple[List[int], float]],
+        *,
+        rrf_k: int = 60,
+    ) -> Tuple[Dict[int, float], Dict[int, int]]:
+        """Return raw Reciprocal Rank Fusion scores plus stable tie order."""
         fused: Dict[int, float] = {}
         first_seen: Dict[int, int] = {}
         order = 0
@@ -2583,10 +2619,43 @@ class SessionDB:
                     first_seen[node_id] = order
                     order += 1
                 fused[node_id] = fused.get(node_id, 0.0) + weight / (rrf_k + rank)
-        return sorted(
-            fused,
-            key=lambda node_id: (-fused[node_id], first_seen.get(node_id, 0)),
-        )
+        return fused, first_seen
+
+    def _memory_decay_rerank(
+        self,
+        ranked_ids: List[int],
+        rrf_scores: Dict[int, float],
+        first_seen: Dict[int, int],
+        *,
+        limit: int,
+    ) -> List[int]:
+        """Apply persisted node recency decay to final recall candidates."""
+        candidate_ids = ranked_ids[:max(limit, 1)]
+        if not candidate_ids:
+            return []
+        placeholders = ",".join("?" for _ in candidate_ids)
+        rows = self._conn.execute(
+            f"SELECT id, decay_score FROM memory_nodes WHERE id IN ({placeholders})",
+            candidate_ids,
+        ).fetchall()
+        decay_by_id: Dict[int, float] = {}
+        for row in rows:
+            try:
+                decay = float(row["decay_score"] if row["decay_score"] is not None else 1.0)
+            except (TypeError, ValueError):
+                decay = 1.0
+            decay_by_id[int(row["id"])] = max(0.0, min(1.0, decay))
+
+        floor = max(0.0, min(1.0, self._MEMORY_RECALL_DECAY_FLOOR))
+        scored: List[Tuple[float, int, int]] = []
+        for fallback_rank, node_id in enumerate(candidate_ids):
+            base_score = rrf_scores.get(node_id, 1.0 / (60 + fallback_rank + 1))
+            decay = decay_by_id.get(node_id, 1.0)
+            recency_factor = floor + ((1.0 - floor) * decay)
+            adjusted = base_score * recency_factor
+            scored.append((adjusted, first_seen.get(node_id, fallback_rank), node_id))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [node_id for _, _, node_id in scored]
 
     def _memory_filter_ranked_ids(
         self,
@@ -3152,7 +3221,11 @@ class SessionDB:
         if graph_ranking:
             rankings.append((graph_ranking, 0.7))
 
-        ranked_ids = self._memory_rrf(rankings) if rankings else []
+        rrf_scores, first_seen = self._memory_rrf_scores(rankings) if rankings else ({}, {})
+        ranked_ids = sorted(
+            rrf_scores,
+            key=lambda node_id: (-rrf_scores[node_id], first_seen.get(node_id, 0)),
+        ) if rrf_scores else []
 
         # Time-filtered recall should still return memories in the requested
         # interval even when semantic/keyword channels are sparse.
@@ -3165,6 +3238,13 @@ class SessionDB:
                 existing.add(node_id)
                 if len(ranked_ids) >= top_k:
                     break
+
+        ranked_ids = self._memory_decay_rerank(
+            ranked_ids,
+            rrf_scores,
+            first_seen,
+            limit=max(top_k * 3, top_k),
+        )
 
         nodes: List[Dict[str, Any]] = []
         for node_id in ranked_ids[:top_k]:
@@ -3742,13 +3822,37 @@ class SessionDB:
         except ValueError:
             return None
 
+    @staticmethod
+    def _memory_decay_score(
+        memory_time: Optional[datetime],
+        *,
+        now: datetime,
+        half_life_days: float,
+    ) -> float:
+        """Return a query-time recency score using half-life decay."""
+        if memory_time is None:
+            return 1.0
+        if memory_time.tzinfo is not None and now.tzinfo is None:
+            memory_time = memory_time.replace(tzinfo=None)
+        elif memory_time.tzinfo is None and now.tzinfo is not None:
+            now = now.replace(tzinfo=None)
+        age_days = max(0.0, (now - memory_time).total_seconds() / 86400.0)
+        half_life = max(1.0, float(half_life_days or 1.0))
+        return max(0.0, min(1.0, math.exp(-math.log(2.0) * age_days / half_life)))
+
+    @staticmethod
+    def _memory_topic_key(topic: Any) -> str:
+        text = str(topic or "").strip().lower()
+        text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "-", text).strip("-")
+        return text or "general"
+
     # ── Consolidated observations ───────────────────────────────────────
 
     def memory_observation_source_nodes(
         self,
         *,
         entity_id: int,
-        topic_terms: List[str],
+        topic_key: str,
         limit: int = 12,
     ) -> List[Dict[str, Any]]:
         """Return fact nodes for an entity/topic bucket."""
@@ -3761,11 +3865,17 @@ class SessionDB:
             "LIMIT ?",
             (entity_id, max(limit * 4, limit)),
         ).fetchall()
-        terms = [str(term or "").strip().lower() for term in topic_terms if str(term or "").strip()]
+        target_key = self._memory_topic_key(topic_key)
         out: List[Dict[str, Any]] = []
         for row in rows:
-            haystack = f"{row['topic']}".lower()
-            if terms and not any(term in haystack for term in terms):
+            topic_text = str(row["topic"] or "")
+            stored_keys = {
+                self._memory_topic_key(topic)
+                for topic in topic_text.split()
+                if str(topic or "").strip()
+            }
+            stored_keys.add(self._memory_topic_key(topic_text))
+            if target_key not in stored_keys:
                 continue
             out.append(dict(row))
             if len(out) >= limit:
@@ -4072,6 +4182,206 @@ class SessionDB:
                 "source_nodes": [dict(row) for row in source_rows],
             })
         return groups
+
+    def memory_reflect_node_decay(
+        self,
+        *,
+        dry_run: bool = True,
+        fact_half_life_days: Optional[float] = None,
+        experience_half_life_days: Optional[float] = None,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Recompute persisted recency decay scores for all memory nodes."""
+        fact_half_life = float(
+            fact_half_life_days or self._MEMORY_OBSERVATION_FACT_HALF_LIFE_DAYS
+        )
+        experience_half_life = float(
+            experience_half_life_days or self._MEMORY_OBSERVATION_EXPERIENCE_HALF_LIFE_DAYS
+        )
+        now_dt = now or datetime.now().astimezone()
+        evaluated_at = now_dt.isoformat()
+        rows = self._conn.execute(
+            "SELECT id, time_key, fact_type FROM memory_nodes "
+            "WHERE fact_type IN ('world', 'experience') "
+            "ORDER BY time_key DESC, id DESC"
+        ).fetchall()
+
+        nodes: List[Dict[str, Any]] = []
+        for row in rows:
+            fact_type = self._normalize_memory_fact_type(row["fact_type"])
+            half_life = experience_half_life if fact_type == "experience" else fact_half_life
+            score = self._memory_decay_score(
+                self._parse_memory_time_key(row["time_key"]),
+                now=now_dt,
+                half_life_days=half_life,
+            )
+            nodes.append({
+                "id": int(row["id"]),
+                "fact_type": fact_type,
+                "score": score,
+                "half_life_days": half_life,
+            })
+
+        if not dry_run and nodes:
+            def _do(conn):
+                for item in nodes:
+                    conn.execute(
+                        "UPDATE memory_nodes SET decay_score = ?, decay_updated_at = ?, "
+                        "decay_half_life_days = ? WHERE id = ?",
+                        (
+                            item["score"],
+                            evaluated_at,
+                            item["half_life_days"],
+                            item["id"],
+                        ),
+                    )
+
+            self._execute_write(_do)
+
+        return {
+            "dry_run": dry_run,
+            "evaluated": len(nodes),
+            "updated": len(nodes) if not dry_run else 0,
+            "fact_half_life_days": fact_half_life,
+            "experience_half_life_days": experience_half_life,
+            "evaluated_at": evaluated_at,
+            "nodes": nodes,
+        }
+
+    def memory_reflect_observation_decay(
+        self,
+        *,
+        dry_run: bool = True,
+        threshold: Optional[float] = None,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate active observations using persisted source-node decay scores.
+
+        The reflect step should call ``memory_reflect_node_decay`` first so the
+        source scores represent the current maintenance run.  The aggregate keeps a
+        small "fresh support" component so one recent supporting source can keep
+        an observation alive even when it also has many older sources.
+        """
+        decay_threshold = max(
+            0.0,
+            min(1.0, float(threshold if threshold is not None else self._MEMORY_OBSERVATION_DECAY_THRESHOLD)),
+        )
+        now_dt = now or datetime.now().astimezone()
+        rows = self._conn.execute(
+            "SELECT mo.id AS observation_id, mo.metadata AS observation_metadata, "
+            "mos.confidence AS source_confidence, mn.id AS node_id, mn.fact_type, "
+            "mn.decay_score, mn.decay_updated_at, mn.decay_half_life_days "
+            "FROM memory_observations mo "
+            "LEFT JOIN memory_observation_sources mos ON mos.observation_id = mo.id "
+            "LEFT JOIN memory_nodes mn ON mn.id = mos.node_id "
+            "WHERE mo.status = 'active' "
+            "ORDER BY mo.id, mn.time_key DESC, mn.id DESC"
+        ).fetchall()
+
+        grouped: Dict[int, Dict[str, Any]] = {}
+        for row in rows:
+            observation_id = int(row["observation_id"])
+            group = grouped.setdefault(
+                observation_id,
+                {
+                    "id": observation_id,
+                    "metadata": row["observation_metadata"],
+                    "sources": [],
+                },
+            )
+            if row["node_id"] is None:
+                continue
+            fact_type = self._normalize_memory_fact_type(row["fact_type"])
+            try:
+                score = float(row["decay_score"] if row["decay_score"] is not None else 1.0)
+            except (TypeError, ValueError):
+                score = 1.0
+            try:
+                confidence = float(row["source_confidence"] or 1.0)
+            except (TypeError, ValueError):
+                confidence = 1.0
+            group["sources"].append({
+                "node_id": int(row["node_id"]),
+                "fact_type": fact_type,
+                "score": score,
+                "confidence": max(0.0, confidence),
+                "decay_updated_at": row["decay_updated_at"],
+                "decay_half_life_days": row["decay_half_life_days"],
+            })
+
+        evaluated: List[Dict[str, Any]] = []
+        for observation_id, group in grouped.items():
+            sources = group["sources"]
+            if not sources:
+                average_score = 0.0
+                max_score = 0.0
+                combined_score = 0.0
+            else:
+                weights = [
+                    source["confidence"] if source["confidence"] > 0 else 1.0
+                    for source in sources
+                ]
+                total_weight = sum(weights) or float(len(sources))
+                average_score = sum(
+                    source["score"] * weight
+                    for source, weight in zip(sources, weights)
+                ) / total_weight
+                max_score = max(source["score"] for source in sources)
+                combined_score = (0.70 * average_score) + (0.30 * max_score)
+            action = "deactivate" if combined_score < decay_threshold else "keep"
+            evaluated.append({
+                "id": observation_id,
+                "action": action,
+                "score": combined_score,
+                "average_score": average_score,
+                "max_score": max_score,
+                "source_count": len(sources),
+            })
+
+        to_deactivate = [item for item in evaluated if item["action"] == "deactivate"]
+
+        if not dry_run and evaluated:
+            evaluated_at = now_dt.isoformat()
+
+            def _do(conn):
+                for item in evaluated:
+                    observation_id = int(item["id"])
+                    metadata_row = grouped[observation_id].get("metadata")
+                    try:
+                        metadata = json.loads(metadata_row or "{}")
+                    except json.JSONDecodeError:
+                        metadata = {}
+                    metadata["decay"] = {
+                        "score": item["score"],
+                        "average_score": item["average_score"],
+                        "max_score": item["max_score"],
+                        "threshold": decay_threshold,
+                        "source_count": item["source_count"],
+                        "evaluated_at": evaluated_at,
+                    }
+                    metadata_str = json.dumps(metadata, ensure_ascii=False)
+                    if item["action"] == "deactivate":
+                        conn.execute(
+                            "UPDATE memory_observations SET status = 'inactive', metadata = ?, updated_at = ? "
+                            "WHERE id = ?",
+                            (metadata_str, evaluated_at, observation_id),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE memory_observations SET metadata = ? WHERE id = ?",
+                            (metadata_str, observation_id),
+                        )
+
+            self._execute_write(_do)
+
+        return {
+            "dry_run": dry_run,
+            "evaluated": len(evaluated),
+            "inactivated": len(to_deactivate) if not dry_run else 0,
+            "would_inactivate": len(to_deactivate),
+            "threshold": decay_threshold,
+            "observations": evaluated,
+        }
 
     def memory_replace_observation_group(
         self,
