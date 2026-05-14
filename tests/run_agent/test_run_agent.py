@@ -2190,6 +2190,48 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_memory_node_reflect_runs_every_five_turns(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("hermes_logging.setup_logging"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent.client = MagicMock()
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Final answer",
+            finish_reason="stop",
+        )
+        memory_node_manager = MagicMock()
+        memory_node_manager.recall.return_value = ""
+        memory_node_manager.store_turn.return_value = True
+        memory_node_manager.reflect.return_value = {"merged": 0}
+        agent._memory_node_manager = memory_node_manager
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            for idx in range(4):
+                result = agent.run_conversation(f"hello {idx}")
+                assert result["final_response"] == "Final answer"
+            assert memory_node_manager.reflect.call_count == 0
+
+            result = agent.run_conversation("hello 4")
+
+        assert result["final_response"] == "Final answer"
+        assert memory_node_manager.store_turn.call_count == 5
+        memory_node_manager.reflect.assert_called_once_with(dry_run=False)
+
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

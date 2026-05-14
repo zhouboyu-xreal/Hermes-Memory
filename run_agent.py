@@ -2075,6 +2075,7 @@ class AIAgent:
             working_dir=os.getenv("TERMINAL_CWD") or None,
         )
         self._user_turn_count = 0
+        self._memory_node_reflect_interval = 5
 
         # Cumulative token usage for the session
         self.session_prompt_tokens = 0
@@ -2194,6 +2195,7 @@ class AIAgent:
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
+        self._memory_node_reflect_interval = getattr(self, "_memory_node_reflect_interval", 5)
 
         # Context engine reset (works for both built-in compressor and plugins)
         if hasattr(self, "context_compressor") and self.context_compressor:
@@ -13398,6 +13400,13 @@ class AIAgent:
                     )
             except Exception:
                 pass
+            try:
+                _reflect_interval = max(1, int(getattr(self, "_memory_node_reflect_interval", 5) or 5))
+                if self._user_turn_count % _reflect_interval == 0:
+                    _reflect_report = self._memory_node_manager.reflect(dry_run=False)
+                    logger.debug("MemoryNodeManager reflect report: %s", _reflect_report)
+            except Exception as exc:
+                logger.debug("MemoryNodeManager reflect skipped: %s", exc)
 
         # Background memory/skill review — runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.
