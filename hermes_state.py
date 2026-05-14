@@ -3466,44 +3466,91 @@ class SessionDB:
             return "merge"
         return "candidate"
 
-    def _entity_reflection_candidates(self, limit: int = 100) -> List[Dict[str, Any]]:
+    def _entity_reflection_candidate_for_pair(
+        self,
+        left: sqlite3.Row,
+        right: sqlite3.Row,
+    ) -> Optional[Dict[str, Any]]:
+        type_compatible, type_score = self._entity_type_compatible(left["type"], right["type"])
+        if type_score <= 0.7:
+            return None
+        name_score, reason, risk = self._entity_name_similarity(left["name"], right["name"])
+        if name_score <= 0:
+            return None
+        co_score = self._entity_cooccurrence_similarity(left["co_entities"], right["co_entities"])
+        confidence = max(0.0, min(1.0, (name_score * 0.72) + (type_score * 0.20) + (co_score * 0.08)))
+        action = self._entity_reflection_action(
+            confidence=confidence,
+            reason=reason,
+            risk=risk,
+            type_compatible=type_compatible,
+        )
+        if action == "skip":
+            return None
+        canonical, duplicate = self._entity_choose_canonical(left, right)
+        return {
+            "canonical_id": int(canonical["id"]),
+            "canonical_name": canonical["name"],
+            "duplicate_id": int(duplicate["id"]),
+            "duplicate_name": duplicate["name"],
+            "type_compatible": type_compatible,
+            "type_score": round(type_score, 4),
+            "name_score": round(name_score, 4),
+            "co_entities_score": round(co_score, 4),
+            "confidence": round(confidence, 4),
+            "reason": reason,
+            "risk": risk,
+            "action": action,
+        }
+
+    def _entity_reflection_candidates(
+        self,
+        limit: int = 100,
+        anchor_entity_ids: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT id, name, type, co_entities FROM entity_nodes ORDER BY id"
         ).fetchall()
+        anchor_ids: Optional[set[int]] = None
+        if anchor_entity_ids is not None:
+            anchor_ids = {
+                int(entity_id)
+                for entity_id in anchor_entity_ids
+                if str(entity_id or "").strip()
+            }
+            if not anchor_ids:
+                return []
+
         candidates: List[Dict[str, Any]] = []
-        for i, left in enumerate(rows):
-            for right in rows[i + 1:]:
-                type_compatible, type_score = self._entity_type_compatible(left["type"], right["type"])
-                if type_score <= 0.7:
-                    continue
-                name_score, reason, risk = self._entity_name_similarity(left["name"], right["name"])
-                if name_score <= 0:
-                    continue
-                co_score = self._entity_cooccurrence_similarity(left["co_entities"], right["co_entities"])
-                confidence = max(0.0, min(1.0, (name_score * 0.72) + (type_score * 0.20) + (co_score * 0.08)))
-                action = self._entity_reflection_action(
-                    confidence=confidence,
-                    reason=reason,
-                    risk=risk,
-                    type_compatible=type_compatible,
-                )
-                if action == "skip":
-                    continue
-                canonical, duplicate = self._entity_choose_canonical(left, right)
-                candidates.append({
-                    "canonical_id": int(canonical["id"]),
-                    "canonical_name": canonical["name"],
-                    "duplicate_id": int(duplicate["id"]),
-                    "duplicate_name": duplicate["name"],
-                    "type_compatible": type_compatible,
-                    "type_score": round(type_score, 4),
-                    "name_score": round(name_score, 4),
-                    "co_entities_score": round(co_score, 4),
-                    "confidence": round(confidence, 4),
-                    "reason": reason,
-                    "risk": risk,
-                    "action": action,
-                })
+        if anchor_ids is None:
+            pair_iter = (
+                (left, right)
+                for i, left in enumerate(rows)
+                for right in rows[i + 1:]
+            )
+        else:
+            anchor_rows = [row for row in rows if int(row["id"]) in anchor_ids]
+            seen_pairs: set[Tuple[int, int]] = set()
+
+            def _anchored_pairs():
+                for left in anchor_rows:
+                    left_id = int(left["id"])
+                    for right in rows:
+                        right_id = int(right["id"])
+                        if left_id == right_id:
+                            continue
+                        pair_key = tuple(sorted((left_id, right_id)))
+                        if pair_key in seen_pairs:
+                            continue
+                        seen_pairs.add(pair_key)
+                        yield left, right
+
+            pair_iter = _anchored_pairs()
+
+        for left, right in pair_iter:
+            candidate = self._entity_reflection_candidate_for_pair(left, right)
+            if candidate is not None:
+                candidates.append(candidate)
         candidates.sort(key=lambda item: (-item["confidence"], item["risk"], item["canonical_id"]))
         return candidates[:limit]
 
@@ -3527,7 +3574,13 @@ class SessionDB:
             return left, right
         return (left, right) if int(left["id"]) <= int(right["id"]) else (right, left)
 
-    def memory_reflect_entities(self, *, dry_run: bool = True, limit: int = 100) -> Dict[str, Any]:
+    def memory_reflect_entities(
+        self,
+        *,
+        dry_run: bool = True,
+        limit: int = 100,
+        anchor_entity_ids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
         """Reflect on the entity graph and merge high-confidence duplicate entities.
 
         Entity merge confidence is driven by normalized name similarity, gated
@@ -3535,7 +3588,10 @@ class SessionDB:
         co-occurring entity profiles. Only low-risk normalized-name matches are
         merged automatically; other similar names are reported as candidates.
         """
-        candidates = self._entity_reflection_candidates(limit=limit)
+        candidates = self._entity_reflection_candidates(
+            limit=limit,
+            anchor_entity_ids=anchor_entity_ids,
+        )
         merged: List[Dict[str, Any]] = []
         if not dry_run:
             for candidate in candidates:
@@ -3554,6 +3610,11 @@ class SessionDB:
             "merged": len(merged),
             "merge_candidates": sum(1 for candidate in candidates if candidate["action"] == "merge"),
             "candidate_count": len(candidates),
+            "anchor_entity_count": (
+                None
+                if anchor_entity_ids is None
+                else len({int(entity_id) for entity_id in anchor_entity_ids if str(entity_id or "").strip()})
+            ),
             "rules": {
                 "auto_merge": "same/compatible type + normalized name match",
                 "candidate_only": "token subset or substring names, even with co-entity overlap",
@@ -3880,6 +3941,56 @@ class SessionDB:
             out.append(dict(row))
             if len(out) >= limit:
                 break
+        return out
+
+    def memory_unobserved_nodes_for_observation(
+        self,
+        *,
+        date_key: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return today's memory nodes that have not yet supported an observation."""
+        day = str(date_key or datetime.now().astimezone().date().isoformat())[:10]
+        rows = self._conn.execute(
+            "WITH candidate_nodes AS ("
+            "  SELECT mn.id, mn.time_key, mn.topic "
+            "  FROM memory_nodes mn "
+            "  WHERE substr(mn.time_key, 1, 10) = ? "
+            "  AND mn.fact_type IN ('world', 'experience') "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 FROM memory_observation_sources mos WHERE mos.node_id = mn.id"
+            "  ) "
+            "  ORDER BY mn.time_key ASC, mn.id ASC "
+            "  LIMIT ?"
+            ") "
+            "SELECT cn.id AS node_id, cn.time_key, cn.topic, "
+            "en.id AS entity_id, en.name AS entity_name "
+            "FROM candidate_nodes cn "
+            "JOIN memory_node_entities mne ON mne.node_id = cn.id "
+            "JOIN entity_nodes en ON en.id = mne.entity_id "
+            "ORDER BY cn.time_key ASC, cn.id ASC, en.name ASC",
+            (day, max(1, int(limit or 100))),
+        ).fetchall()
+
+        grouped: Dict[int, Dict[str, Any]] = {}
+        for row in rows:
+            node_id = int(row["node_id"])
+            item = grouped.setdefault(
+                node_id,
+                {
+                    "node_id": node_id,
+                    "time_key": row["time_key"],
+                    "topics": [
+                        topic
+                        for topic in str(row["topic"] or "").split()
+                        if str(topic or "").strip()
+                    ] or ["general"],
+                    "linked_entities": [],
+                },
+            )
+            item["linked_entities"].append((int(row["entity_id"]), row["entity_name"]))
+
+        out = list(grouped.values())[:max(1, int(limit or 100))]
         return out
 
     def memory_upsert_observation(

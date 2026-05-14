@@ -647,14 +647,44 @@ def test_memory_reflect_reports_entity_merge_conditions(db):
     assert report["rules"]["score_weights"]["co_entities"] > 0
 
 
+def test_memory_reflect_entities_can_scope_candidates_to_anchor_entities(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    alice_spaced = db.entity_add_entity(" alice ", "PERSON")
+    hermes = db.entity_add_entity("Hermes", "PRODUCT")
+    hermes_agent = db.entity_add_entity("Hermes Agent", "PRODUCT")
+    _ = alice
+
+    report = db.memory_reflect_entities(
+        dry_run=True,
+        limit=10,
+        anchor_entity_ids=[alice_spaced],
+    )
+
+    pairs = {
+        frozenset((item["canonical_id"], item["duplicate_id"]))
+        for item in report["candidates"]
+    }
+    assert frozenset((alice, alice_spaced)) in pairs
+    assert frozenset((hermes, hermes_agent)) not in pairs
+    assert report["anchor_entity_count"] == 1
+
+
 def test_memory_node_manager_reflect_delegates_to_db(db):
     db.entity_add_entity("Alice", "PERSON")
-    db.entity_add_entity(" alice ", "PERSON")
+    alice_spaced = db.entity_add_entity(" alice ", "PERSON")
+    node_id = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(0),
+        summary="Alice prefers Slack alerts.",
+        keywords=["Alice", "Slack"],
+    )
+    db.entity_link_node(node_id, alice_spaced)
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
     report = mgr.reflect(dry_run=True, limit=5)
 
     assert report["dry_run"] is True
+    assert report["observation_reflect"]["touched_entity_ids"] == [alice_spaced]
     assert report["merge_candidates"] == 1
 
 
@@ -703,8 +733,15 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         summary="Alice wants incident notifications in Slack.",
         keywords=["Slack", "notifications"],
     )
+    touched_node = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(0),
+        summary="Alice still discusses Slack alerts.",
+        keywords=["alerts"],
+    )
     db.entity_link_node(first_node, alice)
     db.entity_link_node(second_node, alice_spaced)
+    db.entity_link_node(touched_node, alice_spaced)
     first_observation = db.memory_upsert_observation(
         entity_id=alice,
         topic_key="alerts",
@@ -1043,6 +1080,11 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
     )
 
     assert mgr.store_turn("Alice urgent alerts", "Use Slack.") is True
+    assert db._conn.execute("SELECT COUNT(*) FROM memory_observations").fetchone()[0] == 0
+
+    report = mgr.reflect(dry_run=False, limit=10)
+    assert report["observation_reflect"]["candidate_count"] == 3
+    assert report["observations_consolidated"] == 1
 
     observation = db._conn.execute(
         "SELECT mo.summary, mo.topic_key, mo.observation_type, mo.metadata, en.name AS entity_name "
@@ -1106,6 +1148,10 @@ def test_store_turn_can_consolidate_task_observation(db):
     )
 
     assert mgr.store_turn("继续改记忆系统", "我们来调整 observation 分类。") is True
+    assert db._conn.execute("SELECT COUNT(*) FROM memory_observations").fetchone()[0] == 0
+
+    report = mgr.reflect(dry_run=False, limit=10)
+    assert report["observations_consolidated"] == 1
 
     observation = db._conn.execute(
         "SELECT observation_type, summary, metadata FROM memory_observations"

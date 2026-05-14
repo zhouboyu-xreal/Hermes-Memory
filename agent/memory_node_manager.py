@@ -1084,9 +1084,10 @@ class MemoryNodeManager:
         linked_entities: List[Tuple[int, str]],
         min_sources: int = 3,
         min_new_sources: int = 2,
-    ) -> None:
+    ) -> int:
         if not self._db or not linked_entities:
-            return
+            return 0
+        consolidated = 0
         for entity_id, entity_name in linked_entities:
             for topic_key in topics:
                 topic_label = topic_key
@@ -1148,6 +1149,7 @@ class MemoryNodeManager:
                             confidence=observation["confidence"],
                             metadata=observation_metadata,
                         )
+                    consolidated += 1
                 except Exception as exc:
                     logger.debug(
                         "Failed to consolidate observation for node %d entity %s topic %s: %s",
@@ -1156,6 +1158,49 @@ class MemoryNodeManager:
                         topic_key,
                         exc,
                     )
+        return consolidated
+
+    def _reflect_observations_from_unprocessed_facts(
+        self,
+        *,
+        dry_run: bool,
+        limit: int,
+    ) -> Dict[str, Any]:
+        """Generate/update observations from today's facts not yet attached as sources."""
+        if not self._db:
+            return {"candidate_count": 0, "consolidated": 0}
+        candidates = self._db.memory_unobserved_nodes_for_observation(limit=limit)
+        touched_entity_ids = list(dict.fromkeys(
+            int(entity_id)
+            for item in candidates
+            for entity_id, _entity_name in item.get("linked_entities", [])
+        ))
+        if dry_run:
+            return {
+                "candidate_count": len(candidates),
+                "consolidated": 0,
+                "touched_entity_ids": touched_entity_ids,
+                "candidates": [
+                    {
+                        "node_id": item["node_id"],
+                        "topics": item.get("topics", []),
+                        "entity_count": len(item.get("linked_entities", [])),
+                    }
+                    for item in candidates
+                ],
+            }
+        consolidated = 0
+        for item in candidates:
+            consolidated += self._maybe_consolidate_observations(
+                node_id=int(item["node_id"]),
+                topics=item.get("topics", []),
+                linked_entities=item.get("linked_entities", []),
+            )
+        return {
+            "candidate_count": len(candidates),
+            "consolidated": consolidated,
+            "touched_entity_ids": touched_entity_ids,
+        }
 
     def _link_fact_relations(
         self,
@@ -1333,13 +1378,8 @@ class MemoryNodeManager:
                 logger.error("finish store: memory node construction")
 
                 fact_entities = fact.get("entities", [])
-                linked_entities = self._link_fact_entities(node_id, fact_entities)
-                self._maybe_consolidate_observations(
-                    node_id=node_id,
-                    topics=topics,
-                    linked_entities=linked_entities,
-                )
-                logger.error("finish store: observation generation")
+                self._link_fact_entities(node_id, fact_entities)
+                logger.error("finish store: entity linking")
                 
                 stored_nodes.append((node_id, summary, embedding, keywords))
                 node_ids.append(node_id)
@@ -1538,9 +1578,9 @@ class MemoryNodeManager:
     ) -> Dict[str, Any]:
         """Run memory reflection maintenance.
 
-        First scope: entity reflection. It identifies duplicate entity
-        candidates using name similarity, type compatibility, and
-        co-occurring entity profiles. The method is intentionally explicit
+        It first promotes today's unprocessed fact nodes into consolidated
+        observations, then runs entity reflection, duplicate observation
+        merging, and decay maintenance. The method is intentionally explicit
         and is not called from ``run_agent.py`` yet.
         """
         if not self._db:
@@ -1549,9 +1589,20 @@ class MemoryNodeManager:
                 "candidates": [],
                 "merged": 0,
                 "candidate_count": 0,
+                "observations_consolidated": 0,
                 "error": "memory database unavailable",
             }
-        report = self._db.memory_reflect_entities(dry_run=dry_run, limit=limit)
+        observation_report = self._reflect_observations_from_unprocessed_facts(
+            dry_run=dry_run,
+            limit=limit,
+        )
+        report = self._db.memory_reflect_entities(
+            dry_run=dry_run,
+            limit=limit,
+            anchor_entity_ids=observation_report.get("touched_entity_ids", []),
+        )
+        report["observation_reflect"] = observation_report
+        report["observations_consolidated"] = observation_report.get("consolidated", 0)
         report["observation_groups_merged"] = 0
         if not dry_run and report.get("merged"):
             canonical_ids = [
