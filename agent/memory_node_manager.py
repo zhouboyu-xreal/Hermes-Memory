@@ -279,8 +279,12 @@ source facts:
 
 如果是 task：
 - summary 应描述用户正在做什么，以及这个任务的目标或当前焦点。
-- task_status 只能是 active、blocked、paused、stale 之一。
+- task_status 只能是 active、blocked、paused 之一；不要输出 stale，stale 只由 reflect 时间维护策略自动设置。
 - task_source 固定为 inferred_from_observation。
+- goal 描述这个任务想达成的目标；如果来源事实只支持当前焦点但目标不明确，可以省略。
+- steps 记录与这个任务相关的步骤、子任务或阶段性动作；每个 step 必须来自来源事实，不要凭空拆解。
+- step.status 只能是 todo、active、done、blocked、skipped 之一；没有明确信息时使用 active。
+- 已完成的 step 应保留为 done，不要因为后续事实关注新步骤而删除。
 - evidence 使用简短短语概括来源事实中的证据，不要逐字长引用。
 - next_action 只有在来源事实明确暗示时才填写；否则省略。
 - 不要标记为 done，除非来源事实明确表示任务已经完成。
@@ -293,15 +297,25 @@ source facts:
   "confidence": 0.0,
   "metadata": {{
     "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context",
-    "task_status": "active | blocked | paused | stale",
+    "task_status": "active | blocked | paused",
     "task_source": "inferred_from_observation",
+    "goal": "可选，任务目标",
     "evidence": ["简短证据短语1", "简短证据短语2"],
+    "steps": [
+      {{
+        "title": "步骤、子任务或阶段性动作",
+        "status": "todo | active | done | blocked | skipped",
+        "evidence": ["支持该步骤的简短证据"],
+        "updated_at": "可选，YYYY-MM-DD",
+        "notes": "可选补充"
+      }}
+    ],
     "next_action": "可选，只有明确时填写"
   }}
 }}
 
-如果 category 是 insight：metadata 中只填写 insight_type，不要填写 task_status、task_source、next_action。
-如果 category 是 task：metadata 中填写 task_status、task_source、evidence；next_action 可选；不要填写 insight_type。"""
+如果 category 是 insight：metadata 中只填写 insight_type，不要填写 task_status、task_source、goal、steps、next_action。
+如果 category 是 task：metadata 中填写 task_status、task_source、evidence、steps；goal 和 next_action 可选；不要填写 insight_type。"""
 
 OBSERVATION_UPDATE_PROMPT = """你是长期记忆 consolidation 模块。
 
@@ -317,6 +331,9 @@ topic: {topic_label}
 
 已有关键词：
 {existing_keywords}
+
+已有 metadata：
+{existing_metadata}
 
 新的来源事实：
 {source_facts}
@@ -345,7 +362,12 @@ topic: {topic_label}
 
 如果已有 observation 是 task：
 - 如果新事实表示任务仍在继续、推进、受阻、暂停或变得陈旧，可以继续保持 task。
-- task_status 只能是 active、blocked、paused、stale。
+- task_status 只能是 active、blocked、paused；不要输出 stale，stale 只由 reflect 时间维护策略自动设置。
+- 保留已有 steps 中仍然相关的步骤；不要因为新事实没有提到旧步骤就删除它们。
+- 如果新事实推进了已有步骤，更新该 step 的 status、evidence、updated_at 或 notes。
+- 如果新事实引入了新的子任务、阶段性动作或待办事项，追加为新的 step。
+- step.status 只能是 todo、active、done、blocked、skipped 之一；没有明确信息时使用 active。
+- goal 应表示整个任务的目标；如果已有 goal 仍然成立，应保留或轻微改写。
 - 只有事实明确说明完成时，才可以在 summary 中说明已完成；否则不要推断完成。
 - next_action 只有在新事实明确暗示时才填写；否则省略。
 
@@ -362,15 +384,25 @@ topic: {topic_label}
   "confidence": 0.0,
   "metadata": {{
     "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context",
-    "task_status": "active | blocked | paused | stale",
+    "task_status": "active | blocked | paused",
     "task_source": "inferred_from_observation",
+    "goal": "可选，任务目标",
     "evidence": ["简短证据短语1", "简短证据短语2"],
+    "steps": [
+      {{
+        "title": "步骤、子任务或阶段性动作",
+        "status": "todo | active | done | blocked | skipped",
+        "evidence": ["支持该步骤的简短证据"],
+        "updated_at": "可选，YYYY-MM-DD",
+        "notes": "可选补充"
+      }}
+    ],
     "next_action": "可选，只有明确时填写"
   }}
 }}
 
-如果 category 是 insight：metadata 中只填写 insight_type，不要填写 task_status、task_source、next_action。
-如果 category 是 task：metadata 中填写 task_status、task_source、evidence；next_action 可选；不要填写 insight_type。"""
+如果 category 是 insight：metadata 中只填写 insight_type，不要填写 task_status、task_source、goal、steps、next_action。
+如果 category 是 task：metadata 中填写 task_status、task_source、evidence、steps；goal 和 next_action 可选；不要填写 insight_type。"""
 
 OBSERVATION_MERGE_PROMPT = """你是长期记忆 reflection 模块。
 
@@ -394,8 +426,9 @@ supporting facts:
 3. 如果多条 observation 有细微差异或冲突，请用谨慎措辞综合，不要忽略冲突。
 4. 必须忠于给定内容，不要添加没有依据的信息。
 5. 如果是 insight，不要编造任务状态、下一步行动或截止时间。
-6. 如果是 task，task_status 只能是 active、blocked、paused、stale；task_source 固定为 inferred_from_observation。
-7. 只返回 JSON，不要 markdown，不要额外解释。
+6. 如果是 task，task_status 只能是 active、blocked、paused；不要输出 stale，stale 只由 reflect 时间维护策略自动设置；task_source 固定为 inferred_from_observation。
+7. 如果是 task，必须合并 steps：语义相同的 step 合成一个，已完成步骤保留为 done，新步骤追加；step.status 只能是 todo、active、done、blocked、skipped。
+8. 只返回 JSON，不要 markdown，不要额外解释。
 
 只返回合法 JSON。格式如下：
 {{
@@ -405,9 +438,19 @@ supporting facts:
   "confidence": 0.0,
   "metadata": {{
     "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context",
-    "task_status": "active | blocked | paused | stale",
+    "task_status": "active | blocked | paused",
     "task_source": "inferred_from_observation",
+    "goal": "可选，任务目标",
     "evidence": ["简短证据短语1", "简短证据短语2"],
+    "steps": [
+      {{
+        "title": "步骤、子任务或阶段性动作",
+        "status": "todo | active | done | blocked | skipped",
+        "evidence": ["支持该步骤的简短证据"],
+        "updated_at": "可选，YYYY-MM-DD",
+        "notes": "可选补充"
+      }}
+    ],
     "next_action": "可选，只有明确时填写"
   }}
 }}"""
@@ -979,6 +1022,327 @@ class MemoryNodeManager:
             out.append(topic_key)
         return out or ["general"]
 
+    @staticmethod
+    def _string_list(value: Any, *, limit: int = 5) -> List[str]:
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        out = []
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                out.append(text)
+            if len(out) >= limit:
+                break
+        return out
+
+    @classmethod
+    def _normalize_task_steps(cls, value: Any, *, limit: int = 12) -> List[Dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        allowed_statuses = {"todo", "active", "done", "blocked", "skipped"}
+        steps: List[Dict[str, Any]] = []
+        seen_titles = set()
+        for raw_step in value:
+            if isinstance(raw_step, str):
+                raw_step = {"title": raw_step}
+            if not isinstance(raw_step, dict):
+                continue
+            title = str(raw_step.get("title") or "").strip()
+            if not title:
+                continue
+            title_key = title.casefold()
+            if title_key in seen_titles:
+                continue
+            seen_titles.add(title_key)
+            status = str(raw_step.get("status", "active") or "active").strip().lower()
+            if status not in allowed_statuses:
+                status = "active"
+            step: Dict[str, Any] = {
+                "title": title,
+                "status": status,
+            }
+            evidence = cls._string_list(raw_step.get("evidence", []), limit=5)
+            if evidence:
+                step["evidence"] = evidence
+            updated_at = str(raw_step.get("updated_at") or "").strip()
+            if updated_at:
+                step["updated_at"] = updated_at[:32]
+            notes = str(raw_step.get("notes") or "").strip()
+            if notes:
+                step["notes"] = notes
+            steps.append(step)
+            if len(steps) >= limit:
+                break
+        return steps
+
+    @classmethod
+    def _normalize_task_metadata(cls, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        task_status = str(metadata.get("task_status", "active") or "active").strip().lower()
+        if task_status not in {"active", "blocked", "paused"}:
+            task_status = "active"
+
+        normalized: Dict[str, Any] = {
+            "task_status": task_status,
+            "task_source": "inferred_from_observation",
+        }
+        goal = str(metadata.get("goal") or "").strip()
+        if goal:
+            normalized["goal"] = goal
+        evidence = cls._string_list(metadata.get("evidence", []), limit=5)
+        if evidence:
+            normalized["evidence"] = evidence
+        steps = cls._normalize_task_steps(metadata.get("steps", []), limit=12)
+        if steps:
+            normalized["steps"] = steps
+        next_action = str(metadata.get("next_action") or "").strip()
+        if next_action:
+            normalized["next_action"] = next_action
+        return normalized
+
+    @staticmethod
+    def _json_dict(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, str):
+            try:
+                data = json.loads(value or "{}")
+            except (TypeError, ValueError):
+                return {}
+            return data if isinstance(data, dict) else {}
+        return {}
+
+    @classmethod
+    def _task_status(cls, task: Dict[str, Any]) -> str:
+        metadata = cls._json_dict(task.get("metadata", {}))
+        status = str(metadata.get("task_status", "active") or "active").strip().lower()
+        if status not in {"active", "blocked", "paused", "stale"}:
+            status = "active"
+        return status
+
+    @classmethod
+    def _task_profile_text(cls, task: Dict[str, Any]) -> str:
+        metadata = cls._json_dict(task.get("metadata", {}))
+        lines = [
+            f"Task summary: {task.get('summary', '')}",
+            f"Goal: {metadata.get('goal', '')}",
+            f"Current status: {metadata.get('task_status', 'active')}",
+        ]
+        steps = metadata.get("steps", [])
+        if isinstance(steps, list) and steps:
+            lines.append("Steps:")
+            for step in steps[:12]:
+                if isinstance(step, dict):
+                    title = str(step.get("title") or "").strip()
+                    status = str(step.get("status") or "active").strip()
+                else:
+                    title = str(step or "").strip()
+                    status = "active"
+                if title:
+                    lines.append(f"- {status}: {title}")
+        next_action = str(metadata.get("next_action") or "").strip()
+        if next_action:
+            lines.append(f"Next action: {next_action}")
+        lines.extend([
+            f"Keywords: {task.get('keywords', '')}",
+            f"Entity: {task.get('entity_name', '')}",
+            f"Topic: {task.get('topic_label') or task.get('topic_key', '')}",
+        ])
+        return "\n".join(line for line in lines if str(line).strip())
+
+    @staticmethod
+    def _as_embedding_vector(value: Any) -> Optional[np.ndarray]:
+        if value is None:
+            return None
+        arr = np.asarray(value, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            return None
+        norm = float(np.linalg.norm(arr))
+        if norm <= 0:
+            return None
+        return arr / norm
+
+    @classmethod
+    def _embedding_similarity(cls, left: Any, right: Any) -> float:
+        left_vec = cls._as_embedding_vector(left)
+        right_vec = cls._as_embedding_vector(right)
+        if left_vec is None or right_vec is None:
+            return 0.0
+        if left_vec.shape != right_vec.shape:
+            return 0.0
+        return float(np.dot(left_vec, right_vec))
+
+    @staticmethod
+    def _fact_match_text(fact: Dict[str, Any]) -> str:
+        keywords = fact.get("keywords", [])
+        topics = fact.get("topics", [])
+        if not isinstance(keywords, list):
+            keywords = [keywords]
+        if not isinstance(topics, list):
+            topics = [topics]
+        return "\n".join([
+            f"Fact: {fact.get('summary', '')}",
+            f"Keywords: {' '.join(str(item) for item in keywords if str(item or '').strip())}",
+            f"Topics: {' '.join(str(item) for item in topics if str(item or '').strip())}",
+        ])
+
+    @staticmethod
+    def _is_action_like_fact(fact: Dict[str, Any]) -> bool:
+        text = " ".join([
+            str(fact.get("summary", "") or ""),
+            " ".join(str(item) for item in fact.get("keywords", []) if str(item or "").strip()),
+            " ".join(str(item) for item in fact.get("topics", []) if str(item or "").strip()),
+        ]).lower()
+        if not text.strip():
+            return False
+        action_patterns = [
+            "修改", "实现", "排查", "验证", "测试", "设计", "讨论", "优化", "补充",
+            "合并", "接入", "调用", "迁移", "重构", "修复", "继续", "先不要",
+            "可以修改", "需要", "计划", "准备", "下一步", "更新", "生成", "新增",
+            "implement", "fix", "debug", "investigate", "test", "verify",
+            "design", "update", "refactor", "migrate", "add", "remove",
+            "continue", "plan", "next step",
+        ]
+        return any(pattern in text for pattern in action_patterns)
+
+    def _task_match_for_fact(
+        self,
+        fact: Dict[str, Any],
+        tasks: List[Dict[str, Any]],
+        task_embeddings: Dict[int, Any],
+        *,
+        high_similarity_threshold: float = 0.82,
+    ) -> Optional[Tuple[Dict[str, Any], str, float]]:
+        if not tasks:
+            return None
+
+        fact_entity_ids = {
+            int(entity_id)
+            for entity_id, _entity_name in fact.get("linked_entities", [])
+        }
+        fact_topics = {self._topic_key(topic) for topic in fact.get("topics", [])}
+
+        for task in tasks:
+            if (
+                int(task.get("entity_id")) in fact_entity_ids
+                and self._topic_key(task.get("topic_key")) in fact_topics
+            ):
+                return task, "entity_topic", 1.0
+
+        fact_embedding = None
+        if self._embedding_client is not None or self._ensure_embedding_client():
+            try:
+                fact_embedding = self._embedding_client.embed_text(self._fact_match_text(fact))
+            except Exception:
+                fact_embedding = None
+        if fact_embedding is not None:
+            best_task: Optional[Dict[str, Any]] = None
+            best_score = 0.0
+            for task in tasks:
+                task_id = int(task["id"])
+                task_embedding = task_embeddings.get(task_id)
+                if task_embedding is None:
+                    try:
+                        task_embedding = self._embedding_client.embed_text(self._task_profile_text(task))
+                    except Exception:
+                        task_embedding = None
+                    task_embeddings[task_id] = task_embedding
+                score = self._embedding_similarity(fact_embedding, task_embedding)
+                if score > best_score:
+                    best_task = task
+                    best_score = score
+            if best_task is not None and best_score >= high_similarity_threshold:
+                return best_task, "embedding", best_score
+
+        recent_active_tasks = [task for task in tasks if self._task_status(task) == "active"]
+        if len(recent_active_tasks) == 1 and self._is_action_like_fact(fact):
+            return recent_active_tasks[0], "recent_active_action", 0.6
+        return None
+
+    def _update_task_observation_from_facts(
+        self,
+        task: Dict[str, Any],
+        facts: List[Dict[str, Any]],
+        *,
+        match_methods: List[str],
+    ) -> bool:
+        if not self._db or not facts:
+            return False
+        observation = self._generate_observation(
+            entity_name=str(task.get("entity_name") or ""),
+            topic_label=str(task.get("topic_label") or task.get("topic_key") or ""),
+            source_nodes=facts,
+            existing_observation=task,
+        )
+        if not observation:
+            return False
+        observation["observation_type"] = "task"
+        observation_metadata = {
+            "source": "memory_node_manager",
+            "task_match_methods": sorted(set(match_methods)),
+            **(observation.get("metadata") or {}),
+        }
+        existing_source_ids = self._db.memory_observation_source_ids(int(task["id"]))
+        new_source_ids = [int(fact["node_id"]) for fact in facts]
+        source_ids = list(dict.fromkeys(existing_source_ids + new_source_ids))
+        keywords = observation["keywords"] or self._normalize_keywords([
+            task.get("keywords", ""),
+            task.get("topic_label") or task.get("topic_key") or "",
+        ])
+        self._db.memory_replace_observation_group(
+            keep_observation_id=int(task["id"]),
+            remove_observation_ids=[],
+            observation_type="task",
+            summary=observation["summary"],
+            keywords=keywords,
+            confidence=observation["confidence"],
+            source_node_ids=source_ids,
+            metadata=observation_metadata,
+        )
+        return True
+
+    def _match_and_update_tasks_for_facts(
+        self,
+        candidates: List[Dict[str, Any]],
+    ) -> Tuple[set[int], Dict[str, int], int]:
+        if not self._db or not candidates:
+            return set(), {}, 0
+        tasks = [
+            task
+            for task in self._db.memory_active_task_observations(limit=50)
+            if self._task_status(task) != "stale"
+        ]
+        if not tasks:
+            return set(), {}, 0
+
+        task_embeddings: Dict[int, Any] = {}
+        grouped: Dict[int, Dict[str, Any]] = {}
+        method_counts: Dict[str, int] = {}
+        for fact in candidates:
+            match = self._task_match_for_fact(fact, tasks, task_embeddings)
+            if not match:
+                continue
+            task, method, _score = match
+            task_id = int(task["id"])
+            item = grouped.setdefault(task_id, {"task": task, "facts": [], "methods": []})
+            item["facts"].append(fact)
+            item["methods"].append(method)
+            method_counts[method] = method_counts.get(method, 0) + 1
+
+        matched_node_ids: set[int] = set()
+        updated_tasks = 0
+        for item in grouped.values():
+            facts = item["facts"]
+            if self._update_task_observation_from_facts(
+                item["task"],
+                facts,
+                match_methods=item["methods"],
+            ):
+                updated_tasks += 1
+                matched_node_ids.update(int(fact["node_id"]) for fact in facts)
+        return matched_node_ids, method_counts, updated_tasks
+
     def _generate_observation(
         self,
         *,
@@ -999,6 +1363,12 @@ class MemoryNodeManager:
             return None
 
         if existing_observation:
+            existing_metadata = existing_observation.get("metadata", {})
+            if isinstance(existing_metadata, str):
+                try:
+                    existing_metadata = json.loads(existing_metadata or "{}")
+                except (TypeError, ValueError):
+                    existing_metadata = {}
             prompt = OBSERVATION_UPDATE_PROMPT.format(
                 entity_name=entity_name,
                 topic_label=topic_label,
@@ -1006,6 +1376,7 @@ class MemoryNodeManager:
                 existing_type=existing_observation.get("observation_type", "insight"),
                 existing_keywords=existing_observation.get("keywords", ""),
                 existing_confidence=existing_observation.get("confidence", 0.7),
+                existing_metadata=json.dumps(existing_metadata or {}, ensure_ascii=False, sort_keys=True),
                 source_facts="\n".join(fact_lines),
             )
         else:
@@ -1036,26 +1407,7 @@ class MemoryNodeManager:
             metadata = {}
         metadata = dict(metadata)
         if category == "task":
-            task_status = str(metadata.get("task_status", "active") or "active").strip().lower()
-            if task_status not in {"active", "blocked", "paused", "stale"}:
-                task_status = "active"
-            metadata = {
-                key: value
-                for key, value in metadata.items()
-                if key in {"task_status", "task_source", "evidence", "next_action"}
-            }
-            metadata["task_status"] = task_status
-            metadata["task_source"] = "inferred_from_observation"
-            evidence = metadata.get("evidence", [])
-            if isinstance(evidence, str):
-                evidence = [evidence]
-            if not isinstance(evidence, list):
-                evidence = []
-            metadata["evidence"] = [
-                str(item).strip()
-                for item in evidence
-                if str(item or "").strip()
-            ][:5]
+            metadata = self._normalize_task_metadata(metadata)
         else:
             insight_type = str(
                 metadata.get("insight_type", "context") or "context"
@@ -1179,6 +1531,9 @@ class MemoryNodeManager:
             return {
                 "candidate_count": len(candidates),
                 "consolidated": 0,
+                "task_matched": 0,
+                "task_updates": 0,
+                "task_match_methods": {},
                 "touched_entity_ids": touched_entity_ids,
                 "candidates": [
                     {
@@ -1190,7 +1545,15 @@ class MemoryNodeManager:
                 ],
             }
         consolidated = 0
+        (
+            task_matched_node_ids,
+            task_match_methods,
+            task_updates,
+        ) = self._match_and_update_tasks_for_facts(candidates)
+        consolidated += task_updates
         for item in candidates:
+            if int(item["node_id"]) in task_matched_node_ids:
+                continue
             consolidated += self._maybe_consolidate_observations(
                 node_id=int(item["node_id"]),
                 topics=item.get("topics", []),
@@ -1199,6 +1562,9 @@ class MemoryNodeManager:
         return {
             "candidate_count": len(candidates),
             "consolidated": consolidated,
+            "task_matched": len(task_matched_node_ids),
+            "task_updates": task_updates,
+            "task_match_methods": task_match_methods,
             "touched_entity_ids": touched_entity_ids,
         }
 
@@ -1491,26 +1857,7 @@ class MemoryNodeManager:
             metadata = {}
         metadata = dict(metadata)
         if category == "task":
-            task_status = str(metadata.get("task_status", "active") or "active").strip().lower()
-            if task_status not in {"active", "blocked", "paused", "stale"}:
-                task_status = "active"
-            metadata = {
-                key: value
-                for key, value in metadata.items()
-                if key in {"task_status", "task_source", "evidence", "next_action"}
-            }
-            metadata["task_status"] = task_status
-            metadata["task_source"] = "inferred_from_observation"
-            evidence = metadata.get("evidence", [])
-            if isinstance(evidence, str):
-                evidence = [evidence]
-            if not isinstance(evidence, list):
-                evidence = []
-            metadata["evidence"] = [
-                str(item).strip()
-                for item in evidence
-                if str(item or "").strip()
-            ][:5]
+            metadata = self._normalize_task_metadata(metadata)
         else:
             allowed_insight_types = {
                 "preference", "workflow", "strategy", "failure",
@@ -1575,6 +1922,8 @@ class MemoryNodeManager:
         fact_half_life_days: Optional[float] = None,
         experience_half_life_days: Optional[float] = None,
         observation_decay_threshold: Optional[float] = None,
+        task_active_to_paused_days: Optional[float] = None,
+        task_stale_days: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Run memory reflection maintenance.
 
@@ -1625,10 +1974,19 @@ class MemoryNodeManager:
             threshold=observation_decay_threshold,
             now=reflect_now,
         )
+        task_inactivity_report = self._db.memory_reflect_task_inactivity(
+            dry_run=dry_run,
+            active_to_paused_days=task_active_to_paused_days,
+            stale_days=task_stale_days,
+            now=reflect_now,
+        )
         report["node_decay"] = node_decay_report
         report["observation_decay"] = decay_report
+        report["task_inactivity"] = task_inactivity_report
         report["observations_inactivated"] = decay_report.get("inactivated", 0)
         report["observations_would_inactivate"] = decay_report.get("would_inactivate", 0)
+        report["tasks_paused"] = task_inactivity_report.get("paused", 0)
+        report["tasks_stale"] = task_inactivity_report.get("stale", 0)
         return report
 
     # ── Recall relevant memory nodes ──────────────────────────────────────
@@ -1678,19 +2036,20 @@ class MemoryNodeManager:
             ts = time_start or _parsed_time_start
             te = time_end or _parsed_time_end
             search_query = clean_query or query
-
-            # Generate embedding from the clean query
-            query_embedding = self._embedding_client.embed_text(search_query)
-            if query_embedding is None:
-                logger.debug("Query embedding is None")
-                return ""
-
+            
             # Generate summary for the query (for keyword extraction)
             summary_data = self._summarize_turn(search_query, "")
             logger.error("finish recall: query summary")
             
             if not summary_data:
                 logger.debug("Skipping recall — summarisation returned no data")
+                return ""
+            
+            # Generate embedding from the clean query
+            query_summary = summary_data["summary"]
+            query_embedding = self._embedding_client.embed_text(query_summary)
+            if query_embedding is None:
+                logger.debug("Query embedding is None")
                 return ""
 
             keywords = summary_data["keywords"]

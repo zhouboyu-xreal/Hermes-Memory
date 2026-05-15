@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
 import pytest
 
@@ -17,6 +17,30 @@ class _FakeEmbeddingClient:
         if not text:
             return None
         return np.ones((1, 1536), dtype=np.float32)
+
+
+class _KeywordEmbeddingClient:
+    def embed_text(self, text):
+        lowered = str(text or "").lower()
+        vec = np.zeros((1, 3), dtype=np.float32)
+        if "memory" in lowered or "reflect" in lowered:
+            vec[0, 0] = 1.0
+        elif "travel" in lowered:
+            vec[0, 1] = 1.0
+        else:
+            vec[0, 2] = 1.0
+        return vec
+
+
+class _OrthogonalTaskEmbeddingClient:
+    def embed_text(self, text):
+        lowered = str(text or "").lower()
+        vec = np.zeros((1, 2), dtype=np.float32)
+        if lowered.startswith("task summary"):
+            vec[0, 0] = 1.0
+        else:
+            vec[0, 1] = 1.0
+        return vec
 
 
 class _NoAsyncMemoryNodeManager(MemoryNodeManager):
@@ -923,6 +947,115 @@ def test_reflect_observation_decay_uses_fact_type_half_lives(db):
     assert rows[experience_observation] == "inactive"
 
 
+def test_task_inactivity_policy_pauses_and_stales_idle_tasks(db):
+    now = datetime(2026, 5, 15, 12, 0, 0)
+    entity_id = db.entity_add_entity("Hermes Agent", "PROJECT")
+    node_ids = [
+        _add_memory_node(
+            db,
+            time_key=f"2026-05-15 10:0{idx}:00",
+            summary=f"Task source {idx}",
+            keywords=["memory"],
+        )
+        for idx in range(4)
+    ]
+    for node_id in node_ids:
+        db.entity_link_node(node_id, entity_id)
+
+    def add_task(status, last_supported_at, source_node_id):
+        obs_id = db.memory_upsert_observation(
+            entity_id=entity_id,
+            topic_key=f"task-{source_node_id}",
+            topic_label=f"task-{source_node_id}",
+            observation_type="task",
+            summary=f"Task {source_node_id}",
+            keywords=["task"],
+            source_node_ids=[source_node_id],
+            metadata={
+                "task_status": status,
+                "task_source": "inferred_from_observation",
+            },
+        )
+        db._conn.execute(
+            "UPDATE memory_observations SET last_supported_at = ?, updated_at = ? WHERE id = ?",
+            (last_supported_at.isoformat(), last_supported_at.isoformat(), obs_id),
+        )
+        return obs_id
+
+    active_to_paused = add_task("active", now - timedelta(days=10), node_ids[0])
+    active_to_stale = add_task("active", now - timedelta(days=40), node_ids[1])
+    blocked_to_stale = add_task("blocked", now - timedelta(days=40), node_ids[2])
+    recent_active = add_task("active", now - timedelta(days=1), node_ids[3])
+
+    report = db.memory_reflect_task_inactivity(
+        dry_run=False,
+        active_to_paused_days=7,
+        stale_days=30,
+        now=now,
+    )
+
+    assert report["checked"] == 4
+    assert report["paused"] == 1
+    assert report["stale"] == 2
+    rows = {
+        row["id"]: (row["status"], json.loads(row["metadata"]))
+        for row in db._conn.execute(
+            "SELECT id, status, metadata FROM memory_observations ORDER BY id"
+        ).fetchall()
+    }
+    assert rows[active_to_paused][0] == "active"
+    assert rows[active_to_paused][1]["task_status"] == "paused"
+    assert rows[active_to_paused][1]["previous_task_status"] == "active"
+    assert rows[active_to_paused][1]["status_updated_by"] == "reflect_task_inactivity_policy"
+    assert rows[active_to_stale][1]["task_status"] == "stale"
+    assert rows[blocked_to_stale][1]["task_status"] == "stale"
+    assert rows[recent_active][1]["task_status"] == "active"
+
+
+def test_memory_node_manager_reflect_reports_task_inactivity(db):
+    now = datetime.now().astimezone()
+    entity_id = db.entity_add_entity("Hermes Agent", "PROJECT")
+    node_id = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(0),
+        summary="用户正在完善 Hermes Agent 的记忆系统。",
+        keywords=["memory"],
+    )
+    db.entity_link_node(node_id, entity_id)
+    obs_id = db.memory_upsert_observation(
+        entity_id=entity_id,
+        topic_key="memory-system",
+        topic_label="memory-system",
+        observation_type="task",
+        summary="用户正在完善 Hermes Agent 的记忆系统。",
+        keywords=["memory"],
+        source_node_ids=[node_id],
+        metadata={"task_status": "active", "task_source": "inferred_from_observation"},
+    )
+    idle_at = now - timedelta(days=10)
+    db._conn.execute(
+        "UPDATE memory_observations SET last_supported_at = ?, updated_at = ? WHERE id = ?",
+        (idle_at.isoformat(), idle_at.isoformat(), obs_id),
+    )
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    report = mgr.reflect(
+        dry_run=False,
+        limit=10,
+        task_active_to_paused_days=7,
+        task_stale_days=30,
+    )
+
+    assert report["tasks_paused"] == 1
+    assert report["tasks_stale"] == 0
+    assert report["task_inactivity"]["changed"] == 1
+    metadata = json.loads(db._conn.execute(
+        "SELECT metadata FROM memory_observations WHERE id = ?",
+        (obs_id,),
+    ).fetchone()["metadata"])
+    assert metadata["task_status"] == "paused"
+
+
 def test_memory_search_observations_ignores_inactive_observations(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     active_node = _add_memory_node(
@@ -1140,7 +1273,21 @@ def test_store_turn_can_consolidate_task_observation(db):
                 "metadata": {
                     "task_status": "active",
                     "task_source": "inferred_from_observation",
+                    "goal": "完善 Hermes Agent 的长期记忆系统。",
                     "evidence": ["排查 memory recall", "修改 observation 生成逻辑"],
+                    "steps": [
+                        {
+                            "title": "排查 memory recall 匹配问题",
+                            "status": "done",
+                            "evidence": ["排查 memory recall"],
+                            "updated_at": "2026-05-14",
+                        },
+                        {
+                            "title": "将 observation 分类为 insight 和 task",
+                            "status": "active",
+                            "evidence": ["修改 observation 生成逻辑"],
+                        },
+                    ],
                     "next_action": "继续验证 observation 分类逻辑",
                 },
             }),
@@ -1161,7 +1308,260 @@ def test_store_turn_can_consolidate_task_observation(db):
     assert "正在迭代 Hermes Agent" in observation["summary"]
     assert metadata["task_status"] == "active"
     assert metadata["task_source"] == "inferred_from_observation"
+    assert metadata["goal"] == "完善 Hermes Agent 的长期记忆系统。"
     assert metadata["evidence"] == ["排查 memory recall", "修改 observation 生成逻辑"]
+    assert metadata["steps"][0]["title"] == "排查 memory recall 匹配问题"
+    assert metadata["steps"][0]["status"] == "done"
+    assert metadata["steps"][0]["updated_at"] == "2026-05-14"
+    assert metadata["steps"][1]["title"] == "将 observation 分类为 insight 和 task"
+    assert metadata["steps"][1]["status"] == "active"
+
+
+def test_reflect_matches_fact_to_task_by_entity_and_topic(db):
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
+    source_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="用户正在完善 Hermes Agent 的 reflect 机制。",
+        keywords=["memory-reflect"],
+    )
+    db.entity_link_node(source_node, hermes)
+    task_id = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="memory-reflect",
+        topic_label="memory-reflect",
+        observation_type="task",
+        summary="用户正在完善 Hermes Agent 的长期记忆 reflect 机制。",
+        keywords=["Hermes Agent", "memory", "reflect"],
+        source_node_ids=[source_node],
+        metadata={
+            "task_status": "active",
+            "task_source": "inferred_from_observation",
+            "steps": [{"title": "设计 reflect 机制", "status": "active"}],
+        },
+    )
+    new_node = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(0),
+        summary="用户要求在 run_agent 中每 5 轮调用 reflect。",
+        keywords=["memory-reflect"],
+    )
+    db.entity_link_node(new_node, hermes)
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "category": "task",
+                "summary": "用户正在完善 Hermes Agent 的 reflect 调度机制。",
+                "keywords": ["Hermes Agent", "reflect"],
+                "confidence": 0.9,
+                "metadata": {
+                    "task_status": "active",
+                    "task_source": "inferred_from_observation",
+                    "steps": [
+                        {"title": "设计 reflect 机制", "status": "done"},
+                        {"title": "每 5 轮对话调用 reflect", "status": "done"},
+                    ],
+                },
+            })
+        ],
+    )
+
+    report = mgr.reflect(dry_run=False, limit=10)
+
+    assert report["observation_reflect"]["task_matched"] == 1
+    assert report["observation_reflect"]["task_match_methods"] == {"entity_topic": 1}
+    assert db.memory_observation_source_ids(task_id) == [source_node, new_node]
+    row = db._conn.execute(
+        "SELECT summary, metadata FROM memory_observations WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    assert "reflect 调度机制" in row["summary"]
+    metadata = json.loads(row["metadata"])
+    assert metadata["task_match_methods"] == ["entity_topic"]
+    assert metadata["steps"][1]["title"] == "每 5 轮对话调用 reflect"
+
+
+def test_reflect_matches_fact_to_task_by_high_embedding_similarity(db):
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
+    alice = db.entity_add_entity("Alice", "PERSON")
+    source_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="用户正在设计 memory reflect 机制。",
+        keywords=["memory-system"],
+    )
+    db.entity_link_node(source_node, hermes)
+    task_id = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="memory-system",
+        topic_label="memory-system",
+        observation_type="task",
+        summary="用户正在完善 Hermes Agent memory reflect 任务。",
+        keywords=["memory", "reflect"],
+        source_node_ids=[source_node],
+        metadata={"task_status": "active", "task_source": "inferred_from_observation"},
+    )
+    new_node = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(0),
+        summary="用户继续讨论 reflect 的低成本 task matching 方案。",
+        keywords=["unrelated-topic"],
+    )
+    db.entity_link_node(new_node, alice)
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "category": "task",
+                "summary": "用户正在完善 memory reflect 的 task matching 方案。",
+                "keywords": ["memory", "reflect", "task matching"],
+                "confidence": 0.88,
+                "metadata": {
+                    "task_status": "active",
+                    "task_source": "inferred_from_observation",
+                    "steps": [{"title": "设计低成本 task matching", "status": "active"}],
+                },
+            })
+        ],
+    )
+    mgr._embedding_client = _KeywordEmbeddingClient()
+
+    report = mgr.reflect(dry_run=False, limit=10)
+
+    assert report["observation_reflect"]["task_matched"] == 1
+    assert report["observation_reflect"]["task_match_methods"] == {"embedding": 1}
+    assert db.memory_observation_source_ids(task_id) == [source_node, new_node]
+
+
+def test_reflect_matches_action_like_fact_to_single_recent_active_task(db):
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
+    alice = db.entity_add_entity("Alice", "PERSON")
+    source_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="用户正在完善 Hermes Agent 的记忆系统。",
+        keywords=["memory-system"],
+    )
+    db.entity_link_node(source_node, hermes)
+    task_id = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="memory-system",
+        topic_label="memory-system",
+        observation_type="task",
+        summary="用户正在完善 Hermes Agent 的记忆系统。",
+        keywords=["memory"],
+        source_node_ids=[source_node],
+        metadata={"task_status": "active", "task_source": "inferred_from_observation"},
+    )
+    new_node = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(0),
+        summary="用户要求继续修改 prompt。",
+        keywords=["prompt-work"],
+    )
+    db.entity_link_node(new_node, alice)
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "category": "task",
+                "summary": "用户正在继续完善记忆系统 prompt。",
+                "keywords": ["memory", "prompt"],
+                "confidence": 0.78,
+                "metadata": {
+                    "task_status": "active",
+                    "task_source": "inferred_from_observation",
+                    "steps": [{"title": "继续修改 prompt", "status": "active"}],
+                },
+            })
+        ],
+    )
+    mgr._embedding_client = _OrthogonalTaskEmbeddingClient()
+
+    report = mgr.reflect(dry_run=False, limit=10)
+
+    assert report["observation_reflect"]["task_matched"] == 1
+    assert report["observation_reflect"]["task_match_methods"] == {"recent_active_action": 1}
+    assert db.memory_observation_source_ids(task_id) == [source_node, new_node]
+
+
+def test_reflect_leaves_unmatched_non_action_fact_for_regular_observation_flow(db):
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
+    zhang = db.entity_add_entity("小张父亲", "PERSON")
+    source_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="用户正在完善 Hermes Agent 的记忆系统。",
+        keywords=["memory-system"],
+    )
+    db.entity_link_node(source_node, hermes)
+    task_id = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="memory-system",
+        topic_label="memory-system",
+        observation_type="task",
+        summary="用户正在完善 Hermes Agent 的记忆系统。",
+        keywords=["memory"],
+        source_node_ids=[source_node],
+        metadata={"task_status": "active", "task_source": "inferred_from_observation"},
+    )
+    new_node = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(0),
+        summary="小张父亲是中学的校长。",
+        keywords=["家庭"],
+    )
+    db.entity_link_node(new_node, zhang)
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    mgr._embedding_client = _OrthogonalTaskEmbeddingClient()
+
+    report = mgr.reflect(dry_run=False, limit=10)
+
+    assert report["observation_reflect"]["task_matched"] == 0
+    assert db.memory_observation_source_ids(task_id) == [source_node]
+    assert mgr.llm_prompts == []
+
+
+def test_task_metadata_normalizes_steps():
+    metadata = MemoryNodeManager._normalize_task_metadata({
+        "task_status": "stale",
+        "task_source": "model_output",
+        "goal": "  Ship memory task tracking.  ",
+        "evidence": "用户要求 task 存步骤",
+        "steps": [
+            {
+                "title": "  设计 task steps 结构  ",
+                "status": "finished",
+                "evidence": "讨论 goal 和 steps",
+                "notes": "keep compact",
+            },
+            "补充测试",
+            {"title": ""},
+        ],
+        "next_action": "  验证 prompt 解析  ",
+    })
+
+    assert metadata["task_status"] == "active"
+    assert metadata["task_source"] == "inferred_from_observation"
+    assert metadata["goal"] == "Ship memory task tracking."
+    assert metadata["evidence"] == ["用户要求 task 存步骤"]
+    assert metadata["steps"] == [
+        {
+            "title": "设计 task steps 结构",
+            "status": "active",
+            "evidence": ["讨论 goal 和 steps"],
+            "notes": "keep compact",
+        },
+        {
+            "title": "补充测试",
+            "status": "active",
+        },
+    ]
+    assert metadata["next_action"] == "验证 prompt 解析"
 
 
 def test_observation_source_nodes_match_topic_key_exactly(db):

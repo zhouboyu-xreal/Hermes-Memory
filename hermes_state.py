@@ -371,6 +371,8 @@ class SessionDB:
     _MEMORY_OBSERVATION_EXPERIENCE_HALF_LIFE_DAYS = 90.0
     _MEMORY_OBSERVATION_DECAY_THRESHOLD = 0.25
     _MEMORY_RECALL_DECAY_FLOOR = 0.25
+    _MEMORY_TASK_PAUSED_IDLE_DAYS = 7.0
+    _MEMORY_TASK_STALE_IDLE_DAYS = 30.0
 
     def __init__(self, db_path: Path = None):
         self.db_path = db_path or DEFAULT_DB_PATH
@@ -3953,7 +3955,7 @@ class SessionDB:
         day = str(date_key or datetime.now().astimezone().date().isoformat())[:10]
         rows = self._conn.execute(
             "WITH candidate_nodes AS ("
-            "  SELECT mn.id, mn.time_key, mn.topic "
+            "  SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, mn.fact_type "
             "  FROM memory_nodes mn "
             "  WHERE substr(mn.time_key, 1, 10) = ? "
             "  AND mn.fact_type IN ('world', 'experience') "
@@ -3963,7 +3965,7 @@ class SessionDB:
             "  ORDER BY mn.time_key ASC, mn.id ASC "
             "  LIMIT ?"
             ") "
-            "SELECT cn.id AS node_id, cn.time_key, cn.topic, "
+            "SELECT cn.id AS node_id, cn.time_key, cn.summary, cn.keywords, cn.topic, cn.fact_type, "
             "en.id AS entity_id, en.name AS entity_name "
             "FROM candidate_nodes cn "
             "JOIN memory_node_entities mne ON mne.node_id = cn.id "
@@ -3980,6 +3982,13 @@ class SessionDB:
                 {
                     "node_id": node_id,
                     "time_key": row["time_key"],
+                    "summary": row["summary"],
+                    "keywords": [
+                        keyword
+                        for keyword in str(row["keywords"] or "").split()
+                        if str(keyword or "").strip()
+                    ],
+                    "fact_type": row["fact_type"],
                     "topics": [
                         topic
                         for topic in str(row["topic"] or "").split()
@@ -3992,6 +4001,28 @@ class SessionDB:
 
         out = list(grouped.values())[:max(1, int(limit or 100))]
         return out
+
+    def memory_active_task_observations(self, *, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return active task observations for fact-to-task matching."""
+        rows = self._conn.execute(
+            "SELECT mo.*, en.name AS entity_name "
+            "FROM memory_observations mo "
+            "JOIN entity_nodes en ON en.id = mo.entity_id "
+            "WHERE mo.status = 'active' AND mo.observation_type = 'task' "
+            "ORDER BY mo.updated_at DESC, mo.id DESC "
+            "LIMIT ?",
+            (max(1, int(limit or 50)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def memory_observation_source_ids(self, observation_id: int) -> List[int]:
+        """Return all source node ids for an observation."""
+        rows = self._conn.execute(
+            "SELECT node_id FROM memory_observation_sources "
+            "WHERE observation_id = ? ORDER BY node_id",
+            (int(observation_id),),
+        ).fetchall()
+        return [int(row["node_id"]) for row in rows]
 
     def memory_upsert_observation(
         self,
@@ -4497,6 +4528,134 @@ class SessionDB:
             "would_inactivate": len(to_deactivate),
             "threshold": decay_threshold,
             "observations": evaluated,
+        }
+
+    def memory_reflect_task_inactivity(
+        self,
+        *,
+        dry_run: bool = True,
+        active_to_paused_days: Optional[float] = None,
+        stale_days: Optional[float] = None,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Update task observation status when active tasks have no recent support."""
+        paused_after_days = max(
+            1.0,
+            float(
+                active_to_paused_days
+                if active_to_paused_days is not None
+                else self._MEMORY_TASK_PAUSED_IDLE_DAYS
+            ),
+        )
+        stale_after_days = max(
+            paused_after_days,
+            float(stale_days if stale_days is not None else self._MEMORY_TASK_STALE_IDLE_DAYS),
+        )
+        now_dt = now or datetime.now().astimezone()
+        evaluated_at = now_dt.isoformat()
+        rows = self._conn.execute(
+            "SELECT id, metadata, created_at, updated_at, last_supported_at "
+            "FROM memory_observations "
+            "WHERE status = 'active' AND observation_type = 'task' "
+            "ORDER BY updated_at DESC, id DESC"
+        ).fetchall()
+
+        evaluated: List[Dict[str, Any]] = []
+        to_update: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            current_status = str(metadata.get("task_status", "active") or "active").strip().lower()
+            if current_status not in {"active", "blocked", "paused", "stale"}:
+                current_status = "active"
+            last_active_raw = row["last_supported_at"] or row["updated_at"] or row["created_at"]
+            last_active_at = self._parse_memory_time_key(last_active_raw)
+            if last_active_at is None:
+                idle_days = 0.0
+            else:
+                compare_now = now_dt
+                compare_last = last_active_at
+                if compare_last.tzinfo is not None and compare_now.tzinfo is None:
+                    compare_last = compare_last.replace(tzinfo=None)
+                elif compare_last.tzinfo is None and compare_now.tzinfo is not None:
+                    compare_now = compare_now.replace(tzinfo=None)
+                idle_days = max(0.0, (compare_now - compare_last).total_seconds() / 86400.0)
+
+            new_status = current_status
+            action = "keep"
+            if current_status == "active":
+                if idle_days >= stale_after_days:
+                    new_status = "stale"
+                    action = "stale"
+                elif idle_days >= paused_after_days:
+                    new_status = "paused"
+                    action = "pause"
+            elif current_status in {"blocked", "paused"} and idle_days >= stale_after_days:
+                new_status = "stale"
+                action = "stale"
+
+            item = {
+                "id": int(row["id"]),
+                "action": action,
+                "previous_status": current_status,
+                "new_status": new_status,
+                "idle_days": idle_days,
+                "last_active_at": str(last_active_raw or ""),
+            }
+            evaluated.append(item)
+            if action != "keep":
+                updated_metadata = dict(metadata)
+                updated_metadata["previous_task_status"] = current_status
+                updated_metadata["task_status"] = new_status
+                updated_metadata["task_source"] = "inferred_from_observation"
+                updated_metadata["status_reason"] = "no_recent_support"
+                updated_metadata["status_updated_by"] = "reflect_task_inactivity_policy"
+                updated_metadata["status_updated_at"] = evaluated_at
+                updated_metadata["last_active_at"] = str(last_active_raw or "")
+                updated_metadata["task_inactivity"] = {
+                    "idle_days": idle_days,
+                    "paused_after_days": paused_after_days,
+                    "stale_after_days": stale_after_days,
+                    "evaluated_at": evaluated_at,
+                }
+                item["metadata"] = updated_metadata
+                to_update.append(item)
+
+        if not dry_run and to_update:
+            def _do(conn):
+                for item in to_update:
+                    conn.execute(
+                        "UPDATE memory_observations SET metadata = ?, updated_at = ? WHERE id = ?",
+                        (
+                            json.dumps(item["metadata"], ensure_ascii=False),
+                            evaluated_at,
+                            int(item["id"]),
+                        ),
+                    )
+
+            self._execute_write(_do)
+
+        paused = [item for item in to_update if item["new_status"] == "paused"]
+        stale = [item for item in to_update if item["new_status"] == "stale"]
+        return {
+            "dry_run": dry_run,
+            "checked": len(evaluated),
+            "changed": 0 if dry_run else len(to_update),
+            "would_change": len(to_update),
+            "paused": 0 if dry_run else len(paused),
+            "stale": 0 if dry_run else len(stale),
+            "would_pause": len(paused),
+            "would_stale": len(stale),
+            "active_to_paused_days": paused_after_days,
+            "stale_days": stale_after_days,
+            "tasks": [
+                {key: value for key, value in item.items() if key != "metadata"}
+                for item in evaluated
+            ],
         }
 
     def memory_replace_observation_group(
