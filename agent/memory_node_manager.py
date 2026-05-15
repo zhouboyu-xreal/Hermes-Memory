@@ -279,7 +279,7 @@ source facts:
 
 如果是 task：
 - summary 应描述用户正在做什么，以及这个任务的目标或当前焦点。
-- task_status 只能是 active、blocked、paused 之一；不要输出 stale，stale 只由 reflect 时间维护策略自动设置。
+- task_status 只能是 active、blocked、paused 之一；首次生成 task 时不要输出 stale。
 - task_source 固定为 inferred_from_observation。
 - goal 描述这个任务想达成的目标；如果来源事实只支持当前焦点但目标不明确，可以省略。
 - steps 记录与这个任务相关的步骤、子任务或阶段性动作；每个 step 必须来自来源事实，不要凭空拆解。
@@ -288,6 +288,14 @@ source facts:
 - evidence 使用简短短语概括来源事实中的证据，不要逐字长引用。
 - next_action 只有在来源事实明确暗示时才填写；否则省略。
 - 不要标记为 done，除非来源事实明确表示任务已经完成。
+
+task_status 定义：
+- active：用户正在推进该任务，或来源事实表明任务仍在进行、被修改、验证、讨论下一步、实现、排查或继续迭代。
+- blocked：任务仍然重要，但当前存在明确阻塞因素，导致任务无法继续推进。只有来源事实明确提到依赖缺失、权限/接口/资源不可用、等待他人、技术问题无法绕过等阻塞时，才使用 blocked。
+- paused：任务没有明确阻塞，但用户表示暂时搁置、稍后再做、先处理别的事情，或来源事实明确表明任务被主动暂停。
+- 不要仅因为没有看到最新进展就输出 paused。
+- 不要仅因为任务复杂或存在待办步骤就输出 blocked。
+- 如果事实不足以判断任务状态，使用 active。
 
 只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
@@ -362,7 +370,7 @@ topic: {topic_label}
 
 如果已有 observation 是 task：
 - 如果新事实表示任务仍在继续、推进、受阻、暂停或变得陈旧，可以继续保持 task。
-- task_status 只能是 active、blocked、paused；不要输出 stale，stale 只由 reflect 时间维护策略自动设置。
+- task_status 只能是 active、blocked、paused、stale。
 - 保留已有 steps 中仍然相关的步骤；不要因为新事实没有提到旧步骤就删除它们。
 - 如果新事实推进了已有步骤，更新该 step 的 status、evidence、updated_at 或 notes。
 - 如果新事实引入了新的子任务、阶段性动作或待办事项，追加为新的 step。
@@ -370,6 +378,17 @@ topic: {topic_label}
 - goal 应表示整个任务的目标；如果已有 goal 仍然成立，应保留或轻微改写。
 - 只有事实明确说明完成时，才可以在 summary 中说明已完成；否则不要推断完成。
 - next_action 只有在新事实明确暗示时才填写；否则省略。
+
+task_status 定义：
+- active：用户正在推进该任务，或新事实表明任务仍在进行、被修改、验证、讨论下一步、实现、排查或继续迭代。
+- blocked：任务仍然重要，但当前存在明确阻塞因素，导致任务无法继续推进。只有新事实明确提到依赖缺失、权限/接口/资源不可用、等待他人、技术问题无法绕过等阻塞时，才使用 blocked。
+- paused：任务没有明确阻塞，但用户表示暂时搁置、稍后再做、先处理别的事情，或新事实明确表明任务被主动暂停。
+- stale：输入的已有 task 已经是 stale，且新事实不足以说明任务被重新推进、解除阻塞或主动恢复时，可以继续输出 stale。不要仅根据缺少最新进展把非 stale 任务改为 stale。
+- 不要仅因为没有看到最新进展就输出 paused。
+- 不要仅因为任务复杂或存在待办步骤就输出 blocked。
+- 如果新事实显示用户又开始修改、实现、验证、排查或继续讨论该任务，应优先判断为 active。
+- 如果已有 task_status 是 blocked，但新事实显示阻塞已解决、找到替代方案或用户继续推进，应改为 active。
+- 已有 task_status 是参考状态。只有新事实明确支持状态变化时才修改；否则保持原状态。
 
 如果输出 insight：
 - 总结长期有用的稳定信息。
@@ -384,7 +403,7 @@ topic: {topic_label}
   "confidence": 0.0,
   "metadata": {{
     "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context",
-    "task_status": "active | blocked | paused",
+    "task_status": "active | blocked | paused | stale",
     "task_source": "inferred_from_observation",
     "goal": "可选，任务目标",
     "evidence": ["简短证据短语1", "简短证据短语2"],
@@ -426,9 +445,11 @@ supporting facts:
 3. 如果多条 observation 有细微差异或冲突，请用谨慎措辞综合，不要忽略冲突。
 4. 必须忠于给定内容，不要添加没有依据的信息。
 5. 如果是 insight，不要编造任务状态、下一步行动或截止时间。
-6. 如果是 task，task_status 只能是 active、blocked、paused；不要输出 stale，stale 只由 reflect 时间维护策略自动设置；task_source 固定为 inferred_from_observation。
+6. 如果是 task，task_status 只能是 active、blocked、paused、stale；task_source 固定为 inferred_from_observation。
 7. 如果是 task，必须合并 steps：语义相同的 step 合成一个，已完成步骤保留为 done，新步骤追加；step.status 只能是 todo、active、done、blocked、skipped。
-8. 只返回 JSON，不要 markdown，不要额外解释。
+8. 如果是 task，task_status 含义如下：active 表示仍在推进；blocked 表示有明确阻塞导致无法继续；paused 表示用户主动暂时搁置且没有明确阻塞；stale 表示输入 observation 已经长期无新支持，且 supporting facts 不足以说明任务被重新激活。
+9. 合并 task 时，只有 observation 或 supporting facts 明确支持状态变化才修改 task_status；不要仅因为没有最新进展就改为 paused，不要仅因为任务复杂就改为 blocked，也不要把非 stale 任务改为 stale。
+10. 只返回 JSON，不要 markdown，不要额外解释。
 
 只返回合法 JSON。格式如下：
 {{
@@ -438,7 +459,7 @@ supporting facts:
   "confidence": 0.0,
   "metadata": {{
     "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context",
-    "task_status": "active | blocked | paused",
+    "task_status": "active | blocked | paused | stale",
     "task_source": "inferred_from_observation",
     "goal": "可选，任务目标",
     "evidence": ["简短证据短语1", "简短证据短语2"],
@@ -1037,6 +1058,77 @@ class MemoryNodeManager:
                 break
         return out
 
+    @staticmethod
+    def _reflect_log_text(value: Any, *, limit: int = 500) -> str:
+        text = str(value or "").strip()
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}..."
+
+    @classmethod
+    def _reflect_fact_log_items(
+        cls,
+        facts: List[Dict[str, Any]],
+        *,
+        limit: int = 12,
+    ) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for fact in facts[:limit]:
+            entity_items: List[Dict[str, Any]] = []
+            linked_entities = fact.get("linked_entities", [])
+            if not isinstance(linked_entities, list):
+                linked_entities = []
+            for entity in linked_entities:
+                if isinstance(entity, dict):
+                    entity_items.append({
+                        "id": entity.get("id") or entity.get("entity_id"),
+                        "name": entity.get("name") or entity.get("entity_name"),
+                    })
+                elif isinstance(entity, (list, tuple)) and len(entity) >= 2:
+                    entity_items.append({"id": entity[0], "name": entity[1]})
+            items.append({
+                "node_id": fact.get("node_id", fact.get("id")),
+                "time_key": fact.get("time_key"),
+                "fact_type": fact.get("fact_type"),
+                "summary": cls._reflect_log_text(fact.get("summary")),
+                "topics": fact.get("topics", []),
+                "keywords": fact.get("keywords", []),
+                "linked_entities": entity_items,
+            })
+        return items
+
+    @classmethod
+    def _reflect_observation_log_item(cls, observation: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = observation.get("metadata", {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return {
+            "id": observation.get("id"),
+            "entity_id": observation.get("entity_id"),
+            "entity_name": observation.get("entity_name"),
+            "topic_key": observation.get("topic_key"),
+            "topic_label": observation.get("topic_label"),
+            "observation_type": observation.get("observation_type"),
+            "summary": cls._reflect_log_text(observation.get("summary")),
+            "keywords": observation.get("keywords"),
+            "confidence": observation.get("confidence"),
+            "status": observation.get("status"),
+            "metadata": metadata,
+        }
+
+    @classmethod
+    def _log_reflect_error(cls, event: str, payload: Dict[str, Any]) -> None:
+        try:
+            body = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            body = str(payload)
+        logger.error("memory_reflect %s %s", event, body)
+
     @classmethod
     def _normalize_task_steps(cls, value: Any, *, limit: int = 12) -> List[Dict[str, Any]]:
         if not isinstance(value, list):
@@ -1078,9 +1170,17 @@ class MemoryNodeManager:
         return steps
 
     @classmethod
-    def _normalize_task_metadata(cls, metadata: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_task_metadata(
+        cls,
+        metadata: Dict[str, Any],
+        *,
+        allow_stale: bool = False,
+    ) -> Dict[str, Any]:
         task_status = str(metadata.get("task_status", "active") or "active").strip().lower()
-        if task_status not in {"active", "blocked", "paused"}:
+        allowed_statuses = {"active", "blocked", "paused"}
+        if allow_stale:
+            allowed_statuses.add("stale")
+        if task_status not in allowed_statuses:
             task_status = "active"
 
         normalized: Dict[str, Any] = {
@@ -1290,6 +1390,16 @@ class MemoryNodeManager:
             task.get("keywords", ""),
             task.get("topic_label") or task.get("topic_key") or "",
         ])
+        self._log_reflect_error("task_observation_update", {
+            "task_observation": self._reflect_observation_log_item(task),
+            "match_methods": sorted(set(match_methods)),
+            "llm_source_facts": self._reflect_fact_log_items(facts),
+            "stored_source_node_ids": source_ids,
+            "generated_observation": {
+                **self._reflect_observation_log_item(observation),
+                "metadata": observation_metadata,
+            },
+        })
         self._db.memory_replace_observation_group(
             keep_observation_id=int(task["id"]),
             remove_observation_ids=[],
@@ -1407,7 +1517,7 @@ class MemoryNodeManager:
             metadata = {}
         metadata = dict(metadata)
         if category == "task":
-            metadata = self._normalize_task_metadata(metadata)
+            metadata = self._normalize_task_metadata(metadata, allow_stale=bool(existing_observation))
         else:
             insight_type = str(
                 metadata.get("insight_type", "context") or "context"
@@ -1478,7 +1588,11 @@ class MemoryNodeManager:
                         "source": "memory_node_manager",
                         **(observation.get("metadata") or {}),
                     }
+                    observation_id = None
+                    action = "create"
                     if existing_observation is not None:
+                        observation_id = int(existing_observation["id"])
+                        action = "update"
                         self._db.memory_replace_observation_group(
                             keep_observation_id=int(existing_observation["id"]),
                             remove_observation_ids=[],
@@ -1490,7 +1604,7 @@ class MemoryNodeManager:
                             metadata=observation_metadata,
                         )
                     else:
-                        self._db.memory_upsert_observation(
+                        observation_id = self._db.memory_upsert_observation(
                             entity_id=entity_id,
                             topic_key=topic_key,
                             topic_label=topic_label,
@@ -1501,6 +1615,26 @@ class MemoryNodeManager:
                             confidence=observation["confidence"],
                             metadata=observation_metadata,
                         )
+                    self._log_reflect_error("observation_generated", {
+                        "action": action,
+                        "observation_id": observation_id,
+                        "entity_id": entity_id,
+                        "entity_name": entity_name,
+                        "topic_key": topic_key,
+                        "existing_observation_id": (
+                            int(existing_observation["id"])
+                            if existing_observation is not None
+                            else None
+                        ),
+                        "trigger_node_id": node_id,
+                        "llm_source_facts": self._reflect_fact_log_items(nodes_for_llm),
+                        "stored_source_node_ids": source_ids,
+                        "pending_source_node_ids": pending_source_ids,
+                        "generated_observation": {
+                            **self._reflect_observation_log_item(observation),
+                            "metadata": observation_metadata,
+                        },
+                    })
                     consolidated += 1
                 except Exception as exc:
                     logger.debug(
@@ -1527,6 +1661,13 @@ class MemoryNodeManager:
             for item in candidates
             for entity_id, _entity_name in item.get("linked_entities", [])
         ))
+        self._log_reflect_error("fact_candidates_for_observation", {
+            "dry_run": dry_run,
+            "limit": limit,
+            "candidate_count": len(candidates),
+            "touched_entity_ids": touched_entity_ids,
+            "facts": self._reflect_fact_log_items(candidates, limit=limit),
+        })
         if dry_run:
             return {
                 "candidate_count": len(candidates),
@@ -1857,7 +1998,7 @@ class MemoryNodeManager:
             metadata = {}
         metadata = dict(metadata)
         if category == "task":
-            metadata = self._normalize_task_metadata(metadata)
+            metadata = self._normalize_task_metadata(metadata, allow_stale=True)
         else:
             allowed_insight_types = {
                 "preference", "workflow", "strategy", "failure",
@@ -1882,6 +2023,30 @@ class MemoryNodeManager:
             return False
         keep_observation = observations[0]
         remove_ids = [int(observation["id"]) for observation in observations[1:]]
+        self._log_reflect_error("observation_merge", {
+            "entity_id": group.get("entity_id"),
+            "entity_name": group.get("entity_name", ""),
+            "topic_key": group.get("topic_key"),
+            "topic_label": group.get("topic_label", group.get("topic_key", "")),
+            "observation_type": category,
+            "keep_observation_id": int(keep_observation["id"]),
+            "remove_observation_ids": remove_ids,
+            "input_observations": [
+                self._reflect_observation_log_item(observation)
+                for observation in observations
+            ],
+            "supporting_facts": self._reflect_fact_log_items(source_nodes),
+            "merged_observation": {
+                "summary": self._reflect_log_text(summary),
+                "observation_type": category,
+                "keywords": keywords,
+                "confidence": max(0.0, min(1.0, confidence)),
+                "metadata": {
+                    "source": "memory_reflect_observation_merge",
+                    **metadata,
+                },
+            },
+        })
         self._db.memory_replace_observation_group(
             keep_observation_id=int(keep_observation["id"]),
             remove_observation_ids=remove_ids,
@@ -1901,7 +2066,30 @@ class MemoryNodeManager:
         if not entity_ids:
             return 0
         merged = 0
-        for group in self._db.memory_duplicate_observation_groups(entity_ids=entity_ids):
+        groups = self._db.memory_duplicate_observation_groups(entity_ids=entity_ids)
+        self._log_reflect_error("observation_merge_candidates", {
+            "entity_ids": entity_ids,
+            "group_count": len(groups),
+            "groups": [
+                {
+                    "entity_id": group.get("entity_id"),
+                    "entity_name": group.get("entity_name"),
+                    "topic_key": group.get("topic_key"),
+                    "topic_label": group.get("topic_label"),
+                    "observation_type": group.get("observation_type"),
+                    "observation_ids": [
+                        observation.get("id")
+                        for observation in group.get("observations", [])
+                    ],
+                    "source_node_ids": [
+                        node.get("id")
+                        for node in group.get("source_nodes", [])
+                    ],
+                }
+                for group in groups
+            ],
+        })
+        for group in groups:
             try:
                 if self._merge_duplicate_observation_group(group):
                     merged += 1
@@ -1941,6 +2129,15 @@ class MemoryNodeManager:
                 "observations_consolidated": 0,
                 "error": "memory database unavailable",
             }
+        self._log_reflect_error("start", {
+            "dry_run": dry_run,
+            "limit": limit,
+            "fact_half_life_days": fact_half_life_days,
+            "experience_half_life_days": experience_half_life_days,
+            "observation_decay_threshold": observation_decay_threshold,
+            "task_active_to_paused_days": task_active_to_paused_days,
+            "task_stale_days": task_stale_days,
+        })
         observation_report = self._reflect_observations_from_unprocessed_facts(
             dry_run=dry_run,
             limit=limit,
@@ -1950,6 +2147,30 @@ class MemoryNodeManager:
             limit=limit,
             anchor_entity_ids=observation_report.get("touched_entity_ids", []),
         )
+        self._log_reflect_error("entity_merge_candidates", {
+            "dry_run": dry_run,
+            "anchor_entity_ids": observation_report.get("touched_entity_ids", []),
+            "candidate_count": report.get("candidate_count", 0),
+            "merge_candidates": report.get("merge_candidates", 0),
+            "merged": report.get("merged", 0),
+            "candidates": report.get("candidates", []),
+        })
+        for candidate in report.get("candidates", []):
+            if candidate.get("action") != "merge":
+                continue
+            self._log_reflect_error("entity_merge", {
+                "dry_run": dry_run,
+                "canonical_id": candidate.get("canonical_id"),
+                "canonical_name": candidate.get("canonical_name"),
+                "duplicate_id": candidate.get("duplicate_id"),
+                "duplicate_name": candidate.get("duplicate_name"),
+                "confidence": candidate.get("confidence"),
+                "reason": candidate.get("reason"),
+                "risk": candidate.get("risk"),
+                "name_score": candidate.get("name_score"),
+                "type_score": candidate.get("type_score"),
+                "co_entities_score": candidate.get("co_entities_score"),
+            })
         report["observation_reflect"] = observation_report
         report["observations_consolidated"] = observation_report.get("consolidated", 0)
         report["observation_groups_merged"] = 0
@@ -1987,6 +2208,17 @@ class MemoryNodeManager:
         report["observations_would_inactivate"] = decay_report.get("would_inactivate", 0)
         report["tasks_paused"] = task_inactivity_report.get("paused", 0)
         report["tasks_stale"] = task_inactivity_report.get("stale", 0)
+        self._log_reflect_error("finish", {
+            "dry_run": dry_run,
+            "observations_consolidated": report.get("observations_consolidated", 0),
+            "task_matched": observation_report.get("task_matched", 0),
+            "task_updates": observation_report.get("task_updates", 0),
+            "entity_merged": report.get("merged", 0),
+            "observation_groups_merged": report.get("observation_groups_merged", 0),
+            "observations_inactivated": report.get("observations_inactivated", 0),
+            "tasks_paused": report.get("tasks_paused", 0),
+            "tasks_stale": report.get("tasks_stale", 0),
+        })
         return report
 
     # ── Recall relevant memory nodes ──────────────────────────────────────

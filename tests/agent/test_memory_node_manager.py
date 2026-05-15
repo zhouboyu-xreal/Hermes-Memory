@@ -6,6 +6,9 @@ import pytest
 from agent.memory_node_manager import MemoryNodeManager
 from agent.memory_node_manager import (
     CAUSAL_RELATION_TYPE_TEXT,
+    OBSERVATION_CONSOLIDATION_PROMPT,
+    OBSERVATION_MERGE_PROMPT,
+    OBSERVATION_UPDATE_PROMPT,
     RELATION_PROMPT_TEMPLATE,
     RETAIN_FACT_EXTRACTION_PROMPT,
 )
@@ -1562,6 +1565,25 @@ def test_task_metadata_normalizes_steps():
         },
     ]
     assert metadata["next_action"] == "验证 prompt 解析"
+
+    stale_metadata = MemoryNodeManager._normalize_task_metadata(
+        {"task_status": "stale"},
+        allow_stale=True,
+    )
+    assert stale_metadata["task_status"] == "stale"
+
+
+def test_task_status_prompt_definitions_scope_stale_by_prompt_role():
+    assert "task_status 定义" in OBSERVATION_CONSOLIDATION_PROMPT
+    assert "task_status 定义" in OBSERVATION_UPDATE_PROMPT
+    assert "首次生成 task 时不要输出 stale" in OBSERVATION_CONSOLIDATION_PROMPT
+    assert "stale：" in OBSERVATION_UPDATE_PROMPT
+    assert "stale 表示输入 observation" in OBSERVATION_MERGE_PROMPT
+    assert "不要输出 stale" in OBSERVATION_CONSOLIDATION_PROMPT
+    assert '"task_status": "active | blocked | paused"' in OBSERVATION_CONSOLIDATION_PROMPT
+    assert '"task_status": "active | blocked | paused | stale"' in OBSERVATION_UPDATE_PROMPT
+    assert '"task_status": "active | blocked | paused | stale"' in OBSERVATION_MERGE_PROMPT
+    assert '"task_status": "active | blocked | paused | stale"' not in OBSERVATION_CONSOLIDATION_PROMPT
 
 
 def test_observation_source_nodes_match_topic_key_exactly(db):
