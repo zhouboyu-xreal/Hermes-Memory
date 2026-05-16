@@ -150,18 +150,37 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请�
    - world: 客观世界/用户/项目事实
    - experience: 助手自己的行为、建议、推荐、执行经历
 4. occurred_start/occurred_end 如果对话没有明确日期，填空字符串
-5. entities 遵守下方统一实体提取规则；普通时间表达应写入 occurred_start/occurred_end，不进入 entities
-6. keywords 是用于检索这条 fact 的关键词，保留关键实体、产品、技术、动作和约束
-7. topic 是这条 fact 归属的主题词列表，用于后续 observation 分桶；不要把 entity name 本身当作唯一 topic
-8. task_event_like 描述这条 fact 是否是一个可能影响任务状态或步骤的事件；它不要求已经知道具体属于哪个任务
-9. task_event_subject 只能是 user、assistant、both、other；表示任务事件的主体或主要来源
-10. task_relevance 只能是 none、weak、medium、strong：
+5. time_confidence 只能是 explicit、inferred_from_turn、unknown：
+   - explicit: 对话中明确给出日期/时间或可无歧义换算
+   - inferred_from_turn: 只能基于当前这轮对话发生时间推断
+   - unknown: 无法确定时间
+6. entities 遵守下方统一实体提取规则；普通时间表达应写入 occurred_start/occurred_end，不进入 entities
+7. keywords 是用于检索这条 fact 的关键词，保留关键实体、产品、技术、动作和约束
+8. topic 是这条 fact 归属的主题词列表，用于后续 observation 分桶；不要把 entity name 本身当作唯一 topic
+9. fact_kind 只能是 preference、decision、request、recommendation、action、error、context、instruction、other
+   - instruction 只用于用户明确要求 AI 长期遵守的行为规则、格式偏好、语气偏好或工作方式
+   - 临时任务要求、当前轮的一次性请求不要标为 instruction
+10. priority 是 0-100 的整数，表示长期记忆价值：
+   - 80-100: 长期偏好、硬约束、健康/安全/核心项目事实、明确长期指令、重要任务进展
+   - 60-79: 可复用经验、一般任务事件、明确决策、失败原因
+   - <60: 普通闲聊、一次性问答、无后续价值、重复弱信息；不要输出这条 fact
+11. task_event_like 描述这条 fact 是否是一个可能影响任务状态或步骤的事件；它不要求已经知道具体属于哪个任务
+12. task_event_subject 只能是 user、assistant、both、other；表示任务事件的主体或主要来源
+13. task_relevance 只能是 none、weak、medium、strong：
    - none: 与任务状态或步骤无关
    - weak: 像一个事件，但不足以说明它会影响任务状态或步骤
    - medium: 可能影响某个任务的状态或步骤
    - strong: 明确表示用户正在发起、推进、完成、阻塞、暂停、恢复或决策某个任务
-11. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
-12. 只返回 JSON，不要 markdown，不要额外解释
+14. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
+15. 只返回 JSON，不要 markdown，不要额外解释
+
+硬丢弃规则：
+- 不要抽取普通一次性问答，除非包含用户偏好、明确决策、失败经验、约束或任务进展
+- 不要抽取助手泛泛解释概念、复述用户问题、客套话
+- 不要抽取没有未来复用价值的对话流水账
+- 不要抽取纯主观情绪，除非它改变了用户偏好、决策或任务状态
+- 不要抽取已被更高价值 fact 覆盖的重复信息
+- 如果一条候选 fact 的 priority < 60，不要把它放进 facts 数组
 
 task_event_like 判断规则：
 - true: fact 描述了一个可能影响任务生命周期的事件，包括请求、计划、推进、修改、实现、排查、验证、完成、结果、失败、阻塞、暂停、恢复或决策
@@ -169,6 +188,12 @@ task_event_like 判断规则：
 - 单条 fact 不需要判断它属于哪个具体 task；只需要判断它是否可能用于更新某个 task 的状态或步骤
 - 助手执行测试、修改代码、总结方案可以是 task_event_like，但如果只是助手行为，task_relevance 通常不要超过 medium
 - 用户明确要求、计划、继续、完成、阻塞、暂停或恢复某个任务时，task_relevance 通常是 medium 或 strong
+
+固定句式：
+- preference/context: "用户长期/通常/明确偏好..." 或 "关于 [实体/项目]，长期有用背景是..."
+- decision/request/action: "用户在 [时间] 围绕 [topic] 决定/请求/推进..."
+- instruction: "用户要求 AI 以后回答/执行任务时..."
+- experience: "助手曾在 [时间] 围绕 [topic] 执行/建议/验证...，结果是..."
 
 """ + ENTITY_EXTRACTION_GUIDANCE + """
 
@@ -182,12 +207,15 @@ task_event_like 判断规则：
       "keywords": ["关键词1", "关键词2"],
       "topic": ["主题1", "主题2"],
       "fact_type": "world/experience",
-      "fact_kind": "preference/decision/request/recommendation/action/error/context/other",
+      "fact_kind": "preference/decision/request/recommendation/action/error/context/instruction/other",
+      "priority": 80,
+      "priority_reason": "为什么这条 fact 值得长期保留",
       "task_event_like": true,
       "task_event_subject": "user/assistant/both/other",
       "task_relevance": "none/weak/medium/strong",
       "occurred_start": "",
       "occurred_end": "",
+      "time_confidence": "explicit/inferred_from_turn/unknown",
       "where": "",
       "entities": [
         {{"name": "实体名", "type": "CONCEPT"}}
@@ -200,6 +228,7 @@ task_event_like 判断规则：
 }}
 
 对话内容：
+对话发生时间：{turn_timestamp}
 用户：{user_message}
 助手：{assistant_response}"""
 
@@ -800,14 +829,41 @@ class MemoryNodeManager:
             "topic": keywords,
             "fact_type": "world",
             "fact_kind": "conversation_summary",
+            "priority": 60,
+            "priority_reason": "fallback conversation summary",
             "task_event_like": None,
             "task_event_subject": "",
             "task_relevance": "",
             "occurred_start": "",
             "occurred_end": "",
+            "time_confidence": "unknown",
             "where": "",
             "entities": [],
         }
+
+    @staticmethod
+    def _normalize_fact_kind(value: Any) -> str:
+        allowed = {
+            "preference", "decision", "request", "recommendation",
+            "action", "error", "context", "instruction",
+            "conversation_summary", "other",
+        }
+        fact_kind = str(value or "other").strip().lower()
+        return fact_kind if fact_kind in allowed else "other"
+
+    @staticmethod
+    def _normalize_fact_priority(value: Any) -> int:
+        try:
+            priority = int(float(value))
+        except (TypeError, ValueError):
+            return 70
+        return max(0, min(100, priority))
+
+    @staticmethod
+    def _normalize_time_confidence(value: Any) -> str:
+        time_confidence = str(value or "unknown").strip().lower()
+        allowed = {"explicit", "inferred_from_turn", "unknown"}
+        return time_confidence if time_confidence in allowed else "unknown"
 
     def _extract_retain_facts(
         self,
@@ -820,7 +876,9 @@ class MemoryNodeManager:
         model fails or returns malformed JSON, we fall back to the older single
         summary so memory retention remains best-effort instead of all-or-none.
         """
+        turn_timestamp = datetime.now().astimezone().isoformat()
         prompt = RETAIN_FACT_EXTRACTION_PROMPT.format(
+            turn_timestamp=turn_timestamp,
             user_message=user_message,
             assistant_response=assistant_response,
         )
@@ -838,12 +896,18 @@ class MemoryNodeManager:
                 logger.debug("Retain fact extraction parse failed, retrying")
 
         facts: List[Dict[str, Any]] = []
+        skipped_low_priority = False
+        raw_to_fact_index: Dict[int, int] = {}
         if data is not None and isinstance(data.get("facts"), list):
-            for raw_fact in data.get("facts", []):
+            for raw_index, raw_fact in enumerate(data.get("facts", [])):
                 if not isinstance(raw_fact, dict):
                     continue
                 text = str(raw_fact.get("text") or raw_fact.get("summary") or "").strip()
                 if not text:
+                    continue
+                priority = self._normalize_fact_priority(raw_fact.get("priority", 70))
+                if priority < 60:
+                    skipped_low_priority = True
                     continue
                 entities = self._normalize_fact_entities(raw_fact.get("entities", []))
                 keywords = self._normalize_keywords(raw_fact.get("keywords", []))
@@ -880,22 +944,28 @@ class MemoryNodeManager:
                     task_relevance = "medium"
                 if task_event_like is False and not task_relevance:
                     task_relevance = "none"
+                raw_to_fact_index[raw_index] = len(facts)
                 facts.append({
                     "text": text,
                     "keywords": keywords,
                     "topic": topic,
                     "fact_type": str(raw_fact.get("fact_type", "world") or "world").strip().lower(),
-                    "fact_kind": str(raw_fact.get("fact_kind", "other") or "other").strip().lower(),
+                    "fact_kind": self._normalize_fact_kind(raw_fact.get("fact_kind", "other")),
+                    "priority": priority,
+                    "priority_reason": str(raw_fact.get("priority_reason", "") or "").strip(),
                     "task_event_like": task_event_like,
                     "task_event_subject": task_event_subject,
                     "task_relevance": task_relevance,
                     "occurred_start": str(raw_fact.get("occurred_start", "") or "").strip(),
                     "occurred_end": str(raw_fact.get("occurred_end", "") or "").strip(),
+                    "time_confidence": self._normalize_time_confidence(raw_fact.get("time_confidence", "unknown")),
                     "where": str(raw_fact.get("where", "") or "").strip(),
                     "entities": entities,
                 })
 
         if not facts:
+            if skipped_low_priority:
+                return {"facts": [], "causal_relations": []}
             summary_data = self._summarize_turn(user_message, assistant_response)
             if not summary_data:
                 return None
@@ -911,9 +981,13 @@ class MemoryNodeManager:
                     if not isinstance(item, dict):
                         continue
                     try:
-                        source_index = int(item.get("source_index"))
-                        target_index = int(item.get("target_index"))
+                        raw_source_index = int(item.get("source_index"))
+                        raw_target_index = int(item.get("target_index"))
                     except (TypeError, ValueError):
+                        continue
+                    source_index = raw_to_fact_index.get(raw_source_index)
+                    target_index = raw_to_fact_index.get(raw_target_index)
+                    if source_index is None or target_index is None:
                         continue
                     relation = str(item.get("relation", "") or "").strip()
                     if not relation or relation == "None":
@@ -1046,12 +1120,15 @@ class MemoryNodeManager:
                 "text": fact.get("text", ""),
                 "fact_type": fact.get("fact_type", "world"),
                 "fact_kind": fact.get("fact_kind", "other"),
+                "priority": fact.get("priority", 70),
+                "priority_reason": fact.get("priority_reason", ""),
                 "task_event_like": fact.get("task_event_like"),
                 "task_event_subject": fact.get("task_event_subject", ""),
                 "task_relevance": fact.get("task_relevance", ""),
                 "topic": fact.get("topic", fact.get("keywords", [])),
                 "occurred_start": fact.get("occurred_start", ""),
                 "occurred_end": fact.get("occurred_end", ""),
+                "time_confidence": fact.get("time_confidence", "unknown"),
                 "where": fact.get("where", ""),
                 "entities": fact.get("entities", []),
             },
@@ -1070,10 +1147,25 @@ class MemoryNodeManager:
         for tag in (
             f"fact_type:{fact.get('fact_type', 'world')}",
             f"fact_kind:{fact.get('fact_kind', 'other')}",
+            f"priority:{self._normalize_fact_priority(fact.get('priority', 70))}",
             "source:memory_node_manager",
         ):
             if tag not in out:
                 out.append(tag)
+        priority = self._normalize_fact_priority(fact.get("priority", 70))
+        if priority >= 80:
+            priority_band = "high"
+        elif priority >= 60:
+            priority_band = "medium"
+        else:
+            priority_band = "low"
+        priority_band_tag = f"priority_band:{priority_band}"
+        if priority_band_tag not in out:
+            out.append(priority_band_tag)
+        time_confidence = self._normalize_time_confidence(fact.get("time_confidence", "unknown"))
+        time_confidence_tag = f"time_confidence:{time_confidence}"
+        if time_confidence_tag not in out:
+            out.append(time_confidence_tag)
         if fact.get("task_event_like") is True and "task_event_like:true" not in out:
             out.append("task_event_like:true")
         task_event_subject = str(fact.get("task_event_subject") or "").strip()

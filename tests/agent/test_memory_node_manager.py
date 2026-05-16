@@ -82,11 +82,14 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
                 "topic": ["urgent", "team", "communication"],
                 "fact_type": "world",
                 "fact_kind": "preference",
+                "priority": 92,
+                "priority_reason": "stable user communication preference",
                 "task_event_like": False,
                 "task_event_subject": "user",
                 "task_relevance": "none",
                 "occurred_start": "2026-05-01 00:00:00",
                 "occurred_end": "2026-05-01 23:59:59",
+                "time_confidence": "explicit",
                 "where": "work",
                 "entities": [
                     {"name": "Alice", "type": "PERSON"},
@@ -99,9 +102,12 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
                 "topic": ["alert", "routing"],
                 "fact_type": "experience",
                 "fact_kind": "recommendation",
+                "priority": 78,
+                "priority_reason": "reusable assistant recommendation",
                 "task_event_like": True,
                 "task_event_subject": "assistant",
                 "task_relevance": "medium",
+                "time_confidence": "inferred_from_turn",
                 "entities": [
                     {"name": "Alice", "type": "PERSON"},
                     {"name": "Slack", "type": "PRODUCT"},
@@ -131,6 +137,13 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert "urgent team communication" == rows[0]["topic"]
     assert "fact_type:world" in json.loads(rows[0]["tags"])
     assert "fact_type:experience" in json.loads(rows[1]["tags"])
+    assert "fact_kind:preference" in json.loads(rows[0]["tags"])
+    assert "priority:92" in json.loads(rows[0]["tags"])
+    assert "priority_band:high" in json.loads(rows[0]["tags"])
+    assert "time_confidence:explicit" in json.loads(rows[0]["tags"])
+    assert "priority:78" in json.loads(rows[1]["tags"])
+    assert "priority_band:medium" in json.loads(rows[1]["tags"])
+    assert "time_confidence:inferred_from_turn" in json.loads(rows[1]["tags"])
     assert rows[0]["task_event_like"] == 0
     assert rows[0]["task_event_subject"] == "user"
     assert rows[0]["task_relevance"] == "none"
@@ -144,9 +157,12 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     ).fetchone()
     original_payload = json.loads(detail["original_dialog"])
     assert original_payload["retain_fact"]["fact_kind"] == "preference"
+    assert original_payload["retain_fact"]["priority"] == 92
+    assert original_payload["retain_fact"]["priority_reason"] == "stable user communication preference"
     assert original_payload["retain_fact"]["task_event_like"] is False
     assert original_payload["retain_fact"]["task_relevance"] == "none"
     assert original_payload["retain_fact"]["occurred_start"] == "2026-05-01 00:00:00"
+    assert original_payload["retain_fact"]["time_confidence"] == "explicit"
 
     alice = db._conn.execute("SELECT id, type FROM entity_nodes WHERE name = 'Alice'").fetchone()
     assert alice is not None
@@ -213,9 +229,71 @@ def test_retain_and_relation_prompts_share_relation_type_contract():
     assert "Reason/HinderedBy" not in RELATION_PROMPT_TEMPLATE
     assert '"keywords": ["关键词1", "关键词2"]' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"topic": ["主题1", "主题2"]' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert '"fact_kind": "preference/decision/request/recommendation/action/error/context/instruction/other"' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert '"priority": 80' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert '"time_confidence": "explicit/inferred_from_turn/unknown"' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"task_event_like": true' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "对话发生时间：{turn_timestamp}" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "硬丢弃规则" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "固定句式" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "用户要求 AI 以后回答/执行任务时" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "可能影响任务状态或步骤的事件" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "不要求已经知道具体属于哪个任务" in RETAIN_FACT_EXTRACTION_PROMPT
+
+
+def test_retain_fact_prompt_includes_turn_timestamp_context(db):
+    retain_payload = {
+        "facts": [
+            {
+                "text": "助手曾在当前对话时间围绕测试执行验证，结果是测试通过。",
+                "keywords": ["测试", "验证"],
+                "topic": ["测试"],
+                "fact_type": "experience",
+                "fact_kind": "action",
+                "priority": 70,
+                "time_confidence": "inferred_from_turn",
+                "entities": [],
+            }
+        ],
+        "causal_relations": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps(retain_payload)],
+    )
+
+    assert mgr.store_turn("跑测试", "测试通过。") is True
+    assert "对话发生时间：" in mgr.llm_prompts[0]
+    assert "用户：跑测试" in mgr.llm_prompts[0]
+    assert "助手：测试通过。" in mgr.llm_prompts[0]
+
+
+def test_store_turn_discards_low_priority_retain_facts(db):
+    retain_payload = {
+        "facts": [
+            {
+                "text": "The user made a one-off small talk comment with no future utility.",
+                "keywords": ["small", "talk"],
+                "topic": ["small talk"],
+                "fact_type": "world",
+                "fact_kind": "context",
+                "priority": 40,
+                "priority_reason": "one-off low value comment",
+                "time_confidence": "inferred_from_turn",
+                "entities": [],
+            }
+        ],
+        "causal_relations": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps(retain_payload)],
+    )
+
+    assert mgr.store_turn("随便聊一句", "好的。") is False
+    assert db._conn.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0] == 0
 
 
 def test_store_turn_filters_plain_time_expressions_from_fact_entities(db):
