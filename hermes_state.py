@@ -191,6 +191,9 @@ CREATE TABLE IF NOT EXISTS memory_nodes (
     keywords TEXT NOT NULL,
     topic TEXT NOT NULL,
     fact_type TEXT NOT NULL DEFAULT 'world',
+    task_event_like INTEGER,
+    task_event_subject TEXT,
+    task_relevance TEXT,
     original_dialog TEXT,
     decay_score REAL DEFAULT 1.0,
     decay_updated_at TEXT,
@@ -793,6 +796,9 @@ class SessionDB:
             pass  # Column already exists
 
         for col_name, col_type in {
+            "task_event_like": "INTEGER",
+            "task_event_subject": "TEXT",
+            "task_relevance": "TEXT",
             "decay_score": "REAL DEFAULT 1.0",
             "decay_updated_at": "TEXT",
             "decay_half_life_days": "REAL",
@@ -2208,7 +2214,8 @@ class SessionDB:
         cursor = self._conn.execute(
             """SELECT id, time_key, summary, keywords, topic, original_dialog,
                       tags, fact_type, decay_score, decay_updated_at,
-                      decay_half_life_days
+                      decay_half_life_days, task_event_like, task_event_subject,
+                      task_relevance
                FROM memory_nodes
                WHERE id = ?""",
             (node_id,),
@@ -2240,6 +2247,9 @@ class SessionDB:
             "decay_score": float(r[8]) if r[8] is not None else 1.0,
             "decay_updated_at": r[9],
             "decay_half_life_days": r[10],
+            "task_event_like": None if r[11] is None else bool(r[11]),
+            "task_event_subject": r[12] or "",
+            "task_relevance": r[13] or "",
             "node_relations": node_relations,
         }
 
@@ -2917,6 +2927,9 @@ class SessionDB:
         query_embedding: np.ndarray,
         tags: Optional[List[str]] = None,
         fact_type: str = "world",
+        task_event_like: Optional[bool] = None,
+        task_event_subject: str = "",
+        task_relevance: str = "",
     ) -> int:
         """Insert a new memory node (SQLite + FAISS). Returns the node ID.
 
@@ -2931,10 +2944,21 @@ class SessionDB:
             normalized_fact_type = self._normalize_memory_fact_type(
                 fact_type or self._memory_fact_type_from_tags(tags or [])
             )
+            if task_event_like is None:
+                task_event_like_value = None
+            else:
+                task_event_like_value = 1 if bool(task_event_like) else 0
+            task_event_subject_value = str(task_event_subject or "").strip().lower()
+            if task_event_subject_value not in {"user", "assistant", "both", "other"}:
+                task_event_subject_value = ""
+            task_relevance_value = str(task_relevance or "").strip().lower()
+            if task_relevance_value not in {"none", "weak", "medium", "strong"}:
+                task_relevance_value = ""
             cursor = conn.execute(
                 """INSERT INTO memory_nodes
-                   (time_key, summary, keywords, topic, tags, fact_type, original_dialog)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (time_key, summary, keywords, topic, tags, fact_type,
+                    task_event_like, task_event_subject, task_relevance, original_dialog)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     time_key,
                     summary,
@@ -2942,6 +2966,9 @@ class SessionDB:
                     topic_str,
                     tags_str,
                     normalized_fact_type,
+                    task_event_like_value,
+                    task_event_subject_value,
+                    task_relevance_value,
                     original_dialog,
                 ),
             )
@@ -3920,7 +3947,8 @@ class SessionDB:
     ) -> List[Dict[str, Any]]:
         """Return fact nodes for an entity/topic bucket."""
         rows = self._conn.execute(
-            "SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, mn.fact_type "
+            "SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, mn.fact_type, "
+            "mn.task_event_like, mn.task_event_subject, mn.task_relevance "
             "FROM memory_nodes mn "
             "JOIN memory_node_entities mne ON mne.node_id = mn.id "
             "WHERE mne.entity_id = ? "
@@ -3940,7 +3968,15 @@ class SessionDB:
             stored_keys.add(self._memory_topic_key(topic_text))
             if target_key not in stored_keys:
                 continue
-            out.append(dict(row))
+            item = dict(row)
+            item["task_event_like"] = (
+                None
+                if item.get("task_event_like") is None
+                else bool(item.get("task_event_like"))
+            )
+            item["task_event_subject"] = item.get("task_event_subject") or ""
+            item["task_relevance"] = item.get("task_relevance") or ""
+            out.append(item)
             if len(out) >= limit:
                 break
         return out
@@ -3955,7 +3991,8 @@ class SessionDB:
         day = str(date_key or datetime.now().astimezone().date().isoformat())[:10]
         rows = self._conn.execute(
             "WITH candidate_nodes AS ("
-            "  SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, mn.fact_type "
+            "  SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, mn.fact_type, "
+            "  mn.task_event_like, mn.task_event_subject, mn.task_relevance "
             "  FROM memory_nodes mn "
             "  WHERE substr(mn.time_key, 1, 10) = ? "
             "  AND mn.fact_type IN ('world', 'experience') "
@@ -3966,6 +4003,7 @@ class SessionDB:
             "  LIMIT ?"
             ") "
             "SELECT cn.id AS node_id, cn.time_key, cn.summary, cn.keywords, cn.topic, cn.fact_type, "
+            "cn.task_event_like, cn.task_event_subject, cn.task_relevance, "
             "en.id AS entity_id, en.name AS entity_name "
             "FROM candidate_nodes cn "
             "JOIN memory_node_entities mne ON mne.node_id = cn.id "
@@ -3989,6 +4027,13 @@ class SessionDB:
                         if str(keyword or "").strip()
                     ],
                     "fact_type": row["fact_type"],
+                    "task_event_like": (
+                        None
+                        if row["task_event_like"] is None
+                        else bool(row["task_event_like"])
+                    ),
+                    "task_event_subject": row["task_event_subject"] or "",
+                    "task_relevance": row["task_relevance"] or "",
                     "topics": [
                         topic
                         for topic in str(row["topic"] or "").split()
@@ -4254,7 +4299,7 @@ class SessionDB:
         for observation_id in observation_ids:
             rows = self._conn.execute(
                 "SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.original_dialog, "
-                "mn.tags, mn.fact_type "
+                "mn.tags, mn.fact_type, mn.task_event_like, mn.task_event_subject, mn.task_relevance "
                 "FROM memory_observation_sources mos "
                 "JOIN memory_nodes mn ON mn.id = mos.node_id "
                 "WHERE mos.observation_id = ? "
@@ -4273,6 +4318,13 @@ class SessionDB:
                     "original_dialog": row["original_dialog"],
                     "tags": tags,
                     "fact_type": self._normalize_memory_fact_type(row["fact_type"]),
+                    "task_event_like": (
+                        None
+                        if row["task_event_like"] is None
+                        else bool(row["task_event_like"])
+                    ),
+                    "task_event_subject": row["task_event_subject"] or "",
+                    "task_relevance": row["task_relevance"] or "",
                     "node_relations": {},
                 })
             out[observation_id] = nodes
@@ -4312,7 +4364,8 @@ class SessionDB:
                 continue
             observation_ids = [int(obs["id"]) for obs in observations]
             source_rows = self._conn.execute(
-                "SELECT DISTINCT mn.id, mn.time_key, mn.summary, mn.keywords, mn.fact_type "
+                "SELECT DISTINCT mn.id, mn.time_key, mn.summary, mn.keywords, mn.fact_type, "
+                "mn.task_event_like, mn.task_event_subject, mn.task_relevance "
                 "FROM memory_observation_sources mos "
                 "JOIN memory_nodes mn ON mn.id = mos.node_id "
                 f"WHERE mos.observation_id IN ({','.join('?' for _ in observation_ids)}) "

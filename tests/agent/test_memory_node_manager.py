@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime, timedelta
 import numpy as np
 import pytest
@@ -6,11 +7,12 @@ import pytest
 from agent.memory_node_manager import MemoryNodeManager
 from agent.memory_node_manager import (
     CAUSAL_RELATION_TYPE_TEXT,
-    OBSERVATION_CONSOLIDATION_PROMPT,
+    INSIGHT_CONSOLIDATION_PROMPT,
     OBSERVATION_MERGE_PROMPT,
     OBSERVATION_UPDATE_PROMPT,
     RELATION_PROMPT_TEMPLATE,
     RETAIN_FACT_EXTRACTION_PROMPT,
+    TASK_CONSOLIDATION_PROMPT,
 )
 from hermes_state import SessionDB
 
@@ -80,6 +82,9 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
                 "topic": ["urgent", "team", "communication"],
                 "fact_type": "world",
                 "fact_kind": "preference",
+                "task_event_like": False,
+                "task_event_subject": "user",
+                "task_relevance": "none",
                 "occurred_start": "2026-05-01 00:00:00",
                 "occurred_end": "2026-05-01 23:59:59",
                 "where": "work",
@@ -94,6 +99,9 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
                 "topic": ["alert", "routing"],
                 "fact_type": "experience",
                 "fact_kind": "recommendation",
+                "task_event_like": True,
+                "task_event_subject": "assistant",
+                "task_relevance": "medium",
                 "entities": [
                     {"name": "Alice", "type": "PERSON"},
                     {"name": "Slack", "type": "PRODUCT"},
@@ -113,7 +121,8 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert mgr.store_turn("Alice hates email for urgent alerts", "Use Slack alerts.") is True
 
     rows = db._conn.execute(
-        "SELECT id, summary, keywords, topic, tags FROM memory_nodes ORDER BY id"
+        "SELECT id, summary, keywords, topic, tags, task_event_like, task_event_subject, task_relevance "
+        "FROM memory_nodes ORDER BY id"
     ).fetchall()
     assert len(rows) == 2
     assert rows[0]["summary"] == retain_payload["facts"][0]["text"]
@@ -122,6 +131,12 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert "urgent team communication" == rows[0]["topic"]
     assert "fact_type:world" in json.loads(rows[0]["tags"])
     assert "fact_type:experience" in json.loads(rows[1]["tags"])
+    assert rows[0]["task_event_like"] == 0
+    assert rows[0]["task_event_subject"] == "user"
+    assert rows[0]["task_relevance"] == "none"
+    assert rows[1]["task_event_like"] == 1
+    assert rows[1]["task_event_subject"] == "assistant"
+    assert rows[1]["task_relevance"] == "medium"
 
     detail = db._conn.execute(
         "SELECT original_dialog FROM memory_nodes WHERE id = ?",
@@ -129,6 +144,8 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     ).fetchone()
     original_payload = json.loads(detail["original_dialog"])
     assert original_payload["retain_fact"]["fact_kind"] == "preference"
+    assert original_payload["retain_fact"]["task_event_like"] is False
+    assert original_payload["retain_fact"]["task_relevance"] == "none"
     assert original_payload["retain_fact"]["occurred_start"] == "2026-05-01 00:00:00"
 
     alice = db._conn.execute("SELECT id, type FROM entity_nodes WHERE name = 'Alice'").fetchone()
@@ -196,6 +213,9 @@ def test_retain_and_relation_prompts_share_relation_type_contract():
     assert "Reason/HinderedBy" not in RELATION_PROMPT_TEMPLATE
     assert '"keywords": ["关键词1", "关键词2"]' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"topic": ["主题1", "主题2"]' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert '"task_event_like": true' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "可能影响任务状态或步骤的事件" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "不要求已经知道具体属于哪个任务" in RETAIN_FACT_EXTRACTION_PROMPT
 
 
 def test_store_turn_filters_plain_time_expressions_from_fact_entities(db):
@@ -281,7 +301,17 @@ def test_memory_time_key_uses_local_timezone_offset():
     assert local_offset in key
 
 
-def _add_memory_node(db, *, time_key, summary, keywords, fact_type="world"):
+def _add_memory_node(
+    db,
+    *,
+    time_key,
+    summary,
+    keywords,
+    fact_type="world",
+    task_event_like=None,
+    task_event_subject="",
+    task_relevance="",
+):
     return db.memory_add_node(
         time_key=time_key,
         summary=summary,
@@ -290,6 +320,9 @@ def _add_memory_node(db, *, time_key, summary, keywords, fact_type="world"):
         original_dialog="{}",
         query_embedding=np.ones((1, 1536), dtype=np.float32),
         fact_type=fact_type,
+        task_event_like=task_event_like,
+        task_event_subject=task_event_subject,
+        task_relevance=task_relevance,
     )
 
 
@@ -1439,7 +1472,7 @@ def test_reflect_matches_fact_to_task_by_high_embedding_similarity(db):
     assert db.memory_observation_source_ids(task_id) == [source_node, new_node]
 
 
-def test_reflect_matches_action_like_fact_to_single_recent_active_task(db):
+def test_reflect_matches_task_event_like_fact_to_single_recent_active_task(db):
     hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
     alice = db.entity_add_entity("Alice", "PERSON")
     source_node = _add_memory_node(
@@ -1529,6 +1562,97 @@ def test_reflect_leaves_unmatched_non_action_fact_for_regular_observation_flow(d
     assert mgr.llm_prompts == []
 
 
+def test_reflect_creates_task_episode_from_task_event_facts_with_different_entity_topics(db):
+    prompt_entity = db.entity_add_entity("Observation Prompt", "CONCEPT")
+    test_entity = db.entity_add_entity("Memory Tests", "CONCEPT")
+    first_step = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(0),
+        summary="用户先修改 observation prompt 中关于 task status 的定义。",
+        keywords=["prompt-step"],
+    )
+    second_step = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(1),
+        summary="用户接着运行 memory_node_manager 测试验证 task 生成逻辑。",
+        keywords=["test-step"],
+    )
+    db.entity_link_node(first_step, prompt_entity)
+    db.entity_link_node(second_step, test_entity)
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "category": "task",
+                "summary": "用户正在完善 task observation 的生成和验证流程。",
+                "keywords": ["task-observation", "prompt", "test"],
+                "confidence": 0.86,
+                "metadata": {
+                    "task_status": "active",
+                    "task_source": "inferred_from_observation",
+                    "goal": "让 task observation 能捕捉跨 entity/topic 的连续步骤。",
+                    "steps": [
+                        {"title": "修改 task status prompt", "status": "done"},
+                        {"title": "运行 memory_node_manager 测试", "status": "done"},
+                    ],
+                },
+            })
+        ],
+    )
+    mgr._embedding_client = _OrthogonalTaskEmbeddingClient()
+
+    report = mgr.reflect(dry_run=False, limit=10)
+
+    assert report["observation_reflect"]["task_episodes"] == 1
+    assert report["observation_reflect"]["task_episode_node_count"] == 2
+    assert db._conn.execute("SELECT COUNT(*) FROM memory_observations").fetchone()[0] == 1
+    observation = db._conn.execute(
+        "SELECT id, entity_id, topic_key, observation_type, summary, metadata FROM memory_observations"
+    ).fetchone()
+    assert observation["entity_id"] == prompt_entity
+    assert observation["topic_key"] == "task-observation-prompt-test"
+    assert observation["observation_type"] == "task"
+    assert "task observation" in observation["summary"]
+    assert set(db.memory_observation_source_ids(observation["id"])) == {first_step, second_step}
+    metadata = json.loads(observation["metadata"])
+    assert metadata["task_episode"]["node_ids"] == [first_step, second_step]
+    assert metadata["steps"][0]["title"] == "修改 task status prompt"
+
+
+def test_reflect_respects_structured_task_event_like_false_over_keyword_fallback(db):
+    prompt_entity = db.entity_add_entity("Observation Prompt", "CONCEPT")
+    test_entity = db.entity_add_entity("Memory Tests", "CONCEPT")
+    first_step = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(0),
+        summary="用户喜欢讨论如何修改 observation prompt 的历史背景。",
+        keywords=["修改", "prompt"],
+        task_event_like=False,
+        task_event_subject="user",
+        task_relevance="none",
+    )
+    second_step = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(1),
+        summary="用户喜欢讨论如何测试 memory_node_manager 的历史背景。",
+        keywords=["测试", "memory"],
+        task_event_like=False,
+        task_event_subject="user",
+        task_relevance="none",
+    )
+    db.entity_link_node(first_step, prompt_entity)
+    db.entity_link_node(second_step, test_entity)
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    mgr._embedding_client = _OrthogonalTaskEmbeddingClient()
+
+    report = mgr.reflect(dry_run=False, limit=10)
+
+    assert report["observation_reflect"]["task_episodes"] == 0
+    assert db._conn.execute("SELECT COUNT(*) FROM memory_observations").fetchone()[0] == 0
+    assert mgr.llm_prompts == []
+
+
 def test_task_metadata_normalizes_steps():
     metadata = MemoryNodeManager._normalize_task_metadata({
         "task_status": "stale",
@@ -1574,16 +1698,41 @@ def test_task_metadata_normalizes_steps():
 
 
 def test_task_status_prompt_definitions_scope_stale_by_prompt_role():
-    assert "task_status 定义" in OBSERVATION_CONSOLIDATION_PROMPT
+    assert "请只生成 insight，不要生成 task" in INSIGHT_CONSOLIDATION_PROMPT
+    assert "task_status" not in INSIGHT_CONSOLIDATION_PROMPT
+    assert "task_status 定义" in TASK_CONSOLIDATION_PROMPT
     assert "task_status 定义" in OBSERVATION_UPDATE_PROMPT
-    assert "首次生成 task 时不要输出 stale" in OBSERVATION_CONSOLIDATION_PROMPT
+    assert "首次生成 task 时不要输出 stale" in TASK_CONSOLIDATION_PROMPT
     assert "stale：" in OBSERVATION_UPDATE_PROMPT
     assert "stale 表示输入 observation" in OBSERVATION_MERGE_PROMPT
-    assert "不要输出 stale" in OBSERVATION_CONSOLIDATION_PROMPT
-    assert '"task_status": "active | blocked | paused"' in OBSERVATION_CONSOLIDATION_PROMPT
+    assert "不要输出 stale" in TASK_CONSOLIDATION_PROMPT
+    assert '"category": "insight"' in INSIGHT_CONSOLIDATION_PROMPT
+    assert '"category": "task"' in TASK_CONSOLIDATION_PROMPT
+    assert '"task_status": "active | blocked | paused"' in TASK_CONSOLIDATION_PROMPT
     assert '"task_status": "active | blocked | paused | stale"' in OBSERVATION_UPDATE_PROMPT
     assert '"task_status": "active | blocked | paused | stale"' in OBSERVATION_MERGE_PROMPT
-    assert '"task_status": "active | blocked | paused | stale"' not in OBSERVATION_CONSOLIDATION_PROMPT
+    assert '"task_status": "active | blocked | paused | stale"' not in TASK_CONSOLIDATION_PROMPT
+
+
+def test_reflect_error_log_message_is_json(caplog):
+    with caplog.at_level(logging.ERROR, logger="agent.memory_node_manager"):
+        MemoryNodeManager._log_reflect_error("sample_event", {"fact": "用户修改 prompt"})
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "agent.memory_node_manager"
+    ]
+    assert messages
+    assert messages[-1].startswith("\n")
+    assert "\n  \"event\": \"sample_event\"" in messages[-1]
+    assert "\n  \"payload\": {" in messages[-1]
+    data = json.loads(messages[-1])
+    assert data == {
+        "scope": "memory_reflect",
+        "event": "sample_event",
+        "payload": {"fact": "用户修改 prompt"},
+    }
 
 
 def test_observation_source_nodes_match_topic_key_exactly(db):

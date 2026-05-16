@@ -153,8 +153,22 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请�
 5. entities 遵守下方统一实体提取规则；普通时间表达应写入 occurred_start/occurred_end，不进入 entities
 6. keywords 是用于检索这条 fact 的关键词，保留关键实体、产品、技术、动作和约束
 7. topic 是这条 fact 归属的主题词列表，用于后续 observation 分桶；不要把 entity name 本身当作唯一 topic
-8. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
-9. 只返回 JSON，不要 markdown，不要额外解释
+8. task_event_like 描述这条 fact 是否是一个可能影响任务状态或步骤的事件；它不要求已经知道具体属于哪个任务
+9. task_event_subject 只能是 user、assistant、both、other；表示任务事件的主体或主要来源
+10. task_relevance 只能是 none、weak、medium、strong：
+   - none: 与任务状态或步骤无关
+   - weak: 像一个事件，但不足以说明它会影响任务状态或步骤
+   - medium: 可能影响某个任务的状态或步骤
+   - strong: 明确表示用户正在发起、推进、完成、阻塞、暂停、恢复或决策某个任务
+11. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
+12. 只返回 JSON，不要 markdown，不要额外解释
+
+task_event_like 判断规则：
+- true: fact 描述了一个可能影响任务生命周期的事件，包括请求、计划、推进、修改、实现、排查、验证、完成、结果、失败、阻塞、暂停、恢复或决策
+- false: fact 只是偏好、背景、关系、属性、静态信息、一次性知识问答或泛泛主题讨论
+- 单条 fact 不需要判断它属于哪个具体 task；只需要判断它是否可能用于更新某个 task 的状态或步骤
+- 助手执行测试、修改代码、总结方案可以是 task_event_like，但如果只是助手行为，task_relevance 通常不要超过 medium
+- 用户明确要求、计划、继续、完成、阻塞、暂停或恢复某个任务时，task_relevance 通常是 medium 或 strong
 
 """ + ENTITY_EXTRACTION_GUIDANCE + """
 
@@ -169,6 +183,9 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请�
       "topic": ["主题1", "主题2"],
       "fact_type": "world/experience",
       "fact_kind": "preference/decision/request/recommendation/action/error/context/other",
+      "task_event_like": true,
+      "task_event_subject": "user/assistant/both/other",
+      "task_relevance": "none/weak/medium/strong",
       "occurred_start": "",
       "occurred_end": "",
       "where": "",
@@ -242,9 +259,9 @@ RELATION_PROMPT_TEMPLATE = """你是"AI眼镜记忆关系抽取模块"。
 
 # ── Observation consolidation prompt template ────────────────────────────
 
-OBSERVATION_CONSOLIDATION_PROMPT = """你是长期记忆 consolidation 模块。
+INSIGHT_CONSOLIDATION_PROMPT = """你是长期记忆 insight consolidation 模块。
 
-你需要把同一 entity/topic 下的 world facts 和 experience memories，整合成一条长期可用的 observation。
+你需要把同一 entity/topic 下的 world facts 和 experience memories，整合成一条长期可用的 insight observation。
 
 entity: {entity_name}
 topic: {topic_label}
@@ -252,32 +269,51 @@ topic: {topic_label}
 source facts:
 {source_facts}
 
-请判断这些事实应该形成哪一类 observation：
+请只生成 insight，不要生成 task。
 
-1. insight
-表示关于用户、实体、偏好、约束、工作流、背景、经验、关系、模式或稳定上下文的洞察。
+insight 表示关于用户、实体、偏好、约束、工作流、背景、经验、关系、模式或稳定上下文的洞察。
 
-2. task
-表示这些事实能够推断出用户正在持续推进某个具体任务、项目、排查、实现、计划、交付物或待完成目标。
-
-只有在来源事实中出现重复的行动、推进、计划、修改、排查、设计、实现、跟进或阶段性进展时，才允许使用 category="task"。
-
-不要把以下情况判断为 task：
-- 一次性问题
-- 静态偏好
-- 人物背景
-- 家庭关系
-- 单次兴趣表达
-- 泛泛讨论某个主题，但没有持续行动或进展
-- 关于他人的事实，除非用户正在围绕该对象执行某项任务
-- 单纯的属性、条件、限制、标签或分类
-
-如果是 insight：
+要求：
 - 总结这些事实中长期有用的稳定信息。
-- 可以描述偏好、约束、工作方式、反复出现的模式、成功/失败经验或上下文。
-- 不要编造任务状态、下一步行动或截止时间。
+- 可以描述偏好、约束、工作方式、反复出现的模式、成功/失败经验、项目知识或上下文。
+- 不要编造任务状态、步骤、下一步行动或截止时间。
+- 即使事实中出现动作描述，也不要在此 prompt 中生成 task；task 由 task episode prompt 单独生成。
+- metadata 中只填写 insight_type。
 
-如果是 task：
+insight_type 只能是：
+- preference：用户或实体的偏好。
+- workflow：用户反复采用的工作流或操作方式。
+- strategy：用户倾向采用的策略、原则或决策方式。
+- failure：失败、问题、踩坑或负面经验。
+- success：成功做法、有效方案或正面经验。
+- change：状态、偏好、方案或上下文发生变化。
+- constraint：约束、限制、条件、依赖。
+- context：其他长期有用的背景、项目知识或关系信息。
+
+只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
+{{
+  "category": "insight",
+  "summary": "一句简洁、长期可用的 insight observation。",
+  "keywords": ["关键词1", "关键词2"],
+  "confidence": 0.0,
+  "metadata": {{
+    "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context"
+  }}
+}}"""
+
+TASK_CONSOLIDATION_PROMPT = """你是长期记忆 task consolidation 模块。
+
+你需要把一组 task-event-like facts 整合成一条长期可追踪的 task observation。
+
+entity: {entity_name}
+topic: {topic_label}
+
+source facts:
+{source_facts}
+
+task 表示这些事实能够推断出用户正在持续推进某个具体任务、项目、排查、实现、计划、交付物或待完成目标。
+
+要求：
 - summary 应描述用户正在做什么，以及这个任务的目标或当前焦点。
 - task_status 只能是 active、blocked、paused 之一；首次生成 task 时不要输出 stale。
 - task_source 固定为 inferred_from_observation。
@@ -299,12 +335,11 @@ task_status 定义：
 
 只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
-  "category": "insight | task",
-  "summary": "一句简洁、长期可用的 observation。如果是 task，说明用户正在推进的任务。",
+  "category": "task",
+  "summary": "一句简洁、长期可用的 task observation，说明用户正在推进的任务。",
   "keywords": ["关键词1", "关键词2"],
   "confidence": 0.0,
   "metadata": {{
-    "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context",
     "task_status": "active | blocked | paused",
     "task_source": "inferred_from_observation",
     "goal": "可选，任务目标",
@@ -321,9 +356,7 @@ task_status 定义：
     "next_action": "可选，只有明确时填写"
   }}
 }}
-
-如果 category 是 insight：metadata 中只填写 insight_type，不要填写 task_status、task_source、goal、steps、next_action。
-如果 category 是 task：metadata 中填写 task_status、task_source、evidence、steps；goal 和 next_action 可选；不要填写 insight_type。"""
+"""
 
 OBSERVATION_UPDATE_PROMPT = """你是长期记忆 consolidation 模块。
 
@@ -767,6 +800,9 @@ class MemoryNodeManager:
             "topic": keywords,
             "fact_type": "world",
             "fact_kind": "conversation_summary",
+            "task_event_like": None,
+            "task_event_subject": "",
+            "task_relevance": "",
             "occurred_start": "",
             "occurred_end": "",
             "where": "",
@@ -818,12 +854,41 @@ class MemoryNodeManager:
                     keywords = [e["name"] for e in entities[:5]]
                 if not topic:
                     topic = keywords[:]
+                task_event_like_raw = raw_fact.get("task_event_like")
+                task_event_like: Optional[bool]
+                if isinstance(task_event_like_raw, bool):
+                    task_event_like = task_event_like_raw
+                elif isinstance(task_event_like_raw, (int, float)):
+                    task_event_like = bool(task_event_like_raw)
+                elif isinstance(task_event_like_raw, str):
+                    lowered_action = task_event_like_raw.strip().lower()
+                    if lowered_action in {"true", "yes", "1"}:
+                        task_event_like = True
+                    elif lowered_action in {"false", "no", "0"}:
+                        task_event_like = False
+                    else:
+                        task_event_like = None
+                else:
+                    task_event_like = None
+                task_event_subject = str(raw_fact.get("task_event_subject", "") or "").strip().lower()
+                if task_event_subject not in {"user", "assistant", "both", "other"}:
+                    task_event_subject = ""
+                task_relevance = str(raw_fact.get("task_relevance", "") or "").strip().lower()
+                if task_relevance not in {"none", "weak", "medium", "strong"}:
+                    task_relevance = ""
+                if task_event_like is True and not task_relevance:
+                    task_relevance = "medium"
+                if task_event_like is False and not task_relevance:
+                    task_relevance = "none"
                 facts.append({
                     "text": text,
                     "keywords": keywords,
                     "topic": topic,
                     "fact_type": str(raw_fact.get("fact_type", "world") or "world").strip().lower(),
                     "fact_kind": str(raw_fact.get("fact_kind", "other") or "other").strip().lower(),
+                    "task_event_like": task_event_like,
+                    "task_event_subject": task_event_subject,
+                    "task_relevance": task_relevance,
                     "occurred_start": str(raw_fact.get("occurred_start", "") or "").strip(),
                     "occurred_end": str(raw_fact.get("occurred_end", "") or "").strip(),
                     "where": str(raw_fact.get("where", "") or "").strip(),
@@ -981,6 +1046,9 @@ class MemoryNodeManager:
                 "text": fact.get("text", ""),
                 "fact_type": fact.get("fact_type", "world"),
                 "fact_kind": fact.get("fact_kind", "other"),
+                "task_event_like": fact.get("task_event_like"),
+                "task_event_subject": fact.get("task_event_subject", ""),
+                "task_relevance": fact.get("task_relevance", ""),
                 "topic": fact.get("topic", fact.get("keywords", [])),
                 "occurred_start": fact.get("occurred_start", ""),
                 "occurred_end": fact.get("occurred_end", ""),
@@ -1004,6 +1072,18 @@ class MemoryNodeManager:
             f"fact_kind:{fact.get('fact_kind', 'other')}",
             "source:memory_node_manager",
         ):
+            if tag not in out:
+                out.append(tag)
+        if fact.get("task_event_like") is True and "task_event_like:true" not in out:
+            out.append("task_event_like:true")
+        task_event_subject = str(fact.get("task_event_subject") or "").strip()
+        if task_event_subject:
+            tag = f"task_event_subject:{task_event_subject}"
+            if tag not in out:
+                out.append(tag)
+        task_relevance = str(fact.get("task_relevance") or "").strip()
+        if task_relevance:
+            tag = f"task_relevance:{task_relevance}"
             if tag not in out:
                 out.append(tag)
         return out
@@ -1066,6 +1146,34 @@ class MemoryNodeManager:
         return f"{text[:limit]}..."
 
     @classmethod
+    def _fact_entity_items(cls, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+        entity_items: List[Dict[str, Any]] = []
+        linked_entities = fact.get("linked_entities", [])
+        if not isinstance(linked_entities, list):
+            linked_entities = []
+        for entity in linked_entities:
+            if isinstance(entity, dict):
+                entity_items.append({
+                    "id": entity.get("id") or entity.get("entity_id"),
+                    "name": entity.get("name") or entity.get("entity_name"),
+                })
+            elif isinstance(entity, (list, tuple)) and len(entity) >= 2:
+                entity_items.append({"id": entity[0], "name": entity[1]})
+        return entity_items
+
+    @classmethod
+    def _fact_entity_pairs(cls, fact: Dict[str, Any]) -> List[Tuple[int, str]]:
+        pairs: List[Tuple[int, str]] = []
+        for item in cls._fact_entity_items(fact):
+            try:
+                entity_id = int(item.get("id"))
+            except (TypeError, ValueError):
+                continue
+            name = str(item.get("name") or "").strip()
+            pairs.append((entity_id, name))
+        return pairs
+
+    @classmethod
     def _reflect_fact_log_items(
         cls,
         facts: List[Dict[str, Any]],
@@ -1074,18 +1182,6 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         for fact in facts[:limit]:
-            entity_items: List[Dict[str, Any]] = []
-            linked_entities = fact.get("linked_entities", [])
-            if not isinstance(linked_entities, list):
-                linked_entities = []
-            for entity in linked_entities:
-                if isinstance(entity, dict):
-                    entity_items.append({
-                        "id": entity.get("id") or entity.get("entity_id"),
-                        "name": entity.get("name") or entity.get("entity_name"),
-                    })
-                elif isinstance(entity, (list, tuple)) and len(entity) >= 2:
-                    entity_items.append({"id": entity[0], "name": entity[1]})
             items.append({
                 "node_id": fact.get("node_id", fact.get("id")),
                 "time_key": fact.get("time_key"),
@@ -1093,7 +1189,10 @@ class MemoryNodeManager:
                 "summary": cls._reflect_log_text(fact.get("summary")),
                 "topics": fact.get("topics", []),
                 "keywords": fact.get("keywords", []),
-                "linked_entities": entity_items,
+                "task_event_like": fact.get("task_event_like"),
+                "task_event_subject": fact.get("task_event_subject"),
+                "task_relevance": fact.get("task_relevance"),
+                "linked_entities": cls._fact_entity_items(fact),
             })
         return items
 
@@ -1123,11 +1222,20 @@ class MemoryNodeManager:
 
     @classmethod
     def _log_reflect_error(cls, event: str, payload: Dict[str, Any]) -> None:
+        record = {
+            "scope": "memory_reflect",
+            "event": event,
+            "payload": payload,
+        }
         try:
-            body = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+            body = json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2, default=str)
         except (TypeError, ValueError):
-            body = str(payload)
-        logger.error("memory_reflect %s %s", event, body)
+            body = json.dumps({
+                "scope": "memory_reflect",
+                "event": event,
+                "payload": str(payload),
+            }, ensure_ascii=False, sort_keys=True, indent=2)
+        logger.error("\n%s", body)
 
     @classmethod
     def _normalize_task_steps(cls, value: Any, *, limit: int = 12) -> List[Dict[str, Any]]:
@@ -1288,7 +1396,30 @@ class MemoryNodeManager:
         ])
 
     @staticmethod
-    def _is_action_like_fact(fact: Dict[str, Any]) -> bool:
+    def _is_task_event_like_fact(fact: Dict[str, Any]) -> bool:
+        task_event_like_raw = fact.get("task_event_like")
+        task_relevance = str(fact.get("task_relevance") or "").strip().lower()
+        if isinstance(task_event_like_raw, bool):
+            if not task_event_like_raw:
+                return False
+            if task_relevance in {"none", "weak"}:
+                return False
+            return True
+        if isinstance(task_event_like_raw, (int, float)):
+            if int(task_event_like_raw) <= 0:
+                return False
+            if task_relevance in {"none", "weak"}:
+                return False
+            return True
+        if isinstance(task_event_like_raw, str) and task_event_like_raw.strip():
+            lowered = task_event_like_raw.strip().lower()
+            if lowered in {"false", "no", "0"}:
+                return False
+            if lowered in {"true", "yes", "1"}:
+                if task_relevance in {"none", "weak"}:
+                    return False
+                return True
+
         text = " ".join([
             str(fact.get("summary", "") or ""),
             " ".join(str(item) for item in fact.get("keywords", []) if str(item or "").strip()),
@@ -1300,11 +1431,263 @@ class MemoryNodeManager:
             "修改", "实现", "排查", "验证", "测试", "设计", "讨论", "优化", "补充",
             "合并", "接入", "调用", "迁移", "重构", "修复", "继续", "先不要",
             "可以修改", "需要", "计划", "准备", "下一步", "更新", "生成", "新增",
+            "完成", "通过", "失败", "阻塞", "卡住", "暂停", "恢复", "解决", "放一下",
             "implement", "fix", "debug", "investigate", "test", "verify",
             "design", "update", "refactor", "migrate", "add", "remove",
-            "continue", "plan", "next step",
+            "continue", "plan", "next step", "complete", "completed", "done",
+            "pass", "passed", "fail", "failed", "block", "blocked", "pause",
+            "paused", "resume", "resumed", "resolve", "resolved",
         ]
         return any(pattern in text for pattern in action_patterns)
+
+    @staticmethod
+    def _fact_has_user_task_signal(fact: Dict[str, Any]) -> bool:
+        task_event_like_raw = fact.get("task_event_like")
+        task_event_subject = str(fact.get("task_event_subject") or "").strip().lower()
+        task_relevance = str(fact.get("task_relevance") or "").strip().lower()
+        has_structured_event = task_event_like_raw is not None and str(task_event_like_raw).strip() != ""
+        if has_structured_event:
+            if not MemoryNodeManager._is_task_event_like_fact(fact):
+                return False
+            if task_relevance not in {"medium", "strong"}:
+                return False
+            return task_event_subject in {"", "user", "both", "other"}
+        return MemoryNodeManager._is_task_event_like_fact(fact)
+
+    @staticmethod
+    def _fact_time_for_episode(fact: Dict[str, Any]) -> Optional[datetime]:
+        raw = str(fact.get("time_key") or "").split("#", 1)[0].strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw.replace(" ", "T", 1))
+        except ValueError:
+            return None
+
+    @classmethod
+    def _fact_terms_for_episode(cls, fact: Dict[str, Any]) -> set[str]:
+        terms: set[str] = set()
+        for key in ("topics", "keywords"):
+            value = fact.get(key, [])
+            if isinstance(value, str):
+                value = value.split()
+            if not isinstance(value, list):
+                continue
+            for item in value:
+                term = cls._topic_key(item)
+                if term and term != "general":
+                    terms.add(term)
+        return terms
+
+    def _task_episode_embedding(
+        self,
+        fact: Dict[str, Any],
+        cache: Dict[int, Any],
+    ) -> Any:
+        try:
+            node_id = int(fact["node_id"])
+        except (KeyError, TypeError, ValueError):
+            node_id = id(fact)
+        if node_id in cache:
+            return cache[node_id]
+        embedding = None
+        if self._embedding_client is not None or self._ensure_embedding_client():
+            try:
+                embedding = self._embedding_client.embed_text(self._fact_match_text(fact))
+            except Exception:
+                embedding = None
+        cache[node_id] = embedding
+        return embedding
+
+    def _task_episode_related(
+        self,
+        fact: Dict[str, Any],
+        episode: List[Dict[str, Any]],
+        embedding_cache: Dict[int, Any],
+        *,
+        similarity_threshold: float = 0.72,
+        max_gap_minutes: float = 180.0,
+    ) -> Tuple[bool, str, float]:
+        if not episode:
+            return True, "start", 1.0
+
+        fact_entities = {entity_id for entity_id, _name in self._fact_entity_pairs(fact)}
+        episode_entities = {
+            entity_id
+            for item in episode
+            for entity_id, _name in self._fact_entity_pairs(item)
+        }
+        fact_terms = self._fact_terms_for_episode(fact)
+        episode_terms = set().union(*(self._fact_terms_for_episode(item) for item in episode))
+        if fact_entities & episode_entities and fact_terms & episode_terms:
+            return True, "entity_topic", 1.0
+        if fact_terms & episode_terms:
+            return True, "topic_keyword", 0.82
+
+        fact_embedding = self._task_episode_embedding(fact, embedding_cache)
+        if fact_embedding is not None:
+            best_similarity = 0.0
+            for item in episode:
+                item_embedding = self._task_episode_embedding(item, embedding_cache)
+                best_similarity = max(
+                    best_similarity,
+                    self._embedding_similarity(fact_embedding, item_embedding),
+                )
+            if best_similarity >= similarity_threshold:
+                return True, "embedding", best_similarity
+
+        current_time = self._fact_time_for_episode(fact)
+        previous_time = self._fact_time_for_episode(episode[-1])
+        if current_time is not None and previous_time is not None:
+            compare_current = current_time
+            compare_previous = previous_time
+            if compare_current.tzinfo is not None and compare_previous.tzinfo is None:
+                compare_current = compare_current.replace(tzinfo=None)
+            elif compare_current.tzinfo is None and compare_previous.tzinfo is not None:
+                compare_previous = compare_previous.replace(tzinfo=None)
+            gap_minutes = abs((compare_current - compare_previous).total_seconds()) / 60.0
+            if gap_minutes <= max_gap_minutes:
+                return True, "temporal_sequence", max(0.0, 1.0 - (gap_minutes / max_gap_minutes))
+
+        return False, "unrelated", 0.0
+
+    def _task_episode_candidates(
+        self,
+        facts: List[Dict[str, Any]],
+        *,
+        min_facts: int = 2,
+    ) -> List[Dict[str, Any]]:
+        task_event_facts = [fact for fact in facts if self._is_task_event_like_fact(fact)]
+        task_event_facts.sort(key=lambda item: (str(item.get("time_key") or ""), int(item.get("node_id") or 0)))
+        episodes: List[Dict[str, Any]] = []
+        current: List[Dict[str, Any]] = []
+        reasons: List[str] = []
+        scores: List[float] = []
+        embedding_cache: Dict[int, Any] = {}
+
+        def flush_current() -> None:
+            if len(current) >= min_facts:
+                episodes.append({
+                    "facts": list(current),
+                    "reasons": list(reasons),
+                    "scores": list(scores),
+                })
+
+        for fact in task_event_facts:
+            if not current:
+                current = [fact]
+                reasons = ["start"]
+                scores = [1.0]
+                continue
+            related, reason, score = self._task_episode_related(
+                fact,
+                current,
+                embedding_cache,
+            )
+            if related:
+                current.append(fact)
+                reasons.append(reason)
+                scores.append(score)
+            else:
+                flush_current()
+                current = [fact]
+                reasons = ["start"]
+                scores = [1.0]
+        flush_current()
+        return episodes
+
+    def _task_episode_anchor_entity(self, facts: List[Dict[str, Any]]) -> Optional[Tuple[int, str]]:
+        counts: Dict[int, Dict[str, Any]] = {}
+        order = 0
+        for fact in facts:
+            for entity_id, entity_name in self._fact_entity_pairs(fact):
+                item = counts.setdefault(
+                    entity_id,
+                    {"entity_id": entity_id, "entity_name": entity_name, "count": 0, "order": order},
+                )
+                item["count"] += 1
+                order += 1
+        if not counts:
+            return None
+        winner = sorted(counts.values(), key=lambda item: (-item["count"], item["order"]))[0]
+        return int(winner["entity_id"]), str(winner["entity_name"] or "")
+
+    def _task_episode_topic_from_observation(
+        self,
+        observation: Dict[str, Any],
+        facts: List[Dict[str, Any]],
+    ) -> Tuple[str, str]:
+        topic_parts = self._normalize_keywords(observation.get("keywords", []))
+        if not topic_parts:
+            for fact in facts:
+                topic_parts.extend(self._normalize_keywords(fact.get("topics", [])))
+                topic_parts.extend(self._normalize_keywords(fact.get("keywords", [])))
+        topic_parts = list(dict.fromkeys(topic_parts))
+        topic_label = " ".join(topic_parts[:4]) if topic_parts else "task episode"
+        return self._topic_key(topic_label), topic_label
+
+    def _create_task_observation_from_episode(self, episode: Dict[str, Any]) -> Optional[int]:
+        if not self._db:
+            return None
+        facts = episode.get("facts") or []
+        anchor = self._task_episode_anchor_entity(facts)
+        if not facts or anchor is None:
+            return None
+        if not any(self._fact_has_user_task_signal(fact) for fact in facts):
+            return None
+        entity_id, entity_name = anchor
+        observation = self._generate_observation(
+            entity_name=entity_name,
+            topic_label="task episode",
+            source_nodes=facts,
+            existing_observation=None,
+            target_type="task",
+        )
+        if not observation or observation.get("observation_type") != "task":
+            return None
+        topic_key, topic_label = self._task_episode_topic_from_observation(observation, facts)
+        source_ids = [int(fact["node_id"]) for fact in facts]
+        metadata = {
+            "source": "memory_node_manager",
+            "task_episode": {
+                "source": "reflect_action_episode",
+                "node_ids": source_ids,
+                "match_reasons": episode.get("reasons", []),
+                "match_scores": episode.get("scores", []),
+            },
+            **(observation.get("metadata") or {}),
+        }
+        observation_id = self._db.memory_upsert_observation(
+            entity_id=entity_id,
+            topic_key=topic_key,
+            topic_label=topic_label,
+            observation_type="task",
+            summary=observation["summary"],
+            keywords=observation["keywords"] or [topic_label],
+            source_node_ids=source_ids,
+            confidence=observation["confidence"],
+            metadata=metadata,
+        )
+        self._log_reflect_error("task_episode_generated", {
+            "observation_id": observation_id,
+            "entity_id": entity_id,
+            "entity_name": entity_name,
+            "topic_key": topic_key,
+            "topic_label": topic_label,
+            "episode_reasons": episode.get("reasons", []),
+            "episode_scores": episode.get("scores", []),
+            "llm_source_facts": self._reflect_fact_log_items(facts),
+            "generated_observation": {
+                **self._reflect_observation_log_item(observation),
+                "observation_type": "task",
+                "entity_id": entity_id,
+                "entity_name": entity_name,
+                "topic_key": topic_key,
+                "topic_label": topic_label,
+                "metadata": metadata,
+            },
+        })
+        return int(observation_id)
 
     def _task_match_for_fact(
         self,
@@ -1317,10 +1700,7 @@ class MemoryNodeManager:
         if not tasks:
             return None
 
-        fact_entity_ids = {
-            int(entity_id)
-            for entity_id, _entity_name in fact.get("linked_entities", [])
-        }
+        fact_entity_ids = {entity_id for entity_id, _entity_name in self._fact_entity_pairs(fact)}
         fact_topics = {self._topic_key(topic) for topic in fact.get("topics", [])}
 
         for task in tasks:
@@ -1356,7 +1736,7 @@ class MemoryNodeManager:
                 return best_task, "embedding", best_score
 
         recent_active_tasks = [task for task in tasks if self._task_status(task) == "active"]
-        if len(recent_active_tasks) == 1 and self._is_action_like_fact(fact):
+        if len(recent_active_tasks) == 1 and self._is_task_event_like_fact(fact):
             return recent_active_tasks[0], "recent_active_action", 0.6
         return None
 
@@ -1460,6 +1840,7 @@ class MemoryNodeManager:
         topic_label: str,
         source_nodes: List[Dict[str, Any]],
         existing_observation: Optional[Dict[str, Any]] = None,
+        target_type: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Generate a consolidated observation from source facts via LLM."""
         fact_lines = []
@@ -1471,6 +1852,10 @@ class MemoryNodeManager:
             fact_lines.append(f"{index}. [{fact_type}] {summary}")
         if not fact_lines:
             return None
+
+        normalized_target_type = str(target_type or "").strip().lower()
+        if normalized_target_type not in {"insight", "task"}:
+            normalized_target_type = ""
 
         if existing_observation:
             existing_metadata = existing_observation.get("metadata", {})
@@ -1490,7 +1875,12 @@ class MemoryNodeManager:
                 source_facts="\n".join(fact_lines),
             )
         else:
-            prompt = OBSERVATION_CONSOLIDATION_PROMPT.format(
+            prompt_template = (
+                TASK_CONSOLIDATION_PROMPT
+                if normalized_target_type == "task"
+                else INSIGHT_CONSOLIDATION_PROMPT
+            )
+            prompt = prompt_template.format(
                 entity_name=entity_name,
                 topic_label=topic_label,
                 source_facts="\n".join(fact_lines),
@@ -1512,6 +1902,8 @@ class MemoryNodeManager:
         }
         if category not in allowed_categories:
             category = "insight"
+        if normalized_target_type and existing_observation is None:
+            category = normalized_target_type
         metadata = data.get("metadata", {})
         if not isinstance(metadata, dict):
             metadata = {}
@@ -1581,6 +1973,7 @@ class MemoryNodeManager:
                         topic_label=topic_label,
                         source_nodes=nodes_for_llm,
                         existing_observation=existing_observation,
+                        target_type="insight",
                     )
                     if not observation:
                         continue
@@ -1669,12 +2062,19 @@ class MemoryNodeManager:
             "facts": self._reflect_fact_log_items(candidates, limit=limit),
         })
         if dry_run:
+            task_episode_candidates = self._task_episode_candidates(candidates)
             return {
                 "candidate_count": len(candidates),
                 "consolidated": 0,
                 "task_matched": 0,
                 "task_updates": 0,
                 "task_match_methods": {},
+                "task_episodes": 0,
+                "task_episode_node_count": 0,
+                "task_episode_candidates": [
+                    [int(fact["node_id"]) for fact in episode.get("facts", [])]
+                    for episode in task_episode_candidates
+                ],
                 "touched_entity_ids": touched_entity_ids,
                 "candidates": [
                     {
@@ -1692,8 +2092,39 @@ class MemoryNodeManager:
             task_updates,
         ) = self._match_and_update_tasks_for_facts(candidates)
         consolidated += task_updates
+        remaining_candidates = [
+            item
+            for item in candidates
+            if int(item["node_id"]) not in task_matched_node_ids
+        ]
+        task_episode_node_ids: set[int] = set()
+        task_episode_observation_ids: List[int] = []
+        task_episode_candidates = self._task_episode_candidates(remaining_candidates)
+        self._log_reflect_error("task_episode_candidates", {
+            "candidate_count": len(task_episode_candidates),
+            "episodes": [
+                {
+                    "node_ids": [int(fact["node_id"]) for fact in episode.get("facts", [])],
+                    "reasons": episode.get("reasons", []),
+                    "scores": episode.get("scores", []),
+                    "facts": self._reflect_fact_log_items(episode.get("facts", [])),
+                }
+                for episode in task_episode_candidates
+            ],
+        })
+        for episode in task_episode_candidates:
+            observation_id = self._create_task_observation_from_episode(episode)
+            if observation_id is None:
+                continue
+            task_episode_observation_ids.append(observation_id)
+            episode_node_ids = {
+                int(fact["node_id"])
+                for fact in episode.get("facts", [])
+            }
+            task_episode_node_ids.update(episode_node_ids)
+        consolidated += len(task_episode_observation_ids)
         for item in candidates:
-            if int(item["node_id"]) in task_matched_node_ids:
+            if int(item["node_id"]) in task_matched_node_ids or int(item["node_id"]) in task_episode_node_ids:
                 continue
             consolidated += self._maybe_consolidate_observations(
                 node_id=int(item["node_id"]),
@@ -1706,6 +2137,9 @@ class MemoryNodeManager:
             "task_matched": len(task_matched_node_ids),
             "task_updates": task_updates,
             "task_match_methods": task_match_methods,
+            "task_episodes": len(task_episode_observation_ids),
+            "task_episode_node_count": len(task_episode_node_ids),
+            "task_episode_observation_ids": task_episode_observation_ids,
             "touched_entity_ids": touched_entity_ids,
         }
 
@@ -1881,6 +2315,9 @@ class MemoryNodeManager:
                     query_embedding=embedding,
                     tags=self._fact_tags(fact, tags),
                     fact_type=fact.get("fact_type", "world"),
+                    task_event_like=fact.get("task_event_like"),
+                    task_event_subject=fact.get("task_event_subject", ""),
+                    task_relevance=fact.get("task_relevance", ""),
                 )
                 logger.error("finish store: memory node construction")
 
@@ -2213,6 +2650,8 @@ class MemoryNodeManager:
             "observations_consolidated": report.get("observations_consolidated", 0),
             "task_matched": observation_report.get("task_matched", 0),
             "task_updates": observation_report.get("task_updates", 0),
+            "task_episodes": observation_report.get("task_episodes", 0),
+            "task_episode_node_count": observation_report.get("task_episode_node_count", 0),
             "entity_merged": report.get("merged", 0),
             "observation_groups_merged": report.get("observation_groups_merged", 0),
             "observations_inactivated": report.get("observations_inactivated", 0),
