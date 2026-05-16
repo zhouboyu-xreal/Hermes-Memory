@@ -174,6 +174,25 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请�
 14. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
 15. 只返回 JSON，不要 markdown，不要额外解释
 
+fact_kind 定义和判别边界：
+- preference：用户长期或反复表达的喜好、偏好、禁忌、习惯、倾向；不是一次性选择。
+- decision：用户或项目已经明确做出的决定、取舍、采用方案；必须有"已决定/选择/采用/放弃"的证据。
+- request：用户对 AI 或系统提出的当前任务请求，通常是"帮我/请你/能不能/现在去..."。
+- instruction：用户要求 AI 以后长期遵守的行为规则、格式偏好、语气偏好或工作方式；必须具有长期性，如"以后/一直/记住/默认/每次"。
+- recommendation：助手给出的具体建议、推荐方案、操作路径；必须是建议，不是普通解释。
+- action：用户或助手已经执行、正在执行或计划执行的动作、实现、测试、排查、验证、修改。
+- error：失败、报错、阻塞、误判、踩坑、不可用方案，以及明确的负面结果。
+- context：长期有用的背景事实、项目状态、关系、约束、环境信息，但不属于 preference/decision/instruction/error。
+- other：有一定保留价值但不属于以上类型；谨慎使用。
+
+fact_kind 冲突和主体规则：
+- 冲突时选择更具体的 kind，优先级为：instruction > preference > decision > error > action > request > recommendation > context > other。
+- "帮我现在改代码" 属于 request；"以后回答都先给结论" 属于 instruction。
+- "记住我喜欢简洁回答" 如果描述用户属性/偏好，属于 preference；如果要求 AI 以后如何回答，属于 instruction。
+- 用户提出的当前任务需求通常是 request，不要标为 instruction。
+- 助手执行了工具、测试、修改、验证，通常是 action 或 experience/action。
+- 助手提出具体方案，通常是 recommendation；助手解释概念但没有可复用建议，不要抽取，若必须抽取最多为 context/other。
+
 硬丢弃规则：
 - 不要抽取普通一次性问答，除非包含用户偏好、明确决策、失败经验、约束或任务进展
 - 不要抽取助手泛泛解释概念、复述用户问题、客套话

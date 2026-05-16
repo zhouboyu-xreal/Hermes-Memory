@@ -234,6 +234,19 @@ def test_retain_and_relation_prompts_share_relation_type_contract():
     assert '"time_confidence": "explicit/inferred_from_turn/unknown"' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"task_event_like": true' in RETAIN_FACT_EXTRACTION_PROMPT
     assert "对话发生时间：{turn_timestamp}" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "fact_kind 定义和判别边界" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "preference：用户长期或反复表达的喜好" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "decision：用户或项目已经明确做出的决定" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "request：用户对 AI 或系统提出的当前任务请求" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "instruction：用户要求 AI 以后长期遵守" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "recommendation：助手给出的具体建议" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "action：用户或助手已经执行" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "error：失败、报错、阻塞" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "context：长期有用的背景事实" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "冲突时选择更具体的 kind" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert '"帮我现在改代码" 属于 request' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert '"以后回答都先给结论" 属于 instruction' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "助手执行了工具、测试、修改、验证" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "硬丢弃规则" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "固定句式" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "用户要求 AI 以后回答/执行任务时" in RETAIN_FACT_EXTRACTION_PROMPT
