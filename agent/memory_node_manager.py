@@ -1297,6 +1297,7 @@ class MemoryNodeManager:
                 "node_id": fact.get("node_id", fact.get("id")),
                 "time_key": fact.get("time_key"),
                 "fact_type": fact.get("fact_type"),
+                "fact_kind": fact.get("fact_kind"),
                 "summary": cls._reflect_log_text(fact.get("summary")),
                 "topics": fact.get("topics", []),
                 "keywords": fact.get("keywords", []),
@@ -1957,10 +1958,11 @@ class MemoryNodeManager:
         fact_lines = []
         for index, node in enumerate(source_nodes[:8], 1):
             fact_type = str(node.get("fact_type") or "world")
+            fact_kind = str(node.get("fact_kind") or "other")
             summary = str(node.get("summary") or "").strip()
             if not summary:
                 continue
-            fact_lines.append(f"{index}. [{fact_type}] {summary}")
+            fact_lines.append(f"{index}. [{fact_type}/{fact_kind}] {summary}")
         if not fact_lines:
             return None
 
@@ -2426,6 +2428,7 @@ class MemoryNodeManager:
                     query_embedding=embedding,
                     tags=self._fact_tags(fact, tags),
                     fact_type=fact.get("fact_type", "world"),
+                    fact_kind=fact.get("fact_kind", "other"),
                     task_event_like=fact.get("task_event_like"),
                     task_event_subject=fact.get("task_event_subject", ""),
                     task_relevance=fact.get("task_relevance", ""),
@@ -2518,7 +2521,9 @@ class MemoryNodeManager:
             summary = str(node.get("summary") or "").strip()
             if not summary:
                 continue
-            source_lines.append(f"{index}. [{node.get('fact_type', 'world')}] {summary}")
+            source_lines.append(
+                f"{index}. [{node.get('fact_type', 'world')}/{node.get('fact_kind', 'other')}] {summary}"
+            )
 
         current_category = str(group.get("observation_type") or "insight").strip().lower()
         if current_category not in {"insight", "task"}:

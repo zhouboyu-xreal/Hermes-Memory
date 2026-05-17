@@ -191,6 +191,7 @@ CREATE TABLE IF NOT EXISTS memory_nodes (
     keywords TEXT NOT NULL,
     topic TEXT NOT NULL,
     fact_type TEXT NOT NULL DEFAULT 'world',
+    fact_kind TEXT NOT NULL DEFAULT 'other',
     task_event_like INTEGER,
     task_event_subject TEXT,
     task_relevance TEXT,
@@ -789,6 +790,12 @@ class SessionDB:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # ── Add explicit fact_kind column to memory_nodes if missing ──
+        try:
+            cursor.execute("ALTER TABLE memory_nodes ADD COLUMN fact_kind TEXT NOT NULL DEFAULT 'other'")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         # ── Memory node detail fields live directly on memory_nodes ──
         try:
             cursor.execute("ALTER TABLE memory_nodes ADD COLUMN original_dialog TEXT")
@@ -824,6 +831,24 @@ class SessionDB:
         except sqlite3.OperationalError:
             pass
 
+        # Backfill fact_kind from legacy tags for existing retain facts.
+        try:
+            for fact_kind in (
+                "preference", "decision", "request", "recommendation",
+                "action", "error", "context", "instruction",
+                "conversation_summary", "other",
+            ):
+                cursor.execute(
+                    "UPDATE memory_nodes SET fact_kind = ? WHERE tags LIKE ?",
+                    (fact_kind, f'%"fact_kind:{fact_kind}"%'),
+                )
+            cursor.execute(
+                "UPDATE memory_nodes SET fact_kind = 'other' "
+                "WHERE fact_kind IS NULL OR fact_kind = ''"
+            )
+        except sqlite3.OperationalError:
+            pass
+
         # ── Index on time_key for time-range search ──
         try:
             cursor.execute(
@@ -838,6 +863,15 @@ class SessionDB:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_nodes_fact_type "
                 "ON memory_nodes(fact_type)"
+            )
+        except sqlite3.OperationalError:
+            pass
+
+        # ── Index on fact_kind for future kind-aware recall / observation ──
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_nodes_fact_kind "
+                "ON memory_nodes(fact_kind)"
             )
         except sqlite3.OperationalError:
             pass
@@ -2209,11 +2243,38 @@ class SessionDB:
                 return cls._normalize_memory_fact_type(text.split(":", 1)[1])
         return "world"
 
+    @staticmethod
+    def _normalize_memory_fact_kind(value: Any) -> str:
+        """Normalize retained memory fact kinds to the supported semantic buckets."""
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {
+            "preference", "decision", "request", "recommendation",
+            "action", "error", "context", "instruction",
+            "conversation_summary", "other",
+        }
+        return text if text in allowed else "other"
+
+    @classmethod
+    def _memory_fact_kind_from_tags(cls, tags: Any) -> str:
+        """Infer fact_kind from legacy tag arrays."""
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except json.JSONDecodeError:
+                tags = [tags]
+        if not isinstance(tags, list):
+            return "other"
+        for tag in tags:
+            text = str(tag or "").strip().lower()
+            if text.startswith("fact_kind:"):
+                return cls._normalize_memory_fact_kind(text.split(":", 1)[1])
+        return "other"
+
     def _memory_get_node(self, node_id: int) -> Optional[Dict[str, Any]]:
         """Fetch a single memory node with tags and relations."""
         cursor = self._conn.execute(
             """SELECT id, time_key, summary, keywords, topic, original_dialog,
-                      tags, fact_type, decay_score, decay_updated_at,
+                      tags, fact_type, fact_kind, decay_score, decay_updated_at,
                       decay_half_life_days, task_event_like, task_event_subject,
                       task_relevance
                FROM memory_nodes
@@ -2235,6 +2296,7 @@ class SessionDB:
             node_relations[str(rel_row[0])] = rel_row[1]
         tags = json.loads(r[6]) if r[6] else []
         fact_type = self._normalize_memory_fact_type(r[7] or self._memory_fact_type_from_tags(tags))
+        fact_kind = self._normalize_memory_fact_kind(r[8] or self._memory_fact_kind_from_tags(tags))
         return {
             "id": r[0],
             "time_key": r[1],
@@ -2244,12 +2306,13 @@ class SessionDB:
             "original_dialog": r[5],
             "tags": tags,
             "fact_type": fact_type,
-            "decay_score": float(r[8]) if r[8] is not None else 1.0,
-            "decay_updated_at": r[9],
-            "decay_half_life_days": r[10],
-            "task_event_like": None if r[11] is None else bool(r[11]),
-            "task_event_subject": r[12] or "",
-            "task_relevance": r[13] or "",
+            "fact_kind": fact_kind,
+            "decay_score": float(r[9]) if r[9] is not None else 1.0,
+            "decay_updated_at": r[10],
+            "decay_half_life_days": r[11],
+            "task_event_like": None if r[12] is None else bool(r[12]),
+            "task_event_subject": r[13] or "",
+            "task_relevance": r[14] or "",
             "node_relations": node_relations,
         }
 
@@ -2927,6 +2990,7 @@ class SessionDB:
         query_embedding: np.ndarray,
         tags: Optional[List[str]] = None,
         fact_type: str = "world",
+        fact_kind: str = "other",
         task_event_like: Optional[bool] = None,
         task_event_subject: str = "",
         task_relevance: str = "",
@@ -2944,6 +3008,9 @@ class SessionDB:
             normalized_fact_type = self._normalize_memory_fact_type(
                 fact_type or self._memory_fact_type_from_tags(tags or [])
             )
+            normalized_fact_kind = self._normalize_memory_fact_kind(
+                fact_kind or self._memory_fact_kind_from_tags(tags or [])
+            )
             if task_event_like is None:
                 task_event_like_value = None
             else:
@@ -2956,9 +3023,9 @@ class SessionDB:
                 task_relevance_value = ""
             cursor = conn.execute(
                 """INSERT INTO memory_nodes
-                   (time_key, summary, keywords, topic, tags, fact_type,
+                   (time_key, summary, keywords, topic, tags, fact_type, fact_kind,
                     task_event_like, task_event_subject, task_relevance, original_dialog)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     time_key,
                     summary,
@@ -2966,6 +3033,7 @@ class SessionDB:
                     topic_str,
                     tags_str,
                     normalized_fact_type,
+                    normalized_fact_kind,
                     task_event_like_value,
                     task_event_subject_value,
                     task_relevance_value,
@@ -3947,7 +4015,7 @@ class SessionDB:
     ) -> List[Dict[str, Any]]:
         """Return fact nodes for an entity/topic bucket."""
         rows = self._conn.execute(
-            "SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, mn.fact_type, "
+            "SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, mn.fact_type, mn.fact_kind, "
             "mn.task_event_like, mn.task_event_subject, mn.task_relevance "
             "FROM memory_nodes mn "
             "JOIN memory_node_entities mne ON mne.node_id = mn.id "
@@ -3976,6 +4044,7 @@ class SessionDB:
             )
             item["task_event_subject"] = item.get("task_event_subject") or ""
             item["task_relevance"] = item.get("task_relevance") or ""
+            item["fact_kind"] = self._normalize_memory_fact_kind(item.get("fact_kind"))
             out.append(item)
             if len(out) >= limit:
                 break
@@ -3991,7 +4060,7 @@ class SessionDB:
         day = str(date_key or datetime.now().astimezone().date().isoformat())[:10]
         rows = self._conn.execute(
             "WITH candidate_nodes AS ("
-            "  SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, mn.fact_type, "
+            "  SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, mn.fact_type, mn.fact_kind, "
             "  mn.task_event_like, mn.task_event_subject, mn.task_relevance "
             "  FROM memory_nodes mn "
             "  WHERE substr(mn.time_key, 1, 10) = ? "
@@ -4002,7 +4071,7 @@ class SessionDB:
             "  ORDER BY mn.time_key ASC, mn.id ASC "
             "  LIMIT ?"
             ") "
-            "SELECT cn.id AS node_id, cn.time_key, cn.summary, cn.keywords, cn.topic, cn.fact_type, "
+            "SELECT cn.id AS node_id, cn.time_key, cn.summary, cn.keywords, cn.topic, cn.fact_type, cn.fact_kind, "
             "cn.task_event_like, cn.task_event_subject, cn.task_relevance, "
             "en.id AS entity_id, en.name AS entity_name "
             "FROM candidate_nodes cn "
@@ -4027,6 +4096,7 @@ class SessionDB:
                         if str(keyword or "").strip()
                     ],
                     "fact_type": row["fact_type"],
+                    "fact_kind": self._normalize_memory_fact_kind(row["fact_kind"]),
                     "task_event_like": (
                         None
                         if row["task_event_like"] is None
@@ -4299,7 +4369,7 @@ class SessionDB:
         for observation_id in observation_ids:
             rows = self._conn.execute(
                 "SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.original_dialog, "
-                "mn.tags, mn.fact_type, mn.task_event_like, mn.task_event_subject, mn.task_relevance "
+                "mn.tags, mn.fact_type, mn.fact_kind, mn.task_event_like, mn.task_event_subject, mn.task_relevance "
                 "FROM memory_observation_sources mos "
                 "JOIN memory_nodes mn ON mn.id = mos.node_id "
                 "WHERE mos.observation_id = ? "
@@ -4318,6 +4388,7 @@ class SessionDB:
                     "original_dialog": row["original_dialog"],
                     "tags": tags,
                     "fact_type": self._normalize_memory_fact_type(row["fact_type"]),
+                    "fact_kind": self._normalize_memory_fact_kind(row["fact_kind"]),
                     "task_event_like": (
                         None
                         if row["task_event_like"] is None
@@ -4364,7 +4435,7 @@ class SessionDB:
                 continue
             observation_ids = [int(obs["id"]) for obs in observations]
             source_rows = self._conn.execute(
-                "SELECT DISTINCT mn.id, mn.time_key, mn.summary, mn.keywords, mn.fact_type, "
+                "SELECT DISTINCT mn.id, mn.time_key, mn.summary, mn.keywords, mn.fact_type, mn.fact_kind, "
                 "mn.task_event_like, mn.task_event_subject, mn.task_relevance "
                 "FROM memory_observation_sources mos "
                 "JOIN memory_nodes mn ON mn.id = mos.node_id "

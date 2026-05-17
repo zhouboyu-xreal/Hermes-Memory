@@ -127,7 +127,8 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert mgr.store_turn("Alice hates email for urgent alerts", "Use Slack alerts.") is True
 
     rows = db._conn.execute(
-        "SELECT id, summary, keywords, topic, tags, task_event_like, task_event_subject, task_relevance "
+        "SELECT id, summary, keywords, topic, tags, fact_type, fact_kind, "
+        "task_event_like, task_event_subject, task_relevance "
         "FROM memory_nodes ORDER BY id"
     ).fetchall()
     assert len(rows) == 2
@@ -135,6 +136,10 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert rows[1]["summary"] == retain_payload["facts"][1]["text"]
     assert "Alice Slack email" == rows[0]["keywords"]
     assert "urgent team communication" == rows[0]["topic"]
+    assert rows[0]["fact_type"] == "world"
+    assert rows[0]["fact_kind"] == "preference"
+    assert rows[1]["fact_type"] == "experience"
+    assert rows[1]["fact_kind"] == "recommendation"
     assert "fact_type:world" in json.loads(rows[0]["tags"])
     assert "fact_type:experience" in json.loads(rows[1]["tags"])
     assert "fact_kind:preference" in json.loads(rows[0]["tags"])
@@ -197,6 +202,12 @@ def test_memory_node_details_live_on_memory_nodes_table(db):
 
     assert "memory_nodes" in tables
     assert "memory_leaf_details" not in tables
+    columns = {
+        row["name"]
+        for row in db._conn.execute("PRAGMA table_info(memory_nodes)").fetchall()
+    }
+    assert "fact_type" in columns
+    assert "fact_kind" in columns
 
 
 def test_store_turn_falls_back_to_summary_when_retain_json_is_bad(db):
@@ -213,11 +224,12 @@ def test_store_turn_falls_back_to_summary_when_retain_json_is_bad(db):
     assert mgr.store_turn("Use PostgreSQL 16", "Good choice.") is True
 
     row = db._conn.execute(
-        "SELECT summary, keywords, topic, tags FROM memory_nodes"
+        "SELECT summary, keywords, topic, tags, fact_kind FROM memory_nodes"
     ).fetchone()
     assert row["summary"] == summary_payload["summary"]
     assert row["keywords"] == "PostgreSQL project"
     assert row["topic"] == "postgresql project"
+    assert row["fact_kind"] == "conversation_summary"
     assert "fact_kind:conversation_summary" in json.loads(row["tags"])
     assert "run_entity_extraction" not in mgr.async_calls[0]
 
@@ -399,6 +411,7 @@ def _add_memory_node(
     summary,
     keywords,
     fact_type="world",
+    fact_kind="other",
     task_event_like=None,
     task_event_subject="",
     task_relevance="",
@@ -411,6 +424,7 @@ def _add_memory_node(
         original_dialog="{}",
         query_embedding=np.ones((1, 1536), dtype=np.float32),
         fact_type=fact_type,
+        fact_kind=fact_kind,
         task_event_like=task_event_like,
         task_event_subject=task_event_subject,
         task_relevance=task_relevance,
