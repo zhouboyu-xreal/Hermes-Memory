@@ -307,6 +307,28 @@ RELATION_PROMPT_TEMPLATE = """你是"AI眼镜记忆关系抽取模块"。
 
 # ── Observation consolidation prompt template ────────────────────────────
 
+OBSERVATION_SOURCE_FACT_GUIDANCE = """来源事实标注说明：
+- source facts 每行以 [fact_type/fact_kind] 开头，先理解标签，再综合正文。
+- world_fact（即 fact_type=world）：客观世界、用户、项目、偏好、约束、决定、请求、错误、上下文等事实；它描述用户侧或外部状态，不代表助手亲历。
+- experience（即 fact_type=experience）：助手此前亲自执行、建议、推荐、验证、修改、排查或遇到的结果；它描述助手经验，可用于复用做法、避免重复错误或解释已有进展。
+
+fact_kind 类别说明：
+- preference：用户长期或反复表达的偏好、禁忌、习惯、倾向。
+- decision：用户、项目或助手已经明确做出的决定、取舍或采用方案。
+- request：用户对 AI 或系统提出的当前任务请求。
+- recommendation：助手给出的具体建议、推荐方案或操作路径。
+- action：用户或助手已经执行、正在执行或计划执行的动作、实现、测试、排查、验证、修改。
+- error：失败、报错、阻塞、误判、踩坑、不可用方案或明确负面结果。
+- context：长期有用的背景事实、项目状态、关系、约束或环境信息。
+- instruction：用户要求 AI 以后长期遵守的行为规则、格式偏好、语气偏好或工作方式。
+- other：有一定保留价值但不属于以上类别的事实。
+
+使用这些标签时：
+- fact_type 决定事实主体来源：world_fact 偏用户/世界状态，experience 偏助手亲历经验。
+- fact_kind 只作为理解来源事实的线索，不要直接复制成输出 metadata；输出仍必须遵守本 prompt 的 JSON schema。
+- 生成 insight 时优先沉淀长期稳定模式、约束、经验和上下文。
+- 生成或更新 task 时只使用能证明任务发起、推进、完成、阻塞、暂停、恢复或决策的事实。"""
+
 INSIGHT_CONSOLIDATION_PROMPT = """你是长期记忆 insight consolidation 模块。
 
 你需要把同一 entity/topic 下的 world facts 和 experience memories，整合成一条长期可用的 insight observation。
@@ -316,6 +338,8 @@ topic: {topic_label}
 
 source facts:
 {source_facts}
+
+""" + OBSERVATION_SOURCE_FACT_GUIDANCE + """
 
 请只生成 insight，不要生成 task。
 
@@ -358,6 +382,8 @@ topic: {topic_label}
 
 source facts:
 {source_facts}
+
+""" + OBSERVATION_SOURCE_FACT_GUIDANCE + """
 
 task 表示这些事实能够推断出用户正在持续推进某个具体任务、项目、排查、实现、计划、交付物或待完成目标。
 
@@ -426,6 +452,8 @@ topic: {topic_label}
 
 新的来源事实：
 {source_facts}
+
+""" + OBSERVATION_SOURCE_FACT_GUIDANCE + """
 
 请基于已有 observation 和新的来源事实，输出更新后的 observation，并判断它应该属于哪一类：
 
@@ -517,6 +545,8 @@ observations to merge:
 
 supporting facts:
 {source_facts}
+
+""" + OBSERVATION_SOURCE_FACT_GUIDANCE + """
 
 这些 observation 已经按 current_category 分组。合并结果必须保持 current_category，不要在 merge 阶段把 insight 改成 task，或把 task 改成 insight。
 
@@ -1508,7 +1538,14 @@ class MemoryNodeManager:
         ])
 
     @staticmethod
+    def _fact_kind_excluded_from_task(fact: Dict[str, Any]) -> bool:
+        fact_kind = str(fact.get("fact_kind") or "").strip().lower()
+        return fact_kind in {"preference", "instruction", "context", "other"}
+
+    @staticmethod
     def _is_task_event_like_fact(fact: Dict[str, Any]) -> bool:
+        if MemoryNodeManager._fact_kind_excluded_from_task(fact):
+            return False
         task_event_like_raw = fact.get("task_event_like")
         task_relevance = str(fact.get("task_relevance") or "").strip().lower()
         if isinstance(task_event_like_raw, bool):
@@ -1810,6 +1847,8 @@ class MemoryNodeManager:
         high_similarity_threshold: float = 0.82,
     ) -> Optional[Tuple[Dict[str, Any], str, float]]:
         if not tasks:
+            return None
+        if self._fact_kind_excluded_from_task(fact):
             return None
 
         fact_entity_ids = {entity_id for entity_id, _entity_name in self._fact_entity_pairs(fact)}

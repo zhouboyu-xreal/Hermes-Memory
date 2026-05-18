@@ -8,6 +8,7 @@ from agent.memory_node_manager import MemoryNodeManager
 from agent.memory_node_manager import (
     CAUSAL_RELATION_TYPE_TEXT,
     INSIGHT_CONSOLIDATION_PROMPT,
+    OBSERVATION_SOURCE_FACT_GUIDANCE,
     OBSERVATION_MERGE_PROMPT,
     OBSERVATION_UPDATE_PROMPT,
     RELATION_PROMPT_TEMPLATE,
@@ -1382,6 +1383,7 @@ def test_store_turn_can_consolidate_task_observation(db):
                 "keywords": ["Hermes", "memory", "recall", "排查"],
                 "topic": ["memory recall"],
                 "fact_type": "world",
+                "fact_kind": "action",
                 "entities": [{"name": "Hermes Agent", "type": "PROJECT"}],
             },
             {
@@ -1389,6 +1391,7 @@ def test_store_turn_can_consolidate_task_observation(db):
                 "keywords": ["observation", "insight", "task", "修改"],
                 "topic": ["memory recall"],
                 "fact_type": "world",
+                "fact_kind": "action",
                 "entities": [{"name": "Hermes Agent", "type": "PROJECT"}],
             },
             {
@@ -1396,6 +1399,7 @@ def test_store_turn_can_consolidate_task_observation(db):
                 "keywords": ["reflect", "observation", "decay", "实现"],
                 "topic": ["memory recall"],
                 "fact_type": "experience",
+                "fact_kind": "action",
                 "entities": [{"name": "Hermes Agent", "type": "PROJECT"}],
             },
         ],
@@ -1486,6 +1490,7 @@ def test_reflect_matches_fact_to_task_by_entity_and_topic(db):
         time_key=MemoryNodeManager._memory_time_key(0),
         summary="用户要求在 run_agent 中每 5 轮调用 reflect。",
         keywords=["memory-reflect"],
+        fact_kind="request",
     )
     db.entity_link_node(new_node, hermes)
     mgr = _NoAsyncMemoryNodeManager(
@@ -1524,6 +1529,46 @@ def test_reflect_matches_fact_to_task_by_entity_and_topic(db):
     assert metadata["steps"][1]["title"] == "每 5 轮对话调用 reflect"
 
 
+def test_reflect_excludes_non_task_fact_kind_from_existing_task_match(db):
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
+    source_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="用户正在完善 Hermes Agent 的 reflect 机制。",
+        keywords=["memory-reflect"],
+        fact_kind="action",
+    )
+    db.entity_link_node(source_node, hermes)
+    task_id = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="memory-reflect",
+        topic_label="memory-reflect",
+        observation_type="task",
+        summary="用户正在完善 Hermes Agent 的长期记忆 reflect 机制。",
+        keywords=["Hermes Agent", "memory", "reflect"],
+        source_node_ids=[source_node],
+        metadata={"task_status": "active", "task_source": "inferred_from_observation"},
+    )
+    new_node = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(0),
+        summary="用户要求记录自己偏好讨论 reflect 调度机制。",
+        keywords=["memory-reflect"],
+        fact_kind="preference",
+        task_event_like=True,
+        task_event_subject="user",
+        task_relevance="strong",
+    )
+    db.entity_link_node(new_node, hermes)
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    report = mgr.reflect(dry_run=False, limit=10)
+
+    assert report["observation_reflect"]["task_matched"] == 0
+    assert db.memory_observation_source_ids(task_id) == [source_node]
+    assert mgr.llm_prompts == []
+
+
 def test_reflect_matches_fact_to_task_by_high_embedding_similarity(db):
     hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
     alice = db.entity_add_entity("Alice", "PERSON")
@@ -1549,6 +1594,7 @@ def test_reflect_matches_fact_to_task_by_high_embedding_similarity(db):
         time_key=MemoryNodeManager._memory_time_key(0),
         summary="用户继续讨论 reflect 的低成本 task matching 方案。",
         keywords=["unrelated-topic"],
+        fact_kind="action",
     )
     db.entity_link_node(new_node, alice)
     mgr = _NoAsyncMemoryNodeManager(
@@ -1602,6 +1648,7 @@ def test_reflect_matches_task_event_like_fact_to_single_recent_active_task(db):
         time_key=MemoryNodeManager._memory_time_key(0),
         summary="用户要求继续修改 prompt。",
         keywords=["prompt-work"],
+        fact_kind="request",
     )
     db.entity_link_node(new_node, alice)
     mgr = _NoAsyncMemoryNodeManager(
@@ -1675,12 +1722,14 @@ def test_reflect_creates_task_episode_from_task_event_facts_with_different_entit
         time_key=MemoryNodeManager._memory_time_key(0),
         summary="用户先修改 observation prompt 中关于 task status 的定义。",
         keywords=["prompt-step"],
+        fact_kind="action",
     )
     second_step = _add_memory_node(
         db,
         time_key=MemoryNodeManager._memory_time_key(1),
         summary="用户接着运行 memory_node_manager 测试验证 task 生成逻辑。",
         keywords=["test-step"],
+        fact_kind="action",
     )
     db.entity_link_node(first_step, prompt_entity)
     db.entity_link_node(second_step, test_entity)
@@ -1758,6 +1807,41 @@ def test_reflect_respects_structured_task_event_like_false_over_keyword_fallback
     assert mgr.llm_prompts == []
 
 
+def test_reflect_excludes_non_task_fact_kinds_from_task_episodes(db):
+    prompt_entity = db.entity_add_entity("Observation Prompt", "CONCEPT")
+    test_entity = db.entity_add_entity("Memory Tests", "CONCEPT")
+    first_step = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(0),
+        summary="用户要求记录自己喜欢修改 observation prompt 的讨论方式。",
+        keywords=["修改", "prompt"],
+        fact_kind="preference",
+        task_event_like=True,
+        task_event_subject="user",
+        task_relevance="strong",
+    )
+    second_step = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(1),
+        summary="用户要求 AI 以后测试 memory_node_manager 前先说明计划。",
+        keywords=["测试", "memory"],
+        fact_kind="instruction",
+        task_event_like=True,
+        task_event_subject="user",
+        task_relevance="strong",
+    )
+    db.entity_link_node(first_step, prompt_entity)
+    db.entity_link_node(second_step, test_entity)
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    mgr._embedding_client = _OrthogonalTaskEmbeddingClient()
+
+    report = mgr.reflect(dry_run=False, limit=10)
+
+    assert report["observation_reflect"]["task_episodes"] == 0
+    assert db._conn.execute("SELECT COUNT(*) FROM memory_observations").fetchone()[0] == 0
+    assert mgr.llm_prompts == []
+
+
 def test_task_metadata_normalizes_steps():
     metadata = MemoryNodeManager._normalize_task_metadata({
         "task_status": "stale",
@@ -1817,6 +1901,23 @@ def test_task_status_prompt_definitions_scope_stale_by_prompt_role():
     assert '"task_status": "active | blocked | paused | stale"' in OBSERVATION_UPDATE_PROMPT
     assert '"task_status": "active | blocked | paused | stale"' in OBSERVATION_MERGE_PROMPT
     assert '"task_status": "active | blocked | paused | stale"' not in TASK_CONSOLIDATION_PROMPT
+
+
+def test_observation_prompts_explain_fact_type_and_kind_labels():
+    assert "world_fact（即 fact_type=world）" in OBSERVATION_SOURCE_FACT_GUIDANCE
+    assert "experience（即 fact_type=experience）" in OBSERVATION_SOURCE_FACT_GUIDANCE
+    assert "fact_kind 类别说明" in OBSERVATION_SOURCE_FACT_GUIDANCE
+    assert "preference：用户长期或反复表达的偏好" in OBSERVATION_SOURCE_FACT_GUIDANCE
+    assert "instruction：用户要求 AI 以后长期遵守" in OBSERVATION_SOURCE_FACT_GUIDANCE
+    assert "fact_type 决定事实主体来源" in OBSERVATION_SOURCE_FACT_GUIDANCE
+
+    for prompt in (
+        INSIGHT_CONSOLIDATION_PROMPT,
+        TASK_CONSOLIDATION_PROMPT,
+        OBSERVATION_UPDATE_PROMPT,
+        OBSERVATION_MERGE_PROMPT,
+    ):
+        assert OBSERVATION_SOURCE_FACT_GUIDANCE in prompt
 
 
 def test_reflect_error_log_message_is_json(caplog):
