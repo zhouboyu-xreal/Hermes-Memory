@@ -146,9 +146,9 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请�
 要求：
 1. 不要按句子碎片化；每条 fact 必须能独立说明 who/what/when/where/why
 2. 尽量保留用户偏好、约束、决定、失败经验、助手建议和明确原因
-3. 区分 fact_type:
-   - world: 客观世界/用户/项目事实
-   - experience: 助手自己的行为、建议、推荐、执行经历
+3. 区分 fact_type（心理学意义上的记忆性质）:
+   - semantic: 语义记忆，关于事实、概念、常识、稳定背景、长期偏好或长期规则
+   - episodic: 情景记忆，关于具体经历/事件，通常包含特定时间、地点、人物、行为、结果、情绪或状态变化
 4. occurred_start/occurred_end 如果对话没有明确日期，填空字符串
 5. time_confidence 只能是 explicit、inferred_from_turn、unknown：
    - explicit: 对话中明确给出日期/时间或可无歧义换算
@@ -157,22 +157,23 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请�
 6. entities 遵守下方统一实体提取规则；普通时间表达应写入 occurred_start/occurred_end，不进入 entities
 7. keywords 是用于检索这条 fact 的关键词，保留关键实体、产品、技术、动作和约束
 8. topic 是这条 fact 归属的主题词列表，用于后续 observation 分桶；不要把 entity name 本身当作唯一 topic
-9. fact_kind 只能是 preference、decision、request、recommendation、action、error、context、instruction、other
+9. fact_subject 只能是 user、assistant、world、project、system、other；表示这条记忆主要关于谁/什么主体
+10. fact_kind 只能是 preference、decision、request、recommendation、action、error、context、instruction、other
    - instruction 只用于用户明确要求 AI 长期遵守的行为规则、格式偏好、语气偏好或工作方式
    - 临时任务要求、当前轮的一次性请求不要标为 instruction
-10. priority 是 0-100 的整数，表示长期记忆价值：
+11. priority 是 0-100 的整数，表示长期记忆价值：
    - 80-100: 长期偏好、硬约束、健康/安全/核心项目事实、明确长期指令、重要任务进展
    - 60-79: 可复用经验、一般任务事件、明确决策、失败原因
    - <60: 普通闲聊、一次性问答、无后续价值、重复弱信息；不要输出这条 fact
-11. task_event_like 描述这条 fact 是否是一个可能影响任务状态或步骤的事件；它不要求已经知道具体属于哪个任务
-12. task_event_subject 只能是 user、assistant、both、other；表示任务事件的主体或主要来源
-13. task_relevance 只能是 none、weak、medium、strong：
+12. task_event_like 描述这条 fact 是否是一个可能影响任务状态或步骤的事件；它不要求已经知道具体属于哪个任务
+13. task_event_subject 只能是 user、assistant、both、other；表示任务事件的主体或主要来源
+14. task_relevance 只能是 none、weak、medium、strong：
    - none: 与任务状态或步骤无关
    - weak: 像一个事件，但不足以说明它会影响任务状态或步骤
    - medium: 可能影响某个任务的状态或步骤
    - strong: 明确表示用户正在发起、推进、完成、阻塞、暂停、恢复或决策某个任务
-14. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
-15. 只返回 JSON，不要 markdown，不要额外解释
+15. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
+16. 只返回 JSON，不要 markdown，不要额外解释
 
 fact_kind 定义和判别边界：
 - preference：用户长期或反复表达的喜好、偏好、禁忌、习惯、倾向；不是一次性选择。
@@ -185,12 +186,17 @@ fact_kind 定义和判别边界：
 - context：长期有用的背景事实、项目状态、关系、约束、环境信息，但不属于 preference/decision/instruction/error。
 - other：有一定保留价值但不属于以上类型；谨慎使用。
 
+fact_type 判别边界：
+- semantic：不依赖单次经历也能复用的稳定知识，例如项目结构、概念定义、用户长期偏好、长期指令、系统约定、常识。
+- episodic：某次具体发生过的经历或事件，例如用户在某轮提出请求、助手执行修改/测试、一次失败/通过、某个时间点的决定/状态变化/情绪反应。
+- 用户/助手并不等于 fact_type；用户长期偏好通常是 semantic + user，用户本轮请求通常是 episodic + user，助手某次执行通常是 episodic + assistant。
+
 fact_kind 冲突和主体规则：
 - 冲突时选择更具体的 kind，优先级为：instruction > preference > decision > error > action > request > recommendation > context > other。
 - "帮我现在改代码" 属于 request；"以后回答都先给结论" 属于 instruction。
 - "记住我喜欢简洁回答" 如果描述用户属性/偏好，属于 preference；如果要求 AI 以后如何回答，属于 instruction。
 - 用户提出的当前任务需求通常是 request，不要标为 instruction。
-- 助手执行了工具、测试、修改、验证，通常是 action 或 experience/action。
+- 助手执行了工具、测试、修改、验证，通常是 episodic + assistant + action。
 - 助手提出具体方案，通常是 recommendation；助手解释概念但没有可复用建议，不要抽取，若必须抽取最多为 context/other。
 
 硬丢弃规则：
@@ -212,7 +218,7 @@ task_event_like 判断规则：
 - preference/context: "用户长期/通常/明确偏好..." 或 "关于 [实体/项目]，长期有用背景是..."
 - decision/request/action: "用户在 [时间] 围绕 [topic] 决定/请求/推进..."
 - instruction: "用户要求 AI 以后回答/执行任务时..."
-- experience: "助手曾在 [时间] 围绕 [topic] 执行/建议/验证...，结果是..."
+- assistant episodic: "助手曾在 [时间] 围绕 [topic] 执行/建议/验证...，结果是..."
 
 """ + ENTITY_EXTRACTION_GUIDANCE + """
 
@@ -225,7 +231,8 @@ task_event_like 判断规则：
       "text": "完整叙事事实",
       "keywords": ["关键词1", "关键词2"],
       "topic": ["主题1", "主题2"],
-      "fact_type": "world/experience",
+      "fact_type": "semantic/episodic",
+      "fact_subject": "user/assistant/world/project/system/other",
       "fact_kind": "preference/decision/request/recommendation/action/error/context/instruction/other",
       "priority": 80,
       "priority_reason": "为什么这条 fact 值得长期保留",
@@ -308,9 +315,10 @@ RELATION_PROMPT_TEMPLATE = """你是"AI眼镜记忆关系抽取模块"。
 # ── Observation consolidation prompt template ────────────────────────────
 
 OBSERVATION_SOURCE_FACT_GUIDANCE = """来源事实标注说明：
-- source facts 每行以 [fact_type/fact_kind] 开头，先理解标签，再综合正文。
-- world_fact（即 fact_type=world）：客观世界、用户、项目、偏好、约束、决定、请求、错误、上下文等事实；它描述用户侧或外部状态，不代表助手亲历。
-- experience（即 fact_type=experience）：助手此前亲自执行、建议、推荐、验证、修改、排查或遇到的结果；它描述助手经验，可用于复用做法、避免重复错误或解释已有进展。
+- source facts 每行以 [fact_type/fact_subject/fact_kind] 开头，先理解标签，再综合正文。
+- semantic（语义记忆）：关于事实、概念、常识、稳定背景、长期偏好或长期规则；它描述长期可复用的"知道什么"。
+- episodic（情景记忆）：关于具体经历/事件，通常包含特定时间、地点、人物、行为、结果、情绪或状态变化；它描述"发生过什么/经历过什么"。
+- fact_subject 表示记忆主体：user、assistant、world、project、system、other；它独立于 fact_type。
 
 fact_kind 类别说明：
 - preference：用户长期或反复表达的偏好、禁忌、习惯、倾向。
@@ -324,14 +332,15 @@ fact_kind 类别说明：
 - other：有一定保留价值但不属于以上类别的事实。
 
 使用这些标签时：
-- fact_type 决定事实主体来源：world_fact 偏用户/世界状态，experience 偏助手亲历经验。
+- fact_type 决定记忆性质：semantic 偏稳定知识，episodic 偏具体事件。
+- fact_subject 决定主体来源：user/assistant/world/project/system/other。
 - fact_kind 只作为理解来源事实的线索，不要直接复制成输出 metadata；输出仍必须遵守本 prompt 的 JSON schema。
 - 生成 observation 时只描述发生过什么、出现过什么模式、经历过什么变化。
 - insight、task、偏好、策略、风险和当前状态判断由 interpretation 层生成。"""
 
 OBSERVATION_CONSOLIDATION_PROMPT = """你是长期记忆 observation consolidation 模块。
 
-你需要把同一 entity/topic 下的 world facts 和 experience memories，整合成一条长期可追溯的 observation。
+你需要把同一 entity/topic 下的 semantic facts 和 episodic memories，整合成一条长期可追溯的 observation。
 
 三层记忆架构：
 - fact：原始证据，表示对话中提取出的事实。
@@ -508,10 +517,10 @@ supporting facts:
 
 MEMORY_NODE_HEADER = "[Memory recall — past conversation summaries relevant to the current query]"
 WORLD_FACT_SECTION_HEADER = (
-    "[World facts — stable facts about the user, projects, preferences, and external state]"
+    "[Semantic memories — stable facts, concepts, preferences, project background, and common knowledge]"
 )
 EXPERIENCE_SECTION_HEADER = (
-    "[Experience memories — prior assistant actions, recommendations, decisions, and outcomes]"
+    "[Episodic memories — specific user/assistant experiences, events, decisions, actions, and outcomes]"
 )
 OBSERVATION_SECTION_HEADER = (
     "[Observations — consolidated patterns inferred from related facts and experiences]"
@@ -790,7 +799,8 @@ class MemoryNodeManager:
             "text": str(summary_data.get("summary", "")).strip(),
             "keywords": keywords,
             "topic": keywords,
-            "fact_type": "world",
+            "fact_type": "episodic",
+            "fact_subject": "other",
             "fact_kind": "conversation_summary",
             "priority": 60,
             "priority_reason": "fallback conversation summary",
@@ -803,6 +813,21 @@ class MemoryNodeManager:
             "where": "",
             "entities": [],
         }
+
+    @staticmethod
+    def _normalize_fact_type(value: Any) -> str:
+        fact_type = str(value or "semantic").strip().lower().replace("-", "_").replace(" ", "_")
+        if fact_type in {"episodic", "episodic_memory", "experience", "experience_fact"}:
+            return "episodic"
+        if fact_type in {"semantic", "semantic_memory", "world", "world_fact"}:
+            return "semantic"
+        return "semantic"
+
+    @staticmethod
+    def _normalize_fact_subject(value: Any) -> str:
+        fact_subject = str(value or "other").strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {"user", "assistant", "world", "project", "system", "other"}
+        return fact_subject if fact_subject in allowed else "other"
 
     @staticmethod
     def _normalize_fact_kind(value: Any) -> str:
@@ -912,7 +937,8 @@ class MemoryNodeManager:
                     "text": text,
                     "keywords": keywords,
                     "topic": topic,
-                    "fact_type": str(raw_fact.get("fact_type", "world") or "world").strip().lower(),
+                    "fact_type": self._normalize_fact_type(raw_fact.get("fact_type", "semantic")),
+                    "fact_subject": self._normalize_fact_subject(raw_fact.get("fact_subject", "other")),
                     "fact_kind": self._normalize_fact_kind(raw_fact.get("fact_kind", "other")),
                     "priority": priority,
                     "priority_reason": str(raw_fact.get("priority_reason", "") or "").strip(),
@@ -1081,7 +1107,8 @@ class MemoryNodeManager:
             },
             "retain_fact": {
                 "text": fact.get("text", ""),
-                "fact_type": fact.get("fact_type", "world"),
+                "fact_type": MemoryNodeManager._normalize_fact_type(fact.get("fact_type", "semantic")),
+                "fact_subject": MemoryNodeManager._normalize_fact_subject(fact.get("fact_subject", "other")),
                 "fact_kind": fact.get("fact_kind", "other"),
                 "priority": fact.get("priority", 70),
                 "priority_reason": fact.get("priority_reason", ""),
@@ -1108,7 +1135,8 @@ class MemoryNodeManager:
             if tag and tag not in out:
                 out.append(tag)
         for tag in (
-            f"fact_type:{fact.get('fact_type', 'world')}",
+            f"fact_type:{self._normalize_fact_type(fact.get('fact_type', 'semantic'))}",
+            f"fact_subject:{self._normalize_fact_subject(fact.get('fact_subject', 'other'))}",
             f"fact_kind:{fact.get('fact_kind', 'other')}",
             f"priority:{self._normalize_fact_priority(fact.get('priority', 70))}",
             "source:memory_node_manager",
@@ -1241,6 +1269,7 @@ class MemoryNodeManager:
                 "node_id": fact.get("node_id", fact.get("id")),
                 "time_key": fact.get("time_key"),
                 "fact_type": fact.get("fact_type"),
+                "fact_subject": fact.get("fact_subject"),
                 "fact_kind": fact.get("fact_kind"),
                 "summary": cls._reflect_log_text(fact.get("summary")),
                 "topics": fact.get("topics", []),
@@ -1729,12 +1758,13 @@ class MemoryNodeManager:
         """Generate a consolidated observation from source facts via LLM."""
         fact_lines = []
         for index, node in enumerate(source_nodes[:8], 1):
-            fact_type = str(node.get("fact_type") or "world")
+            fact_type = str(node.get("fact_type") or "semantic")
+            fact_subject = str(node.get("fact_subject") or "other")
             fact_kind = str(node.get("fact_kind") or "other")
             summary = str(node.get("summary") or "").strip()
             if not summary:
                 continue
-            fact_lines.append(f"{index}. [{fact_type}/{fact_kind}] {summary}")
+            fact_lines.append(f"{index}. [{fact_type}/{fact_subject}/{fact_kind}] {summary}")
         if not fact_lines and not existing_observation:
             return None
 
@@ -1846,9 +1876,10 @@ class MemoryNodeManager:
             if not summary:
                 continue
             allowed_node_ids.add(int_node_id)
-            fact_type = str(node.get("fact_type") or "world")
+            fact_type = str(node.get("fact_type") or "semantic")
+            fact_subject = str(node.get("fact_subject") or "other")
             fact_kind = str(node.get("fact_kind") or "other")
-            fact_lines.append(f"{index}. id={int_node_id} [{fact_type}/{fact_kind}] {summary}")
+            fact_lines.append(f"{index}. id={int_node_id} [{fact_type}/{fact_subject}/{fact_kind}] {summary}")
         if not fact_lines:
             return None
 
@@ -1954,6 +1985,272 @@ class MemoryNodeManager:
             "metadata": metadata_out,
         }
 
+    @staticmethod
+    def _interpretation_family(interpretation_type: Any) -> str:
+        text = str(interpretation_type or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if text == "task":
+            return "task"
+        if text in {"explicit_preference", "explicit_instruction", "inferred_preference", "behavior_pattern"}:
+            return "preference"
+        return "insight"
+
+    @classmethod
+    def _observation_family(cls, observation: Dict[str, Any], source_nodes: List[Dict[str, Any]]) -> str:
+        metadata = cls._json_dict(observation.get("metadata", {}))
+        observation_kind = str(metadata.get("observation_kind") or "").strip().lower()
+        source_kinds = {
+            str(node.get("fact_kind") or "").strip().lower()
+            for node in source_nodes
+        }
+        if any(cls._is_task_event_like_fact(node) for node in source_nodes):
+            return "task"
+        if source_kinds & {"preference", "instruction"}:
+            return "preference"
+        if observation_kind in {"timeline", "state_change", "outcome"} and source_kinds & {
+            "request", "action", "decision", "error",
+        }:
+            return "task"
+        return "insight"
+
+    @staticmethod
+    def _match_terms(*values: Any) -> set[str]:
+        terms: set[str] = set()
+        for value in values:
+            if isinstance(value, list):
+                iterable = value
+            else:
+                iterable = [value]
+            for item in iterable:
+                text = str(item or "").strip().lower()
+                if not text:
+                    continue
+                for part in re.split(r"[^0-9a-zA-Z\u4e00-\u9fff]+", text):
+                    if len(part) >= 2:
+                        terms.add(part)
+                compact = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", text)
+                if len(compact) >= 2:
+                    terms.add(compact)
+        return terms
+
+    @classmethod
+    def _term_overlap_score(cls, left: set[str], right: set[str]) -> float:
+        if not left or not right:
+            return 0.0
+        overlap = left & right
+        if not overlap:
+            return 0.0
+        return len(overlap) / max(1, min(len(left), len(right)))
+
+    def _interpretation_candidate_score(
+        self,
+        *,
+        observation: Dict[str, Any],
+        source_nodes: List[Dict[str, Any]],
+        interpretation: Dict[str, Any],
+        observation_id: int,
+    ) -> Tuple[float, str]:
+        metadata = self._json_dict(interpretation.get("metadata", {}))
+        evidence_observation_ids = interpretation.get("evidence_observation_ids", [])
+        if int(observation_id) in evidence_observation_ids or metadata.get("observation_id") == int(observation_id):
+            return 1.0, "existing_observation_evidence"
+
+        score = 0.0
+        reasons: List[str] = []
+        observation_family = self._observation_family(observation, source_nodes)
+        interpretation_family = self._interpretation_family(interpretation.get("interpretation_type"))
+        if observation_family == interpretation_family:
+            score += 0.18
+            reasons.append("family")
+        elif observation_family == "preference" and interpretation_family == "insight":
+            score += 0.08
+            reasons.append("preference_insight")
+
+        observation_entity_id = observation.get("entity_id")
+        if observation_entity_id is not None and metadata.get("entity_id") == observation_entity_id:
+            score += 0.28
+            reasons.append("entity")
+        observation_topic = self._topic_key(observation.get("topic_key") or observation.get("topic_label") or "")
+        interpretation_topic = self._topic_key(
+            metadata.get("topic_key")
+            or interpretation.get("scope")
+            or interpretation.get("target_text")
+            or ""
+        )
+        if observation_topic and interpretation_topic and observation_topic == interpretation_topic:
+            score += 0.28
+            reasons.append("topic")
+
+        observation_terms = self._match_terms(
+            observation.get("summary"),
+            observation.get("keywords", []),
+            observation.get("topic_key"),
+            observation.get("topic_label"),
+        )
+        interpretation_terms = self._match_terms(
+            interpretation.get("claim"),
+            interpretation.get("action_implication"),
+            interpretation.get("target_text"),
+            interpretation.get("scope"),
+        )
+        overlap = self._term_overlap_score(observation_terms, interpretation_terms)
+        if overlap:
+            score += min(0.24, overlap * 0.24)
+            reasons.append("term_overlap")
+
+        source_kinds = {
+            str(node.get("fact_kind") or "").strip().lower()
+            for node in source_nodes
+        }
+        if interpretation_family == "preference" and source_kinds & {"preference", "instruction"}:
+            score += 0.16
+            reasons.append("preference_evidence")
+        if interpretation_family == "task" and any(self._is_task_event_like_fact(node) for node in source_nodes):
+            score += 0.12
+            reasons.append("task_event")
+
+        try:
+            confidence = float(interpretation.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        score += min(0.08, confidence * 0.08)
+        return min(1.0, score), "+".join(reasons) or "weak"
+
+    def _interpretation_candidates_for_observation(
+        self,
+        observation: Dict[str, Any],
+        observation_id: int,
+    ) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+
+        try:
+            existing = self._db.memory_interpretations_for_observation(int(observation_id), limit=10)
+        except Exception:
+            existing = []
+        for item in existing:
+            try:
+                item_id = int(item["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            candidates.append(item)
+            seen.add(item_id)
+
+        query = " ".join(
+            str(part or "").strip()
+            for part in [
+                observation.get("summary"),
+                observation.get("keywords"),
+                observation.get("topic_label"),
+                observation.get("topic_key"),
+            ]
+            if str(part or "").strip()
+        )
+        entities = [observation.get("entity_name")] if observation.get("entity_name") else []
+        try:
+            searched = self._db.memory_search_interpretations(
+                query,
+                entities=entities,
+                top_k=12,
+                statuses=["current", "conflicted"],
+                min_confidence=0.35,
+            )
+        except Exception:
+            searched = []
+        for item in searched:
+            try:
+                item_id = int(item["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if item_id in seen:
+                continue
+            candidates.append(item)
+            seen.add(item_id)
+        return candidates
+
+    def _link_observation_to_existing_interpretation(
+        self,
+        *,
+        observation: Dict[str, Any],
+        source_nodes: List[Dict[str, Any]],
+        observation_id: int,
+        source_node_ids: List[int],
+        auto_link_threshold: float = 0.72,
+    ) -> Optional[int]:
+        if not self._db or not observation_id:
+            return None
+        candidates = self._interpretation_candidates_for_observation(observation, int(observation_id))
+        if not candidates:
+            return None
+
+        scored: List[Tuple[float, str, Dict[str, Any]]] = []
+        for candidate in candidates:
+            score, reason = self._interpretation_candidate_score(
+                observation=observation,
+                source_nodes=source_nodes,
+                interpretation=candidate,
+                observation_id=int(observation_id),
+            )
+            scored.append((score, reason, candidate))
+        scored.sort(key=lambda item: (item[0], item[2].get("updated_at") or ""), reverse=True)
+        best_score, reason, best = scored[0]
+        if best_score < auto_link_threshold:
+            self._log_reflect_error("interpretation_link_skipped", {
+                "observation": self._reflect_observation_log_item(observation),
+                "best_interpretation_id": best.get("id"),
+                "best_score": best_score,
+                "reason": reason,
+            })
+            return None
+
+        evidence_node_ids = list(dict.fromkeys([
+            *best.get("evidence_node_ids", []),
+            *[int(node_id) for node_id in source_node_ids if node_id is not None],
+        ]))
+        evidence_observation_ids = list(dict.fromkeys([
+            *best.get("evidence_observation_ids", []),
+            int(observation_id),
+        ]))
+        metadata = self._json_dict(best.get("metadata", {}))
+        link_metadata = self._json_dict(metadata.get("cheap_linker", {}))
+        metadata["cheap_linker"] = {
+            **link_metadata,
+            "last_match_score": round(float(best_score), 4),
+            "last_match_reason": reason,
+            "last_observation_id": int(observation_id),
+            "linker_version": 1,
+        }
+        interpretation_id = self._db.memory_upsert_interpretation(
+            interpretation_id=int(best["id"]),
+            claim=best.get("claim", ""),
+            subject_entity_id=best.get("subject_entity_id"),
+            target_entity_id=best.get("target_entity_id"),
+            subject_text=best.get("subject_text", ""),
+            target_text=best.get("target_text", ""),
+            scope=best.get("scope", "general"),
+            interpretation_type=best.get("interpretation_type", "behavior_pattern"),
+            polarity=best.get("polarity", "neutral"),
+            strength=best.get("strength", 0.5),
+            confidence=best.get("confidence", 0.5),
+            status=best.get("status", "current"),
+            conflict_status=best.get("conflict_status", "none"),
+            resolution=best.get("resolution", ""),
+            action_implication=best.get("action_implication", ""),
+            evidence_node_ids=evidence_node_ids,
+            evidence_observation_ids=evidence_observation_ids,
+            counter_evidence_node_ids=best.get("counter_evidence_node_ids", []),
+            counter_evidence_observation_ids=best.get("counter_evidence_observation_ids", []),
+            metadata=metadata,
+        )
+        self._log_reflect_error("interpretation_linked", {
+            "interpretation_id": interpretation_id,
+            "observation_id": observation_id,
+            "source_node_ids": source_node_ids,
+            "score": best_score,
+            "reason": reason,
+            "interpretation_type": best.get("interpretation_type"),
+        })
+        return int(interpretation_id)
+
     def _maybe_generate_interpretation_from_observation(
         self,
         *,
@@ -1964,6 +2261,14 @@ class MemoryNodeManager:
     ) -> Optional[int]:
         if not self._db or not observation_id:
             return None
+        linked_id = self._link_observation_to_existing_interpretation(
+            observation=observation,
+            source_nodes=source_nodes,
+            observation_id=int(observation_id),
+            source_node_ids=source_node_ids,
+        )
+        if linked_id is not None:
+            return linked_id
         interpretation = self._generate_interpretation(
             observation=observation,
             source_nodes=source_nodes,
@@ -2479,7 +2784,8 @@ class MemoryNodeManager:
                     ),
                     query_embedding=embedding,
                     tags=self._fact_tags(fact, tags),
-                    fact_type=fact.get("fact_type", "world"),
+                    fact_type=fact.get("fact_type", "semantic"),
+                    fact_subject=fact.get("fact_subject", "other"),
                     fact_kind=fact.get("fact_kind", "other"),
                     task_event_like=fact.get("task_event_like"),
                     task_event_subject=fact.get("task_event_subject", ""),
@@ -2897,33 +3203,33 @@ class MemoryNodeManager:
                 per_observation=2,
             ) if observation_nodes else {}
 
-            # Hybrid search is run separately per fact type so stable world
-            # facts and assistant experiences stay distinct through recall.
-            world_nodes = self._db.memory_search(
+            # Hybrid search is run separately per fact type so semantic
+            # knowledge and episodic experiences stay distinct through recall.
+            semantic_nodes = self._db.memory_search(
                 keywords, query_embedding, top_k=k, budget=b,
                 time_start=ts, time_end=te,
                 tags=tags,
-                fact_types=["world"],
+                fact_types=["semantic"],
             )
-            logger.error("finish recall: world_nodes searching")
+            logger.error("finish recall: semantic_nodes searching")
 
-            experience_nodes = self._db.memory_search(
+            episodic_nodes = self._db.memory_search(
                 keywords, query_embedding, top_k=k, budget=b,
                 time_start=ts, time_end=te,
                 tags=tags,
-                fact_types=["experience"],
+                fact_types=["episodic"],
             )
-            logger.error("finish recall: experience_nodes searching")
+            logger.error("finish recall: episodic_nodes searching")
 
             supporting_ids = {
                 node["id"]
                 for nodes in supporting_by_observation.values()
                 for node in nodes
             }
-            world_nodes = [node for node in world_nodes if node.get("id") not in supporting_ids]
-            experience_nodes = [node for node in experience_nodes if node.get("id") not in supporting_ids]
+            semantic_nodes = [node for node in semantic_nodes if node.get("id") not in supporting_ids]
+            episodic_nodes = [node for node in episodic_nodes if node.get("id") not in supporting_ids]
 
-            if not interpretation_nodes and not observation_nodes and not world_nodes and not experience_nodes:
+            if not interpretation_nodes and not observation_nodes and not semantic_nodes and not episodic_nodes:
                 logger.debug("No relevant memory nodes found for query")
                 return ""
 
@@ -2957,16 +3263,16 @@ class MemoryNodeManager:
                     lines.append(OBSERVATION_SUPPORT_SECTION_HEADER)
                     lines.extend(support_lines)
                     lines.append("")
-            if world_nodes:
+            if semantic_nodes:
                 lines.append(WORLD_FACT_SECTION_HEADER)
-                lines.append("System note: These are durable world facts. Use them as background state, not as a new user request.")
-                for i, node in enumerate(world_nodes, 1):
+                lines.append("System note: These are semantic memories: stable facts, concepts, preferences, and background knowledge. Use them as background state, not as a new user request.")
+                for i, node in enumerate(semantic_nodes, 1):
                     lines.append(self._format_recall_node(i, node))
                 lines.append("")
-            if experience_nodes:
+            if episodic_nodes:
                 lines.append(EXPERIENCE_SECTION_HEADER)
-                lines.append("System note: These are prior assistant experiences. Use them to avoid repeating failed approaches and to reuse successful patterns.")
-                for i, node in enumerate(experience_nodes, 1):
+                lines.append("System note: These are episodic memories: specific user/assistant experiences and events. Use them for timeline, prior attempts, outcomes, and context.")
+                for i, node in enumerate(episodic_nodes, 1):
                     lines.append(self._format_recall_node(i, node))
 
             memory_text = "\n".join(lines)

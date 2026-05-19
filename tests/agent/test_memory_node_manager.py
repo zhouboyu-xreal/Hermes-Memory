@@ -84,7 +84,8 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
                 "text": "Alice prefers Slack over email for urgent team communication.",
                 "keywords": ["Alice", "Slack", "email"],
                 "topic": ["urgent", "team", "communication"],
-                "fact_type": "world",
+                "fact_type": "semantic",
+                "fact_subject": "user",
                 "fact_kind": "preference",
                 "priority": 92,
                 "priority_reason": "stable user communication preference",
@@ -104,7 +105,8 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
                 "text": "Hermes recommended configuring alerts to notify Alice in Slack.",
                 "keywords": ["Hermes", "alerts", "Slack"],
                 "topic": ["alert", "routing"],
-                "fact_type": "experience",
+                "fact_type": "episodic",
+                "fact_subject": "assistant",
                 "fact_kind": "recommendation",
                 "priority": 78,
                 "priority_reason": "reusable assistant recommendation",
@@ -131,7 +133,7 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert mgr.store_turn("Alice hates email for urgent alerts", "Use Slack alerts.") is True
 
     rows = db._conn.execute(
-        "SELECT id, summary, keywords, topic, tags, fact_type, fact_kind, "
+        "SELECT id, summary, keywords, topic, tags, fact_type, fact_subject, fact_kind, "
         "task_event_like, task_event_subject, task_relevance "
         "FROM memory_nodes ORDER BY id"
     ).fetchall()
@@ -140,12 +142,16 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert rows[1]["summary"] == retain_payload["facts"][1]["text"]
     assert "Alice Slack email" == rows[0]["keywords"]
     assert "urgent team communication" == rows[0]["topic"]
-    assert rows[0]["fact_type"] == "world"
+    assert rows[0]["fact_type"] == "semantic"
+    assert rows[0]["fact_subject"] == "user"
     assert rows[0]["fact_kind"] == "preference"
-    assert rows[1]["fact_type"] == "experience"
+    assert rows[1]["fact_type"] == "episodic"
+    assert rows[1]["fact_subject"] == "assistant"
     assert rows[1]["fact_kind"] == "recommendation"
-    assert "fact_type:world" in json.loads(rows[0]["tags"])
-    assert "fact_type:experience" in json.loads(rows[1]["tags"])
+    assert "fact_type:semantic" in json.loads(rows[0]["tags"])
+    assert "fact_subject:user" in json.loads(rows[0]["tags"])
+    assert "fact_type:episodic" in json.loads(rows[1]["tags"])
+    assert "fact_subject:assistant" in json.loads(rows[1]["tags"])
     assert "fact_kind:preference" in json.loads(rows[0]["tags"])
     assert "priority:92" in json.loads(rows[0]["tags"])
     assert "priority_band:high" in json.loads(rows[0]["tags"])
@@ -165,6 +171,8 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
         (rows[0]["id"],),
     ).fetchone()
     original_payload = json.loads(detail["original_dialog"])
+    assert original_payload["retain_fact"]["fact_type"] == "semantic"
+    assert original_payload["retain_fact"]["fact_subject"] == "user"
     assert original_payload["retain_fact"]["fact_kind"] == "preference"
     assert original_payload["retain_fact"]["priority"] == 92
     assert original_payload["retain_fact"]["priority_reason"] == "stable user communication preference"
@@ -211,6 +219,7 @@ def test_memory_node_details_live_on_memory_nodes_table(db):
         for row in db._conn.execute("PRAGMA table_info(memory_nodes)").fetchall()
     }
     assert "fact_type" in columns
+    assert "fact_subject" in columns
     assert "fact_kind" in columns
 
 
@@ -265,6 +274,39 @@ def test_memory_interpretations_store_current_agent_interpretations(db):
     assert results[0]["evidence_node_ids"] == [1, 2]
 
 
+def test_memory_search_interpretations_separates_content_and_entity_matches(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    content_match = db.memory_upsert_interpretation(
+        claim="The alert workflow prefers Slack escalation.",
+        target_text="alert routing",
+        scope="alert-workflow",
+        interpretation_type="insight",
+        confidence=0.7,
+        action_implication="Use Slack when alert routing comes up.",
+    )
+    entity_only = db.memory_upsert_interpretation(
+        claim="User has a current collaboration preference.",
+        subject_entity_id=alice,
+        target_text="collaboration",
+        scope="workflow",
+        interpretation_type="inferred_preference",
+        confidence=0.95,
+        action_implication="Consider person-specific collaboration context.",
+    )
+
+    keyword_results = db.memory_search_interpretations(["Alice", "Slack"], top_k=5)
+
+    assert [item["id"] for item in keyword_results[:2]] == [content_match, entity_only]
+
+    entity_results = db.memory_search_interpretations(
+        "collaboration",
+        entities=[{"name": "Alice"}],
+        top_k=5,
+    )
+
+    assert entity_results[0]["id"] == entity_only
+
+
 def test_store_turn_falls_back_to_summary_when_retain_json_is_bad(db):
     summary_payload = {
         "summary": "The user decided to use PostgreSQL 16 for the project.",
@@ -296,12 +338,15 @@ def test_retain_and_relation_prompts_share_relation_type_contract():
     assert "Reason/HinderedBy" not in RELATION_PROMPT_TEMPLATE
     assert '"keywords": ["关键词1", "关键词2"]' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"topic": ["主题1", "主题2"]' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert '"fact_type": "semantic/episodic"' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert '"fact_subject": "user/assistant/world/project/system/other"' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"fact_kind": "preference/decision/request/recommendation/action/error/context/instruction/other"' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"priority": 80' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"time_confidence": "explicit/inferred_from_turn/unknown"' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"task_event_like": true' in RETAIN_FACT_EXTRACTION_PROMPT
     assert "对话发生时间：{turn_timestamp}" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "fact_kind 定义和判别边界" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "fact_type 判别边界" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "preference：用户长期或反复表达的喜好" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "decision：用户或项目已经明确做出的决定" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "request：用户对 AI 或系统提出的当前任务请求" in RETAIN_FACT_EXTRACTION_PROMPT
@@ -328,7 +373,7 @@ def test_retain_fact_prompt_includes_turn_timestamp_context(db):
                 "text": "助手曾在当前对话时间围绕测试执行验证，结果是测试通过。",
                 "keywords": ["测试", "验证"],
                 "topic": ["测试"],
-                "fact_type": "experience",
+                "fact_type": "episodic",
                 "fact_kind": "action",
                 "priority": 70,
                 "time_confidence": "inferred_from_turn",
@@ -356,7 +401,7 @@ def test_store_turn_discards_low_priority_retain_facts(db):
                 "text": "The user made a one-off small talk comment with no future utility.",
                 "keywords": ["small", "talk"],
                 "topic": ["small talk"],
-                "fact_type": "world",
+                "fact_type": "semantic",
                 "fact_kind": "context",
                 "priority": 40,
                 "priority_reason": "one-off low value comment",
@@ -383,7 +428,7 @@ def test_store_turn_filters_plain_time_expressions_from_fact_entities(db):
                 "text": "Alice wants Slack alerts during the Spring Festival launch window.",
                 "keywords": ["Alice", "Slack", "春节"],
                 "topic": ["launch", "alerts"],
-                "fact_type": "world",
+                "fact_type": "semantic",
                 "fact_kind": "preference",
                 "occurred_start": "2026-05-07 00:00:00",
                 "entities": [
@@ -423,7 +468,7 @@ def test_store_turn_filters_attribute_phrases_from_fact_entities(db):
                 "text": "Alice prefers low-intensity outdoor activities with low venue dependency.",
                 "keywords": ["Alice", "户外活动", "低场地依赖"],
                 "topic": ["户外活动"],
-                "fact_type": "world",
+                "fact_type": "semantic",
                 "entities": [
                     {"name": "Alice", "type": "PERSON"},
                     {"name": "低场地依赖", "type": "CONCEPT"},
@@ -465,7 +510,7 @@ def _add_memory_node(
     time_key,
     summary,
     keywords,
-    fact_type="world",
+    fact_type="semantic",
     fact_kind="other",
     task_event_like=None,
     task_event_subject="",
@@ -606,39 +651,39 @@ def test_memory_search_rrf_includes_graph_neighbors(db, monkeypatch):
 
 
 def test_memory_search_filters_by_fact_type(db, monkeypatch):
-    world = _add_memory_node(
+    semantic = _add_memory_node(
         db,
         time_key="2026-05-01 10:00:00",
         summary="Alice prefers Slack for urgent alerts.",
         keywords=["Alice", "Slack"],
-        fact_type="world",
+        fact_type="semantic",
     )
-    experience = _add_memory_node(
+    episodic = _add_memory_node(
         db,
         time_key="2026-05-01 11:00:00",
         summary="Hermes recommended Slack alert routing for Alice.",
         keywords=["Alice", "Slack"],
-        fact_type="experience",
+        fact_type="episodic",
     )
     monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
 
-    world_nodes = db.memory_search(
+    semantic_nodes = db.memory_search(
         ["Alice", "Slack"],
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
-        fact_types=["world"],
+        fact_types=["semantic"],
     )
-    experience_nodes = db.memory_search(
+    episodic_nodes = db.memory_search(
         ["Alice", "Slack"],
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
-        fact_types=["experience"],
+        fact_types=["episodic"],
     )
 
-    assert [n["id"] for n in world_nodes] == [world]
-    assert [n["id"] for n in experience_nodes] == [experience]
-    assert world_nodes[0]["fact_type"] == "world"
-    assert experience_nodes[0]["fact_type"] == "experience"
+    assert [n["id"] for n in semantic_nodes] == [semantic]
+    assert [n["id"] for n in episodic_nodes] == [episodic]
+    assert semantic_nodes[0]["fact_type"] == "semantic"
+    assert episodic_nodes[0]["fact_type"] == "episodic"
 
 
 def test_memory_keyword_search_keeps_cjk_terms_intact(db):
@@ -1159,14 +1204,14 @@ def test_reflect_observation_decay_uses_fact_type_half_lives(db):
         time_key="2026-01-01 10:00:00",
         summary="Alice prefers Slack for urgent alerts.",
         keywords=["Alice", "Slack"],
-        fact_type="world",
+        fact_type="semantic",
     )
     experience_node = _add_memory_node(
         db,
         time_key="2026-01-01 11:00:00",
         summary="Hermes previously routed Alice's alerts through Slack.",
         keywords=["Alice", "Slack"],
-        fact_type="experience",
+        fact_type="episodic",
     )
     world_observation = db.memory_upsert_observation(
         entity_id=alice,
@@ -1383,7 +1428,7 @@ def test_memory_node_manager_reflect_inactivates_stale_observations(db):
         time_key="2000-01-01 10:00:00",
         summary="Alice used email alerts long ago.",
         keywords=["Alice", "email"],
-        fact_type="experience",
+        fact_type="episodic",
     )
     observation_id = db.memory_upsert_observation(
         entity_id=alice,
@@ -1416,20 +1461,20 @@ def test_memory_node_manager_reflect_inactivates_stale_observations(db):
     assert row["decay_score"] < 0.9
 
 
-def test_recall_formats_world_and_experience_sections(db, monkeypatch):
+def test_recall_formats_semantic_and_episodic_sections(db, monkeypatch):
     _add_memory_node(
         db,
         time_key="2026-05-01 10:00:00",
         summary="Alice prefers Slack for urgent alerts.",
         keywords=["Alice", "Slack"],
-        fact_type="world",
+        fact_type="semantic",
     )
     _add_memory_node(
         db,
         time_key="2026-05-01 11:00:00",
         summary="Hermes recommended Slack alert routing for Alice.",
         keywords=["Alice", "Slack"],
-        fact_type="experience",
+        fact_type="episodic",
     )
     monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
     mgr = _NoAsyncMemoryNodeManager(
@@ -1440,10 +1485,10 @@ def test_recall_formats_world_and_experience_sections(db, monkeypatch):
 
     context = mgr.recall("Alice Slack alerts")
 
-    assert "[World facts" in context
-    assert "[Experience memories" in context
-    assert "durable world facts" in context
-    assert "prior assistant experiences" in context
+    assert "[Semantic memories" in context
+    assert "[Episodic memories" in context
+    assert "semantic memories" in context
+    assert "episodic memories" in context
     assert "Alice prefers Slack for urgent alerts." in context
     assert "Hermes recommended Slack alert routing for Alice." in context
 
@@ -1463,7 +1508,7 @@ def test_recall_formats_current_interpretations_before_evidence(db, monkeypatch)
         time_key="2026-05-01 10:00:00",
         summary="用户要求先过滤 preference/instruction/context/other 类型的 fact。",
         keywords=["heuristic", "task", "fact"],
-        fact_type="world",
+        fact_type="semantic",
     )
     monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
     mgr = _NoAsyncMemoryNodeManager(
@@ -1478,7 +1523,7 @@ def test_recall_formats_current_interpretations_before_evidence(db, monkeypatch)
     assert "agent interpretations derived from memory evidence" in context
     assert "用户当前倾向先用 heuristic 控制 task fact 选择" in context
     assert "action implication: 后续先讨论 heuristic/data-flow，再考虑 prompt guidance。" in context
-    assert context.index(INTERPRETATION_SECTION_HEADER) < context.index("[World facts")
+    assert context.index(INTERPRETATION_SECTION_HEADER) < context.index("[Semantic memories")
 
 
 def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
@@ -1488,21 +1533,21 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
                 "text": "Alice prefers Slack for urgent alerts.",
                 "keywords": ["Alice", "Slack", "alerts"],
                 "topic": ["Slack alerts"],
-                "fact_type": "world",
+                "fact_type": "semantic",
                 "entities": [{"name": "Alice", "type": "PERSON"}],
             },
             {
                 "text": "Alice dislikes email for urgent alerts.",
                 "keywords": ["Alice", "email", "alerts"],
                 "topic": ["Slack alerts"],
-                "fact_type": "world",
+                "fact_type": "semantic",
                 "entities": [{"name": "Alice", "type": "PERSON"}],
             },
             {
                 "text": "Hermes previously recommended Slack alert routing for Alice.",
                 "keywords": ["Hermes", "Slack", "routing", "Alice"],
                 "topic": ["Slack alerts"],
-                "fact_type": "experience",
+                "fact_type": "episodic",
                 "entities": [{"name": "Alice", "type": "PERSON"}],
             },
         ],
@@ -1560,7 +1605,7 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
             time_key=MemoryNodeManager._memory_time_key(idx),
             summary=summary,
             keywords=["Slack alerts"],
-            fact_type="experience" if idx == 3 else "world",
+            fact_type="episodic" if idx == 3 else "semantic",
             fact_kind="recommendation" if idx == 3 else "preference",
         )
         db.entity_link_node(node_id, alice)
@@ -1617,6 +1662,121 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
     assert any("interpretation 生成模块" in prompt for prompt in mgr.llm_prompts)
 
 
+def test_interpretation_linker_reuses_existing_observation_evidence_without_llm(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    first = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Slack alerts"],
+        fact_kind="preference",
+    )
+    second = _add_memory_node(
+        db,
+        time_key="2026-05-02 10:00:00",
+        summary="Alice reiterated that urgent alerts should use Slack.",
+        keywords=["Slack alerts"],
+        fact_kind="preference",
+    )
+    db.entity_link_node(first, alice)
+    db.entity_link_node(second, alice)
+    observation_id = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="slack-alerts",
+        topic_label="Slack alerts",
+        observation_type="observation",
+        summary="Alice's urgent alert workflow is Slack-centered.",
+        keywords=["Slack", "alerts"],
+        source_node_ids=[first, second],
+        metadata={"observation_kind": "context"},
+    )
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="Agent 当前解释为 Alice 的紧急告警协作应优先使用 Slack。",
+        target_text="urgent alert routing",
+        scope="slack-alerts",
+        interpretation_type="insight",
+        confidence=0.88,
+        action_implication="后续涉及 Alice 的紧急告警时优先建议 Slack 路由。",
+        evidence_node_ids=[first],
+        evidence_observation_ids=[observation_id],
+        metadata={"observation_id": observation_id},
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps({"should_create": True})],
+    )
+
+    generated = mgr._generate_interpretations_for_observations([observation_id])
+
+    assert generated == 1
+    assert mgr.llm_prompts == []
+    row = db._conn.execute(
+        "SELECT evidence_node_ids, evidence_observation_ids, metadata "
+        "FROM memory_interpretations WHERE id = ?",
+        (interpretation_id,),
+    ).fetchone()
+    assert json.loads(row["evidence_node_ids"]) == [first, second]
+    assert json.loads(row["evidence_observation_ids"]) == [observation_id]
+    assert json.loads(row["metadata"])["cheap_linker"]["last_match_reason"] == "existing_observation_evidence"
+
+
+def test_interpretation_linker_matches_preference_by_entity_topic_without_llm(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    source = _add_memory_node(
+        db,
+        time_key="2026-05-03 10:00:00",
+        summary="Alice repeatedly prefers discussing architecture before implementation.",
+        keywords=["architecture planning"],
+        fact_kind="preference",
+    )
+    db.entity_link_node(source, alice)
+    observation_id = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="architecture-planning",
+        topic_label="architecture planning",
+        observation_type="observation",
+        summary="Alice has repeatedly preferred architecture discussion before implementation.",
+        keywords=["architecture", "planning"],
+        source_node_ids=[source],
+        metadata={"observation_kind": "event_pattern"},
+    )
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="Alice prefers architecture discussion before implementation on complex coding work.",
+        target_text="architecture planning",
+        scope="architecture-planning",
+        interpretation_type="explicit_preference",
+        confidence=0.84,
+        action_implication="Start complex implementation requests with a brief design pass when appropriate.",
+        metadata={
+            "entity_id": alice,
+            "entity_name": "Alice",
+            "topic_key": "architecture-planning",
+            "topic_label": "architecture planning",
+        },
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps({"should_create": True})],
+    )
+
+    generated = mgr._generate_interpretations_for_observations([observation_id])
+
+    assert generated == 1
+    assert mgr.llm_prompts == []
+    row = db._conn.execute(
+        "SELECT evidence_node_ids, evidence_observation_ids, metadata "
+        "FROM memory_interpretations WHERE id = ?",
+        (interpretation_id,),
+    ).fetchone()
+    assert json.loads(row["evidence_node_ids"]) == [source]
+    assert json.loads(row["evidence_observation_ids"]) == [observation_id]
+    metadata = json.loads(row["metadata"])
+    assert metadata["cheap_linker"]["last_match_score"] >= 0.72
+    assert "preference_evidence" in metadata["cheap_linker"]["last_match_reason"]
+
+
 def test_store_turn_can_consolidate_task_observation(db):
     retain_payload = {
         "facts": [
@@ -1624,7 +1784,7 @@ def test_store_turn_can_consolidate_task_observation(db):
                 "text": "用户正在排查 Hermes memory recall 的匹配问题。",
                 "keywords": ["Hermes", "memory", "recall", "排查"],
                 "topic": ["memory recall"],
-                "fact_type": "world",
+                "fact_type": "semantic",
                 "fact_kind": "action",
                 "entities": [{"name": "Hermes Agent", "type": "PROJECT"}],
             },
@@ -1632,7 +1792,7 @@ def test_store_turn_can_consolidate_task_observation(db):
                 "text": "用户计划修改 observation 生成逻辑以区分 insight 和 task。",
                 "keywords": ["observation", "insight", "task", "修改"],
                 "topic": ["memory recall"],
-                "fact_type": "world",
+                "fact_type": "semantic",
                 "fact_kind": "action",
                 "entities": [{"name": "Hermes Agent", "type": "PROJECT"}],
             },
@@ -1640,7 +1800,7 @@ def test_store_turn_can_consolidate_task_observation(db):
                 "text": "助手帮助用户实现记忆系统 reflect 和 observation decay 相关改动。",
                 "keywords": ["reflect", "observation", "decay", "实现"],
                 "topic": ["memory recall"],
-                "fact_type": "experience",
+                "fact_type": "episodic",
                 "fact_kind": "action",
                 "entities": [{"name": "Hermes Agent", "type": "PROJECT"}],
             },
@@ -2113,12 +2273,13 @@ def test_task_status_prompt_definitions_scope_stale_by_prompt_role():
 
 
 def test_observation_prompts_explain_fact_type_and_kind_labels():
-    assert "world_fact（即 fact_type=world）" in OBSERVATION_SOURCE_FACT_GUIDANCE
-    assert "experience（即 fact_type=experience）" in OBSERVATION_SOURCE_FACT_GUIDANCE
+    assert "semantic（语义记忆）" in OBSERVATION_SOURCE_FACT_GUIDANCE
+    assert "episodic（情景记忆）" in OBSERVATION_SOURCE_FACT_GUIDANCE
+    assert "fact_subject 表示记忆主体" in OBSERVATION_SOURCE_FACT_GUIDANCE
     assert "fact_kind 类别说明" in OBSERVATION_SOURCE_FACT_GUIDANCE
     assert "preference：用户长期或反复表达的偏好" in OBSERVATION_SOURCE_FACT_GUIDANCE
     assert "instruction：用户要求 AI 以后长期遵守" in OBSERVATION_SOURCE_FACT_GUIDANCE
-    assert "fact_type 决定事实主体来源" in OBSERVATION_SOURCE_FACT_GUIDANCE
+    assert "fact_type 决定记忆性质" in OBSERVATION_SOURCE_FACT_GUIDANCE
 
     for prompt in (
         INSIGHT_CONSOLIDATION_PROMPT,
@@ -2205,7 +2366,7 @@ def test_recall_includes_observations_and_supporting_facts(db, monkeypatch):
             time_key=f"2026-05-0{idx} 10:00:00",
             summary=summary,
             keywords=["Slack alerts"],
-            fact_type="world" if idx < 3 else "experience",
+            fact_type="semantic" if idx < 3 else "episodic",
         )
         db.entity_link_node(node_id, alice)
         source_ids.append(node_id)
@@ -2357,21 +2518,21 @@ def test_memory_relation_candidates_stay_within_same_fact_type(db, monkeypatch):
         time_key="2026-05-01 10:00:00",
         summary="Alice prefers Slack for urgent alerts.",
         keywords=["Alice", "Slack"],
-        fact_type="world",
+        fact_type="semantic",
     )
     experience_prior = _add_memory_node(
         db,
         time_key="2026-05-01 11:00:00",
         summary="Hermes recommended Slack alert routing for Alice.",
         keywords=["Alice", "Slack"],
-        fact_type="experience",
+        fact_type="episodic",
     )
     current_world = _add_memory_node(
         db,
         time_key="2026-05-01 12:00:00",
         summary="Alice wants urgent alerts in Slack.",
         keywords=["Alice", "Slack"],
-        fact_type="world",
+        fact_type="semantic",
     )
     alice_id = db.entity_add_entity("Alice", "PERSON")
     for node_id in (world_prior, experience_prior, current_world):
