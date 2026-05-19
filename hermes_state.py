@@ -347,6 +347,46 @@ CREATE INDEX IF NOT EXISTS idx_memory_observation_sources_node
 ON memory_observation_sources(node_id);
 """
 
+MEMORY_INTERPRETATIONS_SQL = """
+CREATE TABLE IF NOT EXISTS memory_interpretations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_entity_id INTEGER REFERENCES entity_nodes(id),
+    target_entity_id INTEGER REFERENCES entity_nodes(id),
+    subject_text TEXT NOT NULL DEFAULT '',
+    target_text TEXT NOT NULL DEFAULT '',
+    scope TEXT NOT NULL DEFAULT 'general',
+    interpretation_type TEXT NOT NULL DEFAULT 'behavior_pattern',
+    claim TEXT NOT NULL,
+    polarity TEXT NOT NULL DEFAULT 'neutral',
+    strength REAL DEFAULT 0.5,
+    confidence REAL DEFAULT 0.5,
+    status TEXT NOT NULL DEFAULT 'current',
+    conflict_status TEXT NOT NULL DEFAULT 'none',
+    resolution TEXT NOT NULL DEFAULT '',
+    action_implication TEXT NOT NULL DEFAULT '',
+    evidence_node_ids TEXT DEFAULT '[]',
+    evidence_observation_ids TEXT DEFAULT '[]',
+    counter_evidence_node_ids TEXT DEFAULT '[]',
+    counter_evidence_observation_ids TEXT DEFAULT '[]',
+    metadata TEXT DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_supported_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_interpretations_status
+ON memory_interpretations(status);
+
+CREATE INDEX IF NOT EXISTS idx_memory_interpretations_subject
+ON memory_interpretations(subject_entity_id, subject_text, status);
+
+CREATE INDEX IF NOT EXISTS idx_memory_interpretations_target
+ON memory_interpretations(target_entity_id, target_text, status);
+
+CREATE INDEX IF NOT EXISTS idx_memory_interpretations_type_scope
+ON memory_interpretations(interpretation_type, scope, status);
+"""
+
 
 class SessionDB:
     """
@@ -776,6 +816,8 @@ class SessionDB:
         except sqlite3.OperationalError:
             cursor.executescript(ENTITY_FTS_SQL)
         cursor.executescript(MEMORY_OBSERVATIONS_SQL)
+        cursor.executescript(MEMORY_INTERPRETATIONS_SQL)
+        self._migrate_memory_opinions_to_interpretations(cursor)
         self._repair_graph_created_at_placeholders(cursor)
 
         # ── Add tags column to memory_nodes if missing ──
@@ -920,6 +962,34 @@ class SessionDB:
                        CAST(strftime('%s','now') AS REAL)
                    )
                    WHERE created_at = '%s'"""
+            )
+        except sqlite3.OperationalError:
+            pass
+
+    def _migrate_memory_opinions_to_interpretations(self, cursor: sqlite3.Cursor) -> None:
+        """Copy rows from the short-lived opinion table name to interpretations."""
+        try:
+            has_opinions = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_opinions'"
+            ).fetchone()
+            if not has_opinions:
+                return
+            cursor.execute(
+                "INSERT INTO memory_interpretations "
+                "(id, subject_entity_id, target_entity_id, subject_text, target_text, "
+                "scope, interpretation_type, claim, polarity, strength, confidence, "
+                "status, conflict_status, resolution, action_implication, "
+                "evidence_node_ids, evidence_observation_ids, "
+                "counter_evidence_node_ids, counter_evidence_observation_ids, "
+                "metadata, created_at, updated_at, last_supported_at) "
+                "SELECT id, subject_entity_id, target_entity_id, subject_text, target_text, "
+                "scope, interpretation_type, claim, polarity, strength, confidence, "
+                "status, conflict_status, resolution, action_implication, "
+                "evidence_node_ids, evidence_observation_ids, "
+                "counter_evidence_node_ids, counter_evidence_observation_ids, "
+                "metadata, created_at, updated_at, last_supported_at "
+                "FROM memory_opinions "
+                "WHERE id NOT IN (SELECT id FROM memory_interpretations)"
             )
         except sqlite3.OperationalError:
             pass
@@ -2269,6 +2339,76 @@ class SessionDB:
             if text.startswith("fact_kind:"):
                 return cls._normalize_memory_fact_kind(text.split(":", 1)[1])
         return "other"
+
+    @staticmethod
+    def _normalize_memory_interpretation_status(value: Any) -> str:
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {"current", "superseded", "conflicted", "archived"}
+        return text if text in allowed else "current"
+
+    @staticmethod
+    def _normalize_memory_interpretation_type(value: Any) -> str:
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {
+            "insight", "task",
+            "explicit_preference", "explicit_instruction", "inferred_preference",
+            "behavior_pattern", "project_state", "task_risk", "constraint",
+            "conflict_resolution", "strategy", "other",
+        }
+        return text if text in allowed else "behavior_pattern"
+
+    @staticmethod
+    def _normalize_memory_interpretation_conflict_status(value: Any) -> str:
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {"none", "resolved", "unresolved"}
+        return text if text in allowed else "none"
+
+    @staticmethod
+    def _json_int_list(value: Any) -> List[int]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value or "[]")
+            except json.JSONDecodeError:
+                value = []
+        if not isinstance(value, list):
+            return []
+        out: List[int] = []
+        seen = set()
+        for item in value:
+            try:
+                int_item = int(item)
+            except (TypeError, ValueError):
+                continue
+            if int_item in seen:
+                continue
+            seen.add(int_item)
+            out.append(int_item)
+        return out
+
+    def _memory_interpretation_from_row(self, row: Any) -> Dict[str, Any]:
+        item = dict(row)
+        item["interpretation_type"] = self._normalize_memory_interpretation_type(
+            item.get("interpretation_type")
+        )
+        item["status"] = self._normalize_memory_interpretation_status(item.get("status"))
+        item["conflict_status"] = self._normalize_memory_interpretation_conflict_status(
+            item.get("conflict_status")
+        )
+        for key in (
+            "evidence_node_ids",
+            "evidence_observation_ids",
+            "counter_evidence_node_ids",
+            "counter_evidence_observation_ids",
+        ):
+            item[key] = self._json_int_list(item.get(key))
+        metadata = item.get("metadata")
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata or "{}")
+            except json.JSONDecodeError:
+                metadata = {}
+        item["metadata"] = metadata if isinstance(metadata, dict) else {}
+        return item
 
     def _memory_get_node(self, node_id: int) -> Optional[Dict[str, Any]]:
         """Fetch a single memory node with tags and relations."""
@@ -4004,6 +4144,302 @@ class SessionDB:
         text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "-", text).strip("-")
         return text or "general"
 
+    # ── Memory interpretations ──────────────────────────────────────────
+
+    def memory_upsert_interpretation(
+        self,
+        *,
+        claim: str,
+        subject_entity_id: Optional[int] = None,
+        target_entity_id: Optional[int] = None,
+        subject_text: str = "",
+        target_text: str = "",
+        scope: str = "general",
+        interpretation_type: str = "behavior_pattern",
+        polarity: str = "neutral",
+        strength: float = 0.5,
+        confidence: float = 0.5,
+        status: str = "current",
+        conflict_status: str = "none",
+        resolution: str = "",
+        action_implication: str = "",
+        evidence_node_ids: Optional[List[int]] = None,
+        evidence_observation_ids: Optional[List[int]] = None,
+        counter_evidence_node_ids: Optional[List[int]] = None,
+        counter_evidence_observation_ids: Optional[List[int]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        interpretation_id: Optional[int] = None,
+    ) -> int:
+        """Create or update an agent interpretation over memory evidence.
+
+        Interpretations are the mutable current-state layer: they should cite
+        immutable fact nodes and/or consolidated observations, but they do not
+        replace either evidence layer.
+        """
+        clean_claim = str(claim or "").strip()
+        if not clean_claim:
+            raise ValueError("memory interpretation requires a claim")
+        now_text = datetime.now().astimezone().isoformat()
+        normalized_type = self._normalize_memory_interpretation_type(interpretation_type)
+        normalized_status = self._normalize_memory_interpretation_status(status)
+        normalized_conflict = self._normalize_memory_interpretation_conflict_status(conflict_status)
+        clean_subject = str(subject_text or "").strip()
+        clean_target = str(target_text or "").strip()
+        clean_scope = str(scope or "general").strip() or "general"
+        clean_polarity = str(polarity or "neutral").strip().lower() or "neutral"
+        strength_value = max(0.0, min(1.0, float(strength or 0.0)))
+        confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
+        evidence_nodes = None if evidence_node_ids is None else self._json_int_list(evidence_node_ids)
+        evidence_observations = (
+            None
+            if evidence_observation_ids is None
+            else self._json_int_list(evidence_observation_ids)
+        )
+        counter_nodes = (
+            None
+            if counter_evidence_node_ids is None
+            else self._json_int_list(counter_evidence_node_ids)
+        )
+        counter_observations = (
+            None
+            if counter_evidence_observation_ids is None
+            else self._json_int_list(counter_evidence_observation_ids)
+        )
+        metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
+
+        def _do(conn):
+            existing_id = interpretation_id
+            if existing_id is None:
+                existing = conn.execute(
+                    "SELECT id FROM memory_interpretations "
+                    "WHERE subject_entity_id IS ? AND target_entity_id IS ? "
+                    "AND subject_text = ? AND target_text = ? "
+                    "AND scope = ? AND interpretation_type = ? "
+                    "AND status IN ('current', 'conflicted') "
+                    "ORDER BY updated_at DESC, id DESC LIMIT 1",
+                    (
+                        subject_entity_id,
+                        target_entity_id,
+                        clean_subject,
+                        clean_target,
+                        clean_scope,
+                        normalized_type,
+                    ),
+                ).fetchone()
+                if existing:
+                    existing_id = existing["id"] if isinstance(existing, sqlite3.Row) else existing[0]
+            if existing_id is not None:
+                existing_row = conn.execute(
+                    "SELECT evidence_node_ids, evidence_observation_ids, "
+                    "counter_evidence_node_ids, counter_evidence_observation_ids "
+                    "FROM memory_interpretations WHERE id = ?",
+                    (existing_id,),
+                ).fetchone()
+                stored_evidence_nodes = (
+                    self._json_int_list(existing_row["evidence_node_ids"])
+                    if existing_row
+                    else []
+                )
+                stored_evidence_observations = (
+                    self._json_int_list(existing_row["evidence_observation_ids"])
+                    if existing_row
+                    else []
+                )
+                stored_counter_nodes = (
+                    self._json_int_list(existing_row["counter_evidence_node_ids"])
+                    if existing_row
+                    else []
+                )
+                stored_counter_observations = (
+                    self._json_int_list(existing_row["counter_evidence_observation_ids"])
+                    if existing_row
+                    else []
+                )
+                conn.execute(
+                    "UPDATE memory_interpretations SET "
+                    "subject_entity_id = ?, target_entity_id = ?, subject_text = ?, "
+                    "target_text = ?, scope = ?, interpretation_type = ?, claim = ?, "
+                    "polarity = ?, strength = ?, confidence = ?, status = ?, "
+                    "conflict_status = ?, resolution = ?, action_implication = ?, "
+                    "evidence_node_ids = ?, evidence_observation_ids = ?, "
+                    "counter_evidence_node_ids = ?, counter_evidence_observation_ids = ?, "
+                    "metadata = ?, updated_at = ?, last_supported_at = ? "
+                    "WHERE id = ?",
+                    (
+                        subject_entity_id,
+                        target_entity_id,
+                        clean_subject,
+                        clean_target,
+                        clean_scope,
+                        normalized_type,
+                        clean_claim,
+                        clean_polarity,
+                        strength_value,
+                        confidence_value,
+                        normalized_status,
+                        normalized_conflict,
+                        str(resolution or "").strip(),
+                        str(action_implication or "").strip(),
+                        json.dumps(evidence_nodes if evidence_nodes is not None else stored_evidence_nodes),
+                        json.dumps(
+                            evidence_observations
+                            if evidence_observations is not None
+                            else stored_evidence_observations
+                        ),
+                        json.dumps(counter_nodes if counter_nodes is not None else stored_counter_nodes),
+                        json.dumps(
+                            counter_observations
+                            if counter_observations is not None
+                            else stored_counter_observations
+                        ),
+                        metadata_str,
+                        now_text,
+                        now_text,
+                        existing_id,
+                    ),
+                )
+                return int(existing_id)
+            cursor = conn.execute(
+                "INSERT INTO memory_interpretations "
+                "(subject_entity_id, target_entity_id, subject_text, target_text, "
+                "scope, interpretation_type, claim, polarity, strength, confidence, "
+                "status, conflict_status, resolution, action_implication, "
+                "evidence_node_ids, evidence_observation_ids, "
+                "counter_evidence_node_ids, counter_evidence_observation_ids, "
+                "metadata, created_at, updated_at, last_supported_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    subject_entity_id,
+                    target_entity_id,
+                    clean_subject,
+                    clean_target,
+                    clean_scope,
+                    normalized_type,
+                    clean_claim,
+                    clean_polarity,
+                    strength_value,
+                    confidence_value,
+                    normalized_status,
+                    normalized_conflict,
+                    str(resolution or "").strip(),
+                    str(action_implication or "").strip(),
+                    json.dumps(evidence_nodes or []),
+                    json.dumps(evidence_observations or []),
+                    json.dumps(counter_nodes or []),
+                    json.dumps(counter_observations or []),
+                    metadata_str,
+                    now_text,
+                    now_text,
+                    now_text,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+        return self._execute_write(_do)
+
+    def memory_search_interpretations(
+        self,
+        keyword: Any,
+        *,
+        entities: Optional[List[Any]] = None,
+        top_k: int = 3,
+        statuses: Optional[List[str]] = None,
+        min_confidence: float = 0.4,
+    ) -> List[Dict[str, Any]]:
+        """Search current/conflicted agent interpretations relevant to a query."""
+        keyword_query = " ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
+        terms = [term.strip().lower() for term in re.split(r"\s+|OR", keyword_query) if term.strip()]
+        entity_terms: List[str] = []
+        for entity in entities or []:
+            if isinstance(entity, dict):
+                name = str(entity.get("name", "")).strip()
+            else:
+                name = str(entity or "").strip()
+            if name:
+                entity_terms.append(name.lower())
+        normalized_statuses = [
+            self._normalize_memory_interpretation_status(status)
+            for status in (statuses or ["current", "conflicted"])
+        ]
+        normalized_statuses = list(dict.fromkeys(normalized_statuses))
+        placeholders = ",".join("?" for _ in normalized_statuses)
+        rows = self._conn.execute(
+            "SELECT mo.*, se.name AS subject_entity_name, te.name AS target_entity_name "
+            "FROM memory_interpretations mo "
+            "LEFT JOIN entity_nodes se ON se.id = mo.subject_entity_id "
+            "LEFT JOIN entity_nodes te ON te.id = mo.target_entity_id "
+            f"WHERE mo.status IN ({placeholders}) AND mo.confidence >= ?",
+            [*normalized_statuses, max(0.0, min(1.0, float(min_confidence or 0.0)))],
+        ).fetchall()
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for row in rows:
+            item = self._memory_interpretation_from_row(row)
+            haystack = " ".join(
+                str(item.get(key) or "")
+                for key in (
+                    "claim", "action_implication", "subject_text", "target_text",
+                    "scope", "interpretation_type", "resolution",
+                    "subject_entity_name", "target_entity_name",
+                )
+            ).lower()
+            matched_terms = [term for term in terms if term in haystack]
+            entity_matches = sum(1 for term in entity_terms if term in haystack)
+            if terms or entity_terms:
+                if not matched_terms and entity_matches <= 0:
+                    continue
+            else:
+                matched_terms = ["_"]
+            score = (
+                len(matched_terms)
+                + (entity_matches * 1.5)
+                + float(item.get("confidence") or 0.0)
+                + (0.5 if item.get("status") == "current" else 0.0)
+            )
+            scored.append((score, item))
+        scored.sort(key=lambda pair: (pair[0], pair[1].get("last_supported_at") or ""), reverse=True)
+        return [item for _, item in scored[:max(1, int(top_k or 3))]]
+
+    def memory_active_task_interpretations(self, *, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return current task interpretations for fact-to-task matching."""
+        rows = self._conn.execute(
+            "SELECT mi.*, se.name AS subject_entity_name, te.name AS target_entity_name "
+            "FROM memory_interpretations mi "
+            "LEFT JOIN entity_nodes se ON se.id = mi.subject_entity_id "
+            "LEFT JOIN entity_nodes te ON te.id = mi.target_entity_id "
+            "WHERE mi.status IN ('current', 'conflicted') "
+            "AND mi.interpretation_type = 'task' "
+            "ORDER BY mi.updated_at DESC, mi.id DESC "
+            "LIMIT ?",
+            (max(1, int(limit or 50)),),
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = self._memory_interpretation_from_row(row)
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            item["entity_id"] = metadata.get("entity_id")
+            item["entity_name"] = metadata.get("entity_name") or item.get("target_entity_name") or ""
+            item["topic_key"] = metadata.get("topic_key") or item.get("scope") or "general"
+            item["topic_label"] = metadata.get("topic_label") or item.get("target_text") or item.get("scope") or "general"
+            item["summary"] = item.get("claim") or ""
+            item["keywords"] = " ".join(
+                part
+                for part in [
+                    str(item.get("target_text") or ""),
+                    str(item.get("scope") or ""),
+                    str(item.get("claim") or ""),
+                ]
+                if part.strip()
+            )
+            out.append(item)
+        return out
+
+    # Backward-compatible aliases for worktrees created while this layer was named "opinion".
+    def memory_upsert_opinion(self, **kwargs) -> int:
+        return self.memory_upsert_interpretation(**kwargs)
+
+    def memory_search_opinions(self, *args, **kwargs) -> List[Dict[str, Any]]:
+        return self.memory_search_interpretations(*args, **kwargs)
+
     # ── Consolidated observations ───────────────────────────────────────
 
     def memory_observation_source_nodes(
@@ -4138,6 +4574,35 @@ class SessionDB:
             (int(observation_id),),
         ).fetchall()
         return [int(row["node_id"]) for row in rows]
+
+    def memory_observed_source_node_ids(self, node_ids: List[int]) -> List[int]:
+        """Return node ids that already support at least one observation."""
+        clean_ids = self._json_int_list(node_ids)
+        if not clean_ids:
+            return []
+        placeholders = ",".join("?" for _ in clean_ids)
+        rows = self._conn.execute(
+            f"SELECT DISTINCT node_id FROM memory_observation_sources "
+            f"WHERE node_id IN ({placeholders}) ORDER BY node_id",
+            clean_ids,
+        ).fetchall()
+        return [int(row["node_id"]) for row in rows]
+
+    def memory_observations_by_ids(self, observation_ids: List[int]) -> List[Dict[str, Any]]:
+        """Return active observations by id, including entity names."""
+        clean_ids = self._json_int_list(observation_ids)
+        if not clean_ids:
+            return []
+        placeholders = ",".join("?" for _ in clean_ids)
+        rows = self._conn.execute(
+            "SELECT mo.*, en.name AS entity_name "
+            "FROM memory_observations mo "
+            "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
+            f"WHERE mo.id IN ({placeholders}) AND mo.status = 'active'",
+            clean_ids,
+        ).fetchall()
+        by_id = {int(row["id"]): dict(row) for row in rows}
+        return [by_id[observation_id] for observation_id in clean_ids if observation_id in by_id]
 
     def memory_upsert_observation(
         self,
@@ -4662,7 +5127,7 @@ class SessionDB:
         stale_days: Optional[float] = None,
         now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
-        """Update task observation status when active tasks have no recent support."""
+        """Update task interpretation status when active tasks have no recent support."""
         paused_after_days = max(
             1.0,
             float(
@@ -4679,8 +5144,8 @@ class SessionDB:
         evaluated_at = now_dt.isoformat()
         rows = self._conn.execute(
             "SELECT id, metadata, created_at, updated_at, last_supported_at "
-            "FROM memory_observations "
-            "WHERE status = 'active' AND observation_type = 'task' "
+            "FROM memory_interpretations "
+            "WHERE status IN ('current', 'conflicted') AND interpretation_type = 'task' "
             "ORDER BY updated_at DESC, id DESC"
         ).fetchall()
 
@@ -4735,7 +5200,7 @@ class SessionDB:
                 updated_metadata = dict(metadata)
                 updated_metadata["previous_task_status"] = current_status
                 updated_metadata["task_status"] = new_status
-                updated_metadata["task_source"] = "inferred_from_observation"
+                updated_metadata["task_source"] = "inferred_from_interpretation"
                 updated_metadata["status_reason"] = "no_recent_support"
                 updated_metadata["status_updated_by"] = "reflect_task_inactivity_policy"
                 updated_metadata["status_updated_at"] = evaluated_at
@@ -4753,7 +5218,7 @@ class SessionDB:
             def _do(conn):
                 for item in to_update:
                     conn.execute(
-                        "UPDATE memory_observations SET metadata = ?, updated_at = ? WHERE id = ?",
+                        "UPDATE memory_interpretations SET metadata = ?, updated_at = ? WHERE id = ?",
                         (
                             json.dumps(item["metadata"], ensure_ascii=False),
                             evaluated_at,

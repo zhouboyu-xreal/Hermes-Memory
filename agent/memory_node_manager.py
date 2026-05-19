@@ -326,12 +326,17 @@ fact_kind 类别说明：
 使用这些标签时：
 - fact_type 决定事实主体来源：world_fact 偏用户/世界状态，experience 偏助手亲历经验。
 - fact_kind 只作为理解来源事实的线索，不要直接复制成输出 metadata；输出仍必须遵守本 prompt 的 JSON schema。
-- 生成 insight 时优先沉淀长期稳定模式、约束、经验和上下文。
-- 生成或更新 task 时只使用能证明任务发起、推进、完成、阻塞、暂停、恢复或决策的事实。"""
+- 生成 observation 时只描述发生过什么、出现过什么模式、经历过什么变化。
+- insight、task、偏好、策略、风险和当前状态判断由 interpretation 层生成。"""
 
-INSIGHT_CONSOLIDATION_PROMPT = """你是长期记忆 insight consolidation 模块。
+OBSERVATION_CONSOLIDATION_PROMPT = """你是长期记忆 observation consolidation 模块。
 
-你需要把同一 entity/topic 下的 world facts 和 experience memories，整合成一条长期可用的 insight observation。
+你需要把同一 entity/topic 下的 world facts 和 experience memories，整合成一条长期可追溯的 observation。
+
+三层记忆架构：
+- fact：原始证据，表示对话中提取出的事实。
+- observation：历史归纳，表示发生过什么、出现过什么模式、经历过什么变化。
+- interpretation：当前解释，负责 insight、task、偏好、风险、策略和当前状态判断。
 
 entity: {entity_name}
 topic: {topic_label}
@@ -341,100 +346,39 @@ source facts:
 
 """ + OBSERVATION_SOURCE_FACT_GUIDANCE + """
 
-请只生成 insight，不要生成 task。
-
-insight 表示关于用户、实体、偏好、约束、工作流、背景、经验、关系、模式或稳定上下文的洞察。
-
 要求：
-- 总结这些事实中长期有用的稳定信息。
-- 可以描述偏好、约束、工作方式、反复出现的模式、成功/失败经验、项目知识或上下文。
-- 不要编造任务状态、步骤、下一步行动或截止时间。
-- 即使事实中出现动作描述，也不要在此 prompt 中生成 task；task 由 task episode prompt 单独生成。
-- metadata 中只填写 insight_type。
-
-insight_type 只能是：
-- preference：用户或实体的偏好。
-- workflow：用户反复采用的工作流或操作方式。
-- strategy：用户倾向采用的策略、原则或决策方式。
-- failure：失败、问题、踩坑或负面经验。
-- success：成功做法、有效方案或正面经验。
-- change：状态、偏好、方案或上下文发生变化。
-- constraint：约束、限制、条件、依赖。
-- context：其他长期有用的背景、项目知识或关系信息。
+- 只描述这些事实共同说明"发生过什么"，不要输出 task 或 insight 分类。
+- 可以总结时间线、事件簇、状态变化、结果、冲突、成功/失败经验或反复出现的现象。
+- 如果事实中出现前后变化或冲突，用"曾经/后来/当前事实显示/存在不一致"描述脉络，不要裁决最终应该相信什么。
+- 不要生成 task_status、goal、steps、next_action、insight_type；这些属于 interpretation 层。
+- observation_kind 只能是 timeline、event_pattern、state_change、outcome、conflict、context。
+- metadata 中只填写 observation_kind、has_conflict、source_note。
 
 只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
-  "category": "insight",
-  "summary": "一句简洁、长期可用的 insight observation。",
+  "category": "observation",
+  "summary": "一句简洁、长期可追溯的 observation，描述发生过什么。",
   "keywords": ["关键词1", "关键词2"],
   "confidence": 0.0,
   "metadata": {{
-    "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context"
+    "observation_kind": "timeline | event_pattern | state_change | outcome | conflict | context",
+    "has_conflict": false,
+    "source_note": "可选，简短说明该 observation 的证据性质"
   }}
 }}"""
 
-TASK_CONSOLIDATION_PROMPT = """你是长期记忆 task consolidation 模块。
+# Backward-compatible names for callers/tests that still import the old constants.
+INSIGHT_CONSOLIDATION_PROMPT = OBSERVATION_CONSOLIDATION_PROMPT
+TASK_CONSOLIDATION_PROMPT = OBSERVATION_CONSOLIDATION_PROMPT
 
-你需要把一组 task-event-like facts 整合成一条长期可追踪的 task observation。
+OBSERVATION_UPDATE_PROMPT = """你是长期记忆 observation consolidation 模块。
 
-entity: {entity_name}
-topic: {topic_label}
+你需要根据新的记忆事实，以及可能因 entity 合并带来的相关既有 observation，更新同一 entity/topic 下已有的 observation。
 
-source facts:
-{source_facts}
-
-""" + OBSERVATION_SOURCE_FACT_GUIDANCE + """
-
-task 表示这些事实能够推断出用户正在持续推进某个具体任务、项目、排查、实现、计划、交付物或待完成目标。
-
-要求：
-- summary 应描述用户正在做什么，以及这个任务的目标或当前焦点。
-- task_status 只能是 active、blocked、paused 之一；首次生成 task 时不要输出 stale。
-- task_source 固定为 inferred_from_observation。
-- goal 描述这个任务想达成的目标；如果来源事实只支持当前焦点但目标不明确，可以省略。
-- steps 记录与这个任务相关的步骤、子任务或阶段性动作；每个 step 必须来自来源事实，不要凭空拆解。
-- step.status 只能是 todo、active、done、blocked、skipped 之一；没有明确信息时使用 active。
-- 已完成的 step 应保留为 done，不要因为后续事实关注新步骤而删除。
-- evidence 使用简短短语概括来源事实中的证据，不要逐字长引用。
-- next_action 只有在来源事实明确暗示时才填写；否则省略。
-- 不要标记为 done，除非来源事实明确表示任务已经完成。
-
-task_status 定义：
-- active：用户正在推进该任务，或来源事实表明任务仍在进行、被修改、验证、讨论下一步、实现、排查或继续迭代。
-- blocked：任务仍然重要，但当前存在明确阻塞因素，导致任务无法继续推进。只有来源事实明确提到依赖缺失、权限/接口/资源不可用、等待他人、技术问题无法绕过等阻塞时，才使用 blocked。
-- paused：任务没有明确阻塞，但用户表示暂时搁置、稍后再做、先处理别的事情，或来源事实明确表明任务被主动暂停。
-- 不要仅因为没有看到最新进展就输出 paused。
-- 不要仅因为任务复杂或存在待办步骤就输出 blocked。
-- 如果事实不足以判断任务状态，使用 active。
-
-只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
-{{
-  "category": "task",
-  "summary": "一句简洁、长期可用的 task observation，说明用户正在推进的任务。",
-  "keywords": ["关键词1", "关键词2"],
-  "confidence": 0.0,
-  "metadata": {{
-    "task_status": "active | blocked | paused",
-    "task_source": "inferred_from_observation",
-    "goal": "可选，任务目标",
-    "evidence": ["简短证据短语1", "简短证据短语2"],
-    "steps": [
-      {{
-        "title": "步骤、子任务或阶段性动作",
-        "status": "todo | active | done | blocked | skipped",
-        "evidence": ["支持该步骤的简短证据"],
-        "updated_at": "可选，YYYY-MM-DD",
-        "notes": "可选补充"
-      }}
-    ],
-    "next_action": "可选，只有明确时填写"
-  }}
-}}
-"""
-
-OBSERVATION_UPDATE_PROMPT = """你是长期记忆 consolidation 模块。
-
-你需要根据新的记忆事实，更新同一 entity/topic 下已有的 observation。
+三层记忆架构：
+- fact：原始证据。
+- observation：历史归纳，只描述发生过什么。
+- interpretation：当前解释，负责 insight、task、偏好、风险、策略和当前状态判断。
 
 entity: {entity_name}
 topic: {topic_label}
@@ -450,141 +394,108 @@ topic: {topic_label}
 已有 metadata：
 {existing_metadata}
 
+相关既有 observation（通常来自 entity 合并；没有则为 none）：
+{related_observations}
+
 新的来源事实：
 {source_facts}
 
 """ + OBSERVATION_SOURCE_FACT_GUIDANCE + """
 
-请基于已有 observation 和新的来源事实，输出更新后的 observation，并判断它应该属于哪一类：
-
-默认保持当前类别；只有当新事实明确支持类别变化时，才改变 category。
-
-1. insight
-表示关于用户、实体、偏好、约束、工作流、背景、经验、关系、模式或稳定上下文的洞察。
-
-2. task
-表示这些事实能够推断出用户正在持续推进某个具体任务、项目、排查、实现、计划、交付物或待完成目标。
-
-只有在已有 observation 和新事实共同表明用户正在持续行动、推进、计划、修改、排查、设计、实现、跟进或产生阶段性进展时，才允许使用 category="task"。
-
-不要把以下情况判断为 task：
-- 一次性问题
-- 静态偏好
-- 人物背景
-- 家庭关系
-- 单次兴趣表达
-- 泛泛讨论某个主题，但没有持续行动或进展
-- 关于他人的事实，除非用户正在围绕该对象执行某项任务
-- 单纯的属性、条件、限制、标签或分类
-
-如果已有 observation 是 task：
-- 如果新事实表示任务仍在继续、推进、受阻、暂停或变得陈旧，可以继续保持 task。
-- task_status 只能是 active、blocked、paused、stale。
-- 保留已有 steps 中仍然相关的步骤；不要因为新事实没有提到旧步骤就删除它们。
-- 如果新事实推进了已有步骤，更新该 step 的 status、evidence、updated_at 或 notes。
-- 如果新事实引入了新的子任务、阶段性动作或待办事项，追加为新的 step。
-- step.status 只能是 todo、active、done、blocked、skipped 之一；没有明确信息时使用 active。
-- goal 应表示整个任务的目标；如果已有 goal 仍然成立，应保留或轻微改写。
-- 只有事实明确说明完成时，才可以在 summary 中说明已完成；否则不要推断完成。
-- next_action 只有在新事实明确暗示时才填写；否则省略。
-
-task_status 定义：
-- active：用户正在推进该任务，或新事实表明任务仍在进行、被修改、验证、讨论下一步、实现、排查或继续迭代。
-- blocked：任务仍然重要，但当前存在明确阻塞因素，导致任务无法继续推进。只有新事实明确提到依赖缺失、权限/接口/资源不可用、等待他人、技术问题无法绕过等阻塞时，才使用 blocked。
-- paused：任务没有明确阻塞，但用户表示暂时搁置、稍后再做、先处理别的事情，或新事实明确表明任务被主动暂停。
-- stale：输入的已有 task 已经是 stale，且新事实不足以说明任务被重新推进、解除阻塞或主动恢复时，可以继续输出 stale。不要仅根据缺少最新进展把非 stale 任务改为 stale。
-- 不要仅因为没有看到最新进展就输出 paused。
-- 不要仅因为任务复杂或存在待办步骤就输出 blocked。
-- 如果新事实显示用户又开始修改、实现、验证、排查或继续讨论该任务，应优先判断为 active。
-- 如果已有 task_status 是 blocked，但新事实显示阻塞已解决、找到替代方案或用户继续推进，应改为 active。
-- 已有 task_status 是参考状态。只有新事实明确支持状态变化时才修改；否则保持原状态。
-
-如果输出 insight：
-- 总结长期有用的稳定信息。
-- 可以描述偏好、约束、工作方式、反复出现的模式、成功/失败经验或上下文。
-- 不要编造任务状态、下一步行动或截止时间。
+要求：
+- 输出更新后的 observation，category 固定为 "observation"。
+- 同一个 prompt 同时服务两类更新：entity 合并后的 observation 综合，以及新 facts 追加后的 observation 更新。
+- 只描述已有 observation、相关既有 observation 和新事实共同说明的历史脉络、事件变化、结果或冲突。
+- 如果新事实或相关 observation 覆盖、修正或反驳旧内容，不要静默删除关键历史；用简洁措辞保留重要变化过程。
+- 如果相关既有 observation 与已有 observation 只是同义重复，请合并为更高阶、更简洁的一条，不要简单拼接原文。
+- 不要生成 task_status、goal、steps、next_action、insight_type。
+- 不要裁决 "现在应该怎么做"；当前解释由 interpretation 层生成。
+- observation_kind 只能是 timeline、event_pattern、state_change、outcome、conflict、context。
 
 只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
-  "category": "insight | task",
-  "summary": "更新后的一句简洁 observation。",
+  "category": "observation",
+  "summary": "更新后的一句简洁 observation，描述发生过什么。",
   "keywords": ["关键词1", "关键词2"],
   "confidence": 0.0,
   "metadata": {{
-    "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context",
-    "task_status": "active | blocked | paused | stale",
-    "task_source": "inferred_from_observation",
-    "goal": "可选，任务目标",
-    "evidence": ["简短证据短语1", "简短证据短语2"],
-    "steps": [
-      {{
-        "title": "步骤、子任务或阶段性动作",
-        "status": "todo | active | done | blocked | skipped",
-        "evidence": ["支持该步骤的简短证据"],
-        "updated_at": "可选，YYYY-MM-DD",
-        "notes": "可选补充"
-      }}
-    ],
-    "next_action": "可选，只有明确时填写"
+    "observation_kind": "timeline | event_pattern | state_change | outcome | conflict | context",
+    "has_conflict": false,
+    "source_note": "可选，简短说明该 observation 的证据性质"
   }}
-}}
+}}"""
 
-如果 category 是 insight：metadata 中只填写 insight_type，不要填写 task_status、task_source、goal、steps、next_action。
-如果 category 是 task：metadata 中填写 task_status、task_source、evidence、steps；goal 和 next_action 可选；不要填写 insight_type。"""
+# Backward-compatible name for callers/tests that still import the old constant.
+OBSERVATION_MERGE_PROMPT = OBSERVATION_UPDATE_PROMPT
 
-OBSERVATION_MERGE_PROMPT = """你是长期记忆 reflection 模块。
+INTERPRETATION_GENERATION_PROMPT = """你是长期记忆 interpretation 生成模块。
 
-两个 entity 已经被判断为同一个实体。请把同一 entity/topic 下的多条 observation 合并成一条新的高阶 observation。
+你需要基于一条已经 consolidation 完成的 observation，以及它的 supporting facts，判断是否值得生成或更新一条 Agent 对当前世界状态的解释。
+
+这里的 interpretation 不是用户原话，也不是原始事实；它是 Agent 基于记忆证据形成的 current best interpretation，用于后续召回时指导如何理解和行动。
+
+三层记忆架构：
+- fact：原始证据，表示对话中提取出的事实。
+- observation：历史归纳，表示发生过什么、出现过什么模式、经历过什么变化。
+- interpretation：当前解释，表示 Agent 现在如何理解这些 observation，以及后续应该如何行动。
 
 entity: {entity_name}
 topic: {topic_label}
-current_category: {current_category}
-
-observations to merge:
-{observations}
+observation_type: {observation_type}
+observation_summary: {observation_summary}
+observation_metadata: {observation_metadata}
 
 supporting facts:
 {source_facts}
 
-""" + OBSERVATION_SOURCE_FACT_GUIDANCE + """
+只在 observation 对未来行为有明确指导价值时生成 interpretation。适合生成的情况：
+- 用户明确偏好、长期指令、稳定工作方式、决策倾向
+- 项目当前状态、任务策略、风险、约束或冲突解决结论
+- 多个事实共同支持的行为模式或当前解释
+- observation 背后体现出可复用的 insight、task、策略、偏好、风险或状态判断
 
-这些 observation 已经按 current_category 分组。合并结果必须保持 current_category，不要在 merge 阶段把 insight 改成 task，或把 task 改成 insight。
+不要生成 interpretation 的情况：
+- observation 只是普通事实摘要，缺少未来行动含义
+- observation 只描述一次性任务步骤，没有可复用解释
+- 证据不足，只能靠猜测用户心理
+- 只是复述 observation，没有形成新的 current interpretation
 
-要求：
-1. 输出一条统一 observation，不要简单拼接原文。
-2. 必须保留所有 observation 中仍然成立的信息。
-3. 如果多条 observation 有细微差异或冲突，请用谨慎措辞综合，不要忽略冲突。
-4. 必须忠于给定内容，不要添加没有依据的信息。
-5. 如果是 insight，不要编造任务状态、下一步行动或截止时间。
-6. 如果是 task，task_status 只能是 active、blocked、paused、stale；task_source 固定为 inferred_from_observation。
-7. 如果是 task，必须合并 steps：语义相同的 step 合成一个，已完成步骤保留为 done，新步骤追加；step.status 只能是 todo、active、done、blocked、skipped。
-8. 如果是 task，task_status 含义如下：active 表示仍在推进；blocked 表示有明确阻塞导致无法继续；paused 表示用户主动暂时搁置且没有明确阻塞；stale 表示输入 observation 已经长期无新支持，且 supporting facts 不足以说明任务被重新激活。
-9. 合并 task 时，只有 observation 或 supporting facts 明确支持状态变化才修改 task_status；不要仅因为没有最新进展就改为 paused，不要仅因为任务复杂就改为 blocked，也不要把非 stale 任务改为 stale。
-10. 只返回 JSON，不要 markdown，不要额外解释。
+字段要求：
+- should_create=false 时，只输出 {{"should_create": false}}。
+- claim 是 Agent 当前解释，必须谨慎、可证据支持；不要写成用户原话。
+- interpretation_type 只能是 insight、task、explicit_preference、explicit_instruction、inferred_preference、behavior_pattern、project_state、task_risk、constraint、conflict_resolution、strategy、other。
+- insight 表示从 observation 提炼出的当前可用洞察；task 表示 Agent 当前认为用户正在推进的任务或目标。
+- 如果 interpretation_type=task，metadata 中填写 task_status、task_source、goal、evidence、steps；task_status 只能是 active、blocked、paused、stale，task_source 固定为 inferred_from_interpretation。
+- 如果 interpretation_type 不是 task，不要填写 task_status、goal、steps、next_action。
+- status 只能是 current、conflicted；新生成的 interpretation 不要输出 superseded 或 archived。
+- conflict_status 只能是 none、resolved、unresolved。
+- polarity 只能是 positive、negative、mixed、neutral。
+- strength/confidence 是 0.0-1.0；inferred 类型如果证据少，confidence 不要超过 0.75。
+- scope 是这条解释适用的范围，尽量短，如 "memory-system-design"。
+- target_text 是解释指向的对象、方案、习惯、项目状态或风险。
+- action_implication 描述这条解释未来如何影响 Agent 行为；如果没有明确行动含义，应 should_create=false。
+- evidence_node_ids 和 evidence_observation_ids 只能使用输入中出现的 id。
+- counter_evidence_* 只在存在反证或 unresolved conflict 时填写。
 
-只返回合法 JSON。格式如下：
+只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
-  "category": "{current_category}",
-  "summary": "合并后可用于未来决策的 observation",
-  "keywords": ["关键词1", "关键词2"],
+  "should_create": true,
+  "claim": "Agent 当前解释为...",
+  "target_text": "解释对象",
+  "scope": "适用范围",
+  "interpretation_type": "insight | task | explicit_preference | explicit_instruction | inferred_preference | behavior_pattern | project_state | task_risk | constraint | conflict_resolution | strategy | other",
+  "polarity": "positive | negative | mixed | neutral",
+  "strength": 0.0,
   "confidence": 0.0,
-  "metadata": {{
-    "insight_type": "preference | workflow | strategy | failure | success | change | constraint | context",
-    "task_status": "active | blocked | paused | stale",
-    "task_source": "inferred_from_observation",
-    "goal": "可选，任务目标",
-    "evidence": ["简短证据短语1", "简短证据短语2"],
-    "steps": [
-      {{
-        "title": "步骤、子任务或阶段性动作",
-        "status": "todo | active | done | blocked | skipped",
-        "evidence": ["支持该步骤的简短证据"],
-        "updated_at": "可选，YYYY-MM-DD",
-        "notes": "可选补充"
-      }}
-    ],
-    "next_action": "可选，只有明确时填写"
-  }}
+  "status": "current | conflicted",
+  "conflict_status": "none | resolved | unresolved",
+  "resolution": "可选，冲突如何被解决",
+  "action_implication": "未来 Agent 应如何使用这个解释",
+  "evidence_node_ids": [1, 2],
+  "evidence_observation_ids": [3],
+  "counter_evidence_node_ids": [],
+  "counter_evidence_observation_ids": [],
+  "metadata": {{"source": "interpretation_generation"}}
 }}"""
 
 # ── Reflect prompt template ───────────────────────────────────────────────
@@ -607,6 +518,9 @@ OBSERVATION_SECTION_HEADER = (
 )
 OBSERVATION_SUPPORT_SECTION_HEADER = (
     "[Supporting facts for observations]"
+)
+INTERPRETATION_SECTION_HEADER = (
+    "[Current interpretations — agent's current best interpretation of memory]"
 )
 
 MEMORY_CONTEXT_BLOCK = """<memory-context>
@@ -1435,7 +1349,7 @@ class MemoryNodeManager:
 
         normalized: Dict[str, Any] = {
             "task_status": task_status,
-            "task_source": "inferred_from_observation",
+            "task_source": "inferred_from_interpretation",
         }
         goal = str(metadata.get("goal") or "").strip()
         if goal:
@@ -1603,149 +1517,7 @@ class MemoryNodeManager:
             return task_event_subject in {"", "user", "both", "other"}
         return MemoryNodeManager._is_task_event_like_fact(fact)
 
-    @staticmethod
-    def _fact_time_for_episode(fact: Dict[str, Any]) -> Optional[datetime]:
-        raw = str(fact.get("time_key") or "").split("#", 1)[0].strip()
-        if not raw:
-            return None
-        try:
-            return datetime.fromisoformat(raw.replace(" ", "T", 1))
-        except ValueError:
-            return None
-
-    @classmethod
-    def _fact_terms_for_episode(cls, fact: Dict[str, Any]) -> set[str]:
-        terms: set[str] = set()
-        for key in ("topics", "keywords"):
-            value = fact.get(key, [])
-            if isinstance(value, str):
-                value = value.split()
-            if not isinstance(value, list):
-                continue
-            for item in value:
-                term = cls._topic_key(item)
-                if term and term != "general":
-                    terms.add(term)
-        return terms
-
-    def _task_episode_embedding(
-        self,
-        fact: Dict[str, Any],
-        cache: Dict[int, Any],
-    ) -> Any:
-        try:
-            node_id = int(fact["node_id"])
-        except (KeyError, TypeError, ValueError):
-            node_id = id(fact)
-        if node_id in cache:
-            return cache[node_id]
-        embedding = None
-        if self._embedding_client is not None or self._ensure_embedding_client():
-            try:
-                embedding = self._embedding_client.embed_text(self._fact_match_text(fact))
-            except Exception:
-                embedding = None
-        cache[node_id] = embedding
-        return embedding
-
-    def _task_episode_related(
-        self,
-        fact: Dict[str, Any],
-        episode: List[Dict[str, Any]],
-        embedding_cache: Dict[int, Any],
-        *,
-        similarity_threshold: float = 0.72,
-        max_gap_minutes: float = 180.0,
-    ) -> Tuple[bool, str, float]:
-        if not episode:
-            return True, "start", 1.0
-
-        fact_entities = {entity_id for entity_id, _name in self._fact_entity_pairs(fact)}
-        episode_entities = {
-            entity_id
-            for item in episode
-            for entity_id, _name in self._fact_entity_pairs(item)
-        }
-        fact_terms = self._fact_terms_for_episode(fact)
-        episode_terms = set().union(*(self._fact_terms_for_episode(item) for item in episode))
-        if fact_entities & episode_entities and fact_terms & episode_terms:
-            return True, "entity_topic", 1.0
-        if fact_terms & episode_terms:
-            return True, "topic_keyword", 0.82
-
-        fact_embedding = self._task_episode_embedding(fact, embedding_cache)
-        if fact_embedding is not None:
-            best_similarity = 0.0
-            for item in episode:
-                item_embedding = self._task_episode_embedding(item, embedding_cache)
-                best_similarity = max(
-                    best_similarity,
-                    self._embedding_similarity(fact_embedding, item_embedding),
-                )
-            if best_similarity >= similarity_threshold:
-                return True, "embedding", best_similarity
-
-        current_time = self._fact_time_for_episode(fact)
-        previous_time = self._fact_time_for_episode(episode[-1])
-        if current_time is not None and previous_time is not None:
-            compare_current = current_time
-            compare_previous = previous_time
-            if compare_current.tzinfo is not None and compare_previous.tzinfo is None:
-                compare_current = compare_current.replace(tzinfo=None)
-            elif compare_current.tzinfo is None and compare_previous.tzinfo is not None:
-                compare_previous = compare_previous.replace(tzinfo=None)
-            gap_minutes = abs((compare_current - compare_previous).total_seconds()) / 60.0
-            if gap_minutes <= max_gap_minutes:
-                return True, "temporal_sequence", max(0.0, 1.0 - (gap_minutes / max_gap_minutes))
-
-        return False, "unrelated", 0.0
-
-    def _task_episode_candidates(
-        self,
-        facts: List[Dict[str, Any]],
-        *,
-        min_facts: int = 2,
-    ) -> List[Dict[str, Any]]:
-        task_event_facts = [fact for fact in facts if self._is_task_event_like_fact(fact)]
-        task_event_facts.sort(key=lambda item: (str(item.get("time_key") or ""), int(item.get("node_id") or 0)))
-        episodes: List[Dict[str, Any]] = []
-        current: List[Dict[str, Any]] = []
-        reasons: List[str] = []
-        scores: List[float] = []
-        embedding_cache: Dict[int, Any] = {}
-
-        def flush_current() -> None:
-            if len(current) >= min_facts:
-                episodes.append({
-                    "facts": list(current),
-                    "reasons": list(reasons),
-                    "scores": list(scores),
-                })
-
-        for fact in task_event_facts:
-            if not current:
-                current = [fact]
-                reasons = ["start"]
-                scores = [1.0]
-                continue
-            related, reason, score = self._task_episode_related(
-                fact,
-                current,
-                embedding_cache,
-            )
-            if related:
-                current.append(fact)
-                reasons.append(reason)
-                scores.append(score)
-            else:
-                flush_current()
-                current = [fact]
-                reasons = ["start"]
-                scores = [1.0]
-        flush_current()
-        return episodes
-
-    def _task_episode_anchor_entity(self, facts: List[Dict[str, Any]]) -> Optional[Tuple[int, str]]:
+    def _fact_anchor_entity(self, facts: List[Dict[str, Any]]) -> Optional[Tuple[int, str]]:
         counts: Dict[int, Dict[str, Any]] = {}
         order = 0
         for fact in facts:
@@ -1760,83 +1532,6 @@ class MemoryNodeManager:
             return None
         winner = sorted(counts.values(), key=lambda item: (-item["count"], item["order"]))[0]
         return int(winner["entity_id"]), str(winner["entity_name"] or "")
-
-    def _task_episode_topic_from_observation(
-        self,
-        observation: Dict[str, Any],
-        facts: List[Dict[str, Any]],
-    ) -> Tuple[str, str]:
-        topic_parts = self._normalize_keywords(observation.get("keywords", []))
-        if not topic_parts:
-            for fact in facts:
-                topic_parts.extend(self._normalize_keywords(fact.get("topics", [])))
-                topic_parts.extend(self._normalize_keywords(fact.get("keywords", [])))
-        topic_parts = list(dict.fromkeys(topic_parts))
-        topic_label = " ".join(topic_parts[:4]) if topic_parts else "task episode"
-        return self._topic_key(topic_label), topic_label
-
-    def _create_task_observation_from_episode(self, episode: Dict[str, Any]) -> Optional[int]:
-        if not self._db:
-            return None
-        facts = episode.get("facts") or []
-        anchor = self._task_episode_anchor_entity(facts)
-        if not facts or anchor is None:
-            return None
-        if not any(self._fact_has_user_task_signal(fact) for fact in facts):
-            return None
-        entity_id, entity_name = anchor
-        observation = self._generate_observation(
-            entity_name=entity_name,
-            topic_label="task episode",
-            source_nodes=facts,
-            existing_observation=None,
-            target_type="task",
-        )
-        if not observation or observation.get("observation_type") != "task":
-            return None
-        topic_key, topic_label = self._task_episode_topic_from_observation(observation, facts)
-        source_ids = [int(fact["node_id"]) for fact in facts]
-        metadata = {
-            "source": "memory_node_manager",
-            "task_episode": {
-                "source": "reflect_action_episode",
-                "node_ids": source_ids,
-                "match_reasons": episode.get("reasons", []),
-                "match_scores": episode.get("scores", []),
-            },
-            **(observation.get("metadata") or {}),
-        }
-        observation_id = self._db.memory_upsert_observation(
-            entity_id=entity_id,
-            topic_key=topic_key,
-            topic_label=topic_label,
-            observation_type="task",
-            summary=observation["summary"],
-            keywords=observation["keywords"] or [topic_label],
-            source_node_ids=source_ids,
-            confidence=observation["confidence"],
-            metadata=metadata,
-        )
-        self._log_reflect_error("task_episode_generated", {
-            "observation_id": observation_id,
-            "entity_id": entity_id,
-            "entity_name": entity_name,
-            "topic_key": topic_key,
-            "topic_label": topic_label,
-            "episode_reasons": episode.get("reasons", []),
-            "episode_scores": episode.get("scores", []),
-            "llm_source_facts": self._reflect_fact_log_items(facts),
-            "generated_observation": {
-                **self._reflect_observation_log_item(observation),
-                "observation_type": "task",
-                "entity_id": entity_id,
-                "entity_name": entity_name,
-                "topic_key": topic_key,
-                "topic_label": topic_label,
-                "metadata": metadata,
-            },
-        })
-        return int(observation_id)
 
     def _task_match_for_fact(
         self,
@@ -1891,7 +1586,7 @@ class MemoryNodeManager:
             return recent_active_tasks[0], "recent_active_action", 0.6
         return None
 
-    def _update_task_observation_from_facts(
+    def _update_task_interpretation_from_facts(
         self,
         task: Dict[str, Any],
         facts: List[Dict[str, Any]],
@@ -1900,46 +1595,83 @@ class MemoryNodeManager:
     ) -> bool:
         if not self._db or not facts:
             return False
+        try:
+            entity_id = int(task.get("entity_id"))
+        except (TypeError, ValueError):
+            anchor = self._fact_anchor_entity(facts)
+            if anchor is None:
+                return False
+            entity_id = int(anchor[0])
+        entity_name = str(task.get("entity_name") or "")
+        topic_label = str(task.get("topic_label") or task.get("topic_key") or task.get("target_text") or "task")
+        topic_key = self._topic_key(str(task.get("topic_key") or topic_label))
         observation = self._generate_observation(
-            entity_name=str(task.get("entity_name") or ""),
-            topic_label=str(task.get("topic_label") or task.get("topic_key") or ""),
+            entity_name=entity_name,
+            topic_label=topic_label,
             source_nodes=facts,
-            existing_observation=task,
+            existing_observation=None,
         )
         if not observation:
             return False
-        observation["observation_type"] = "task"
         observation_metadata = {
             "source": "memory_node_manager",
             "task_match_methods": sorted(set(match_methods)),
+            "matched_task_interpretation_id": int(task["id"]) if task.get("id") is not None else None,
             **(observation.get("metadata") or {}),
         }
-        existing_source_ids = self._db.memory_observation_source_ids(int(task["id"]))
+        existing_source_ids = []
+        metadata = self._json_dict(task.get("metadata", {}))
+        observation_id_from_task = metadata.get("observation_id")
+        try:
+            if observation_id_from_task:
+                existing_source_ids = self._db.memory_observation_source_ids(int(observation_id_from_task))
+        except (TypeError, ValueError):
+            existing_source_ids = []
         new_source_ids = [int(fact["node_id"]) for fact in facts]
         source_ids = list(dict.fromkeys(existing_source_ids + new_source_ids))
         keywords = observation["keywords"] or self._normalize_keywords([
             task.get("keywords", ""),
-            task.get("topic_label") or task.get("topic_key") or "",
+            topic_label,
         ])
-        self._log_reflect_error("task_observation_update", {
-            "task_observation": self._reflect_observation_log_item(task),
-            "match_methods": sorted(set(match_methods)),
-            "llm_source_facts": self._reflect_fact_log_items(facts),
-            "stored_source_node_ids": source_ids,
-            "generated_observation": {
-                **self._reflect_observation_log_item(observation),
-                "metadata": observation_metadata,
-            },
-        })
-        self._db.memory_replace_observation_group(
-            keep_observation_id=int(task["id"]),
-            remove_observation_ids=[],
-            observation_type="task",
+        observation_id = self._db.memory_upsert_observation(
+            entity_id=entity_id,
+            topic_key=topic_key,
+            topic_label=topic_label,
+            observation_type="observation",
             summary=observation["summary"],
             keywords=keywords,
             confidence=observation["confidence"],
             source_node_ids=source_ids,
             metadata=observation_metadata,
+        )
+        self._log_reflect_error("task_interpretation_evidence_update", {
+            "task_interpretation": self._reflect_observation_log_item(task),
+            "match_methods": sorted(set(match_methods)),
+            "llm_source_facts": self._reflect_fact_log_items(facts),
+            "stored_source_node_ids": source_ids,
+            "observation_id": observation_id,
+            "generated_observation": {
+                **self._reflect_observation_log_item(observation),
+                "metadata": observation_metadata,
+            },
+        })
+        stored_observation = {
+            "id": int(observation_id),
+            "entity_id": entity_id,
+            "entity_name": entity_name,
+            "topic_label": topic_label,
+            "topic_key": topic_key,
+            "observation_type": "observation",
+            "summary": observation["summary"],
+            "keywords": keywords,
+            "confidence": observation["confidence"],
+            "metadata": observation_metadata,
+        }
+        self._maybe_generate_interpretation_from_observation(
+            observation=stored_observation,
+            source_nodes=facts,
+            observation_id=int(observation_id),
+            source_node_ids=source_ids,
         )
         return True
 
@@ -1951,7 +1683,7 @@ class MemoryNodeManager:
             return set(), {}, 0
         tasks = [
             task
-            for task in self._db.memory_active_task_observations(limit=50)
+            for task in self._db.memory_active_task_interpretations(limit=50)
             if self._task_status(task) != "stale"
         ]
         if not tasks:
@@ -1975,7 +1707,7 @@ class MemoryNodeManager:
         updated_tasks = 0
         for item in grouped.values():
             facts = item["facts"]
-            if self._update_task_observation_from_facts(
+            if self._update_task_interpretation_from_facts(
                 item["task"],
                 facts,
                 match_methods=item["methods"],
@@ -1991,6 +1723,7 @@ class MemoryNodeManager:
         topic_label: str,
         source_nodes: List[Dict[str, Any]],
         existing_observation: Optional[Dict[str, Any]] = None,
+        related_observations: Optional[List[Dict[str, Any]]] = None,
         target_type: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Generate a consolidated observation from source facts via LLM."""
@@ -2002,12 +1735,8 @@ class MemoryNodeManager:
             if not summary:
                 continue
             fact_lines.append(f"{index}. [{fact_type}/{fact_kind}] {summary}")
-        if not fact_lines:
+        if not fact_lines and not existing_observation:
             return None
-
-        normalized_target_type = str(target_type or "").strip().lower()
-        if normalized_target_type not in {"insight", "task"}:
-            normalized_target_type = ""
 
         if existing_observation:
             existing_metadata = existing_observation.get("metadata", {})
@@ -2016,6 +1745,15 @@ class MemoryNodeManager:
                     existing_metadata = json.loads(existing_metadata or "{}")
                 except (TypeError, ValueError):
                     existing_metadata = {}
+            related_lines = []
+            for index, observation in enumerate(related_observations or [], 1):
+                summary = str(observation.get("summary") or "").strip()
+                if not summary:
+                    continue
+                related_lines.append(
+                    f"{index}. [{observation.get('observation_type', 'observation')}; "
+                    f"confidence={observation.get('confidence', 0.0)}] {summary}"
+                )
             prompt = OBSERVATION_UPDATE_PROMPT.format(
                 entity_name=entity_name,
                 topic_label=topic_label,
@@ -2024,15 +1762,11 @@ class MemoryNodeManager:
                 existing_keywords=existing_observation.get("keywords", ""),
                 existing_confidence=existing_observation.get("confidence", 0.7),
                 existing_metadata=json.dumps(existing_metadata or {}, ensure_ascii=False, sort_keys=True),
-                source_facts="\n".join(fact_lines),
+                related_observations="\n".join(related_lines) or "(none)",
+                source_facts="\n".join(fact_lines) or "(none)",
             )
         else:
-            prompt_template = (
-                TASK_CONSOLIDATION_PROMPT
-                if normalized_target_type == "task"
-                else INSIGHT_CONSOLIDATION_PROMPT
-            )
-            prompt = prompt_template.format(
+            prompt = OBSERVATION_CONSOLIDATION_PROMPT.format(
                 entity_name=entity_name,
                 topic_label=topic_label,
                 source_facts="\n".join(fact_lines),
@@ -2046,29 +1780,22 @@ class MemoryNodeManager:
         summary = str(data.get("summary", "")).strip()
         if not summary:
             return None
-        category = str(data.get("category", "") or "").strip().lower()
-        allowed_categories = {"insight", "task"}
-        allowed_insight_types = {
-            "preference", "workflow", "strategy", "failure",
-            "success", "change", "constraint", "context",
-        }
-        if category not in allowed_categories:
-            category = "insight"
-        if normalized_target_type and existing_observation is None:
-            category = normalized_target_type
+        category = "observation"
         metadata = data.get("metadata", {})
         if not isinstance(metadata, dict):
             metadata = {}
         metadata = dict(metadata)
-        if category == "task":
-            metadata = self._normalize_task_metadata(metadata, allow_stale=bool(existing_observation))
-        else:
-            insight_type = str(
-                metadata.get("insight_type", "context") or "context"
-            ).strip().lower()
-            if insight_type not in allowed_insight_types:
-                insight_type = "context"
-            metadata = {"insight_type": insight_type}
+        allowed_observation_kinds = {
+            "timeline", "event_pattern", "state_change", "outcome", "conflict", "context",
+        }
+        observation_kind = str(metadata.get("observation_kind") or "context").strip().lower()
+        if observation_kind not in allowed_observation_kinds:
+            observation_kind = "context"
+        metadata = {
+            "observation_kind": observation_kind,
+            "has_conflict": bool(metadata.get("has_conflict", False)),
+            "source_note": str(metadata.get("source_note") or "").strip(),
+        }
         keywords = self._normalize_keywords(data.get("keywords", []))
         try:
             confidence = float(data.get("confidence", 0.7) or 0.7)
@@ -2082,6 +1809,233 @@ class MemoryNodeManager:
             "metadata": metadata,
         }
 
+    @staticmethod
+    def _filter_int_ids(values: Any, allowed: set[int]) -> List[int]:
+        if not isinstance(values, list):
+            return []
+        out: List[int] = []
+        seen = set()
+        for value in values:
+            try:
+                int_value = int(value)
+            except (TypeError, ValueError):
+                continue
+            if int_value not in allowed or int_value in seen:
+                continue
+            seen.add(int_value)
+            out.append(int_value)
+        return out
+
+    def _generate_interpretation(
+        self,
+        *,
+        observation: Dict[str, Any],
+        source_nodes: List[Dict[str, Any]],
+        observation_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Generate an optional current interpretation from an observation."""
+        fact_lines = []
+        allowed_node_ids: set[int] = set()
+        for index, node in enumerate(source_nodes[:8], 1):
+            node_id = node.get("id", node.get("node_id"))
+            try:
+                int_node_id = int(node_id)
+            except (TypeError, ValueError):
+                continue
+            summary = str(node.get("summary") or "").strip()
+            if not summary:
+                continue
+            allowed_node_ids.add(int_node_id)
+            fact_type = str(node.get("fact_type") or "world")
+            fact_kind = str(node.get("fact_kind") or "other")
+            fact_lines.append(f"{index}. id={int_node_id} [{fact_type}/{fact_kind}] {summary}")
+        if not fact_lines:
+            return None
+
+        metadata = observation.get("metadata", {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+        prompt = INTERPRETATION_GENERATION_PROMPT.format(
+            entity_name=observation.get("entity_name", ""),
+            topic_label=observation.get("topic_label") or observation.get("topic_key") or "",
+            observation_type=observation.get("observation_type", "insight"),
+            observation_summary=observation.get("summary", ""),
+            observation_metadata=json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+            source_facts="\n".join(fact_lines),
+        )
+        result = self._call_llm(prompt)
+        data = self._json_object_from_llm_text(result or "")
+        if not data or not bool(data.get("should_create")):
+            return None
+
+        claim = str(data.get("claim") or "").strip()
+        action_implication = str(data.get("action_implication") or "").strip()
+        if not claim or not action_implication:
+            return None
+        allowed_types = {
+            "insight", "task",
+            "explicit_preference", "explicit_instruction", "inferred_preference",
+            "behavior_pattern", "project_state", "task_risk", "constraint",
+            "conflict_resolution", "strategy", "other",
+        }
+        interpretation_type = str(
+            data.get("interpretation_type") or "behavior_pattern"
+        ).strip().lower().replace("-", "_").replace(" ", "_")
+        if interpretation_type not in allowed_types:
+            interpretation_type = "behavior_pattern"
+        status = str(data.get("status") or "current").strip().lower()
+        if status not in {"current", "conflicted"}:
+            status = "current"
+        conflict_status = str(data.get("conflict_status") or "none").strip().lower()
+        if conflict_status not in {"none", "resolved", "unresolved"}:
+            conflict_status = "none"
+        polarity = str(data.get("polarity") or "neutral").strip().lower()
+        if polarity not in {"positive", "negative", "mixed", "neutral"}:
+            polarity = "neutral"
+        try:
+            strength = float(data.get("strength", 0.5) or 0.5)
+        except (TypeError, ValueError):
+            strength = 0.5
+        try:
+            confidence = float(data.get("confidence", 0.5) or 0.5)
+        except (TypeError, ValueError):
+            confidence = 0.5
+        allowed_observation_ids = {int(observation_id)}
+        evidence_observation_ids = self._filter_int_ids(
+            data.get("evidence_observation_ids", [observation_id]),
+            allowed_observation_ids,
+        ) or [int(observation_id)]
+        metadata_out = data.get("metadata", {})
+        if not isinstance(metadata_out, dict):
+            metadata_out = {}
+        if interpretation_type == "task":
+            task_metadata = self._normalize_task_metadata(metadata_out, allow_stale=True)
+            task_metadata["task_source"] = "inferred_from_interpretation"
+            metadata_out = task_metadata
+        else:
+            metadata_out = {
+                key: value
+                for key, value in metadata_out.items()
+                if key not in {"task_status", "task_source", "goal", "steps", "next_action"}
+            }
+        metadata_out = {
+            "source": "interpretation_generation",
+            **metadata_out,
+        }
+        return {
+            "claim": claim,
+            "subject_text": str(data.get("subject_text") or "agent").strip() or "agent",
+            "target_text": str(data.get("target_text") or "").strip(),
+            "scope": str(data.get("scope") or "general").strip() or "general",
+            "interpretation_type": interpretation_type,
+            "polarity": polarity,
+            "strength": max(0.0, min(1.0, strength)),
+            "confidence": max(0.0, min(1.0, confidence)),
+            "status": status,
+            "conflict_status": conflict_status,
+            "resolution": str(data.get("resolution") or "").strip(),
+            "action_implication": action_implication,
+            "evidence_node_ids": self._filter_int_ids(
+                data.get("evidence_node_ids", []),
+                allowed_node_ids,
+            ),
+            "evidence_observation_ids": evidence_observation_ids,
+            "counter_evidence_node_ids": self._filter_int_ids(
+                data.get("counter_evidence_node_ids", []),
+                allowed_node_ids,
+            ),
+            "counter_evidence_observation_ids": self._filter_int_ids(
+                data.get("counter_evidence_observation_ids", []),
+                allowed_observation_ids,
+            ),
+            "metadata": metadata_out,
+        }
+
+    def _maybe_generate_interpretation_from_observation(
+        self,
+        *,
+        observation: Dict[str, Any],
+        source_nodes: List[Dict[str, Any]],
+        observation_id: int,
+        source_node_ids: List[int],
+    ) -> Optional[int]:
+        if not self._db or not observation_id:
+            return None
+        interpretation = self._generate_interpretation(
+            observation=observation,
+            source_nodes=source_nodes,
+            observation_id=int(observation_id),
+        )
+        if not interpretation:
+            return None
+        interpretation_id = self._db.memory_upsert_interpretation(
+            claim=interpretation["claim"],
+            subject_text=interpretation["subject_text"],
+            target_text=interpretation["target_text"],
+            scope=interpretation["scope"],
+            interpretation_type=interpretation["interpretation_type"],
+            polarity=interpretation["polarity"],
+            strength=interpretation["strength"],
+            confidence=interpretation["confidence"],
+            status=interpretation["status"],
+            conflict_status=interpretation["conflict_status"],
+            resolution=interpretation["resolution"],
+            action_implication=interpretation["action_implication"],
+            evidence_node_ids=interpretation["evidence_node_ids"] or source_node_ids,
+            evidence_observation_ids=interpretation["evidence_observation_ids"],
+            counter_evidence_node_ids=interpretation["counter_evidence_node_ids"],
+            counter_evidence_observation_ids=interpretation["counter_evidence_observation_ids"],
+            metadata={
+                **(interpretation["metadata"] or {}),
+                "observation_id": int(observation_id),
+                "entity_id": observation.get("entity_id"),
+                "entity_name": observation.get("entity_name"),
+                "topic_key": observation.get("topic_key"),
+                "topic_label": observation.get("topic_label"),
+                "observation_type": observation.get("observation_type", "observation"),
+            },
+        )
+        self._log_reflect_error("interpretation_generated", {
+            "interpretation_id": interpretation_id,
+            "observation_id": observation_id,
+            "source_node_ids": source_node_ids,
+            "generated_interpretation": interpretation,
+        })
+        return int(interpretation_id)
+
+    def _generate_interpretations_for_observations(self, observation_ids: List[int]) -> int:
+        if not self._db:
+            return 0
+        clean_ids = list(dict.fromkeys(
+            int(observation_id)
+            for observation_id in observation_ids
+            if observation_id is not None
+        ))
+        if not clean_ids:
+            return 0
+        observations = self._db.memory_observations_by_ids(clean_ids)
+        supporting_by_observation = self._db.memory_observation_supporting_nodes(
+            [int(observation["id"]) for observation in observations],
+            per_observation=12,
+        ) if observations else {}
+        generated = 0
+        for observation in observations:
+            observation_id = int(observation["id"])
+            source_nodes = supporting_by_observation.get(observation_id, [])
+            source_node_ids = [int(node["id"]) for node in source_nodes if node.get("id") is not None]
+            interpretation_id = self._maybe_generate_interpretation_from_observation(
+                observation=observation,
+                source_nodes=source_nodes,
+                observation_id=observation_id,
+                source_node_ids=source_node_ids,
+            )
+            if interpretation_id is not None:
+                generated += 1
+        return generated
+
     def _maybe_consolidate_observations(
         self,
         *,
@@ -2090,6 +2044,8 @@ class MemoryNodeManager:
         linked_entities: List[Tuple[int, str]],
         min_sources: int = 3,
         min_new_sources: int = 2,
+        changed_observation_ids: Optional[List[int]] = None,
+        generate_interpretation: bool = True,
     ) -> int:
         if not self._db or not linked_entities:
             return 0
@@ -2125,7 +2081,6 @@ class MemoryNodeManager:
                         topic_label=topic_label,
                         source_nodes=nodes_for_llm,
                         existing_observation=existing_observation,
-                        target_type="insight",
                     )
                     if not observation:
                         continue
@@ -2135,9 +2090,12 @@ class MemoryNodeManager:
                     }
                     observation_id = None
                     action = "create"
+                    stored_source_ids = source_ids
                     if existing_observation is not None:
                         observation_id = int(existing_observation["id"])
                         action = "update"
+                        existing_source_ids = self._db.memory_observation_source_ids(observation_id)
+                        stored_source_ids = list(dict.fromkeys(existing_source_ids + source_ids))
                         self._db.memory_replace_observation_group(
                             keep_observation_id=int(existing_observation["id"]),
                             remove_observation_ids=[],
@@ -2145,7 +2103,7 @@ class MemoryNodeManager:
                             summary=observation["summary"],
                             keywords=observation["keywords"] or topic_terms,
                             confidence=observation["confidence"],
-                            source_node_ids=source_ids,
+                            source_node_ids=stored_source_ids,
                             metadata=observation_metadata,
                         )
                     else:
@@ -2156,9 +2114,30 @@ class MemoryNodeManager:
                             observation_type=observation["observation_type"],
                             summary=observation["summary"],
                             keywords=observation["keywords"] or topic_terms,
-                            source_node_ids=source_ids,
+                            source_node_ids=stored_source_ids,
                             confidence=observation["confidence"],
                             metadata=observation_metadata,
+                        )
+                    stored_observation = {
+                        "id": int(observation_id),
+                        "entity_id": entity_id,
+                        "entity_name": entity_name,
+                        "topic_key": topic_key,
+                        "topic_label": topic_label,
+                        "observation_type": observation["observation_type"],
+                        "summary": observation["summary"],
+                        "keywords": observation["keywords"] or topic_terms,
+                        "confidence": observation["confidence"],
+                        "metadata": observation_metadata,
+                    }
+                    if changed_observation_ids is not None:
+                        changed_observation_ids.append(int(observation_id))
+                    if generate_interpretation:
+                        self._maybe_generate_interpretation_from_observation(
+                            observation=stored_observation,
+                            source_nodes=source_nodes,
+                            observation_id=int(observation_id),
+                            source_node_ids=stored_source_ids,
                         )
                     self._log_reflect_error("observation_generated", {
                         "action": action,
@@ -2173,7 +2152,7 @@ class MemoryNodeManager:
                         ),
                         "trigger_node_id": node_id,
                         "llm_source_facts": self._reflect_fact_log_items(nodes_for_llm),
-                        "stored_source_node_ids": source_ids,
+                        "stored_source_node_ids": stored_source_ids,
                         "pending_source_node_ids": pending_source_ids,
                         "generated_observation": {
                             **self._reflect_observation_log_item(observation),
@@ -2181,6 +2160,7 @@ class MemoryNodeManager:
                         },
                     })
                     consolidated += 1
+                    return consolidated
                 except Exception as exc:
                     logger.debug(
                         "Failed to consolidate observation for node %d entity %s topic %s: %s",
@@ -2191,42 +2171,38 @@ class MemoryNodeManager:
                     )
         return consolidated
 
-    def _reflect_observations_from_unprocessed_facts(
+    def _reflect_generate_observations(
         self,
         *,
         dry_run: bool,
         limit: int,
+        entity_ids: List[int],
+        unprocessed_fact_candidates: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Generate/update observations from today's facts not yet attached as sources."""
         if not self._db:
             return {"candidate_count": 0, "consolidated": 0}
-        candidates = self._db.memory_unobserved_nodes_for_observation(limit=limit)
         touched_entity_ids = list(dict.fromkeys(
             int(entity_id)
-            for item in candidates
+            for item in unprocessed_fact_candidates
             for entity_id, _entity_name in item.get("linked_entities", [])
         ))
+        merge_entity_ids = list(dict.fromkeys(int(entity_id) for entity_id in entity_ids))
         self._log_reflect_error("fact_candidates_for_observation", {
             "dry_run": dry_run,
             "limit": limit,
-            "candidate_count": len(candidates),
+            "candidate_count": len(unprocessed_fact_candidates),
             "touched_entity_ids": touched_entity_ids,
-            "facts": self._reflect_fact_log_items(candidates, limit=limit),
+            "facts": self._reflect_fact_log_items(unprocessed_fact_candidates, limit=limit),
         })
         if dry_run:
-            task_episode_candidates = self._task_episode_candidates(candidates)
             return {
-                "candidate_count": len(candidates),
+                "candidate_count": len(unprocessed_fact_candidates),
                 "consolidated": 0,
-                "task_matched": 0,
-                "task_updates": 0,
-                "task_match_methods": {},
-                "task_episodes": 0,
-                "task_episode_node_count": 0,
-                "task_episode_candidates": [
-                    [int(fact["node_id"]) for fact in episode.get("facts", [])]
-                    for episode in task_episode_candidates
-                ],
+                "entity_topic_updates": 0,
+                "entity_topic_node_count": 0,
+                "observation_groups_merged": 0,
+                "changed_observation_ids": [],
                 "touched_entity_ids": touched_entity_ids,
                 "candidates": [
                     {
@@ -2234,64 +2210,101 @@ class MemoryNodeManager:
                         "topics": item.get("topics", []),
                         "entity_count": len(item.get("linked_entities", [])),
                     }
-                    for item in candidates
+                    for item in unprocessed_fact_candidates
                 ],
             }
+        unprocessed_fact_candidates = self._db.memory_unobserved_nodes_for_observation(limit=limit)
+        touched_entity_ids = list(dict.fromkeys(
+            int(entity_id)
+            for item in unprocessed_fact_candidates
+            for entity_id, _entity_name in item.get("linked_entities", [])
+        ))
         consolidated = 0
-        (
-            task_matched_node_ids,
-            task_match_methods,
-            task_updates,
-        ) = self._match_and_update_tasks_for_facts(candidates)
-        consolidated += task_updates
-        remaining_candidates = [
-            item
-            for item in candidates
-            if int(item["node_id"]) not in task_matched_node_ids
-        ]
-        task_episode_node_ids: set[int] = set()
-        task_episode_observation_ids: List[int] = []
-        task_episode_candidates = self._task_episode_candidates(remaining_candidates)
-        self._log_reflect_error("task_episode_candidates", {
-            "candidate_count": len(task_episode_candidates),
-            "episodes": [
-                {
-                    "node_ids": [int(fact["node_id"]) for fact in episode.get("facts", [])],
-                    "reasons": episode.get("reasons", []),
-                    "scores": episode.get("scores", []),
-                    "facts": self._reflect_fact_log_items(episode.get("facts", [])),
-                }
-                for episode in task_episode_candidates
-            ],
-        })
-        for episode in task_episode_candidates:
-            observation_id = self._create_task_observation_from_episode(episode)
-            if observation_id is None:
+        entity_topic_updates = 0
+        entity_topic_node_ids: set[int] = set()
+        changed_observation_ids: List[int] = []
+        candidate_node_ids = [int(item["node_id"]) for item in unprocessed_fact_candidates]
+
+        observation_groups_merged = 0
+        merge_consumed_node_ids: set[int] = set()
+        if merge_entity_ids:
+            groups = self._db.memory_duplicate_observation_groups(entity_ids=merge_entity_ids)
+            augmented_groups = [
+                self._augment_observation_merge_group_with_pending_sources(group)
+                for group in groups
+            ]
+            self._log_reflect_error("observation_merge_candidates", {
+                "entity_ids": merge_entity_ids,
+                "group_count": len(augmented_groups),
+                "groups": [
+                    {
+                        "entity_id": group.get("entity_id"),
+                        "entity_name": group.get("entity_name"),
+                        "topic_key": group.get("topic_key"),
+                        "topic_label": group.get("topic_label"),
+                        "observation_type": group.get("observation_type"),
+                        "observation_ids": [
+                            observation.get("id")
+                            for observation in group.get("observations", [])
+                        ],
+                        "source_node_ids": [
+                            node.get("id")
+                            for node in group.get("source_nodes", [])
+                        ],
+                        "pending_source_node_ids": group.get("pending_source_node_ids", []),
+                    }
+                    for group in augmented_groups
+                ],
+            })
+            for group in augmented_groups:
+                try:
+                    before_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
+                    if self._merge_duplicate_observation_group(
+                        group,
+                        changed_observation_ids=changed_observation_ids,
+                    ):
+                        observation_groups_merged += 1
+                        after_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
+                        newly_observed = after_observed - before_observed
+                        merge_consumed_node_ids.update(newly_observed)
+                        entity_topic_node_ids.update(newly_observed)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to merge observations for entity %s topic %s: %s",
+                        group.get("entity_id"),
+                        group.get("topic_key"),
+                        exc,
+                    )
+
+        for item in unprocessed_fact_candidates:
+            node_id = int(item["node_id"])
+            if node_id in entity_topic_node_ids:
                 continue
-            task_episode_observation_ids.append(observation_id)
-            episode_node_ids = {
-                int(fact["node_id"])
-                for fact in episode.get("facts", [])
-            }
-            task_episode_node_ids.update(episode_node_ids)
-        consolidated += len(task_episode_observation_ids)
-        for item in candidates:
-            if int(item["node_id"]) in task_matched_node_ids or int(item["node_id"]) in task_episode_node_ids:
+            if node_id in merge_consumed_node_ids:
                 continue
-            consolidated += self._maybe_consolidate_observations(
-                node_id=int(item["node_id"]),
+            before_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
+            updated = self._maybe_consolidate_observations(
+                node_id=node_id,
                 topics=item.get("topics", []),
                 linked_entities=item.get("linked_entities", []),
+                min_new_sources=1,
+                changed_observation_ids=changed_observation_ids,
+                generate_interpretation=False,
             )
+            if not updated:
+                continue
+            entity_topic_updates += updated
+            after_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
+            entity_topic_node_ids.update(after_observed - before_observed)
+        consolidated += entity_topic_updates
+        
         return {
-            "candidate_count": len(candidates),
+            "candidate_count": len(unprocessed_fact_candidates),
             "consolidated": consolidated,
-            "task_matched": len(task_matched_node_ids),
-            "task_updates": task_updates,
-            "task_match_methods": task_match_methods,
-            "task_episodes": len(task_episode_observation_ids),
-            "task_episode_node_count": len(task_episode_node_ids),
-            "task_episode_observation_ids": task_episode_observation_ids,
+            "entity_topic_updates": entity_topic_updates,
+            "entity_topic_node_count": len(entity_topic_node_ids),
+            "observation_groups_merged": observation_groups_merged,
+            "changed_observation_ids": list(dict.fromkeys(changed_observation_ids)),
             "touched_entity_ids": touched_entity_ids,
         }
 
@@ -2537,83 +2550,94 @@ class MemoryNodeManager:
         )
         self._async_thread.start()
 
-    def _merge_duplicate_observation_group(self, group: Dict[str, Any]) -> bool:
+    def _augment_observation_merge_group_with_pending_sources(
+        self,
+        group: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Add same entity/topic facts to a merge group so overlap updates use one LLM call."""
+        if not self._db:
+            return group
+        try:
+            entity_id = int(group.get("entity_id"))
+            topic_key = str(group.get("topic_key") or "")
+        except (TypeError, ValueError):
+            return group
+        if not topic_key:
+            return group
+
+        group_source_nodes = [
+            dict(node)
+            for node in group.get("source_nodes", [])
+            if node.get("id") is not None
+        ]
+        group_source_ids = {int(node["id"]) for node in group_source_nodes}
+        topic_source_nodes = self._db.memory_observation_source_nodes(
+            entity_id=entity_id,
+            topic_key=topic_key,
+            limit=12,
+        )
+        pending_source_nodes = [
+            dict(node)
+            for node in topic_source_nodes
+            if node.get("id") is not None and int(node["id"]) not in group_source_ids
+        ]
+
+        combined_source_nodes: List[Dict[str, Any]] = []
+        seen_source_ids: set[int] = set()
+        for node in pending_source_nodes + group_source_nodes + topic_source_nodes:
+            if node.get("id") is None:
+                continue
+            node_id = int(node["id"])
+            if node_id in seen_source_ids:
+                continue
+            seen_source_ids.add(node_id)
+            combined_source_nodes.append(dict(node))
+
+        augmented = dict(group)
+        augmented["source_nodes"] = combined_source_nodes
+        augmented["pending_source_nodes"] = pending_source_nodes
+        augmented["pending_source_node_ids"] = [
+            int(node["id"]) for node in pending_source_nodes
+        ]
+        return augmented
+
+    def _merge_duplicate_observation_group(
+        self,
+        group: Dict[str, Any],
+        *,
+        changed_observation_ids: Optional[List[int]] = None,
+    ) -> bool:
         observations = group.get("observations") or []
         source_nodes = group.get("source_nodes") or []
         if len(observations) < 2:
             return False
-
-        observation_lines = []
-        for index, observation in enumerate(observations, 1):
-            summary = str(observation.get("summary") or "").strip()
-            if not summary:
-                continue
-            observation_lines.append(
-                f"{index}. [{observation.get('observation_type', 'insight')}; "
-                f"confidence={observation.get('confidence', 0.0)}] {summary}"
-            )
-        if not observation_lines:
-            return False
-
-        source_lines = []
-        for index, node in enumerate(source_nodes[:12], 1):
-            summary = str(node.get("summary") or "").strip()
-            if not summary:
-                continue
-            source_lines.append(
-                f"{index}. [{node.get('fact_type', 'world')}/{node.get('fact_kind', 'other')}] {summary}"
-            )
-
-        current_category = str(group.get("observation_type") or "insight").strip().lower()
-        if current_category not in {"insight", "task"}:
-            current_category = "insight"
-
-        prompt = OBSERVATION_MERGE_PROMPT.format(
-            entity_name=group.get("entity_name", ""),
-            topic_label=group.get("topic_label", group.get("topic_key", "")),
-            current_category=current_category,
-            observations="\n".join(observation_lines),
-            source_facts="\n".join(source_lines) or "(no supporting facts found)",
-        )
-        result = self._call_llm(prompt)
-        data = self._json_object_from_llm_text(result or "")
-        if not data:
-            logger.debug("Observation reflection returned invalid JSON")
-            return False
-
-        summary = str(data.get("summary", "")).strip()
-        if not summary:
-            return False
-        category = current_category
-        metadata = data.get("metadata", {})
-        if not isinstance(metadata, dict):
-            metadata = {}
-        metadata = dict(metadata)
-        if category == "task":
-            metadata = self._normalize_task_metadata(metadata, allow_stale=True)
-        else:
-            allowed_insight_types = {
-                "preference", "workflow", "strategy", "failure",
-                "success", "change", "constraint", "context",
-            }
-            insight_type = str(metadata.get("insight_type", "context") or "context").strip().lower()
-            if insight_type not in allowed_insight_types:
-                insight_type = "context"
-            metadata = {"insight_type": insight_type}
-        keywords = self._normalize_keywords(data.get("keywords", []))
-        if not keywords:
-            for observation in observations:
-                keywords.extend(self._normalize_keywords(str(observation.get("keywords", "")).split()))
-            keywords = list(dict.fromkeys(keywords))
-        try:
-            confidence = float(data.get("confidence", 0.7) or 0.7)
-        except (TypeError, ValueError):
-            confidence = 0.7
-
         source_ids = [int(node["id"]) for node in source_nodes]
         if not source_ids:
             return False
         keep_observation = observations[0]
+        related_observations = observations[1:]
+        prompt_source_nodes = group.get("pending_source_nodes", [])
+        generated = self._generate_observation(
+            entity_name=group.get("entity_name", ""),
+            topic_label=group.get("topic_label", group.get("topic_key", "")),
+            source_nodes=prompt_source_nodes,
+            existing_observation=keep_observation,
+            related_observations=related_observations,
+            target_type="observation",
+        )
+        if not generated:
+            return False
+        category = generated["observation_type"]
+        metadata = {
+            "source": "memory_reflect_observation_merge",
+            **(generated.get("metadata") or {}),
+        }
+        keywords = generated["keywords"]
+        if not keywords:
+            for item in observations:
+                keywords.extend(self._normalize_keywords(str(item.get("keywords", "")).split()))
+            keywords = list(dict.fromkeys(keywords))
+
         remove_ids = [int(observation["id"]) for observation in observations[1:]]
         self._log_reflect_error("observation_merge", {
             "entity_id": group.get("entity_id"),
@@ -2629,70 +2653,26 @@ class MemoryNodeManager:
             ],
             "supporting_facts": self._reflect_fact_log_items(source_nodes),
             "merged_observation": {
-                "summary": self._reflect_log_text(summary),
+                "summary": self._reflect_log_text(generated["summary"]),
                 "observation_type": category,
                 "keywords": keywords,
-                "confidence": max(0.0, min(1.0, confidence)),
-                "metadata": {
-                    "source": "memory_reflect_observation_merge",
-                    **metadata,
-                },
+                "confidence": generated["confidence"],
+                "metadata": metadata,
             },
         })
         self._db.memory_replace_observation_group(
             keep_observation_id=int(keep_observation["id"]),
             remove_observation_ids=remove_ids,
             observation_type=category,
-            summary=summary,
+            summary=generated["summary"],
             keywords=keywords,
-            confidence=max(0.0, min(1.0, confidence)),
+            confidence=generated["confidence"],
             source_node_ids=source_ids,
-            metadata={
-                "source": "memory_reflect_observation_merge",
-                **metadata,
-            },
+            metadata=metadata,
         )
+        if changed_observation_ids is not None:
+            changed_observation_ids.append(int(keep_observation["id"]))
         return True
-
-    def _merge_duplicate_observations_for_entities(self, entity_ids: List[int]) -> int:
-        if not entity_ids:
-            return 0
-        merged = 0
-        groups = self._db.memory_duplicate_observation_groups(entity_ids=entity_ids)
-        self._log_reflect_error("observation_merge_candidates", {
-            "entity_ids": entity_ids,
-            "group_count": len(groups),
-            "groups": [
-                {
-                    "entity_id": group.get("entity_id"),
-                    "entity_name": group.get("entity_name"),
-                    "topic_key": group.get("topic_key"),
-                    "topic_label": group.get("topic_label"),
-                    "observation_type": group.get("observation_type"),
-                    "observation_ids": [
-                        observation.get("id")
-                        for observation in group.get("observations", [])
-                    ],
-                    "source_node_ids": [
-                        node.get("id")
-                        for node in group.get("source_nodes", [])
-                    ],
-                }
-                for group in groups
-            ],
-        })
-        for group in groups:
-            try:
-                if self._merge_duplicate_observation_group(group):
-                    merged += 1
-            except Exception as exc:
-                logger.debug(
-                    "Failed to merge observations for entity %s topic %s: %s",
-                    group.get("entity_id"),
-                    group.get("topic_key"),
-                    exc,
-                )
-        return merged
 
     def reflect(
         self,
@@ -2707,10 +2687,10 @@ class MemoryNodeManager:
     ) -> Dict[str, Any]:
         """Run memory reflection maintenance.
 
-        It first promotes today's unprocessed fact nodes into consolidated
-        observations, then runs entity reflection, duplicate observation
-        merging, and decay maintenance. The method is intentionally explicit
-        and is not called from ``run_agent.py`` yet.
+        It selects unprocessed facts, merges newly introduced entities, updates
+        or creates observations, generates interpretations, and then applies
+        decay maintenance. The method is intentionally explicit and is not
+        called from ``run_agent.py`` yet.
         """
         if not self._db:
             return {
@@ -2730,24 +2710,27 @@ class MemoryNodeManager:
             "task_active_to_paused_days": task_active_to_paused_days,
             "task_stale_days": task_stale_days,
         })
-        observation_report = self._reflect_observations_from_unprocessed_facts(
+        unprocessed_fact_candidates = self._db.memory_unobserved_nodes_for_observation(limit=limit)
+        new_entity_ids = list(dict.fromkeys(
+            int(entity_id)
+            for item in unprocessed_fact_candidates
+            for entity_id, _entity_name in item.get("linked_entities", [])
+        ))
+
+        entity_merging_report = self._db.memory_reflect_entities(
             dry_run=dry_run,
             limit=limit,
-        )
-        report = self._db.memory_reflect_entities(
-            dry_run=dry_run,
-            limit=limit,
-            anchor_entity_ids=observation_report.get("touched_entity_ids", []),
+            anchor_entity_ids=new_entity_ids,
         )
         self._log_reflect_error("entity_merge_candidates", {
             "dry_run": dry_run,
-            "anchor_entity_ids": observation_report.get("touched_entity_ids", []),
-            "candidate_count": report.get("candidate_count", 0),
-            "merge_candidates": report.get("merge_candidates", 0),
-            "merged": report.get("merged", 0),
-            "candidates": report.get("candidates", []),
+            "anchor_entity_ids": new_entity_ids,
+            "candidate_count": entity_merging_report.get("candidate_count", 0),
+            "merge_candidates": entity_merging_report.get("merge_candidates", 0),
+            "merged": entity_merging_report.get("merged", 0),
+            "candidates": entity_merging_report.get("candidates", []),
         })
-        for candidate in report.get("candidates", []):
+        for candidate in entity_merging_report.get("candidates", []):
             if candidate.get("action") != "merge":
                 continue
             self._log_reflect_error("entity_merge", {
@@ -2763,17 +2746,33 @@ class MemoryNodeManager:
                 "type_score": candidate.get("type_score"),
                 "co_entities_score": candidate.get("co_entities_score"),
             })
-        report["observation_reflect"] = observation_report
-        report["observations_consolidated"] = observation_report.get("consolidated", 0)
-        report["observation_groups_merged"] = 0
-        if not dry_run and report.get("merged"):
-            canonical_ids = [
+
+        merged_entity_ids: List[int] = []
+        if not dry_run and entity_merging_report.get("merged"):
+            merged_entity_ids = [
                 int(candidate["canonical_id"])
-                for candidate in report.get("candidates", [])
+                for candidate in entity_merging_report.get("candidates", [])
                 if candidate.get("action") == "merge"
             ]
-            report["observation_groups_merged"] = self._merge_duplicate_observations_for_entities(
-                list(dict.fromkeys(canonical_ids))
+        
+        observation_report = self._reflect_generate_observations(
+            dry_run=dry_run,
+            limit=limit,
+            entity_ids=list(dict.fromkeys(merged_entity_ids)),
+            unprocessed_fact_candidates=unprocessed_fact_candidates,
+        )
+
+        report = entity_merging_report
+        report["observation_reflect"] = observation_report
+        report["observations_consolidated"] = observation_report.get("consolidated", 0)
+        report["observation_groups_merged"] = observation_report.get("observation_groups_merged", 0)
+        report["changed_observation_ids"] = list(dict.fromkeys(
+            observation_report.get("changed_observation_ids", [])
+        ))
+        report["interpretations_generated"] = 0
+        if not dry_run:
+            report["interpretations_generated"] = self._generate_interpretations_for_observations(
+                report["changed_observation_ids"]
             )
         reflect_now = datetime.now().astimezone()
         node_decay_report = self._db.memory_reflect_node_decay(
@@ -2805,10 +2804,9 @@ class MemoryNodeManager:
             "observations_consolidated": report.get("observations_consolidated", 0),
             "task_matched": observation_report.get("task_matched", 0),
             "task_updates": observation_report.get("task_updates", 0),
-            "task_episodes": observation_report.get("task_episodes", 0),
-            "task_episode_node_count": observation_report.get("task_episode_node_count", 0),
             "entity_merged": report.get("merged", 0),
             "observation_groups_merged": report.get("observation_groups_merged", 0),
+            "interpretations_generated": report.get("interpretations_generated", 0),
             "observations_inactivated": report.get("observations_inactivated", 0),
             "tasks_paused": report.get("tasks_paused", 0),
             "tasks_stale": report.get("tasks_stale", 0),
@@ -2880,6 +2878,13 @@ class MemoryNodeManager:
 
             keywords = summary_data["keywords"]
             entities = summary_data.get("entities", [])
+            interpretation_nodes = self._db.memory_search_interpretations(
+                keywords,
+                entities=entities,
+                top_k=max(2, min(4, k // 2)),
+            )
+            logger.error("finish recall: interpretations searching")
+
             observation_nodes = self._db.memory_search_observations(
                 keywords,
                 entities=entities,
@@ -2918,7 +2923,7 @@ class MemoryNodeManager:
             world_nodes = [node for node in world_nodes if node.get("id") not in supporting_ids]
             experience_nodes = [node for node in experience_nodes if node.get("id") not in supporting_ids]
 
-            if not observation_nodes and not world_nodes and not experience_nodes:
+            if not interpretation_nodes and not observation_nodes and not world_nodes and not experience_nodes:
                 logger.debug("No relevant memory nodes found for query")
                 return ""
 
@@ -2926,6 +2931,12 @@ class MemoryNodeManager:
             lines: List[str] = []
             lines.append(MEMORY_NODE_HEADER)
             lines.append("")
+            if interpretation_nodes:
+                lines.append(INTERPRETATION_SECTION_HEADER)
+                lines.append("System note: These are agent interpretations derived from memory evidence, not direct user quotes. Treat low-confidence or inferred claims cautiously.")
+                for i, interpretation in enumerate(interpretation_nodes, 1):
+                    lines.append(self._format_interpretation(i, interpretation))
+                lines.append("")
             if observation_nodes:
                 lines.append(OBSERVATION_SECTION_HEADER)
                 lines.append("System note: These are consolidated long-term patterns. Treat them as high-level guidance supported by the facts below.")
@@ -2988,6 +2999,25 @@ class MemoryNodeManager:
         line += summary
         if updated:
             line += f"  (last supported: {updated})"
+        return line
+
+    @staticmethod
+    def _format_interpretation(index: int, interpretation: Dict[str, Any]) -> str:
+        claim = str(interpretation.get("claim") or "").strip()
+        interpretation_type = str(interpretation.get("interpretation_type") or "behavior_pattern")
+        status = str(interpretation.get("status") or "current")
+        confidence = interpretation.get("confidence", 0.0)
+        scope = str(interpretation.get("scope") or "general").strip()
+        action = str(interpretation.get("action_implication") or "").strip()
+        conflict_status = str(interpretation.get("conflict_status") or "none").strip()
+        prefix_parts = [interpretation_type, f"status={status}", f"confidence={confidence}"]
+        if scope:
+            prefix_parts.append(f"scope={scope}")
+        if conflict_status and conflict_status != "none":
+            prefix_parts.append(f"conflict={conflict_status}")
+        line = f"{index}. [{'; '.join(prefix_parts)}] {claim}"
+        if action:
+            line += f"  (action implication: {action})"
         return line
 
     # ── Time expression parser ───────────────────────────────────────────

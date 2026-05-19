@@ -8,9 +8,12 @@ from agent.memory_node_manager import MemoryNodeManager
 from agent.memory_node_manager import (
     CAUSAL_RELATION_TYPE_TEXT,
     INSIGHT_CONSOLIDATION_PROMPT,
+    OBSERVATION_CONSOLIDATION_PROMPT,
     OBSERVATION_SOURCE_FACT_GUIDANCE,
     OBSERVATION_MERGE_PROMPT,
     OBSERVATION_UPDATE_PROMPT,
+    INTERPRETATION_GENERATION_PROMPT,
+    INTERPRETATION_SECTION_HEADER,
     RELATION_PROMPT_TEMPLATE,
     RETAIN_FACT_EXTRACTION_PROMPT,
     TASK_CONSOLIDATION_PROMPT,
@@ -209,6 +212,57 @@ def test_memory_node_details_live_on_memory_nodes_table(db):
     }
     assert "fact_type" in columns
     assert "fact_kind" in columns
+
+
+def test_memory_interpretations_store_current_agent_interpretations(db):
+    tables = {
+        row["name"]
+        for row in db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert "memory_interpretations" in tables
+
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户当前倾向先用 heuristic 控制 task fact 选择，再谨慎修改 prompt。",
+        subject_text="user",
+        target_text="memory task fact selection",
+        scope="memory-system-design",
+        interpretation_type="task",
+        confidence=0.86,
+        strength=0.8,
+        action_implication="后续先讨论 heuristic/data-flow，再考虑 prompt guidance。",
+        evidence_node_ids=[1, "2", "bad", 2],
+        evidence_observation_ids=[3],
+        metadata={"source": "agent_interpretation"},
+    )
+
+    row = db._conn.execute(
+        "SELECT claim, interpretation_type, status, confidence, evidence_node_ids, metadata "
+        "FROM memory_interpretations WHERE id = ?",
+        (interpretation_id,),
+    ).fetchone()
+    assert row["interpretation_type"] == "task"
+    assert row["status"] == "current"
+    assert row["confidence"] == pytest.approx(0.86)
+    assert json.loads(row["evidence_node_ids"]) == [1, 2]
+    assert json.loads(row["metadata"]) == {"source": "agent_interpretation"}
+
+    updated_id = db.memory_upsert_interpretation(
+        claim="用户当前更偏好 deterministic heuristic 控制 task fact 选择。",
+        subject_text="user",
+        target_text="memory task fact selection",
+        scope="memory-system-design",
+        interpretation_type="task",
+        confidence=0.9,
+    )
+    assert updated_id == interpretation_id
+
+    results = db.memory_search_interpretations(["heuristic", "task"], top_k=5)
+
+    assert [item["id"] for item in results] == [interpretation_id]
+    assert results[0]["claim"] == "用户当前更偏好 deterministic heuristic 控制 task fact 选择。"
+    assert results[0]["evidence_node_ids"] == [1, 2]
 
 
 def test_store_turn_falls_back_to_summary_when_retain_json_is_bad(db):
@@ -430,6 +484,53 @@ def _add_memory_node(
         task_event_subject=task_event_subject,
         task_relevance=task_relevance,
     )
+
+
+def _add_task_interpretation(
+    db,
+    *,
+    entity_id,
+    topic_key,
+    topic_label=None,
+    summary,
+    keywords=None,
+    source_node_ids=None,
+    metadata=None,
+):
+    source_node_ids = source_node_ids or []
+    topic_label = topic_label or topic_key
+    observation_id = None
+    if source_node_ids:
+        observation_id = db.memory_upsert_observation(
+            entity_id=entity_id,
+            topic_key=topic_key,
+            topic_label=topic_label,
+            observation_type="observation",
+            summary=summary,
+            keywords=keywords or [topic_label],
+            source_node_ids=source_node_ids,
+            metadata={"observation_kind": "timeline"},
+        )
+    task_metadata = {
+        "task_status": "active",
+        "task_source": "inferred_from_interpretation",
+        "entity_id": entity_id,
+        "topic_key": topic_key,
+        "topic_label": topic_label,
+        **(metadata or {}),
+    }
+    if observation_id is not None:
+        task_metadata["observation_id"] = observation_id
+    interpretation_id = db.memory_upsert_interpretation(
+        claim=summary,
+        target_text=topic_label,
+        scope=topic_key,
+        interpretation_type="task",
+        metadata=task_metadata,
+        evidence_node_ids=source_node_ids,
+        evidence_observation_ids=[observation_id] if observation_id is not None else [],
+    )
+    return interpretation_id, observation_id
 
 
 def test_memory_search_uses_temporal_channel_when_semantic_and_keyword_are_empty(db, monkeypatch):
@@ -912,33 +1013,43 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         entity_id=alice,
         topic_key="alerts",
         topic_label="alerts",
-        observation_type="insight",
+        observation_type="observation",
         summary="Alice prefers Slack for urgent alerts.",
         keywords=["Slack", "alerts"],
         source_node_ids=[first_node],
         confidence=0.8,
+        metadata={"observation_kind": "context"},
     )
     second_observation = db.memory_upsert_observation(
         entity_id=alice_spaced,
         topic_key="alerts",
         topic_label="alerts",
-        observation_type="insight",
+        observation_type="observation",
         summary="Alice routes incident notifications through Slack.",
         keywords=["Slack", "notifications"],
         source_node_ids=[second_node],
         confidence=0.75,
+        metadata={"observation_kind": "context"},
     )
     mgr = _NoAsyncMemoryNodeManager(
         db,
         embedding_config={},
         llm_outputs=[
             json.dumps({
-                "category": "insight",
+                "category": "observation",
                 "summary": "Alice consistently wants urgent and incident alerts routed through Slack.",
                 "keywords": ["Slack", "alerts", "notifications"],
                 "confidence": 0.9,
-                "metadata": {"insight_type": "preference"},
-            })
+                "metadata": {"observation_kind": "context"},
+            }),
+            json.dumps({
+                "category": "observation",
+                "summary": "Alice consistently wants urgent and incident alerts routed through Slack.",
+                "keywords": ["Slack", "alerts", "notifications"],
+                "confidence": 0.9,
+                "metadata": {"observation_kind": "context"},
+            }),
+            json.dumps({"should_create": False}),
         ],
     )
 
@@ -946,7 +1057,27 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
 
     assert report["merged"] == 1
     assert report["observation_groups_merged"] == 1
-    assert "current_category: insight" in mgr.llm_prompts[-1]
+    merge_prompt = next(
+        prompt
+        for prompt in mgr.llm_prompts
+        if "相关既有 observation" in prompt
+        and "Alice routes incident notifications through Slack." in prompt
+    )
+    assert "已有 observation" in merge_prompt
+    assert "相关既有 observation" in merge_prompt
+    assert "Alice prefers Slack for urgent alerts." in merge_prompt
+    assert "Alice routes incident notifications through Slack." in merge_prompt
+    assert "Alice still discusses Slack alerts." in merge_prompt
+    source_facts_section = merge_prompt.split("新的来源事实：", 1)[1]
+    assert "Alice still discusses Slack alerts." in source_facts_section
+    assert "Alice prefers Slack for urgent alerts." not in source_facts_section
+    assert "Alice wants incident notifications in Slack." not in source_facts_section
+    observation_prompts = [
+        prompt
+        for prompt in mgr.llm_prompts
+        if "observation consolidation 模块" in prompt
+    ]
+    assert observation_prompts == [merge_prompt]
     rows = db._conn.execute(
         "SELECT id, entity_id, topic_key, observation_type, summary, keywords "
         "FROM memory_observations ORDER BY id"
@@ -955,7 +1086,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
     assert rows[0]["id"] in {first_observation, second_observation}
     assert rows[0]["entity_id"] == alice
     assert rows[0]["topic_key"] == "alerts"
-    assert rows[0]["observation_type"] == "insight"
+    assert rows[0]["observation_type"] == "observation"
     assert "urgent and incident alerts" in rows[0]["summary"]
     assert "notifications" in rows[0]["keywords"]
     source_ids = {
@@ -965,7 +1096,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
             (rows[0]["id"],),
         ).fetchall()
     }
-    assert source_ids == {first_node, second_node}
+    assert source_ids == {first_node, second_node, touched_node}
 
 
 def test_reflect_keeps_insight_and_task_observations_separate(db):
@@ -1105,24 +1236,25 @@ def test_task_inactivity_policy_pauses_and_stales_idle_tasks(db):
         db.entity_link_node(node_id, entity_id)
 
     def add_task(status, last_supported_at, source_node_id):
-        obs_id = db.memory_upsert_observation(
-            entity_id=entity_id,
-            topic_key=f"task-{source_node_id}",
-            topic_label=f"task-{source_node_id}",
-            observation_type="task",
-            summary=f"Task {source_node_id}",
-            keywords=["task"],
-            source_node_ids=[source_node_id],
+        interpretation_id = db.memory_upsert_interpretation(
+            claim=f"Task {source_node_id}",
+            target_text=f"task-{source_node_id}",
+            scope=f"task-{source_node_id}",
+            interpretation_type="task",
             metadata={
                 "task_status": status,
-                "task_source": "inferred_from_observation",
+                "task_source": "inferred_from_interpretation",
+                "entity_id": entity_id,
+                "entity_name": "Hermes Agent",
+                "topic_key": f"task-{source_node_id}",
+                "topic_label": f"task-{source_node_id}",
             },
         )
         db._conn.execute(
-            "UPDATE memory_observations SET last_supported_at = ?, updated_at = ? WHERE id = ?",
-            (last_supported_at.isoformat(), last_supported_at.isoformat(), obs_id),
+            "UPDATE memory_interpretations SET last_supported_at = ?, updated_at = ? WHERE id = ?",
+            (last_supported_at.isoformat(), last_supported_at.isoformat(), interpretation_id),
         )
-        return obs_id
+        return interpretation_id
 
     active_to_paused = add_task("active", now - timedelta(days=10), node_ids[0])
     active_to_stale = add_task("active", now - timedelta(days=40), node_ids[1])
@@ -1142,10 +1274,10 @@ def test_task_inactivity_policy_pauses_and_stales_idle_tasks(db):
     rows = {
         row["id"]: (row["status"], json.loads(row["metadata"]))
         for row in db._conn.execute(
-            "SELECT id, status, metadata FROM memory_observations ORDER BY id"
+            "SELECT id, status, metadata FROM memory_interpretations ORDER BY id"
         ).fetchall()
     }
-    assert rows[active_to_paused][0] == "active"
+    assert rows[active_to_paused][0] == "current"
     assert rows[active_to_paused][1]["task_status"] == "paused"
     assert rows[active_to_paused][1]["previous_task_status"] == "active"
     assert rows[active_to_paused][1]["status_updated_by"] == "reflect_task_inactivity_policy"
@@ -1164,20 +1296,24 @@ def test_memory_node_manager_reflect_reports_task_inactivity(db):
         keywords=["memory"],
     )
     db.entity_link_node(node_id, entity_id)
-    obs_id = db.memory_upsert_observation(
-        entity_id=entity_id,
-        topic_key="memory-system",
-        topic_label="memory-system",
-        observation_type="task",
-        summary="用户正在完善 Hermes Agent 的记忆系统。",
-        keywords=["memory"],
-        source_node_ids=[node_id],
-        metadata={"task_status": "active", "task_source": "inferred_from_observation"},
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户正在完善 Hermes Agent 的记忆系统。",
+        target_text="memory-system",
+        scope="memory-system",
+        interpretation_type="task",
+        metadata={
+            "task_status": "active",
+            "task_source": "inferred_from_interpretation",
+            "entity_id": entity_id,
+            "entity_name": "Hermes Agent",
+            "topic_key": "memory-system",
+            "topic_label": "memory-system",
+        },
     )
     idle_at = now - timedelta(days=10)
     db._conn.execute(
-        "UPDATE memory_observations SET last_supported_at = ?, updated_at = ? WHERE id = ?",
-        (idle_at.isoformat(), idle_at.isoformat(), obs_id),
+        "UPDATE memory_interpretations SET last_supported_at = ?, updated_at = ? WHERE id = ?",
+        (idle_at.isoformat(), idle_at.isoformat(), interpretation_id),
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
@@ -1192,8 +1328,8 @@ def test_memory_node_manager_reflect_reports_task_inactivity(db):
     assert report["tasks_stale"] == 0
     assert report["task_inactivity"]["changed"] == 1
     metadata = json.loads(db._conn.execute(
-        "SELECT metadata FROM memory_observations WHERE id = ?",
-        (obs_id,),
+        "SELECT metadata FROM memory_interpretations WHERE id = ?",
+        (interpretation_id,),
     ).fetchone()["metadata"])
     assert metadata["task_status"] == "paused"
 
@@ -1312,6 +1448,39 @@ def test_recall_formats_world_and_experience_sections(db, monkeypatch):
     assert "Hermes recommended Slack alert routing for Alice." in context
 
 
+def test_recall_formats_current_interpretations_before_evidence(db, monkeypatch):
+    db.memory_upsert_interpretation(
+        claim="用户当前倾向先用 heuristic 控制 task fact 选择，再谨慎修改 prompt。",
+        subject_text="user",
+        target_text="memory task fact selection",
+        scope="memory-system-design",
+        interpretation_type="inferred_preference",
+        confidence=0.86,
+        action_implication="后续先讨论 heuristic/data-flow，再考虑 prompt guidance。",
+    )
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="用户要求先过滤 preference/instruction/context/other 类型的 fact。",
+        keywords=["heuristic", "task", "fact"],
+        fact_type="world",
+    )
+    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps({"summary": "heuristic task fact", "keywords": ["heuristic", "task", "fact"]})],
+    )
+
+    context = mgr.recall("heuristic task fact")
+
+    assert INTERPRETATION_SECTION_HEADER in context
+    assert "agent interpretations derived from memory evidence" in context
+    assert "用户当前倾向先用 heuristic 控制 task fact 选择" in context
+    assert "action implication: 后续先讨论 heuristic/data-flow，再考虑 prompt guidance。" in context
+    assert context.index(INTERPRETATION_SECTION_HEADER) < context.index("[World facts")
+
+
 def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
     retain_payload = {
         "facts": [
@@ -1345,11 +1514,11 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
         llm_outputs=[
             json.dumps(retain_payload),
             json.dumps({
-                "category": "insight",
+                "category": "observation",
                 "summary": "Alice's urgent alert workflow is Slack-centered.",
                 "keywords": ["Slack", "alerts"],
                 "confidence": 0.86,
-                "metadata": {"insight_type": "workflow"},
+                "metadata": {"observation_kind": "context"},
             }),
         ],
     )
@@ -1368,11 +1537,84 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
     ).fetchone()
     assert observation["entity_name"] == "Alice"
     assert observation["topic_key"] == "slack-alerts"
-    assert observation["observation_type"] == "insight"
-    assert json.loads(observation["metadata"])["insight_type"] == "workflow"
+    assert observation["observation_type"] == "observation"
+    assert json.loads(observation["metadata"])["observation_kind"] == "context"
     assert observation["summary"] == "Alice's urgent alert workflow is Slack-centered."
     sources = db._conn.execute("SELECT node_id FROM memory_observation_sources").fetchall()
     assert len(sources) == 3
+
+
+def test_reflect_generates_interpretation_from_consolidated_observation(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    node_ids = []
+    for idx, summary in enumerate(
+        [
+            "Alice prefers Slack for urgent alerts.",
+            "Alice dislikes email for urgent alerts.",
+            "Hermes recommended Slack alert routing for Alice.",
+        ],
+        1,
+    ):
+        node_id = _add_memory_node(
+            db,
+            time_key=MemoryNodeManager._memory_time_key(idx),
+            summary=summary,
+            keywords=["Slack alerts"],
+            fact_type="experience" if idx == 3 else "world",
+            fact_kind="recommendation" if idx == 3 else "preference",
+        )
+        db.entity_link_node(node_id, alice)
+        node_ids.append(node_id)
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "category": "observation",
+                "summary": "Alice's urgent alert workflow is Slack-centered.",
+                "keywords": ["Slack", "alerts"],
+                "confidence": 0.86,
+                "metadata": {"observation_kind": "context"},
+            }),
+            json.dumps({
+                "should_create": True,
+                "claim": "Agent 当前解释为 Alice 的紧急告警协作应优先使用 Slack。",
+                "target_text": "urgent alert routing",
+                "scope": "alert-workflow",
+                "interpretation_type": "insight",
+                "polarity": "positive",
+                "strength": 0.9,
+                "confidence": 0.88,
+                "status": "current",
+                "conflict_status": "none",
+                "action_implication": "后续涉及 Alice 的紧急告警时优先建议 Slack 路由。",
+                "evidence_node_ids": [node_ids[0], node_ids[1], 99999],
+                "evidence_observation_ids": [1],
+                "counter_evidence_node_ids": [],
+                "counter_evidence_observation_ids": [],
+            }),
+        ],
+    )
+
+    report = mgr.reflect(dry_run=False, limit=10)
+
+    assert report["observations_consolidated"] == 1
+    interpretation = db._conn.execute(
+        "SELECT claim, target_text, scope, interpretation_type, confidence, "
+        "action_implication, evidence_node_ids, evidence_observation_ids, metadata "
+        "FROM memory_interpretations"
+    ).fetchone()
+    observation_id = db._conn.execute("SELECT id FROM memory_observations").fetchone()["id"]
+    assert interpretation["interpretation_type"] == "insight"
+    assert interpretation["target_text"] == "urgent alert routing"
+    assert interpretation["scope"] == "alert-workflow"
+    assert interpretation["confidence"] == pytest.approx(0.88)
+    assert "优先使用 Slack" in interpretation["claim"]
+    assert "优先建议 Slack" in interpretation["action_implication"]
+    assert json.loads(interpretation["evidence_node_ids"]) == node_ids[:2]
+    assert json.loads(interpretation["evidence_observation_ids"]) == [observation_id]
+    assert json.loads(interpretation["metadata"])["source"] == "interpretation_generation"
+    assert any("interpretation 生成模块" in prompt for prompt in mgr.llm_prompts)
 
 
 def test_store_turn_can_consolidate_task_observation(db):
@@ -1411,13 +1653,32 @@ def test_store_turn_can_consolidate_task_observation(db):
         llm_outputs=[
             json.dumps(retain_payload),
             json.dumps({
-                "category": "task",
+                "category": "observation",
                 "summary": "用户正在迭代 Hermes Agent 的记忆系统，当前聚焦 recall、reflect 与 observation 生成逻辑。",
                 "keywords": ["Hermes Agent", "memory", "recall", "observation"],
                 "confidence": 0.82,
                 "metadata": {
+                    "observation_kind": "timeline",
+                    "has_conflict": False,
+                },
+            }),
+            json.dumps({
+                "should_create": True,
+                "claim": "用户当前正在迭代 Hermes Agent 的记忆系统。",
+                "target_text": "Hermes Agent memory system",
+                "scope": "memory-recall",
+                "interpretation_type": "task",
+                "polarity": "neutral",
+                "strength": 0.82,
+                "confidence": 0.82,
+                "status": "current",
+                "conflict_status": "none",
+                "action_implication": "后续围绕 Hermes Agent 记忆系统改动时应保留当前任务上下文。",
+                "evidence_node_ids": [],
+                "evidence_observation_ids": [1],
+                "metadata": {
                     "task_status": "active",
-                    "task_source": "inferred_from_observation",
+                    "task_source": "inferred_from_interpretation",
                     "goal": "完善 Hermes Agent 的长期记忆系统。",
                     "evidence": ["排查 memory recall", "修改 observation 生成逻辑"],
                     "steps": [
@@ -1449,20 +1710,22 @@ def test_store_turn_can_consolidate_task_observation(db):
         "SELECT observation_type, summary, metadata FROM memory_observations"
     ).fetchone()
     metadata = json.loads(observation["metadata"])
-    assert observation["observation_type"] == "task"
+    assert observation["observation_type"] == "observation"
     assert "正在迭代 Hermes Agent" in observation["summary"]
-    assert metadata["task_status"] == "active"
-    assert metadata["task_source"] == "inferred_from_observation"
-    assert metadata["goal"] == "完善 Hermes Agent 的长期记忆系统。"
-    assert metadata["evidence"] == ["排查 memory recall", "修改 observation 生成逻辑"]
-    assert metadata["steps"][0]["title"] == "排查 memory recall 匹配问题"
-    assert metadata["steps"][0]["status"] == "done"
-    assert metadata["steps"][0]["updated_at"] == "2026-05-14"
-    assert metadata["steps"][1]["title"] == "将 observation 分类为 insight 和 task"
-    assert metadata["steps"][1]["status"] == "active"
+    assert metadata["observation_kind"] == "timeline"
+    interpretation = db._conn.execute(
+        "SELECT interpretation_type, claim, metadata FROM memory_interpretations"
+    ).fetchone()
+    interpretation_metadata = json.loads(interpretation["metadata"])
+    assert interpretation["interpretation_type"] == "task"
+    assert "正在迭代 Hermes Agent" in interpretation["claim"]
+    assert interpretation_metadata["task_status"] == "active"
+    assert interpretation_metadata["task_source"] == "inferred_from_interpretation"
+    assert interpretation_metadata["goal"] == "完善 Hermes Agent 的长期记忆系统。"
+    assert interpretation_metadata["steps"][0]["title"] == "排查 memory recall 匹配问题"
 
 
-def test_reflect_matches_fact_to_task_by_entity_and_topic(db):
+def test_reflect_updates_observation_by_entity_and_topic(db):
     hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
     source_node = _add_memory_node(
         db,
@@ -1471,17 +1734,15 @@ def test_reflect_matches_fact_to_task_by_entity_and_topic(db):
         keywords=["memory-reflect"],
     )
     db.entity_link_node(source_node, hermes)
-    task_id = db.memory_upsert_observation(
+    task_id, observation_id = _add_task_interpretation(
+        db,
         entity_id=hermes,
         topic_key="memory-reflect",
         topic_label="memory-reflect",
-        observation_type="task",
         summary="用户正在完善 Hermes Agent 的长期记忆 reflect 机制。",
         keywords=["Hermes Agent", "memory", "reflect"],
         source_node_ids=[source_node],
         metadata={
-            "task_status": "active",
-            "task_source": "inferred_from_observation",
             "steps": [{"title": "设计 reflect 机制", "status": "active"}],
         },
     )
@@ -1498,17 +1759,13 @@ def test_reflect_matches_fact_to_task_by_entity_and_topic(db):
         embedding_config={},
         llm_outputs=[
             json.dumps({
-                "category": "task",
+                "category": "observation",
                 "summary": "用户正在完善 Hermes Agent 的 reflect 调度机制。",
                 "keywords": ["Hermes Agent", "reflect"],
                 "confidence": 0.9,
                 "metadata": {
-                    "task_status": "active",
-                    "task_source": "inferred_from_observation",
-                    "steps": [
-                        {"title": "设计 reflect 机制", "status": "done"},
-                        {"title": "每 5 轮对话调用 reflect", "status": "done"},
-                    ],
+                    "observation_kind": "timeline",
+                    "has_conflict": False,
                 },
             })
         ],
@@ -1516,17 +1773,22 @@ def test_reflect_matches_fact_to_task_by_entity_and_topic(db):
 
     report = mgr.reflect(dry_run=False, limit=10)
 
-    assert report["observation_reflect"]["task_matched"] == 1
-    assert report["observation_reflect"]["task_match_methods"] == {"entity_topic": 1}
-    assert db.memory_observation_source_ids(task_id) == [source_node, new_node]
+    assert report["observation_reflect"].get("task_matched", 0) == 0
+    assert report["observation_reflect"]["entity_topic_updates"] == 1
+    assert report["observation_reflect"]["entity_topic_node_count"] == 1
+    assert db.memory_observation_source_ids(observation_id) == [source_node, new_node]
     row = db._conn.execute(
         "SELECT summary, metadata FROM memory_observations WHERE id = ?",
-        (task_id,),
+        (observation_id,),
     ).fetchone()
     assert "reflect 调度机制" in row["summary"]
-    metadata = json.loads(row["metadata"])
-    assert metadata["task_match_methods"] == ["entity_topic"]
-    assert metadata["steps"][1]["title"] == "每 5 轮对话调用 reflect"
+
+    task_row = db._conn.execute(
+        "SELECT metadata FROM memory_interpretations WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    metadata = json.loads(task_row["metadata"])
+    assert metadata["task_status"] == "active"
 
 
 def test_reflect_excludes_non_task_fact_kind_from_existing_task_match(db):
@@ -1539,15 +1801,14 @@ def test_reflect_excludes_non_task_fact_kind_from_existing_task_match(db):
         fact_kind="action",
     )
     db.entity_link_node(source_node, hermes)
-    task_id = db.memory_upsert_observation(
+    task_id, observation_id = _add_task_interpretation(
+        db,
         entity_id=hermes,
         topic_key="memory-reflect",
         topic_label="memory-reflect",
-        observation_type="task",
         summary="用户正在完善 Hermes Agent 的长期记忆 reflect 机制。",
         keywords=["Hermes Agent", "memory", "reflect"],
         source_node_ids=[source_node],
-        metadata={"task_status": "active", "task_source": "inferred_from_observation"},
     )
     new_node = _add_memory_node(
         db,
@@ -1560,16 +1821,29 @@ def test_reflect_excludes_non_task_fact_kind_from_existing_task_match(db):
         task_relevance="strong",
     )
     db.entity_link_node(new_node, hermes)
-    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "category": "observation",
+                "summary": "用户偏好讨论 reflect 调度机制，但这不是 task 进展。",
+                "keywords": ["memory-reflect", "preference"],
+                "confidence": 0.78,
+                "metadata": {"observation_kind": "context"},
+            }),
+            json.dumps({"should_create": False}),
+        ],
+    )
 
     report = mgr.reflect(dry_run=False, limit=10)
 
-    assert report["observation_reflect"]["task_matched"] == 0
-    assert db.memory_observation_source_ids(task_id) == [source_node]
-    assert mgr.llm_prompts == []
+    assert report["observation_reflect"].get("task_matched", 0) == 0
+    assert db.memory_observation_source_ids(observation_id) == [source_node, new_node]
+    assert mgr.llm_prompts
 
 
-def test_reflect_matches_fact_to_task_by_high_embedding_similarity(db):
+def test_reflect_no_longer_matches_observation_by_high_task_embedding_similarity(db):
     hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
     alice = db.entity_add_entity("Alice", "PERSON")
     source_node = _add_memory_node(
@@ -1579,15 +1853,14 @@ def test_reflect_matches_fact_to_task_by_high_embedding_similarity(db):
         keywords=["memory-system"],
     )
     db.entity_link_node(source_node, hermes)
-    task_id = db.memory_upsert_observation(
+    task_id, observation_id = _add_task_interpretation(
+        db,
         entity_id=hermes,
         topic_key="memory-system",
         topic_label="memory-system",
-        observation_type="task",
         summary="用户正在完善 Hermes Agent memory reflect 任务。",
         keywords=["memory", "reflect"],
         source_node_ids=[source_node],
-        metadata={"task_status": "active", "task_source": "inferred_from_observation"},
     )
     new_node = _add_memory_node(
         db,
@@ -1602,14 +1875,13 @@ def test_reflect_matches_fact_to_task_by_high_embedding_similarity(db):
         embedding_config={},
         llm_outputs=[
             json.dumps({
-                "category": "task",
+                "category": "observation",
                 "summary": "用户正在完善 memory reflect 的 task matching 方案。",
                 "keywords": ["memory", "reflect", "task matching"],
                 "confidence": 0.88,
                 "metadata": {
-                    "task_status": "active",
-                    "task_source": "inferred_from_observation",
-                    "steps": [{"title": "设计低成本 task matching", "status": "active"}],
+                    "observation_kind": "timeline",
+                    "has_conflict": False,
                 },
             })
         ],
@@ -1618,12 +1890,12 @@ def test_reflect_matches_fact_to_task_by_high_embedding_similarity(db):
 
     report = mgr.reflect(dry_run=False, limit=10)
 
-    assert report["observation_reflect"]["task_matched"] == 1
-    assert report["observation_reflect"]["task_match_methods"] == {"embedding": 1}
-    assert db.memory_observation_source_ids(task_id) == [source_node, new_node]
+    assert report["observation_reflect"].get("task_matched", 0) == 0
+    assert report["observation_reflect"]["entity_topic_updates"] == 0
+    assert db.memory_observation_source_ids(observation_id) == [source_node]
 
 
-def test_reflect_matches_task_event_like_fact_to_single_recent_active_task(db):
+def test_reflect_no_longer_matches_fact_to_single_recent_active_task(db):
     hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
     alice = db.entity_add_entity("Alice", "PERSON")
     source_node = _add_memory_node(
@@ -1633,15 +1905,14 @@ def test_reflect_matches_task_event_like_fact_to_single_recent_active_task(db):
         keywords=["memory-system"],
     )
     db.entity_link_node(source_node, hermes)
-    task_id = db.memory_upsert_observation(
+    task_id, observation_id = _add_task_interpretation(
+        db,
         entity_id=hermes,
         topic_key="memory-system",
         topic_label="memory-system",
-        observation_type="task",
         summary="用户正在完善 Hermes Agent 的记忆系统。",
         keywords=["memory"],
         source_node_ids=[source_node],
-        metadata={"task_status": "active", "task_source": "inferred_from_observation"},
     )
     new_node = _add_memory_node(
         db,
@@ -1656,14 +1927,13 @@ def test_reflect_matches_task_event_like_fact_to_single_recent_active_task(db):
         embedding_config={},
         llm_outputs=[
             json.dumps({
-                "category": "task",
+                "category": "observation",
                 "summary": "用户正在继续完善记忆系统 prompt。",
                 "keywords": ["memory", "prompt"],
                 "confidence": 0.78,
                 "metadata": {
-                    "task_status": "active",
-                    "task_source": "inferred_from_observation",
-                    "steps": [{"title": "继续修改 prompt", "status": "active"}],
+                    "observation_kind": "timeline",
+                    "has_conflict": False,
                 },
             })
         ],
@@ -1672,9 +1942,9 @@ def test_reflect_matches_task_event_like_fact_to_single_recent_active_task(db):
 
     report = mgr.reflect(dry_run=False, limit=10)
 
-    assert report["observation_reflect"]["task_matched"] == 1
-    assert report["observation_reflect"]["task_match_methods"] == {"recent_active_action": 1}
-    assert db.memory_observation_source_ids(task_id) == [source_node, new_node]
+    assert report["observation_reflect"].get("task_matched", 0) == 0
+    assert report["observation_reflect"]["entity_topic_updates"] == 0
+    assert db.memory_observation_source_ids(observation_id) == [source_node]
 
 
 def test_reflect_leaves_unmatched_non_action_fact_for_regular_observation_flow(db):
@@ -1687,15 +1957,14 @@ def test_reflect_leaves_unmatched_non_action_fact_for_regular_observation_flow(d
         keywords=["memory-system"],
     )
     db.entity_link_node(source_node, hermes)
-    task_id = db.memory_upsert_observation(
+    task_id, observation_id = _add_task_interpretation(
+        db,
         entity_id=hermes,
         topic_key="memory-system",
         topic_label="memory-system",
-        observation_type="task",
         summary="用户正在完善 Hermes Agent 的记忆系统。",
         keywords=["memory"],
         source_node_ids=[source_node],
-        metadata={"task_status": "active", "task_source": "inferred_from_observation"},
     )
     new_node = _add_memory_node(
         db,
@@ -1709,139 +1978,81 @@ def test_reflect_leaves_unmatched_non_action_fact_for_regular_observation_flow(d
 
     report = mgr.reflect(dry_run=False, limit=10)
 
-    assert report["observation_reflect"]["task_matched"] == 0
-    assert db.memory_observation_source_ids(task_id) == [source_node]
+    assert report["observation_reflect"].get("task_matched", 0) == 0
+    assert db.memory_observation_source_ids(observation_id) == [source_node]
     assert mgr.llm_prompts == []
 
 
-def test_reflect_creates_task_episode_from_task_event_facts_with_different_entity_topics(db):
-    prompt_entity = db.entity_add_entity("Observation Prompt", "CONCEPT")
-    test_entity = db.entity_add_entity("Memory Tests", "CONCEPT")
-    first_step = _add_memory_node(
+def test_reflect_updates_existing_observation_by_entity_topic(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    bob = db.entity_add_entity("Bob", "PERSON")
+    old_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice previously routed alerts through Slack.",
+        keywords=["alert-routing"],
+        fact_kind="action",
+    )
+    db.entity_link_node(old_node, alice)
+    observation_id = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="alert-routing",
+        topic_label="alert-routing",
+        observation_type="observation",
+        summary="Alice has an alert routing history.",
+        keywords=["alert-routing"],
+        source_node_ids=[old_node],
+        metadata={"observation_kind": "timeline"},
+    )
+    new_matching_node = _add_memory_node(
         db,
         time_key=MemoryNodeManager._memory_time_key(0),
-        summary="用户先修改 observation prompt 中关于 task status 的定义。",
-        keywords=["prompt-step"],
+        summary="Alice continued refining alert routing today.",
+        keywords=["alert-routing"],
         fact_kind="action",
+        task_event_like=True,
+        task_event_subject="user",
+        task_relevance="strong",
     )
-    second_step = _add_memory_node(
+    unrelated_task_node = _add_memory_node(
         db,
         time_key=MemoryNodeManager._memory_time_key(1),
-        summary="用户接着运行 memory_node_manager 测试验证 task 生成逻辑。",
-        keywords=["test-step"],
+        summary="Bob also discussed alert routing implementation today.",
+        keywords=["alert-routing"],
         fact_kind="action",
+        task_event_like=True,
+        task_event_subject="user",
+        task_relevance="strong",
     )
-    db.entity_link_node(first_step, prompt_entity)
-    db.entity_link_node(second_step, test_entity)
+    db.entity_link_node(new_matching_node, alice)
+    db.entity_link_node(unrelated_task_node, bob)
     mgr = _NoAsyncMemoryNodeManager(
         db,
         embedding_config={},
         llm_outputs=[
             json.dumps({
-                "category": "task",
-                "summary": "用户正在完善 task observation 的生成和验证流程。",
-                "keywords": ["task-observation", "prompt", "test"],
-                "confidence": 0.86,
-                "metadata": {
-                    "task_status": "active",
-                    "task_source": "inferred_from_observation",
-                    "goal": "让 task observation 能捕捉跨 entity/topic 的连续步骤。",
-                    "steps": [
-                        {"title": "修改 task status prompt", "status": "done"},
-                        {"title": "运行 memory_node_manager 测试", "status": "done"},
-                    ],
-                },
-            })
+                "category": "observation",
+                "summary": "Alice has continued refining alert routing over time.",
+                "keywords": ["alert-routing", "Slack"],
+                "confidence": 0.88,
+                "metadata": {"observation_kind": "timeline"},
+            }),
+            json.dumps({"should_create": False}),
         ],
     )
     mgr._embedding_client = _OrthogonalTaskEmbeddingClient()
 
     report = mgr.reflect(dry_run=False, limit=10)
 
-    assert report["observation_reflect"]["task_episodes"] == 1
-    assert report["observation_reflect"]["task_episode_node_count"] == 2
-    assert db._conn.execute("SELECT COUNT(*) FROM memory_observations").fetchone()[0] == 1
-    observation = db._conn.execute(
-        "SELECT id, entity_id, topic_key, observation_type, summary, metadata FROM memory_observations"
+    assert report["observation_reflect"]["entity_topic_updates"] == 1
+    assert report["observation_reflect"]["entity_topic_node_count"] == 1
+    assert db.memory_observation_source_ids(observation_id) == [old_node, new_matching_node]
+    assert unrelated_task_node not in db.memory_observed_source_node_ids([unrelated_task_node])
+    row = db._conn.execute(
+        "SELECT summary FROM memory_observations WHERE id = ?",
+        (observation_id,),
     ).fetchone()
-    assert observation["entity_id"] == prompt_entity
-    assert observation["topic_key"] == "task-observation-prompt-test"
-    assert observation["observation_type"] == "task"
-    assert "task observation" in observation["summary"]
-    assert set(db.memory_observation_source_ids(observation["id"])) == {first_step, second_step}
-    metadata = json.loads(observation["metadata"])
-    assert metadata["task_episode"]["node_ids"] == [first_step, second_step]
-    assert metadata["steps"][0]["title"] == "修改 task status prompt"
-
-
-def test_reflect_respects_structured_task_event_like_false_over_keyword_fallback(db):
-    prompt_entity = db.entity_add_entity("Observation Prompt", "CONCEPT")
-    test_entity = db.entity_add_entity("Memory Tests", "CONCEPT")
-    first_step = _add_memory_node(
-        db,
-        time_key=MemoryNodeManager._memory_time_key(0),
-        summary="用户喜欢讨论如何修改 observation prompt 的历史背景。",
-        keywords=["修改", "prompt"],
-        task_event_like=False,
-        task_event_subject="user",
-        task_relevance="none",
-    )
-    second_step = _add_memory_node(
-        db,
-        time_key=MemoryNodeManager._memory_time_key(1),
-        summary="用户喜欢讨论如何测试 memory_node_manager 的历史背景。",
-        keywords=["测试", "memory"],
-        task_event_like=False,
-        task_event_subject="user",
-        task_relevance="none",
-    )
-    db.entity_link_node(first_step, prompt_entity)
-    db.entity_link_node(second_step, test_entity)
-    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
-    mgr._embedding_client = _OrthogonalTaskEmbeddingClient()
-
-    report = mgr.reflect(dry_run=False, limit=10)
-
-    assert report["observation_reflect"]["task_episodes"] == 0
-    assert db._conn.execute("SELECT COUNT(*) FROM memory_observations").fetchone()[0] == 0
-    assert mgr.llm_prompts == []
-
-
-def test_reflect_excludes_non_task_fact_kinds_from_task_episodes(db):
-    prompt_entity = db.entity_add_entity("Observation Prompt", "CONCEPT")
-    test_entity = db.entity_add_entity("Memory Tests", "CONCEPT")
-    first_step = _add_memory_node(
-        db,
-        time_key=MemoryNodeManager._memory_time_key(0),
-        summary="用户要求记录自己喜欢修改 observation prompt 的讨论方式。",
-        keywords=["修改", "prompt"],
-        fact_kind="preference",
-        task_event_like=True,
-        task_event_subject="user",
-        task_relevance="strong",
-    )
-    second_step = _add_memory_node(
-        db,
-        time_key=MemoryNodeManager._memory_time_key(1),
-        summary="用户要求 AI 以后测试 memory_node_manager 前先说明计划。",
-        keywords=["测试", "memory"],
-        fact_kind="instruction",
-        task_event_like=True,
-        task_event_subject="user",
-        task_relevance="strong",
-    )
-    db.entity_link_node(first_step, prompt_entity)
-    db.entity_link_node(second_step, test_entity)
-    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
-    mgr._embedding_client = _OrthogonalTaskEmbeddingClient()
-
-    report = mgr.reflect(dry_run=False, limit=10)
-
-    assert report["observation_reflect"]["task_episodes"] == 0
-    assert db._conn.execute("SELECT COUNT(*) FROM memory_observations").fetchone()[0] == 0
-    assert mgr.llm_prompts == []
-
-
+    assert row["summary"] == "Alice has continued refining alert routing over time."
 def test_task_metadata_normalizes_steps():
     metadata = MemoryNodeManager._normalize_task_metadata({
         "task_status": "stale",
@@ -1862,7 +2073,7 @@ def test_task_metadata_normalizes_steps():
     })
 
     assert metadata["task_status"] == "active"
-    assert metadata["task_source"] == "inferred_from_observation"
+    assert metadata["task_source"] == "inferred_from_interpretation"
     assert metadata["goal"] == "Ship memory task tracking."
     assert metadata["evidence"] == ["用户要求 task 存步骤"]
     assert metadata["steps"] == [
@@ -1887,20 +2098,18 @@ def test_task_metadata_normalizes_steps():
 
 
 def test_task_status_prompt_definitions_scope_stale_by_prompt_role():
-    assert "请只生成 insight，不要生成 task" in INSIGHT_CONSOLIDATION_PROMPT
-    assert "task_status" not in INSIGHT_CONSOLIDATION_PROMPT
-    assert "task_status 定义" in TASK_CONSOLIDATION_PROMPT
-    assert "task_status 定义" in OBSERVATION_UPDATE_PROMPT
-    assert "首次生成 task 时不要输出 stale" in TASK_CONSOLIDATION_PROMPT
-    assert "stale：" in OBSERVATION_UPDATE_PROMPT
-    assert "stale 表示输入 observation" in OBSERVATION_MERGE_PROMPT
-    assert "不要输出 stale" in TASK_CONSOLIDATION_PROMPT
-    assert '"category": "insight"' in INSIGHT_CONSOLIDATION_PROMPT
-    assert '"category": "task"' in TASK_CONSOLIDATION_PROMPT
-    assert '"task_status": "active | blocked | paused"' in TASK_CONSOLIDATION_PROMPT
-    assert '"task_status": "active | blocked | paused | stale"' in OBSERVATION_UPDATE_PROMPT
-    assert '"task_status": "active | blocked | paused | stale"' in OBSERVATION_MERGE_PROMPT
-    assert '"task_status": "active | blocked | paused | stale"' not in TASK_CONSOLIDATION_PROMPT
+    assert INSIGHT_CONSOLIDATION_PROMPT == OBSERVATION_CONSOLIDATION_PROMPT
+    assert TASK_CONSOLIDATION_PROMPT == OBSERVATION_CONSOLIDATION_PROMPT
+    for prompt in (OBSERVATION_CONSOLIDATION_PROMPT, OBSERVATION_UPDATE_PROMPT, OBSERVATION_MERGE_PROMPT):
+        assert '"category": "observation"' in prompt
+        assert "task_status、goal、steps、next_action、insight_type" in prompt
+        assert '"task_status": "active | blocked | paused | stale"' not in prompt
+        assert '"category": "task"' not in prompt
+        assert '"category": "insight"' not in prompt
+
+    assert "interpretation_type 只能是 insight、task" in INTERPRETATION_GENERATION_PROMPT
+    assert "task_status 只能是 active、blocked、paused、stale" in INTERPRETATION_GENERATION_PROMPT
+    assert "task_source 固定为 inferred_from_interpretation" in INTERPRETATION_GENERATION_PROMPT
 
 
 def test_observation_prompts_explain_fact_type_and_kind_labels():
@@ -1918,6 +2127,17 @@ def test_observation_prompts_explain_fact_type_and_kind_labels():
         OBSERVATION_MERGE_PROMPT,
     ):
         assert OBSERVATION_SOURCE_FACT_GUIDANCE in prompt
+
+
+def test_interpretation_generation_prompt_defines_interpretation_contract():
+    assert "三层记忆架构" in INTERPRETATION_GENERATION_PROMPT
+    assert "current best interpretation" in INTERPRETATION_GENERATION_PROMPT
+    assert "不是用户原话" in INTERPRETATION_GENERATION_PROMPT
+    assert "should_create=false" in INTERPRETATION_GENERATION_PROMPT
+    assert "action_implication" in INTERPRETATION_GENERATION_PROMPT
+    assert "evidence_node_ids" in INTERPRETATION_GENERATION_PROMPT
+    assert "interpretation_type 只能是 insight、task" in INTERPRETATION_GENERATION_PROMPT
+    assert "conflict_resolution" in INTERPRETATION_GENERATION_PROMPT
 
 
 def test_reflect_error_log_message_is_json(caplog):
@@ -2020,18 +2240,19 @@ def test_observation_consolidation_waits_for_incremental_sources(db):
         embedding_config={},
         llm_outputs=[
             json.dumps({
-                "category": "insight",
+                "category": "observation",
                 "summary": "Alice's urgent alert workflow is Slack-centered.",
                 "keywords": ["Slack", "alerts"],
                 "confidence": 0.86,
-                "metadata": {"insight_type": "workflow"},
+                "metadata": {"observation_kind": "context"},
             }),
+            json.dumps({"should_create": False}),
             json.dumps({
-                "category": "insight",
+                "category": "observation",
                 "summary": "Alice continues to prefer Slack for urgent alert routing.",
                 "keywords": ["Slack", "alerts"],
                 "confidence": 0.9,
-                "metadata": {"insight_type": "workflow"},
+                "metadata": {"observation_kind": "context"},
             }),
         ],
     )
@@ -2063,7 +2284,7 @@ def test_observation_consolidation_waits_for_incremental_sources(db):
     add_source(5)
     updated_summary = db._conn.execute("SELECT summary FROM memory_observations").fetchone()["summary"]
     assert updated_summary == "Alice continues to prefer Slack for urgent alert routing."
-    update_prompt = mgr.llm_prompts[-1]
+    update_prompt = next(prompt for prompt in reversed(mgr.llm_prompts) if "已有 observation" in prompt)
     assert "已有 observation" in update_prompt
     assert "Alice's urgent alert workflow is Slack-centered." in update_prompt
     assert "Alice Slack alert fact 4." in update_prompt
