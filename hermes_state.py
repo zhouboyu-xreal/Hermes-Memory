@@ -196,6 +196,7 @@ CREATE TABLE IF NOT EXISTS memory_nodes (
     task_event_like INTEGER,
     task_event_subject TEXT,
     task_relevance TEXT,
+    entity_names TEXT NOT NULL DEFAULT '[]',
     original_dialog TEXT,
     decay_score REAL DEFAULT 1.0,
     decay_updated_at TEXT,
@@ -855,6 +856,7 @@ class SessionDB:
             "task_event_like": "INTEGER",
             "task_event_subject": "TEXT",
             "task_relevance": "TEXT",
+            "entity_names": "TEXT NOT NULL DEFAULT '[]'",
             "decay_score": "REAL DEFAULT 1.0",
             "decay_updated_at": "TEXT",
             "decay_half_life_days": "REAL",
@@ -2485,7 +2487,7 @@ class SessionDB:
             """SELECT id, time_key, summary, keywords, topic, original_dialog,
                       tags, fact_type, fact_subject, fact_kind, decay_score, decay_updated_at,
                       decay_half_life_days, task_event_like, task_event_subject,
-                      task_relevance
+                      task_relevance, entity_names
                FROM memory_nodes
                WHERE id = ?""",
             (node_id,),
@@ -2526,6 +2528,7 @@ class SessionDB:
             "task_event_like": None if r[13] is None else bool(r[13]),
             "task_event_subject": r[14] or "",
             "task_relevance": r[15] or "",
+            "entity_names": json.loads(r[16] or "[]"),
             "node_relations": node_relations,
         }
 
@@ -3208,6 +3211,7 @@ class SessionDB:
         task_event_like: Optional[bool] = None,
         task_event_subject: str = "",
         task_relevance: str = "",
+        entity_names: Optional[List[str]] = None,
     ) -> int:
         """Insert a new memory node (SQLite + FAISS). Returns the node ID.
 
@@ -3219,6 +3223,7 @@ class SessionDB:
             keywords_str = " ".join(keywords) if isinstance(keywords, list) else keywords
             topic_str = " ".join(topic) if isinstance(topic, list) else topic
             tags_str = json.dumps(tags or [], ensure_ascii=False)
+            entity_names_str = json.dumps(entity_names or [], ensure_ascii=False)
             normalized_fact_type = self._normalize_memory_fact_type(
                 fact_type or self._memory_fact_type_from_tags(tags or [])
             )
@@ -3241,8 +3246,8 @@ class SessionDB:
             cursor = conn.execute(
                 """INSERT INTO memory_nodes
                    (time_key, summary, keywords, topic, tags, fact_type, fact_subject, fact_kind,
-                    task_event_like, task_event_subject, task_relevance, original_dialog)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    task_event_like, task_event_subject, task_relevance, entity_names, original_dialog)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     time_key,
                     summary,
@@ -3255,6 +3260,7 @@ class SessionDB:
                     task_event_like_value,
                     task_event_subject_value,
                     task_relevance_value,
+                    entity_names_str,
                     original_dialog,
                 ),
             )

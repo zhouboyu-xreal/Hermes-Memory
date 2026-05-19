@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
 import pytest
 
@@ -133,7 +133,7 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert mgr.store_turn("Alice hates email for urgent alerts", "Use Slack alerts.") is True
 
     rows = db._conn.execute(
-        "SELECT id, summary, keywords, topic, tags, fact_type, fact_subject, fact_kind, "
+        "SELECT id, summary, keywords, topic, tags, fact_type, fact_subject, fact_kind, entity_names, "
         "task_event_like, task_event_subject, task_relevance "
         "FROM memory_nodes ORDER BY id"
     ).fetchall()
@@ -148,6 +148,8 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert rows[1]["fact_type"] == "episodic"
     assert rows[1]["fact_subject"] == "assistant"
     assert rows[1]["fact_kind"] == "recommendation"
+    assert json.loads(rows[0]["entity_names"]) == ["用户", "Alice", "Slack"]
+    assert json.loads(rows[1]["entity_names"]) == ["助手", "Alice", "Slack"]
     assert "fact_type:semantic" in json.loads(rows[0]["tags"])
     assert "fact_subject:user" in json.loads(rows[0]["tags"])
     assert "fact_type:episodic" in json.loads(rows[1]["tags"])
@@ -221,6 +223,7 @@ def test_memory_node_details_live_on_memory_nodes_table(db):
     assert "fact_type" in columns
     assert "fact_subject" in columns
     assert "fact_kind" in columns
+    assert "entity_names" in columns
 
 
 def test_memory_interpretations_store_current_agent_interpretations(db):
@@ -364,6 +367,11 @@ def test_retain_and_relation_prompts_share_relation_type_contract():
     assert "用户要求 AI 以后回答/执行任务时" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "可能影响任务状态或步骤的事件" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "不要求已经知道具体属于哪个任务" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "实体不是只限传统 NER" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "健康管理" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "商务活动" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "经济负担" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "每条长期记忆 fact 通常至少包含主体实体" in RETAIN_FACT_EXTRACTION_PROMPT
 
 
 def test_retain_fact_prompt_includes_turn_timestamp_context(db):
@@ -392,6 +400,77 @@ def test_retain_fact_prompt_includes_turn_timestamp_context(db):
     assert "对话发生时间：" in mgr.llm_prompts[0]
     assert "用户：跑测试" in mgr.llm_prompts[0]
     assert "助手：测试通过。" in mgr.llm_prompts[0]
+
+
+def test_store_turn_uses_explicit_turn_timestamp_for_prompt_and_node_time(db):
+    retain_payload = {
+        "facts": [
+            {
+                "text": "助手在指定样本时间完成测试验证。",
+                "keywords": ["测试", "验证"],
+                "topic": ["测试"],
+                "fact_type": "episodic",
+                "fact_kind": "action",
+                "priority": 70,
+                "time_confidence": "inferred_from_turn",
+                "entities": [],
+            }
+        ],
+        "causal_relations": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps(retain_payload)],
+    )
+    turn_timestamp = datetime(2026, 5, 19, 12, 30, 0, tzinfo=timezone.utc)
+
+    assert mgr.store_turn("跑测试", "测试通过。", turn_timestamp=turn_timestamp) is True
+    assert "对话发生时间：2026-05-19T12:30:00+00:00" in mgr.llm_prompts[0]
+    row = db._conn.execute("SELECT time_key FROM memory_nodes").fetchone()
+    assert row["time_key"].startswith("2026-05-19 12:30:00.000000+00:00#")
+
+
+def test_store_turn_adds_subject_entity_names_when_llm_omits_entities(db):
+    retain_payload = {
+        "facts": [
+            {
+                "text": "用户明确偏好先给结论。",
+                "keywords": ["结论", "偏好"],
+                "topic": ["回答方式"],
+                "fact_type": "semantic",
+                "fact_subject": "user",
+                "fact_kind": "preference",
+                "priority": 80,
+                "entities": [],
+            },
+            {
+                "text": "助手建议先总结再展开。",
+                "keywords": ["总结", "建议"],
+                "topic": ["回答方式"],
+                "fact_type": "episodic",
+                "fact_subject": "assistant",
+                "fact_kind": "recommendation",
+                "priority": 65,
+                "entities": [],
+            },
+        ],
+        "causal_relations": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps(retain_payload)],
+    )
+
+    assert mgr.store_turn("以后先给结论", "可以，我会先总结。") is True
+    rows = db._conn.execute(
+        "SELECT entity_names, original_dialog FROM memory_nodes ORDER BY id"
+    ).fetchall()
+    assert json.loads(rows[0]["entity_names"]) == ["用户"]
+    assert json.loads(rows[1]["entity_names"]) == ["助手"]
+    assert json.loads(rows[0]["original_dialog"])["retain_fact"]["entities"][0]["name"] == "用户"
+    assert json.loads(rows[1]["original_dialog"])["retain_fact"]["entities"][0]["name"] == "助手"
 
 
 def test_store_turn_discards_low_priority_retain_facts(db):
@@ -1574,6 +1653,8 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
     report = mgr.reflect(dry_run=False, limit=10)
     assert report["observation_reflect"]["candidate_count"] == 3
     assert report["observations_consolidated"] == 1
+    assert report["observation_reflect"]["fact_clusters_consolidated"] == 1
+    assert report["observation_reflect"]["fact_cluster_node_count"] == 3
 
     observation = db._conn.execute(
         "SELECT mo.summary, mo.topic_key, mo.observation_type, mo.metadata, en.name AS entity_name "
@@ -1872,7 +1953,10 @@ def test_store_turn_can_consolidate_task_observation(db):
     metadata = json.loads(observation["metadata"])
     assert observation["observation_type"] == "observation"
     assert "正在迭代 Hermes Agent" in observation["summary"]
-    assert metadata["observation_kind"] == "timeline"
+    assert metadata["observation_kind"] == "event_cluster"
+    assert metadata["evidence_shape"] == "progression"
+    assert metadata["temporal_scope"] == "recent"
+    assert metadata["candidate_interpretation_types"] == ["insight", "task"]
     interpretation = db._conn.execute(
         "SELECT interpretation_type, claim, metadata FROM memory_interpretations"
     ).fetchone()
@@ -1934,7 +2018,9 @@ def test_reflect_updates_observation_by_entity_and_topic(db):
     report = mgr.reflect(dry_run=False, limit=10)
 
     assert report["observation_reflect"].get("task_matched", 0) == 0
-    assert report["observation_reflect"]["entity_topic_updates"] == 1
+    assert report["observation_reflect"]["fact_observation_matches"] == 1
+    assert report["observation_reflect"]["fact_observation_node_count"] == 1
+    assert report["observation_reflect"]["entity_topic_updates"] == 0
     assert report["observation_reflect"]["entity_topic_node_count"] == 1
     assert db.memory_observation_source_ids(observation_id) == [source_node, new_node]
     row = db._conn.execute(
@@ -1999,8 +2085,10 @@ def test_reflect_excludes_non_task_fact_kind_from_existing_task_match(db):
     report = mgr.reflect(dry_run=False, limit=10)
 
     assert report["observation_reflect"].get("task_matched", 0) == 0
-    assert db.memory_observation_source_ids(observation_id) == [source_node, new_node]
-    assert mgr.llm_prompts
+    assert report["observation_reflect"]["fact_observation_matches"] == 0
+    assert report["observation_reflect"]["fact_clusters_consolidated"] == 0
+    assert db.memory_observation_source_ids(observation_id) == [source_node]
+    assert mgr.llm_prompts == []
 
 
 def test_reflect_no_longer_matches_observation_by_high_task_embedding_similarity(db):
@@ -2204,7 +2292,9 @@ def test_reflect_updates_existing_observation_by_entity_topic(db):
 
     report = mgr.reflect(dry_run=False, limit=10)
 
-    assert report["observation_reflect"]["entity_topic_updates"] == 1
+    assert report["observation_reflect"]["fact_observation_matches"] == 1
+    assert report["observation_reflect"]["fact_observation_node_count"] == 1
+    assert report["observation_reflect"]["entity_topic_updates"] == 0
     assert report["observation_reflect"]["entity_topic_node_count"] == 1
     assert db.memory_observation_source_ids(observation_id) == [old_node, new_matching_node]
     assert unrelated_task_node not in db.memory_observed_source_node_ids([unrelated_task_node])
@@ -2288,6 +2378,10 @@ def test_observation_prompts_explain_fact_type_and_kind_labels():
         OBSERVATION_MERGE_PROMPT,
     ):
         assert OBSERVATION_SOURCE_FACT_GUIDANCE in prompt
+        assert "candidate_interpretation_types" in prompt
+        assert "evidence_shape" in prompt
+        assert "temporal_scope" in prompt
+        assert "preference_signal" in prompt
 
 
 def test_interpretation_generation_prompt_defines_interpretation_contract():

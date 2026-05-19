@@ -12,7 +12,9 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -31,6 +33,7 @@ from hermes_state import EMBEDDING_DIM, SessionDB
 
 DEFAULT_INPUT = Path("/Users/zhouboyu/Downloads/history_dialogue.json")
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "tmp" / "memory_store_fact_test"
+SAMPLE_ID_RE = re.compile(r"(?:^|_)sample(\d+)$")
 
 
 class StableEmbeddingClient:
@@ -90,32 +93,88 @@ class StoreFactExtractionManager(MemoryNodeManager):
         return None
 
 
-def flatten_dialogue(path: Path) -> List[Tuple[str, int, str, str]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+def strip_jsonc(text: str) -> str:
+    """Remove JSONC comments and trailing commas without touching strings."""
+    output: List[str] = []
+    in_string = False
+    escape = False
+    idx = 0
+    while idx < len(text):
+        char = text[idx]
+        next_char = text[idx + 1] if idx + 1 < len(text) else ""
+        if in_string:
+            output.append(char)
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            idx += 1
+            continue
+        if char == '"':
+            in_string = True
+            output.append(char)
+            idx += 1
+            continue
+        if char == "/" and next_char == "/":
+            idx += 2
+            while idx < len(text) and text[idx] not in "\r\n":
+                idx += 1
+            continue
+        if char == "/" and next_char == "*":
+            idx += 2
+            while idx + 1 < len(text) and not (text[idx] == "*" and text[idx + 1] == "/"):
+                idx += 1
+            idx += 2
+            continue
+        output.append(char)
+        idx += 1
+    return re.sub(r",\s*([}\]])", r"\1", "".join(output))
+
+
+def sample_hour_offset(sample_id: str, fallback_offset: int) -> int:
+    match = SAMPLE_ID_RE.search(sample_id)
+    if match:
+        return int(match.group(1))
+    return fallback_offset
+
+
+def flatten_dialogue(path: Path) -> List[Tuple[str, int, str, str, int]]:
+    data = json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
     dialogue = data.get("dialogue") if isinstance(data, dict) else data
     if not isinstance(dialogue, list):
         raise ValueError("Expected JSON to contain a top-level dialogue list")
 
-    turns: List[Tuple[str, int, str, str]] = []
+    turns: List[Tuple[str, int, str, str, int]] = []
+    fallback_sample_offsets: Dict[str, int] = {}
     for group in dialogue:
         if not isinstance(group, dict):
             continue
         for sample_id, sample_turns in group.items():
             if not isinstance(sample_turns, list):
                 continue
+            sample_key = str(sample_id)
+            if sample_key not in fallback_sample_offsets:
+                fallback_sample_offsets[sample_key] = len(fallback_sample_offsets)
+            hour_offset = sample_hour_offset(sample_key, fallback_sample_offsets[sample_key])
             for turn_index, turn in enumerate(sample_turns):
                 if not isinstance(turn, dict):
                     continue
                 user = str(turn.get("user") or "").strip()
                 assistant = str(turn.get("assistant") or "").strip()
+                if turn_index == (len(sample_turns) - 1):
+                    is_last_turn = True
+                else:
+                    is_last_turn = False 
                 if user and assistant:
-                    turns.append((str(sample_id), turn_index, user, assistant))
+                    turns.append((sample_key, turn_index, user, assistant, hour_offset, is_last_turn))
     return turns
 
 
 def iter_stored_nodes(db: SessionDB, start_id: int) -> Iterable[Dict[str, Any]]:
     rows = db._conn.execute(
-        """SELECT id, summary, keywords, topic, tags, fact_type, fact_kind,
+        """SELECT id, time_key, summary, keywords, topic, tags, fact_type, fact_kind, entity_names,
                   task_event_like, task_event_subject, task_relevance, original_dialog
              FROM memory_nodes
             WHERE id > ?
@@ -126,6 +185,10 @@ def iter_stored_nodes(db: SessionDB, start_id: int) -> Iterable[Dict[str, Any]]:
         item = dict(row)
         try:
             item["tags"] = json.loads(item.get("tags") or "[]")
+        except json.JSONDecodeError:
+            pass
+        try:
+            item["entity_names"] = json.loads(item.get("entity_names") or "[]")
         except json.JSONDecodeError:
             pass
         try:
@@ -157,6 +220,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-base-url")
     parser.add_argument("--llm-api-key")
     parser.add_argument("--llm-timeout", type=int)
+    parser.add_argument(
+        "--enable-reflect",
+        action="store_true",
+        help='Enable reflect',
+    )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--manager-log-level", default="CRITICAL")
     return parser.parse_args()
@@ -254,23 +322,35 @@ def main() -> int:
 
     stored_turns = 0
     stored_facts = 0
+    reflect_runs = 0
+    base_turn_timestamp = datetime.now().astimezone()
     try:
         with report_path.open("w", encoding="utf-8") as report:
-            for flat_index, (sample_id, turn_index, user, assistant) in enumerate(turns, start=args.start):
+            for local_index, (sample_id, turn_index, user, assistant, hour_offset, is_last_turn) in enumerate(turns):
+                flat_index = args.start + local_index
+                # Keep sample-level spacing at one hour for reflect tests, while
+                # giving each turn a unique timestamp so memory_nodes.time_key
+                # does not collide on "#00" across turns in the same sample.
+                turn_timestamp = base_turn_timestamp + timedelta(hours=hour_offset, seconds=turn_index)
                 before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_nodes").fetchone()["max_id"]
                 ok = manager.store_turn(
                     user,
                     assistant,
                     tags=["store_fact_test", f"sample:{sample_id}", f"turn:{turn_index}"],
+                    turn_timestamp=turn_timestamp,
                 )
                 nodes = list(iter_stored_nodes(db, before_id))
                 if ok:
                     stored_turns += 1
                     stored_facts += len(nodes)
                 row = {
+                    "event": "store_turn",
                     "flat_index": flat_index,
                     "sample_id": sample_id,
                     "turn_index": turn_index,
+                    "sample_hour_offset": hour_offset,
+                    "turn_second_offset": turn_index,
+                    "turn_timestamp": turn_timestamp.isoformat(),
                     "stored": bool(ok),
                     "fact_count": len(nodes),
                     "user": user,
@@ -288,6 +368,28 @@ def main() -> int:
                     ok,
                     len(nodes),
                 )
+                
+                if args.enable_reflect and is_last_turn:
+                    logging.info(
+                        "Running reflect after sample %s",
+                        sample_id,
+                    )
+                    reflect_report = manager.reflect(dry_run=False)
+                    reflect_runs += 1
+                    reflect_row = {
+                        "event": "reflect",
+                        "after_sample_id": sample_id,
+                        "after_flat_index": flat_index,
+                        "report": reflect_report,
+                    }
+                    report.write(json.dumps(reflect_row, ensure_ascii=False, default=str) + "\n")
+                    report.flush()
+                    logging.info(
+                        "Reflect after %s consolidated=%s interpretations=%s",
+                        sample_id,
+                        reflect_report.get("observations_consolidated"),
+                        reflect_report.get("interpretations_generated"),
+                    )
     finally:
         db.close()
 
@@ -298,6 +400,7 @@ def main() -> int:
         "turns_processed": len(turns),
         "turns_with_facts": stored_turns,
         "facts_stored": stored_facts,
+        "reflect_runs": reflect_runs,
         "llm_model": args.llm_model,
         "llm_base_url": args.llm_base_url,
     }

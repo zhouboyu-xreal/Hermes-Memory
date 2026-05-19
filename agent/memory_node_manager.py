@@ -158,6 +158,7 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请�
 7. keywords 是用于检索这条 fact 的关键词，保留关键实体、产品、技术、动作和约束
 8. topic 是这条 fact 归属的主题词列表，用于后续 observation 分桶；不要把 entity name 本身当作唯一 topic
 9. fact_subject 只能是 user、assistant、world、project、system、other；表示这条记忆主要关于谁/什么主体
+   - 如果 fact_subject 是 user 或 assistant，可以把 "用户" 或 "助手" 作为 OTHER entity 输出，便于后续按对话主体聚合
 10. fact_kind 只能是 preference、decision、request、recommendation、action、error、context、instruction、other
    - instruction 只用于用户明确要求 AI 长期遵守的行为规则、格式偏好、语气偏好或工作方式
    - 临时任务要求、当前轮的一次性请求不要标为 instruction
@@ -200,7 +201,6 @@ fact_kind 冲突和主体规则：
 - 助手提出具体方案，通常是 recommendation；助手解释概念但没有可复用建议，不要抽取，若必须抽取最多为 context/other。
 
 硬丢弃规则：
-- 不要抽取普通一次性问答，除非包含用户偏好、明确决策、失败经验、约束或任务进展
 - 不要抽取助手泛泛解释概念、复述用户问题、客套话
 - 不要抽取没有未来复用价值的对话流水账
 - 不要抽取纯主观情绪，除非它改变了用户偏好、决策或任务状态
@@ -334,7 +334,7 @@ fact_kind 类别说明：
 使用这些标签时：
 - fact_type 决定记忆性质：semantic 偏稳定知识，episodic 偏具体事件。
 - fact_subject 决定主体来源：user/assistant/world/project/system/other。
-- fact_kind 只作为理解来源事实的线索，不要直接复制成输出 metadata；输出仍必须遵守本 prompt 的 JSON schema。
+- fact_kind 只作为理解来源事实的线索；可以据此推断 observation metadata，但不要把 fact_kind 原样复制成 observation_kind。
 - 生成 observation 时只描述发生过什么、出现过什么模式、经历过什么变化。
 - insight、task、偏好、策略、风险和当前状态判断由 interpretation 层生成。"""
 
@@ -356,12 +356,15 @@ source facts:
 """ + OBSERVATION_SOURCE_FACT_GUIDANCE + """
 
 要求：
-- 只描述这些事实共同说明"发生过什么"，不要输出 task 或 insight 分类。
-- 可以总结时间线、事件簇、状态变化、结果、冲突、成功/失败经验或反复出现的现象。
+- 只描述这些事实共同说明"发生过什么"。
+- 可以总结时间线、事件簇、状态变化、结果、冲突、成功/失败经验、约束信号或反复出现的现象。
 - 如果事实中出现前后变化或冲突，用"曾经/后来/当前事实显示/存在不一致"描述脉络，不要裁决最终应该相信什么。
 - 不要生成 task_status、goal、steps、next_action、insight_type；这些属于 interpretation 层。
-- observation_kind 只能是 timeline、event_pattern、state_change、outcome、conflict、context。
-- metadata 中只填写 observation_kind、has_conflict、source_note。
+- observation_kind 只能是 pattern、event_cluster、state_change、outcome、conflict、context、preference_signal、task_signal、constraint、goal_signal、emotion_signal、relationship_signal。
+- evidence_shape 只能是 single_event、repeated_pattern、contrast、progression、correction、confirmation。
+- temporal_scope 只能是 momentary、recent、ongoing、historical、recurring。
+- candidate_interpretation_types 只能包含 insight、task、preference。
+- metadata 中只填写 observation_kind、evidence_shape、temporal_scope、candidate_interpretation_types、has_conflict、source_note。
 
 只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
@@ -370,7 +373,10 @@ source facts:
   "keywords": ["关键词1", "关键词2"],
   "confidence": 0.0,
   "metadata": {{
-    "observation_kind": "timeline | event_pattern | state_change | outcome | conflict | context",
+    "observation_kind": "pattern | event_cluster | state_change | outcome | conflict | context | preference_signal | task_signal | constraint | goal_signal | emotion_signal | relationship_signal",
+    "evidence_shape": "single_event | repeated_pattern | contrast | progression | correction | confirmation",
+    "temporal_scope": "momentary | recent | ongoing | historical | recurring",
+    "candidate_interpretation_types": ["insight"],
     "has_conflict": false,
     "source_note": "可选，简短说明该 observation 的证据性质"
   }}
@@ -419,7 +425,10 @@ topic: {topic_label}
 - 如果相关既有 observation 与已有 observation 只是同义重复，请合并为更高阶、更简洁的一条，不要简单拼接原文。
 - 不要生成 task_status、goal、steps、next_action、insight_type。
 - 不要裁决 "现在应该怎么做"；当前解释由 interpretation 层生成。
-- observation_kind 只能是 timeline、event_pattern、state_change、outcome、conflict、context。
+- observation_kind 只能是 pattern、event_cluster、state_change、outcome、conflict、context、preference_signal、task_signal、constraint、goal_signal、emotion_signal、relationship_signal。
+- evidence_shape 只能是 single_event、repeated_pattern、contrast、progression、correction、confirmation。
+- temporal_scope 只能是 momentary、recent、ongoing、historical、recurring。
+- candidate_interpretation_types 只能包含 insight、task、preference。
 
 只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
@@ -428,7 +437,10 @@ topic: {topic_label}
   "keywords": ["关键词1", "关键词2"],
   "confidence": 0.0,
   "metadata": {{
-    "observation_kind": "timeline | event_pattern | state_change | outcome | conflict | context",
+    "observation_kind": "pattern | event_cluster | state_change | outcome | conflict | context | preference_signal | task_signal | constraint | goal_signal | emotion_signal | relationship_signal",
+    "evidence_shape": "single_event | repeated_pattern | contrast | progression | correction | confirmation",
+    "temporal_scope": "momentary | recent | ongoing | historical | recurring",
+    "candidate_interpretation_types": ["insight"],
     "has_conflict": false,
     "source_note": "可选，简短说明该 observation 的证据性质"
   }}
@@ -790,6 +802,28 @@ class MemoryNodeManager:
             entities.append({"name": name, "type": etype})
         return entities
 
+    @staticmethod
+    def _subject_entity_name(fact_subject: Any) -> str:
+        subject = MemoryNodeManager._normalize_fact_subject(fact_subject)
+        if subject == "user":
+            return "用户"
+        if subject == "assistant":
+            return "助手"
+        return ""
+
+    @classmethod
+    def _fact_entities_with_subject(
+        cls,
+        entities: List[Dict[str, str]],
+        fact_subject: Any,
+    ) -> List[Dict[str, str]]:
+        subject_name = cls._subject_entity_name(fact_subject)
+        if not subject_name:
+            return entities
+        if any(str(entity.get("name") or "").strip() == subject_name for entity in entities):
+            return entities
+        return [{"name": subject_name, "type": "OTHER"}, *entities]
+
     def _fallback_fact_from_summary(
         self,
         summary_data: Dict[str, Any],
@@ -857,6 +891,7 @@ class MemoryNodeManager:
         self,
         user_message: str,
         assistant_response: str,
+        turn_timestamp: Optional[Any] = None,
     ) -> Optional[Dict[str, Any]]:
         """Extract HindSight-style narrative facts for retain.
 
@@ -864,9 +899,14 @@ class MemoryNodeManager:
         model fails or returns malformed JSON, we fall back to the older single
         summary so memory retention remains best-effort instead of all-or-none.
         """
-        turn_timestamp = datetime.now().astimezone().isoformat()
+        if turn_timestamp is None:
+            turn_timestamp_text = datetime.now().astimezone().isoformat()
+        elif isinstance(turn_timestamp, datetime):
+            turn_timestamp_text = turn_timestamp.astimezone().isoformat()
+        else:
+            turn_timestamp_text = str(turn_timestamp)
         prompt = RETAIN_FACT_EXTRACTION_PROMPT.format(
-            turn_timestamp=turn_timestamp,
+            turn_timestamp=turn_timestamp_text,
             user_message=user_message,
             assistant_response=assistant_response,
         )
@@ -897,7 +937,11 @@ class MemoryNodeManager:
                 if priority < 60:
                     skipped_low_priority = True
                     continue
-                entities = self._normalize_fact_entities(raw_fact.get("entities", []))
+                fact_subject = self._normalize_fact_subject(raw_fact.get("fact_subject", "other"))
+                entities = self._fact_entities_with_subject(
+                    self._normalize_fact_entities(raw_fact.get("entities", [])),
+                    fact_subject,
+                )
                 keywords = self._normalize_keywords(raw_fact.get("keywords", []))
                 topic = self._normalize_keywords(raw_fact.get("topic", []))
                 if not keywords:
@@ -938,7 +982,7 @@ class MemoryNodeManager:
                     "keywords": keywords,
                     "topic": topic,
                     "fact_type": self._normalize_fact_type(raw_fact.get("fact_type", "semantic")),
-                    "fact_subject": self._normalize_fact_subject(raw_fact.get("fact_subject", "other")),
+                    "fact_subject": fact_subject,
                     "fact_kind": self._normalize_fact_kind(raw_fact.get("fact_kind", "other")),
                     "priority": priority,
                     "priority_reason": str(raw_fact.get("priority_reason", "") or "").strip(),
@@ -1079,9 +1123,17 @@ class MemoryNodeManager:
             return None
 
     @staticmethod
-    def _memory_time_key(fact_index: int = 0) -> str:
+    def _memory_time_key(fact_index: int = 0, turn_timestamp: Optional[Any] = None) -> str:
         """Return a lexicographically sortable, unique-ish local timestamp key."""
-        now = datetime.now().astimezone()
+        if turn_timestamp is None:
+            now = datetime.now().astimezone()
+        elif isinstance(turn_timestamp, datetime):
+            now = turn_timestamp.astimezone()
+        else:
+            try:
+                now = datetime.fromisoformat(str(turn_timestamp).replace("Z", "+00:00")).astimezone()
+            except ValueError:
+                now = datetime.now().astimezone()
         base = now.strftime("%Y-%m-%d %H:%M:%S.%f")
         offset = now.strftime("%z")
         if len(offset) == 5:
@@ -1486,6 +1538,127 @@ class MemoryNodeManager:
         return fact_kind in {"preference", "instruction", "context", "other"}
 
     @staticmethod
+    def _node_id(value: Dict[str, Any]) -> Optional[int]:
+        raw = value.get("node_id", value.get("id"))
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _metadata_candidate_types(value: Any) -> List[str]:
+        if isinstance(value, str):
+            raw = re.split(r"[,/|\s]+", value)
+        elif isinstance(value, list):
+            raw = value
+        else:
+            raw = []
+        out: List[str] = []
+        for item in raw:
+            text = str(item or "").strip().lower().replace("-", "_").replace(" ", "_")
+            if text in {"insight", "task", "preference"} and text not in out:
+                out.append(text)
+        return out
+
+    @classmethod
+    def _normalize_observation_metadata(cls, metadata: Any, source_nodes: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        metadata = cls._json_dict(metadata)
+        source_nodes = source_nodes or []
+        kind_aliases = {
+            "timeline": "event_cluster",
+            "event_pattern": "pattern",
+        }
+        allowed_kinds = {
+            "pattern", "event_cluster", "state_change", "outcome", "conflict", "context",
+            "preference_signal", "task_signal", "constraint", "goal_signal",
+            "emotion_signal", "relationship_signal",
+        }
+        observation_kind = str(metadata.get("observation_kind") or "context").strip().lower()
+        observation_kind = kind_aliases.get(observation_kind, observation_kind)
+        if observation_kind not in allowed_kinds:
+            observation_kind = cls._infer_observation_kind_from_facts(source_nodes)
+
+        allowed_shapes = {
+            "single_event", "repeated_pattern", "contrast", "progression",
+            "correction", "confirmation",
+        }
+        evidence_shape = str(metadata.get("evidence_shape") or "").strip().lower()
+        if evidence_shape not in allowed_shapes:
+            evidence_shape = cls._infer_evidence_shape_from_facts(source_nodes, observation_kind)
+
+        allowed_scopes = {"momentary", "recent", "ongoing", "historical", "recurring"}
+        temporal_scope = str(metadata.get("temporal_scope") or "").strip().lower()
+        if temporal_scope not in allowed_scopes:
+            temporal_scope = cls._infer_temporal_scope_from_facts(source_nodes, evidence_shape)
+
+        candidate_types = cls._metadata_candidate_types(metadata.get("candidate_interpretation_types"))
+        if not candidate_types:
+            candidate_types = cls._candidate_interpretation_types_for_observation_kind(observation_kind, source_nodes)
+
+        return {
+            "observation_kind": observation_kind,
+            "evidence_shape": evidence_shape,
+            "temporal_scope": temporal_scope,
+            "candidate_interpretation_types": candidate_types,
+            "has_conflict": bool(metadata.get("has_conflict", observation_kind == "conflict")),
+            "source_note": str(metadata.get("source_note") or "").strip(),
+        }
+
+    @classmethod
+    def _infer_observation_kind_from_facts(cls, facts: List[Dict[str, Any]]) -> str:
+        fact_kinds = {str(fact.get("fact_kind") or "other").strip().lower() for fact in facts}
+        fact_subjects = {str(fact.get("fact_subject") or "").strip().lower() for fact in facts}
+        if fact_kinds & {"preference", "instruction"}:
+            return "preference_signal" if "preference" in fact_kinds else "constraint"
+        if fact_kinds & {"request", "action", "recommendation"} or any(cls._is_task_event_like_fact(fact) for fact in facts):
+            return "task_signal"
+        if fact_kinds & {"decision"}:
+            return "state_change"
+        if fact_kinds & {"error"}:
+            return "conflict"
+        if fact_subjects & {"user", "assistant"} and any(str(fact.get("fact_type") or "") == "episodic" for fact in facts):
+            return "event_cluster"
+        return "context"
+
+    @classmethod
+    def _infer_evidence_shape_from_facts(cls, facts: List[Dict[str, Any]], observation_kind: str) -> str:
+        if len(facts) <= 1:
+            return "single_event"
+        fact_kinds = {str(fact.get("fact_kind") or "other").strip().lower() for fact in facts}
+        if observation_kind == "conflict" or "error" in fact_kinds:
+            return "contrast"
+        if "decision" in fact_kinds or any(cls._is_task_event_like_fact(fact) for fact in facts):
+            return "progression"
+        if observation_kind in {"pattern", "preference_signal", "constraint", "goal_signal"}:
+            return "repeated_pattern"
+        return "confirmation"
+
+    @staticmethod
+    def _infer_temporal_scope_from_facts(facts: List[Dict[str, Any]], evidence_shape: str) -> str:
+        fact_types = {str(fact.get("fact_type") or "semantic").strip().lower() for fact in facts}
+        if evidence_shape == "repeated_pattern":
+            return "recurring"
+        if fact_types == {"semantic"}:
+            return "ongoing"
+        if "episodic" in fact_types:
+            return "recent"
+        return "historical"
+
+    @classmethod
+    def _candidate_interpretation_types_for_observation_kind(
+        cls,
+        observation_kind: str,
+        facts: List[Dict[str, Any]],
+    ) -> List[str]:
+        fact_kinds = {str(fact.get("fact_kind") or "other").strip().lower() for fact in facts}
+        out: List[str] = ["insight"]
+        if observation_kind in {"task_signal", "state_change", "outcome"} or fact_kinds & {"request", "action", "decision", "recommendation"}:
+            out.append("task")
+        if observation_kind in {"preference_signal", "constraint", "pattern"} or fact_kinds & {"preference", "instruction"}:
+            out.append("preference")
+        return out
+
+    @staticmethod
     def _is_task_event_like_fact(fact: Dict[str, Any]) -> bool:
         if MemoryNodeManager._fact_kind_excluded_from_task(fact):
             return False
@@ -1814,18 +1987,7 @@ class MemoryNodeManager:
         metadata = data.get("metadata", {})
         if not isinstance(metadata, dict):
             metadata = {}
-        metadata = dict(metadata)
-        allowed_observation_kinds = {
-            "timeline", "event_pattern", "state_change", "outcome", "conflict", "context",
-        }
-        observation_kind = str(metadata.get("observation_kind") or "context").strip().lower()
-        if observation_kind not in allowed_observation_kinds:
-            observation_kind = "context"
-        metadata = {
-            "observation_kind": observation_kind,
-            "has_conflict": bool(metadata.get("has_conflict", False)),
-            "source_note": str(metadata.get("source_note") or "").strip(),
-        }
+        metadata = self._normalize_observation_metadata(metadata, source_nodes)
         keywords = self._normalize_keywords(data.get("keywords", []))
         try:
             confidence = float(data.get("confidence", 0.7) or 0.7)
@@ -2341,6 +2503,474 @@ class MemoryNodeManager:
                 generated += 1
         return generated
 
+    @staticmethod
+    def _observation_kind_family(observation_kind: Any) -> str:
+        text = str(observation_kind or "").strip().lower()
+        if text in {"preference_signal", "constraint", "goal_signal", "pattern"}:
+            return "preference"
+        if text in {"task_signal", "state_change", "outcome", "event_cluster", "timeline"}:
+            return "task"
+        return "insight"
+
+    @classmethod
+    def _fact_observation_kind_targets(cls, fact: Dict[str, Any]) -> set[str]:
+        fact_kind = str(fact.get("fact_kind") or "other").strip().lower()
+        fact_type = str(fact.get("fact_type") or "semantic").strip().lower()
+        if fact_kind == "preference":
+            return {"preference_signal", "pattern"}
+        if fact_kind == "instruction":
+            return {"constraint", "preference_signal"}
+        if fact_kind == "request":
+            return {"task_signal", "goal_signal", "state_change"}
+        if fact_kind in {"action", "recommendation"}:
+            return {"task_signal", "event_cluster", "outcome"}
+        if fact_kind == "decision":
+            return {"state_change", "event_cluster", "task_signal"}
+        if fact_kind == "error":
+            return {"conflict", "outcome", "state_change"}
+        if fact_kind == "context":
+            return {"context", "pattern"}
+        if fact_type == "episodic":
+            return {"event_cluster", "state_change", "context"}
+        return {"context", "pattern"}
+
+    def _observation_match_score(
+        self,
+        *,
+        fact: Dict[str, Any],
+        observation: Dict[str, Any],
+        supporting_nodes: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[float, str]:
+        metadata = self._normalize_observation_metadata(observation.get("metadata", {}), supporting_nodes or [])
+        observation_kind = str(metadata.get("observation_kind") or "context")
+        candidate_types = set(self._metadata_candidate_types(metadata.get("candidate_interpretation_types")))
+        fact_targets = self._fact_observation_kind_targets(fact)
+
+        score = 0.0
+        reasons: List[str] = []
+
+        fact_entity_ids = {entity_id for entity_id, _name in self._fact_entity_pairs(fact)}
+        try:
+            observation_entity_id = int(observation.get("entity_id"))
+        except (TypeError, ValueError):
+            observation_entity_id = None
+        if observation_entity_id is not None and observation_entity_id in fact_entity_ids:
+            score += 0.24
+            reasons.append("entity")
+
+        fact_topics = {self._topic_key(topic) for topic in fact.get("topics", [])}
+        observation_topic = self._topic_key(observation.get("topic_key") or observation.get("topic_label") or "")
+        if observation_topic and observation_topic in fact_topics:
+            score += 0.20
+            reasons.append("topic")
+
+        if observation_kind in fact_targets:
+            score += 0.18
+            reasons.append("kind")
+        fact_family = ""
+        fact_kind = str(fact.get("fact_kind") or "").strip().lower()
+        if self._is_task_event_like_fact(fact):
+            fact_family = "task"
+        elif fact_kind in {"preference", "instruction"}:
+            fact_family = "preference"
+        if fact_family and self._observation_kind_family(observation_kind) == fact_family:
+            score += 0.08
+            reasons.append("kind_family")
+
+        fact_subject = str(fact.get("fact_subject") or "other").strip().lower()
+        source_subjects = {
+            str(node.get("fact_subject") or "other").strip().lower()
+            for node in supporting_nodes or []
+        }
+        if fact_subject != "other" and fact_subject in source_subjects:
+            score += 0.08
+            reasons.append("subject")
+
+        fact_type = str(fact.get("fact_type") or "semantic").strip().lower()
+        temporal_scope = str(metadata.get("temporal_scope") or "")
+        if fact_type == "semantic" and temporal_scope in {"ongoing", "recurring", "historical"}:
+            score += 0.06
+            reasons.append("semantic_scope")
+        elif fact_type == "episodic" and temporal_scope in {"momentary", "recent", "recurring"}:
+            score += 0.06
+            reasons.append("episodic_scope")
+
+        if self._is_task_event_like_fact(fact) and "task" in candidate_types:
+            score += 0.08
+            reasons.append("task_affordance")
+        if str(fact.get("fact_kind") or "") in {"preference", "instruction"} and "preference" in candidate_types:
+            score += 0.08
+            reasons.append("preference_affordance")
+
+        fact_terms = self._match_terms(
+            fact.get("summary"),
+            fact.get("keywords", []),
+            fact.get("topics", []),
+        )
+        observation_terms = self._match_terms(
+            observation.get("summary"),
+            observation.get("keywords", ""),
+            observation.get("topic_label"),
+            observation.get("topic_key"),
+        )
+        overlap = self._term_overlap_score(fact_terms, observation_terms)
+        if overlap:
+            score += min(0.18, overlap * 0.18)
+            reasons.append("term_overlap")
+
+        try:
+            confidence = float(observation.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        score += min(0.06, confidence * 0.06)
+        return min(1.0, score), "+".join(reasons) or "weak"
+
+    def _candidate_observations_for_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not self._db:
+            return []
+        query = " ".join(
+            str(part or "").strip()
+            for part in [
+                fact.get("summary"),
+                " ".join(str(item) for item in fact.get("keywords", [])),
+                " ".join(str(item) for item in fact.get("topics", [])),
+            ]
+            if str(part or "").strip()
+        )
+        candidates: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+        for entity_id, entity_name in self._fact_entity_pairs(fact):
+            try:
+                searched = self._db.memory_search_observations(
+                    query,
+                    entities=[entity_name] if entity_name else None,
+                    entity_ids=[entity_id],
+                    top_k=8,
+                )
+            except Exception:
+                searched = []
+            for item in searched:
+                try:
+                    observation_id = int(item["id"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if observation_id in seen:
+                    continue
+                seen.add(observation_id)
+                candidates.append(item)
+        return candidates
+
+    def _match_fact_to_existing_observation(
+        self,
+        fact: Dict[str, Any],
+        *,
+        auto_update_threshold: float = 0.72,
+    ) -> Optional[Tuple[Dict[str, Any], float, str, List[Dict[str, Any]]]]:
+        candidates = self._candidate_observations_for_fact(fact)
+        if not candidates:
+            return None
+        supporting_by_observation = self._db.memory_observation_supporting_nodes(
+            [int(item["id"]) for item in candidates],
+            per_observation=8,
+        )
+        scored: List[Tuple[float, str, Dict[str, Any], List[Dict[str, Any]]]] = []
+        for candidate in candidates:
+            observation_id = int(candidate["id"])
+            supporting_nodes = supporting_by_observation.get(observation_id, [])
+            score, reason = self._observation_match_score(
+                fact=fact,
+                observation=candidate,
+                supporting_nodes=supporting_nodes,
+            )
+            scored.append((score, reason, candidate, supporting_nodes))
+        scored.sort(key=lambda item: (item[0], item[2].get("last_supported_at") or ""), reverse=True)
+        best_score, reason, best, supporting_nodes = scored[0]
+        if best_score < auto_update_threshold:
+            self._log_reflect_error("fact_observation_match_skipped", {
+                "fact": self._reflect_fact_log_items([fact], limit=1),
+                "best_observation_id": best.get("id"),
+                "best_score": round(best_score, 4),
+                "reason": reason,
+            })
+            return None
+        return best, best_score, reason, supporting_nodes
+
+    def _update_existing_observation_from_fact(
+        self,
+        fact: Dict[str, Any],
+        *,
+        changed_observation_ids: Optional[List[int]] = None,
+    ) -> Optional[int]:
+        if not self._db:
+            return None
+        match = self._match_fact_to_existing_observation(fact)
+        if not match:
+            return None
+        existing_observation, score, reason, supporting_nodes = match
+        observation_id = int(existing_observation["id"])
+        fact_id = self._node_id(fact)
+        if fact_id is None:
+            return None
+        existing_source_ids = self._db.memory_observation_source_ids(observation_id)
+        if fact_id in existing_source_ids:
+            return observation_id
+
+        source_nodes_for_prompt = [fact]
+        generated = self._generate_observation(
+            entity_name=existing_observation.get("entity_name", ""),
+            topic_label=existing_observation.get("topic_label") or existing_observation.get("topic_key") or "",
+            source_nodes=source_nodes_for_prompt,
+            existing_observation=existing_observation,
+        )
+        if not generated:
+            return None
+        metadata = {
+            "source": "memory_fact_observation_match",
+            "fact_match_score": round(float(score), 4),
+            "fact_match_reason": reason,
+            **(generated.get("metadata") or {}),
+        }
+        stored_source_ids = list(dict.fromkeys(existing_source_ids + [fact_id]))
+        self._db.memory_replace_observation_group(
+            keep_observation_id=observation_id,
+            remove_observation_ids=[],
+            observation_type=generated["observation_type"],
+            summary=generated["summary"],
+            keywords=generated["keywords"] or self._normalize_keywords(existing_observation.get("keywords", "")),
+            confidence=generated["confidence"],
+            source_node_ids=stored_source_ids,
+            metadata=metadata,
+        )
+        if changed_observation_ids is not None:
+            changed_observation_ids.append(observation_id)
+        self._log_reflect_error("fact_observation_matched", {
+            "observation_id": observation_id,
+            "fact_node_id": fact_id,
+            "score": score,
+            "reason": reason,
+            "supporting_facts": self._reflect_fact_log_items(supporting_nodes + [fact]),
+            "updated_observation": {
+                **self._reflect_observation_log_item(generated),
+                "metadata": metadata,
+            },
+        })
+        return observation_id
+
+    @classmethod
+    def _fact_cluster_family(cls, fact: Dict[str, Any]) -> str:
+        fact_kind = str(fact.get("fact_kind") or "other").strip().lower()
+        if fact_kind in {"preference", "instruction"}:
+            return "preference"
+        if fact_kind in {"request", "recommendation", "action", "decision", "error"}:
+            return "task"
+        if cls._is_task_event_like_fact(fact):
+            return "task"
+        if str(fact.get("fact_type") or "semantic").strip().lower() == "episodic":
+            return "event"
+        return "context"
+
+    @classmethod
+    def _fact_cluster_score(cls, facts: List[Dict[str, Any]], family: str) -> Tuple[float, str]:
+        if not facts:
+            return 0.0, "empty"
+        if len(facts) < 2:
+            return 0.0, "single_fact_deferred"
+        fact_types = {
+            str(fact.get("fact_type") or "semantic").strip().lower()
+            for fact in facts
+        }
+        fact_subjects = {
+            str(fact.get("fact_subject") or "other").strip().lower()
+            for fact in facts
+        }
+        fact_kinds = {
+            str(fact.get("fact_kind") or "other").strip().lower()
+            for fact in facts
+        }
+        task_kinds = {"request", "recommendation", "action", "decision", "error"}
+        preference_kinds = {"preference", "instruction"}
+        if family == "mixed" and fact_kinds & preference_kinds and fact_kinds & task_kinds:
+            return 0.0, "mixed_preference_task_deferred"
+        score = 0.45
+        reasons = ["min_size"]
+        if len(facts) >= 3:
+            score += 0.12
+            reasons.append("multi_fact")
+        if len(fact_types) == 1:
+            score += 0.08
+            reasons.append("fact_type")
+        elif family in {"task", "event"} and fact_types <= {"semantic", "episodic"}:
+            score += 0.05
+            reasons.append("semantic_episodic_chain")
+        if len(fact_subjects - {"other"}) <= 1:
+            score += 0.06
+            reasons.append("subject")
+        if family == "preference" and fact_kinds & {"preference", "instruction"}:
+            score += 0.14
+            reasons.append("preference_kind")
+        elif family == "task" and (fact_kinds & {"request", "action", "decision", "recommendation"}):
+            score += 0.14
+            reasons.append("task_kind")
+        elif family == "event" and "episodic" in fact_types:
+            score += 0.12
+            reasons.append("episodic_event")
+        elif family == "context" and fact_kinds <= {"context", "other"}:
+            score += 0.10
+            reasons.append("context_kind")
+        elif family == "mixed" and fact_kinds <= {"context", "other", "recommendation"}:
+            score += 0.16
+            reasons.append("mixed_context_event")
+        if "error" in fact_kinds:
+            score += 0.04
+            reasons.append("error_signal")
+        return min(1.0, score), "+".join(reasons)
+
+    def _unmatched_fact_clusters(
+        self,
+        facts: List[Dict[str, Any]],
+        *,
+        excluded_node_ids: set[int],
+        min_cluster_score: float = 0.66,
+    ) -> List[Dict[str, Any]]:
+        buckets: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+        for fact in facts:
+            node_id = self._node_id(fact)
+            if node_id is None or node_id in excluded_node_ids:
+                continue
+            family = self._fact_cluster_family(fact)
+            topics = fact.get("topics", []) or ["general"]
+            for entity_id, entity_name in self._fact_entity_pairs(fact):
+                for topic in topics:
+                    topic_key = self._topic_key(topic)
+                    for bucket_family in (family, "mixed"):
+                        key = (int(entity_id), topic_key, bucket_family)
+                        bucket = buckets.setdefault(
+                            key,
+                            {
+                                "entity_id": int(entity_id),
+                                "entity_name": entity_name,
+                                "topic_key": topic_key,
+                                "topic_label": topic_key,
+                                "cluster_family": bucket_family,
+                                "facts": [],
+                                "node_ids": set(),
+                            },
+                        )
+                        if node_id in bucket["node_ids"]:
+                            continue
+                        bucket["node_ids"].add(node_id)
+                        bucket["facts"].append(fact)
+
+        clusters: List[Dict[str, Any]] = []
+        for bucket in buckets.values():
+            facts_for_cluster = sorted(
+                bucket["facts"],
+                key=lambda fact: (str(fact.get("time_key") or ""), self._node_id(fact) or 0),
+            )
+            score, reason = self._fact_cluster_score(facts_for_cluster, str(bucket["cluster_family"]))
+            if score < min_cluster_score:
+                continue
+            clusters.append({
+                **{key: value for key, value in bucket.items() if key not in {"facts", "node_ids"}},
+                "source_nodes": facts_for_cluster,
+                "source_node_ids": [self._node_id(fact) for fact in facts_for_cluster if self._node_id(fact) is not None],
+                "cluster_score": score,
+                "cluster_reason": reason,
+            })
+
+        clusters.sort(
+            key=lambda item: (
+                float(item.get("cluster_score") or 0.0),
+                len(item.get("source_node_ids", [])),
+                1 if item.get("cluster_family") == "mixed" else 0,
+                str(item.get("topic_key") or ""),
+            ),
+            reverse=True,
+        )
+        return clusters
+
+    def _consolidate_unmatched_fact_cluster(
+        self,
+        cluster: Dict[str, Any],
+        *,
+        consumed_node_ids: set[int],
+        changed_observation_ids: Optional[List[int]] = None,
+    ) -> Optional[int]:
+        if not self._db:
+            return None
+        source_nodes = [
+            fact
+            for fact in cluster.get("source_nodes", [])
+            if (self._node_id(fact) is not None and self._node_id(fact) not in consumed_node_ids)
+        ]
+        source_node_ids = [self._node_id(fact) for fact in source_nodes if self._node_id(fact) is not None]
+        source_node_ids = [int(node_id) for node_id in dict.fromkeys(source_node_ids)]
+        if len(source_node_ids) < 2:
+            return None
+
+        entity_id = int(cluster["entity_id"])
+        topic_key = str(cluster.get("topic_key") or "general")
+        existing_observation, _pending = self._db.memory_observation_pending_sources(
+            entity_id=entity_id,
+            topic_key=topic_key,
+            candidate_node_ids=source_node_ids,
+        )
+        if existing_observation is not None:
+            self._log_reflect_error("fact_cluster_skipped_existing_observation", {
+                "entity_id": entity_id,
+                "topic_key": topic_key,
+                "cluster_family": cluster.get("cluster_family"),
+                "source_node_ids": source_node_ids,
+                "existing_observation_id": existing_observation.get("id"),
+            })
+            return None
+
+        observation = self._generate_observation(
+            entity_name=str(cluster.get("entity_name") or ""),
+            topic_label=topic_key,
+            source_nodes=source_nodes,
+            existing_observation=None,
+        )
+        if not observation:
+            return None
+        observation_metadata = {
+            "source": "memory_unmatched_fact_cluster",
+            "cluster_family": cluster.get("cluster_family"),
+            "cluster_score": round(float(cluster.get("cluster_score") or 0.0), 4),
+            "cluster_reason": cluster.get("cluster_reason"),
+            **(observation.get("metadata") or {}),
+        }
+        observation_id = self._db.memory_upsert_observation(
+            entity_id=entity_id,
+            topic_key=topic_key,
+            topic_label=str(cluster.get("topic_label") or topic_key),
+            observation_type=observation["observation_type"],
+            summary=observation["summary"],
+            keywords=observation["keywords"] or [topic_key],
+            source_node_ids=source_node_ids,
+            confidence=observation["confidence"],
+            metadata=observation_metadata,
+        )
+        if changed_observation_ids is not None:
+            changed_observation_ids.append(int(observation_id))
+        consumed_node_ids.update(source_node_ids)
+        self._log_reflect_error("fact_cluster_observation_generated", {
+            "observation_id": observation_id,
+            "entity_id": entity_id,
+            "entity_name": cluster.get("entity_name"),
+            "topic_key": topic_key,
+            "cluster_family": cluster.get("cluster_family"),
+            "cluster_score": cluster.get("cluster_score"),
+            "cluster_reason": cluster.get("cluster_reason"),
+            "source_node_ids": source_node_ids,
+            "source_facts": self._reflect_fact_log_items(source_nodes),
+            "generated_observation": {
+                **self._reflect_observation_log_item(observation),
+                "metadata": observation_metadata,
+            },
+        })
+        return int(observation_id)
+
     def _maybe_consolidate_observations(
         self,
         *,
@@ -2507,6 +3137,11 @@ class MemoryNodeManager:
                 "entity_topic_updates": 0,
                 "entity_topic_node_count": 0,
                 "observation_groups_merged": 0,
+                "fact_observation_matches": 0,
+                "fact_observation_node_count": 0,
+                "fact_clusters_considered": 0,
+                "fact_clusters_consolidated": 0,
+                "fact_cluster_node_count": 0,
                 "changed_observation_ids": [],
                 "touched_entity_ids": touched_entity_ids,
                 "candidates": [
@@ -2527,6 +3162,11 @@ class MemoryNodeManager:
         consolidated = 0
         entity_topic_updates = 0
         entity_topic_node_ids: set[int] = set()
+        fact_observation_matches = 0
+        fact_observation_node_ids: set[int] = set()
+        fact_clusters_considered = 0
+        fact_clusters_consolidated = 0
+        fact_cluster_node_ids: set[int] = set()
         changed_observation_ids: List[int] = []
         candidate_node_ids = [int(item["node_id"]) for item in unprocessed_fact_candidates]
 
@@ -2583,31 +3223,81 @@ class MemoryNodeManager:
 
         for item in unprocessed_fact_candidates:
             node_id = int(item["node_id"])
-            if node_id in entity_topic_node_ids:
-                continue
             if node_id in merge_consumed_node_ids:
                 continue
             before_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
-            updated = self._maybe_consolidate_observations(
-                node_id=node_id,
-                topics=item.get("topics", []),
-                linked_entities=item.get("linked_entities", []),
-                min_new_sources=1,
-                changed_observation_ids=changed_observation_ids,
-                generate_interpretation=False,
-            )
-            if not updated:
+            try:
+                matched_observation_id = self._update_existing_observation_from_fact(
+                    item,
+                    changed_observation_ids=changed_observation_ids,
+                )
+            except Exception as exc:
+                logger.debug("Failed to match fact %d to existing observation: %s", node_id, exc)
+                matched_observation_id = None
+            if matched_observation_id is None:
                 continue
-            entity_topic_updates += updated
+            fact_observation_matches += 1
             after_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
-            entity_topic_node_ids.update(after_observed - before_observed)
-        consolidated += entity_topic_updates
+            newly_observed = after_observed - before_observed
+            fact_observation_node_ids.update(newly_observed)
+            entity_topic_node_ids.update(newly_observed)
+
+        consumed_for_clusters = set(entity_topic_node_ids) | set(merge_consumed_node_ids)
+        clusters = self._unmatched_fact_clusters(
+            unprocessed_fact_candidates,
+            excluded_node_ids=consumed_for_clusters,
+        )
+        fact_clusters_considered = len(clusters)
+        self._log_reflect_error("fact_cluster_candidates", {
+            "cluster_count": fact_clusters_considered,
+            "clusters": [
+                {
+                    "entity_id": cluster.get("entity_id"),
+                    "entity_name": cluster.get("entity_name"),
+                    "topic_key": cluster.get("topic_key"),
+                    "cluster_family": cluster.get("cluster_family"),
+                    "cluster_score": cluster.get("cluster_score"),
+                    "cluster_reason": cluster.get("cluster_reason"),
+                    "source_node_ids": cluster.get("source_node_ids", []),
+                }
+                for cluster in clusters
+            ],
+        })
+        for cluster in clusters:
+            before_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
+            try:
+                observation_id = self._consolidate_unmatched_fact_cluster(
+                    cluster,
+                    consumed_node_ids=consumed_for_clusters,
+                    changed_observation_ids=changed_observation_ids,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Failed to consolidate unmatched fact cluster entity %s topic %s: %s",
+                    cluster.get("entity_id"),
+                    cluster.get("topic_key"),
+                    exc,
+                )
+                observation_id = None
+            if observation_id is None:
+                continue
+            fact_clusters_consolidated += 1
+            after_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
+            newly_observed = after_observed - before_observed
+            fact_cluster_node_ids.update(newly_observed)
+            entity_topic_node_ids.update(newly_observed)
+        consolidated += fact_observation_matches + fact_clusters_consolidated
         
         return {
             "candidate_count": len(unprocessed_fact_candidates),
             "consolidated": consolidated,
             "entity_topic_updates": entity_topic_updates,
             "entity_topic_node_count": len(entity_topic_node_ids),
+            "fact_observation_matches": fact_observation_matches,
+            "fact_observation_node_count": len(fact_observation_node_ids),
+            "fact_clusters_considered": fact_clusters_considered,
+            "fact_clusters_consolidated": fact_clusters_consolidated,
+            "fact_cluster_node_count": len(fact_cluster_node_ids),
             "observation_groups_merged": observation_groups_merged,
             "changed_observation_ids": list(dict.fromkeys(changed_observation_ids)),
             "touched_entity_ids": touched_entity_ids,
@@ -2723,6 +3413,7 @@ class MemoryNodeManager:
         user_message: str,
         assistant_response: str,
         tags: Optional[List[str]] = None,
+        turn_timestamp: Optional[Any] = None,
     ) -> bool:
         """Retain a turn as one or more narrative memory nodes.
 
@@ -2747,7 +3438,7 @@ class MemoryNodeManager:
 
         try:
             # ── Step 1: Extract narrative facts (SYNC) ──
-            retain_data = self._extract_retain_facts(user_message, assistant_response)
+            retain_data = self._extract_retain_facts(user_message, assistant_response, turn_timestamp=turn_timestamp)
             if not retain_data:
                 logger.debug("Skipping memory node — retain extraction returned no data")
                 return False
@@ -2773,7 +3464,7 @@ class MemoryNodeManager:
                 
                 # ── Step 3: Store the new node (SYNC) ──
                 node_id = self._db.memory_add_node(
-                    time_key=self._memory_time_key(idx),
+                    time_key=self._memory_time_key(idx, turn_timestamp=turn_timestamp),
                     summary=summary,
                     keywords=keywords,
                     topic=topics,
@@ -2790,6 +3481,11 @@ class MemoryNodeManager:
                     task_event_like=fact.get("task_event_like"),
                     task_event_subject=fact.get("task_event_subject", ""),
                     task_relevance=fact.get("task_relevance", ""),
+                    entity_names=[
+                        str(entity.get("name", "")).strip()
+                        for entity in fact.get("entities", [])
+                        if isinstance(entity, dict) and str(entity.get("name", "")).strip()
+                    ],
                 )
                 logger.error("finish store: memory node construction")
 
@@ -3076,10 +3772,10 @@ class MemoryNodeManager:
             observation_report.get("changed_observation_ids", [])
         ))
         report["interpretations_generated"] = 0
-        if not dry_run:
-            report["interpretations_generated"] = self._generate_interpretations_for_observations(
-                report["changed_observation_ids"]
-            )
+        # if not dry_run:
+        #     report["interpretations_generated"] = self._generate_interpretations_for_observations(
+        #         report["changed_observation_ids"]
+        #     )
         reflect_now = datetime.now().astimezone()
         node_decay_report = self._db.memory_reflect_node_decay(
             dry_run=dry_run,
