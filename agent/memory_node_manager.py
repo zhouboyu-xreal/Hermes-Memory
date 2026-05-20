@@ -338,6 +338,18 @@ fact_kind 类别说明：
 - 生成 observation 时只描述发生过什么、出现过什么模式、经历过什么变化。
 - insight、task、偏好、策略、风险和当前状态判断由 interpretation 层生成。"""
 
+OBSERVATION_METADATA_GUIDANCE = """observation metadata 字段含义：
+- observation_kind 表示 observation 的信息性质，也就是它在描述什么类型的历史归纳，例如模式、事件簇、状态变化、结果、冲突、偏好信号、任务信号、约束、目标信号、情绪信号或关系信号。
+- evidence_shape 表示支撑 observation 的证据形态，也就是它是由单个事件、多次重复、对比、逐步推进、修正还是确认形成的。
+- temporal_scope 表示 observation 的时间范围，也就是它是瞬时、近期、持续、历史还是反复发生的。"""
+
+OBSERVATION_TIME_GUIDANCE = """时间字段说明：
+- source facts 行中的 time 表示该事实的证据时间或记忆时间，用于判断事件先后、重复出现、近期性和历史性。
+- existing observation 的 source_time_start/source_time_end 表示已有 observation 的证据覆盖范围，优先用于判断 temporal_scope。
+- last_supported_at 表示已有 observation 最近一次被新证据支持。
+- created_at/updated_at 表示 observation 记录的存储生命周期，不要仅因为 updated_at 很新就判断现象本身是 recent。
+- 判断 temporal_scope 时优先依据 source facts 的 time 和 observation 的 source_time_start/source_time_end；单个具体事件通常是 momentary 或 recent，多时间点重复出现通常是 recurring，长期稳定背景/规则/偏好通常是 ongoing，明确属于过去阶段且未必当前有效的内容是 historical。"""
+
 OBSERVATION_CONSOLIDATION_PROMPT = """你是长期记忆 observation consolidation 模块。
 
 你需要把同一 entity/topic 下的 semantic facts 和 episodic memories，整合成一条长期可追溯的 observation。
@@ -354,6 +366,10 @@ source facts:
 {source_facts}
 
 """ + OBSERVATION_SOURCE_FACT_GUIDANCE + """
+
+""" + OBSERVATION_METADATA_GUIDANCE + """
+
+""" + OBSERVATION_TIME_GUIDANCE + """
 
 要求：
 - 只描述这些事实共同说明"发生过什么"。
@@ -409,6 +425,9 @@ topic: {topic_label}
 已有 metadata：
 {existing_metadata}
 
+已有 observation 时间信息：
+{existing_time_context}
+
 相关既有 observation（通常来自 entity 合并；没有则为 none）：
 {related_observations}
 
@@ -416,6 +435,10 @@ topic: {topic_label}
 {source_facts}
 
 """ + OBSERVATION_SOURCE_FACT_GUIDANCE + """
+
+""" + OBSERVATION_METADATA_GUIDANCE + """
+
+""" + OBSERVATION_TIME_GUIDANCE + """
 
 要求：
 - 输出更新后的 observation，category 固定为 "observation"。
@@ -1918,6 +1941,44 @@ class MemoryNodeManager:
                 matched_node_ids.update(int(fact["node_id"]) for fact in facts)
         return matched_node_ids, method_counts, updated_tasks
 
+    @staticmethod
+    def _observation_time_value(value: Any) -> str:
+        text = str(value or "").strip()
+        return text[:64] if text else "unknown"
+
+    @classmethod
+    def _format_observation_source_fact(cls, index: int, node: Dict[str, Any]) -> Optional[str]:
+        fact_type = str(node.get("fact_type") or "semantic")
+        fact_subject = str(node.get("fact_subject") or "other")
+        fact_kind = str(node.get("fact_kind") or "other")
+        summary = str(node.get("summary") or "").strip()
+        if not summary:
+            return None
+        time_key = cls._observation_time_value(node.get("time_key"))
+        return f"{index}. [time={time_key}; {fact_type}/{fact_subject}/{fact_kind}] {summary}"
+
+    @classmethod
+    def _observation_time_context(cls, observation: Dict[str, Any]) -> str:
+        fields = (
+            "source_time_start",
+            "source_time_end",
+            "last_supported_at",
+            "created_at",
+            "updated_at",
+        )
+        return "\n".join(
+            f"- {field}: {cls._observation_time_value(observation.get(field))}"
+            for field in fields
+        )
+
+    @classmethod
+    def _observation_time_inline(cls, observation: Dict[str, Any]) -> str:
+        start = cls._observation_time_value(observation.get("source_time_start"))
+        end = cls._observation_time_value(observation.get("source_time_end"))
+        last_supported = cls._observation_time_value(observation.get("last_supported_at"))
+        updated = cls._observation_time_value(observation.get("updated_at"))
+        return f"source_time={start}..{end}; last_supported_at={last_supported}; updated_at={updated}"
+
     def _generate_observation(
         self,
         *,
@@ -1931,13 +1992,9 @@ class MemoryNodeManager:
         """Generate a consolidated observation from source facts via LLM."""
         fact_lines = []
         for index, node in enumerate(source_nodes[:8], 1):
-            fact_type = str(node.get("fact_type") or "semantic")
-            fact_subject = str(node.get("fact_subject") or "other")
-            fact_kind = str(node.get("fact_kind") or "other")
-            summary = str(node.get("summary") or "").strip()
-            if not summary:
-                continue
-            fact_lines.append(f"{index}. [{fact_type}/{fact_subject}/{fact_kind}] {summary}")
+            line = self._format_observation_source_fact(index, node)
+            if line:
+                fact_lines.append(line)
         if not fact_lines and not existing_observation:
             return None
 
@@ -1953,9 +2010,10 @@ class MemoryNodeManager:
                 summary = str(observation.get("summary") or "").strip()
                 if not summary:
                     continue
+                time_context = self._observation_time_inline(observation)
                 related_lines.append(
                     f"{index}. [{observation.get('observation_type', 'observation')}; "
-                    f"confidence={observation.get('confidence', 0.0)}] {summary}"
+                    f"confidence={observation.get('confidence', 0.0)}; {time_context}] {summary}"
                 )
             prompt = OBSERVATION_UPDATE_PROMPT.format(
                 entity_name=entity_name,
@@ -1965,6 +2023,7 @@ class MemoryNodeManager:
                 existing_keywords=existing_observation.get("keywords", ""),
                 existing_confidence=existing_observation.get("confidence", 0.7),
                 existing_metadata=json.dumps(existing_metadata or {}, ensure_ascii=False, sort_keys=True),
+                existing_time_context=self._observation_time_context(existing_observation),
                 related_observations="\n".join(related_lines) or "(none)",
                 source_facts="\n".join(fact_lines) or "(none)",
             )
@@ -3903,10 +3962,10 @@ class MemoryNodeManager:
             observation_report.get("changed_observation_ids", [])
         ))
         report["interpretations_generated"] = 0
-        # if not dry_run:
-        #     report["interpretations_generated"] = self._generate_interpretations_for_observations(
-        #         report["changed_observation_ids"]
-        #     )
+        if not dry_run:
+            report["interpretations_generated"] = self._generate_interpretations_for_observations(
+                report["changed_observation_ids"]
+            )
         reflect_now = datetime.now().astimezone()
         node_decay_report = self._db.memory_reflect_node_decay(
             dry_run=dry_run,
