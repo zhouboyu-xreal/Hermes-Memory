@@ -350,6 +350,13 @@ OBSERVATION_TIME_GUIDANCE = """时间字段说明：
 - created_at/updated_at 表示 observation 记录的存储生命周期，不要仅因为 updated_at 很新就判断现象本身是 recent。
 - 判断 temporal_scope 时优先依据 source facts 的 time 和 observation 的 source_time_start/source_time_end；单个具体事件通常是 momentary 或 recent，多时间点重复出现通常是 recurring，长期稳定背景/规则/偏好通常是 ongoing，明确属于过去阶段且未必当前有效的内容是 historical。"""
 
+OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE = """candidate_interpretation_types 字段含义：
+- candidate_interpretation_types 是给 interpretation 生成/匹配阶段使用的粗粒度路由提示，不是最终 interpretation_type；最终 interpretation_type 仍由 interpretation prompt 在 insight、task、explicit_preference、explicit_instruction、inferred_preference、behavior_pattern、project_state、task_risk、constraint、conflict_resolution、strategy、other 中选择。
+- insight 表示 observation 可能支持当前可用洞察、项目状态、风险、约束、冲突解决结论、策略或其他可复用解释；它关注 Agent 现在如何理解这些 observation。
+- task 表示 observation 可能支持 Agent 当前认为用户正在推进的任务或目标；只在 observation 指向请求、目标、进展、阻塞、结果或任务状态变化时加入。
+- preference 表示 observation 可能支持显式偏好、长期指令、推断偏好或行为模式；只在 observation 指向用户偏好、长期规则、工作方式、习惯、禁忌或反复行为倾向时加入。
+- 只加入有证据支持且对未来行为有明确指导价值的候选类型；普通事实摘要如果缺少未来行动含义，通常只保留 insight 或不生成 interpretation。"""
+
 OBSERVATION_CONSOLIDATION_PROMPT = """你是长期记忆 observation consolidation 模块。
 
 你需要把同一 entity/topic 下的 semantic facts 和 episodic memories，整合成一条长期可追溯的 observation。
@@ -370,6 +377,8 @@ source facts:
 """ + OBSERVATION_METADATA_GUIDANCE + """
 
 """ + OBSERVATION_TIME_GUIDANCE + """
+
+""" + OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE + """
 
 要求：
 - 只描述这些事实共同说明"发生过什么"。
@@ -397,6 +406,10 @@ source facts:
     "source_note": "可选，简短说明该 observation 的证据性质"
   }}
 }}"""
+
+# Backward-compatible names for callers/tests that still import the old constants.
+INSIGHT_CONSOLIDATION_PROMPT = OBSERVATION_CONSOLIDATION_PROMPT
+TASK_CONSOLIDATION_PROMPT = OBSERVATION_CONSOLIDATION_PROMPT
 
 OBSERVATION_UPDATE_PROMPT = """你是长期记忆 observation consolidation 模块。
 
@@ -435,6 +448,8 @@ topic: {topic_label}
 """ + OBSERVATION_METADATA_GUIDANCE + """
 
 """ + OBSERVATION_TIME_GUIDANCE + """
+
+""" + OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE + """
 
 要求：
 - 输出更新后的 observation，category 固定为 "observation"。

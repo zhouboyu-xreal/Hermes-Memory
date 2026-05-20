@@ -8,6 +8,7 @@ from agent.memory_node_manager import MemoryNodeManager
 from agent.memory_node_manager import (
     CAUSAL_RELATION_TYPE_TEXT,
     INSIGHT_CONSOLIDATION_PROMPT,
+    OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE,
     OBSERVATION_CONSOLIDATION_PROMPT,
     OBSERVATION_METADATA_GUIDANCE,
     OBSERVATION_SOURCE_FACT_GUIDANCE,
@@ -2570,6 +2571,10 @@ def test_observation_prompts_explain_fact_type_and_kind_labels():
     assert "source facts 行中的 time 表示该事实的证据时间" in OBSERVATION_TIME_GUIDANCE
     assert "source_time_start/source_time_end 表示已有 observation 的证据覆盖范围" in OBSERVATION_TIME_GUIDANCE
     assert "created_at/updated_at 表示 observation 记录的存储生命周期" in OBSERVATION_TIME_GUIDANCE
+    assert "candidate_interpretation_types 是给 interpretation 生成/匹配阶段使用的粗粒度路由提示" in OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE
+    assert "最终 interpretation_type 仍由 interpretation prompt" in OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE
+    assert "explicit_preference、explicit_instruction、inferred_preference、behavior_pattern" in OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE
+    assert "task 表示 observation 可能支持 Agent 当前认为用户正在推进的任务或目标" in OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE
 
     for prompt in (
         INSIGHT_CONSOLIDATION_PROMPT,
@@ -2580,6 +2585,7 @@ def test_observation_prompts_explain_fact_type_and_kind_labels():
         assert OBSERVATION_SOURCE_FACT_GUIDANCE in prompt
         assert OBSERVATION_METADATA_GUIDANCE in prompt
         assert OBSERVATION_TIME_GUIDANCE in prompt
+        assert OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE in prompt
         assert "candidate_interpretation_types" in prompt
         assert "evidence_shape" in prompt
         assert "temporal_scope" in prompt
