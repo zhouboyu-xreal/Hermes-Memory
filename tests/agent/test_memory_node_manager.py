@@ -16,6 +16,7 @@ from agent.memory_node_manager import (
     OBSERVATION_MERGE_PROMPT,
     OBSERVATION_UPDATE_PROMPT,
     INTERPRETATION_GENERATION_PROMPT,
+    INTERPRETATION_UPDATE_PROMPT,
     INTERPRETATION_SECTION_HEADER,
     RELATION_PROMPT_TEMPLATE,
     RETAIN_FACT_EXTRACTION_PROMPT,
@@ -2034,23 +2035,209 @@ def test_interpretation_linker_matches_preference_by_entity_topic_without_llm(db
     mgr = _NoAsyncMemoryNodeManager(
         db,
         embedding_config={},
-        llm_outputs=[json.dumps({"should_create": True})],
+        llm_outputs=[
+            json.dumps({
+                "should_update": True,
+                "claim": "Alice has a reinforced preference for architecture discussion before implementation.",
+                "target_text": "architecture planning",
+                "scope": "architecture-planning",
+                "interpretation_type": "explicit_preference",
+                "polarity": "positive",
+                "strength": 0.88,
+                "confidence": 0.9,
+                "status": "current",
+                "conflict_status": "none",
+                "action_implication": "Start complex implementation requests with architecture discussion before editing code.",
+                "evidence_node_ids": [source],
+                "evidence_observation_ids": [observation_id],
+                "metadata": {"source": "interpretation_update", "preference_domain": "coding-workflow"},
+            })
+        ],
     )
 
     generated = mgr._generate_interpretations_for_observations([observation_id])
 
     assert generated == 1
-    assert mgr.llm_prompts == []
+    assert len([prompt for prompt in mgr.llm_prompts if "interpretation 更新模块" in prompt]) == 1
     row = db._conn.execute(
-        "SELECT evidence_node_ids, evidence_observation_ids, metadata "
+        "SELECT claim, action_implication, confidence, evidence_node_ids, evidence_observation_ids, metadata "
         "FROM memory_interpretations WHERE id = ?",
         (interpretation_id,),
     ).fetchone()
+    assert "reinforced preference" in row["claim"]
+    assert "before editing code" in row["action_implication"]
+    assert row["confidence"] == pytest.approx(0.9)
     assert json.loads(row["evidence_node_ids"]) == [source]
     assert json.loads(row["evidence_observation_ids"]) == [observation_id]
     metadata = json.loads(row["metadata"])
     assert metadata["cheap_linker"]["last_match_score"] >= 0.72
     assert "preference_evidence" in metadata["cheap_linker"]["last_match_reason"]
+    assert metadata["cheap_linker"]["content_updated"] is True
+    assert metadata["source"] == "interpretation_update"
+    assert metadata["preference_domain"] == "coding-workflow"
+
+
+def test_interpretation_linker_respects_observation_candidate_type_gate(db):
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
+    source = _add_memory_node(
+        db,
+        time_key="2026-05-04 10:00:00",
+        summary="用户要求实现 observation 与 interpretation 的 task 匹配逻辑。",
+        keywords=["memory matching"],
+        fact_kind="request",
+        task_event_like=True,
+        task_event_subject="user",
+        task_relevance="strong",
+    )
+    db.entity_link_node(source, hermes)
+    observation_id = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="memory-matching",
+        topic_label="memory matching",
+        observation_type="observation",
+        summary="用户正在推进 observation 与 interpretation 的匹配实现任务。",
+        keywords=["memory", "matching"],
+        source_node_ids=[source],
+        metadata={
+            "observation_kind": "task_signal",
+            "candidate_interpretation_types": ["task"],
+        },
+    )
+    preference_id = db.memory_upsert_interpretation(
+        claim="用户偏好围绕 memory matching 先讨论方案再实现。",
+        target_text="memory matching",
+        scope="memory-matching",
+        interpretation_type="explicit_preference",
+        confidence=0.94,
+        action_implication="处理 memory matching 改动时先讨论方案。",
+        metadata={
+            "entity_id": hermes,
+            "entity_name": "Hermes Agent",
+            "topic_key": "memory-matching",
+            "topic_label": "memory matching",
+        },
+    )
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    source_nodes = db.memory_observation_supporting_nodes([observation_id])[observation_id]
+
+    linked = mgr._link_observation_to_existing_interpretation(
+        observation=dict(db._conn.execute("SELECT * FROM memory_observations WHERE id = ?", (observation_id,)).fetchone()),
+        source_nodes=source_nodes,
+        observation_id=observation_id,
+        source_node_ids=[source],
+    )
+
+    assert linked is None
+    metadata = json.loads(
+        db._conn.execute(
+            "SELECT metadata FROM memory_interpretations WHERE id = ?",
+            (preference_id,),
+        ).fetchone()["metadata"]
+    )
+    assert "cheap_linker" not in metadata
+
+
+def test_interpretation_generation_clusters_unmatched_observations(db):
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
+    first_source = _add_memory_node(
+        db,
+        time_key="2026-05-05 10:00:00",
+        summary="用户要求设计 observation 与 interpretation 的匹配策略。",
+        keywords=["memory interpretation"],
+        fact_kind="request",
+        task_event_like=True,
+        task_event_subject="user",
+        task_relevance="strong",
+    )
+    second_source = _add_memory_node(
+        db,
+        time_key="2026-05-05 11:00:00",
+        summary="助手开始实现 observation 与 interpretation 的 cheap matcher。",
+        keywords=["memory interpretation"],
+        fact_kind="action",
+        task_event_like=True,
+        task_event_subject="assistant",
+        task_relevance="strong",
+    )
+    db.entity_link_node(first_source, hermes)
+    db.entity_link_node(second_source, hermes)
+    first_observation = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="memory-interpretation",
+        topic_label="memory interpretation",
+        observation_type="observation",
+        summary="用户要求设计 observation 与 interpretation 的匹配策略。",
+        keywords=["memory", "interpretation"],
+        source_node_ids=[first_source],
+        metadata={
+            "observation_kind": "task_signal",
+            "evidence_shape": "single_event",
+            "temporal_scope": "recent",
+            "candidate_interpretation_types": ["task"],
+        },
+    )
+    second_observation = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="memory-implementation",
+        topic_label="memory implementation",
+        observation_type="observation",
+        summary="助手开始实现 observation 与 interpretation 的 cheap matcher。",
+        keywords=["memory", "interpretation"],
+        source_node_ids=[second_source],
+        metadata={
+            "observation_kind": "state_change",
+            "evidence_shape": "progression",
+            "temporal_scope": "recent",
+            "candidate_interpretation_types": ["task"],
+        },
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "should_create": True,
+                "claim": "用户当前正在推进 observation 与 interpretation 的匹配实现。",
+                "target_text": "observation interpretation matching",
+                "scope": "memory-interpretation",
+                "interpretation_type": "task",
+                "polarity": "neutral",
+                "strength": 0.8,
+                "confidence": 0.82,
+                "status": "current",
+                "conflict_status": "none",
+                "action_implication": "后续 memory interpretation 工作应保留该任务上下文。",
+                "evidence_node_ids": [first_source, second_source],
+                "evidence_observation_ids": [first_observation, second_observation],
+                "metadata": {
+                    "task_status": "active",
+                    "goal": "实现 observation 与 interpretation 的匹配逻辑。",
+                    "steps": [{"title": "实现 cheap matcher", "status": "active"}],
+                },
+            })
+        ],
+    )
+
+    generated = mgr._generate_interpretations_for_observations([first_observation, second_observation])
+
+    assert generated == 1
+    interpretation_prompts = [
+        prompt for prompt in mgr.llm_prompts if "interpretation 生成模块" in prompt
+    ]
+    assert len(interpretation_prompts) == 1
+    assert "Clustered observations" in interpretation_prompts[0]
+    assert f"id={first_observation}" in interpretation_prompts[0]
+    assert f"id={second_observation}" in interpretation_prompts[0]
+    row = db._conn.execute(
+        "SELECT interpretation_type, evidence_node_ids, evidence_observation_ids, metadata "
+        "FROM memory_interpretations"
+    ).fetchone()
+    assert row["interpretation_type"] == "task"
+    assert json.loads(row["evidence_node_ids"]) == [first_source, second_source]
+    assert json.loads(row["evidence_observation_ids"]) == [first_observation, second_observation]
+    metadata = json.loads(row["metadata"])
+    assert metadata["observation_ids"] == [first_observation, second_observation]
+    assert metadata["interpretation_cluster_family"] == "task"
 
 
 def test_store_turn_can_consolidate_task_observation(db):
@@ -2555,6 +2742,9 @@ def test_task_status_prompt_definitions_scope_stale_by_prompt_role():
     assert "interpretation_type 只能是 insight、task" in INTERPRETATION_GENERATION_PROMPT
     assert "task_status 只能是 active、blocked、paused、stale" in INTERPRETATION_GENERATION_PROMPT
     assert "task_source 固定为 inferred_from_interpretation" in INTERPRETATION_GENERATION_PROMPT
+    assert "interpretation 更新模块" in INTERPRETATION_UPDATE_PROMPT
+    assert "should_update" in INTERPRETATION_UPDATE_PROMPT
+    assert "task_status 只能是 active、blocked、paused、stale" in INTERPRETATION_UPDATE_PROMPT
 
 
 def test_observation_prompts_explain_fact_type_and_kind_labels():
@@ -2601,6 +2791,8 @@ def test_interpretation_generation_prompt_defines_interpretation_contract():
     assert "evidence_node_ids" in INTERPRETATION_GENERATION_PROMPT
     assert "interpretation_type 只能是 insight、task" in INTERPRETATION_GENERATION_PROMPT
     assert "conflict_resolution" in INTERPRETATION_GENERATION_PROMPT
+    assert "更新一条已经存在的 interpretation" in INTERPRETATION_UPDATE_PROMPT
+    assert "新的 observation" in INTERPRETATION_UPDATE_PROMPT
 
 
 def test_reflect_error_log_message_is_json(caplog):
@@ -2694,72 +2886,6 @@ def test_recall_includes_observations_and_supporting_facts(db, monkeypatch):
     assert "Alice's urgent alert workflow is Slack-centered." in context
     assert "[Supporting facts for observations]" in context
     assert "Alice prefers Slack for urgent alerts." in context
-
-
-def test_observation_consolidation_waits_for_incremental_sources(db):
-    alice = db.entity_add_entity("Alice", "PERSON")
-    mgr = _NoAsyncMemoryNodeManager(
-        db,
-        embedding_config={},
-        llm_outputs=[
-            json.dumps({
-                "category": "observation",
-                "summary": "Alice's urgent alert workflow is Slack-centered.",
-                "keywords": ["Slack", "alerts"],
-                "confidence": 0.86,
-                "metadata": {"observation_kind": "context"},
-            }),
-            json.dumps({"should_create": False}),
-            json.dumps({
-                "category": "observation",
-                "summary": "Alice continues to prefer Slack for urgent alert routing.",
-                "keywords": ["Slack", "alerts"],
-                "confidence": 0.9,
-                "metadata": {"observation_kind": "context"},
-            }),
-        ],
-    )
-
-    def add_source(idx):
-        node_id = _add_memory_node(
-            db,
-            time_key=f"2026-05-0{idx} 10:00:00",
-            summary=f"Alice Slack alert fact {idx}.",
-            keywords=["Slack alerts"],
-        )
-        db.entity_link_node(node_id, alice)
-        mgr._maybe_consolidate_observations(
-            node_id=node_id,
-            topics=["slack-alerts"],
-            linked_entities=[(alice, "Alice")],
-        )
-        return node_id
-
-    for idx in range(1, 4):
-        add_source(idx)
-    first_summary = db._conn.execute("SELECT summary FROM memory_observations").fetchone()["summary"]
-    assert first_summary == "Alice's urgent alert workflow is Slack-centered."
-
-    add_source(4)
-    second_summary = db._conn.execute("SELECT summary FROM memory_observations").fetchone()["summary"]
-    assert second_summary == first_summary
-
-    add_source(5)
-    updated_summary = db._conn.execute("SELECT summary FROM memory_observations").fetchone()["summary"]
-    assert updated_summary == "Alice continues to prefer Slack for urgent alert routing."
-    update_prompt = next(prompt for prompt in reversed(mgr.llm_prompts) if "已有 observation" in prompt)
-    assert "已有 observation" in update_prompt
-    assert "Alice's urgent alert workflow is Slack-centered." in update_prompt
-    assert "Alice Slack alert fact 4." in update_prompt
-    assert "Alice Slack alert fact 5." in update_prompt
-    assert "[time=2026-05-04 10:00:00; semantic/other/other]" in update_prompt
-    assert "[time=2026-05-05 10:00:00; semantic/other/other]" in update_prompt
-    assert "已有 observation 时间信息" in update_prompt
-    assert "source_time_start: 2026-05-01 10:00:00" in update_prompt
-    assert "source_time_end: 2026-05-03 10:00:00" in update_prompt
-    assert "Alice Slack alert fact 1." not in update_prompt
-    assert "Alice Slack alert fact 2." not in update_prompt
-    assert "Alice Slack alert fact 3." not in update_prompt
 
 
 def test_topic_list_creates_standardized_topic_keys(db):

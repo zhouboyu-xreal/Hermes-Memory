@@ -553,6 +553,85 @@ supporting facts:
   "metadata": {{"source": "interpretation_generation"}}
 }}"""
 
+INTERPRETATION_UPDATE_PROMPT = """你是长期记忆 interpretation 更新模块。
+
+你需要根据新的 observation 和 supporting facts，更新一条已经存在的 interpretation。
+
+这里的 interpretation 是 Agent 当前对记忆证据的 current best interpretation。更新时要让它吸收新 observation 带来的进展、确认、修正、冲突或范围变化，而不是只追加证据。
+
+三层记忆架构：
+- fact：原始证据，表示对话中提取出的事实。
+- observation：历史归纳，表示发生过什么、出现过什么模式、经历过什么变化。
+- interpretation：当前解释，表示 Agent 现在如何理解这些 observation，以及后续应该如何行动。
+
+entity: {entity_name}
+topic: {topic_label}
+
+已有 interpretation：
+id: {interpretation_id}
+interpretation_type: {interpretation_type}
+status: {status}
+conflict_status: {conflict_status}
+polarity: {polarity}
+strength: {strength}
+confidence: {confidence}
+subject_text: {subject_text}
+target_text: {target_text}
+scope: {scope}
+claim: {claim}
+resolution: {resolution}
+action_implication: {action_implication}
+metadata: {interpretation_metadata}
+
+新的 observation：
+id: {observation_id}
+observation_type: {observation_type}
+summary: {observation_summary}
+metadata: {observation_metadata}
+
+supporting facts:
+{source_facts}
+
+更新要求：
+- 如果新的 observation 只是确认旧 interpretation，可以小幅提高 confidence/strength，并让 metadata 反映确认来源。
+- 如果新的 observation 表示进展、状态变化、结果、冲突或修正，应更新 claim、action_implication、status/conflict_status、resolution 或 task metadata。
+- 如果 interpretation_type=task，metadata 中填写 task_status、task_source、goal、evidence、steps；task_status 只能是 active、blocked、paused、stale，task_source 固定为 inferred_from_interpretation。
+- 如果 interpretation_type 不是 task，不要填写 task_status、goal、steps、next_action。
+- 不要改变 interpretation_type，除非原类型明显错误；若必须改变，只能使用合法类型。
+- 不要编造没有证据支持的新目标、偏好或风险。
+- evidence_node_ids 和 evidence_observation_ids 只能使用输入中出现的 id。
+- 如果没有任何内容需要更新，只输出 {{"should_update": false}}。
+
+字段要求：
+- claim 是更新后的 Agent 当前解释，必须谨慎、可证据支持；不要写成用户原话。
+- interpretation_type 只能是 insight、task、explicit_preference、explicit_instruction、inferred_preference、behavior_pattern、project_state、task_risk、constraint、conflict_resolution、strategy、other。
+- status 只能是 current、conflicted；不要输出 superseded 或 archived。
+- conflict_status 只能是 none、resolved、unresolved。
+- polarity 只能是 positive、negative、mixed、neutral。
+- strength/confidence 是 0.0-1.0。
+- action_implication 描述这条解释未来如何影响 Agent 行为；如果旧内容仍然准确，可以保留但应吸收新 observation 的变化。
+
+只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
+{{
+  "should_update": true,
+  "claim": "更新后的 Agent 当前解释...",
+  "target_text": "解释对象",
+  "scope": "适用范围",
+  "interpretation_type": "insight | task | explicit_preference | explicit_instruction | inferred_preference | behavior_pattern | project_state | task_risk | constraint | conflict_resolution | strategy | other",
+  "polarity": "positive | negative | mixed | neutral",
+  "strength": 0.0,
+  "confidence": 0.0,
+  "status": "current | conflicted",
+  "conflict_status": "none | resolved | unresolved",
+  "resolution": "可选，冲突如何被解决",
+  "action_implication": "未来 Agent 应如何使用这个解释",
+  "evidence_node_ids": [1, 2],
+  "evidence_observation_ids": [3],
+  "counter_evidence_node_ids": [],
+  "counter_evidence_observation_ids": [],
+  "metadata": {{"source": "interpretation_update"}}
+}}"""
+
 # ── Reflect prompt template ───────────────────────────────────────────────
 
 # ── Memory node context block template ───────────────────────────────────
@@ -1768,190 +1847,7 @@ class MemoryNodeManager:
             return None
         winner = sorted(counts.values(), key=lambda item: (-item["count"], item["order"]))[0]
         return int(winner["entity_id"]), str(winner["entity_name"] or "")
-
-    def _task_match_for_fact(
-        self,
-        fact: Dict[str, Any],
-        tasks: List[Dict[str, Any]],
-        task_embeddings: Dict[int, Any],
-        *,
-        high_similarity_threshold: float = 0.82,
-    ) -> Optional[Tuple[Dict[str, Any], str, float]]:
-        if not tasks:
-            return None
-        if self._fact_kind_excluded_from_task(fact):
-            return None
-
-        fact_entity_ids = {entity_id for entity_id, _entity_name in self._fact_entity_pairs(fact)}
-        fact_topics = {self._topic_key(topic) for topic in fact.get("topics", [])}
-
-        for task in tasks:
-            if (
-                int(task.get("entity_id")) in fact_entity_ids
-                and self._topic_key(task.get("topic_key")) in fact_topics
-            ):
-                return task, "entity_topic", 1.0
-
-        fact_embedding = None
-        if self._embedding_client is not None or self._ensure_embedding_client():
-            try:
-                fact_embedding = self._embedding_client.embed_text(self._fact_match_text(fact))
-            except Exception:
-                fact_embedding = None
-        if fact_embedding is not None:
-            best_task: Optional[Dict[str, Any]] = None
-            best_score = 0.0
-            for task in tasks:
-                task_id = int(task["id"])
-                task_embedding = task_embeddings.get(task_id)
-                if task_embedding is None:
-                    try:
-                        task_embedding = self._embedding_client.embed_text(self._task_profile_text(task))
-                    except Exception:
-                        task_embedding = None
-                    task_embeddings[task_id] = task_embedding
-                score = self._embedding_similarity(fact_embedding, task_embedding)
-                if score > best_score:
-                    best_task = task
-                    best_score = score
-            if best_task is not None and best_score >= high_similarity_threshold:
-                return best_task, "embedding", best_score
-
-        recent_active_tasks = [task for task in tasks if self._task_status(task) == "active"]
-        if len(recent_active_tasks) == 1 and self._is_task_event_like_fact(fact):
-            return recent_active_tasks[0], "recent_active_action", 0.6
-        return None
-
-    def _update_task_interpretation_from_facts(
-        self,
-        task: Dict[str, Any],
-        facts: List[Dict[str, Any]],
-        *,
-        match_methods: List[str],
-    ) -> bool:
-        if not self._db or not facts:
-            return False
-        try:
-            entity_id = int(task.get("entity_id"))
-        except (TypeError, ValueError):
-            anchor = self._fact_anchor_entity(facts)
-            if anchor is None:
-                return False
-            entity_id = int(anchor[0])
-        entity_name = str(task.get("entity_name") or "")
-        topic_label = str(task.get("topic_label") or task.get("topic_key") or task.get("target_text") or "task")
-        topic_key = self._topic_key(str(task.get("topic_key") or topic_label))
-        observation = self._generate_observation(
-            entity_name=entity_name,
-            topic_label=topic_label,
-            source_nodes=facts,
-            existing_observation=None,
-        )
-        if not observation:
-            return False
-        observation_metadata = {
-            "source": "memory_node_manager",
-            "task_match_methods": sorted(set(match_methods)),
-            "matched_task_interpretation_id": int(task["id"]) if task.get("id") is not None else None,
-            **(observation.get("metadata") or {}),
-        }
-        existing_source_ids = []
-        metadata = self._json_dict(task.get("metadata", {}))
-        observation_id_from_task = metadata.get("observation_id")
-        try:
-            if observation_id_from_task:
-                existing_source_ids = self._db.memory_observation_source_ids(int(observation_id_from_task))
-        except (TypeError, ValueError):
-            existing_source_ids = []
-        new_source_ids = [int(fact["node_id"]) for fact in facts]
-        source_ids = list(dict.fromkeys(existing_source_ids + new_source_ids))
-        keywords = observation["keywords"] or self._normalize_keywords([
-            task.get("keywords", ""),
-            topic_label,
-        ])
-        observation_id = self._db.memory_upsert_observation(
-            entity_id=entity_id,
-            topic_key=topic_key,
-            topic_label=topic_label,
-            observation_type="observation",
-            summary=observation["summary"],
-            keywords=keywords,
-            confidence=observation["confidence"],
-            source_node_ids=source_ids,
-            metadata=observation_metadata,
-        )
-        self._log_reflect_error("task_interpretation_evidence_update", {
-            "task_interpretation": self._reflect_observation_log_item(task),
-            "match_methods": sorted(set(match_methods)),
-            "llm_source_facts": self._reflect_fact_log_items(facts),
-            "stored_source_node_ids": source_ids,
-            "observation_id": observation_id,
-            "generated_observation": {
-                **self._reflect_observation_log_item(observation),
-                "metadata": observation_metadata,
-            },
-        })
-        stored_observation = {
-            "id": int(observation_id),
-            "entity_id": entity_id,
-            "entity_name": entity_name,
-            "topic_label": topic_label,
-            "topic_key": topic_key,
-            "observation_type": "observation",
-            "summary": observation["summary"],
-            "keywords": keywords,
-            "confidence": observation["confidence"],
-            "metadata": observation_metadata,
-        }
-        self._maybe_generate_interpretation_from_observation(
-            observation=stored_observation,
-            source_nodes=facts,
-            observation_id=int(observation_id),
-            source_node_ids=source_ids,
-        )
-        return True
-
-    def _match_and_update_tasks_for_facts(
-        self,
-        candidates: List[Dict[str, Any]],
-    ) -> Tuple[set[int], Dict[str, int], int]:
-        if not self._db or not candidates:
-            return set(), {}, 0
-        tasks = [
-            task
-            for task in self._db.memory_active_task_interpretations(limit=50)
-            if self._task_status(task) != "stale"
-        ]
-        if not tasks:
-            return set(), {}, 0
-
-        task_embeddings: Dict[int, Any] = {}
-        grouped: Dict[int, Dict[str, Any]] = {}
-        method_counts: Dict[str, int] = {}
-        for fact in candidates:
-            match = self._task_match_for_fact(fact, tasks, task_embeddings)
-            if not match:
-                continue
-            task, method, _score = match
-            task_id = int(task["id"])
-            item = grouped.setdefault(task_id, {"task": task, "facts": [], "methods": []})
-            item["facts"].append(fact)
-            item["methods"].append(method)
-            method_counts[method] = method_counts.get(method, 0) + 1
-
-        matched_node_ids: set[int] = set()
-        updated_tasks = 0
-        for item in grouped.values():
-            facts = item["facts"]
-            if self._update_task_interpretation_from_facts(
-                item["task"],
-                facts,
-                match_methods=item["methods"],
-            ):
-                updated_tasks += 1
-                matched_node_ids.update(int(fact["node_id"]) for fact in facts)
-        return matched_node_ids, method_counts, updated_tasks
-
+        
     @staticmethod
     def _observation_time_value(value: Any) -> str:
         text = str(value or "").strip()
@@ -2094,6 +1990,7 @@ class MemoryNodeManager:
         observation: Dict[str, Any],
         source_nodes: List[Dict[str, Any]],
         observation_id: int,
+        observation_ids: Optional[List[int]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Generate an optional current interpretation from an observation."""
         fact_lines = []
@@ -2166,11 +2063,17 @@ class MemoryNodeManager:
             confidence = float(data.get("confidence", 0.5) or 0.5)
         except (TypeError, ValueError):
             confidence = 0.5
-        allowed_observation_ids = {int(observation_id)}
+        allowed_observation_ids = {
+            int(item)
+            for item in (observation_ids or [observation_id])
+            if item is not None
+        }
+        if not allowed_observation_ids:
+            allowed_observation_ids = {int(observation_id)}
         evidence_observation_ids = self._filter_int_ids(
-            data.get("evidence_observation_ids", [observation_id]),
+            data.get("evidence_observation_ids", sorted(allowed_observation_ids)),
             allowed_observation_ids,
-        ) or [int(observation_id)]
+        ) or sorted(allowed_observation_ids)
         metadata_out = data.get("metadata", {})
         if not isinstance(metadata_out, dict):
             metadata_out = {}
@@ -2217,6 +2120,154 @@ class MemoryNodeManager:
             "metadata": metadata_out,
         }
 
+    def _update_existing_interpretation_from_observation(
+        self,
+        *,
+        interpretation: Dict[str, Any],
+        observation: Dict[str, Any],
+        source_nodes: List[Dict[str, Any]],
+        observation_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Update a matched current interpretation using a new observation."""
+        fact_lines = []
+        allowed_node_ids: set[int] = set()
+        for index, node in enumerate(source_nodes[:8], 1):
+            node_id = node.get("id", node.get("node_id"))
+            try:
+                int_node_id = int(node_id)
+            except (TypeError, ValueError):
+                continue
+            summary = str(node.get("summary") or "").strip()
+            if not summary:
+                continue
+            allowed_node_ids.add(int_node_id)
+            fact_type = str(node.get("fact_type") or "semantic")
+            fact_subject = str(node.get("fact_subject") or "other")
+            fact_kind = str(node.get("fact_kind") or "other")
+            fact_lines.append(f"{index}. id={int_node_id} [{fact_type}/{fact_subject}/{fact_kind}] {summary}")
+        if not fact_lines:
+            return None
+
+        interpretation_metadata = self._json_dict(interpretation.get("metadata", {}))
+        observation_metadata = self._json_dict(observation.get("metadata", {}))
+        prompt = INTERPRETATION_UPDATE_PROMPT.format(
+            entity_name=observation.get("entity_name", ""),
+            topic_label=observation.get("topic_label") or observation.get("topic_key") or "",
+            interpretation_id=interpretation.get("id"),
+            interpretation_type=interpretation.get("interpretation_type", "insight"),
+            status=interpretation.get("status", "current"),
+            conflict_status=interpretation.get("conflict_status", "none"),
+            polarity=interpretation.get("polarity", "neutral"),
+            strength=interpretation.get("strength", 0.5),
+            confidence=interpretation.get("confidence", 0.5),
+            subject_text=interpretation.get("subject_text", ""),
+            target_text=interpretation.get("target_text", ""),
+            scope=interpretation.get("scope", "general"),
+            claim=interpretation.get("claim", ""),
+            resolution=interpretation.get("resolution", ""),
+            action_implication=interpretation.get("action_implication", ""),
+            interpretation_metadata=json.dumps(interpretation_metadata or {}, ensure_ascii=False, sort_keys=True),
+            observation_id=int(observation_id),
+            observation_type=observation.get("observation_type", "observation"),
+            observation_summary=observation.get("summary", ""),
+            observation_metadata=json.dumps(observation_metadata or {}, ensure_ascii=False, sort_keys=True),
+            source_facts="\n".join(fact_lines),
+        )
+        result = self._call_llm(prompt)
+        data = self._json_object_from_llm_text(result or "")
+        if not data or not bool(data.get("should_update")):
+            return None
+
+        allowed_types = {
+            "insight", "task",
+            "explicit_preference", "explicit_instruction", "inferred_preference",
+            "behavior_pattern", "project_state", "task_risk", "constraint",
+            "conflict_resolution", "strategy", "other",
+        }
+        existing_type = str(interpretation.get("interpretation_type") or "insight")
+        interpretation_type = str(
+            data.get("interpretation_type") or existing_type
+        ).strip().lower().replace("-", "_").replace(" ", "_")
+        if interpretation_type not in allowed_types:
+            interpretation_type = existing_type if existing_type in allowed_types else "insight"
+
+        claim = str(data.get("claim") or interpretation.get("claim") or "").strip()
+        action_implication = str(
+            data.get("action_implication") or interpretation.get("action_implication") or ""
+        ).strip()
+        if not claim or not action_implication:
+            return None
+
+        status = str(data.get("status") or interpretation.get("status") or "current").strip().lower()
+        if status not in {"current", "conflicted"}:
+            status = "current"
+        conflict_status = str(
+            data.get("conflict_status") or interpretation.get("conflict_status") or "none"
+        ).strip().lower()
+        if conflict_status not in {"none", "resolved", "unresolved"}:
+            conflict_status = "none"
+        polarity = str(data.get("polarity") or interpretation.get("polarity") or "neutral").strip().lower()
+        if polarity not in {"positive", "negative", "mixed", "neutral"}:
+            polarity = "neutral"
+        try:
+            strength = float(data.get("strength", interpretation.get("strength", 0.5)) or 0.5)
+        except (TypeError, ValueError):
+            strength = float(interpretation.get("strength") or 0.5)
+        try:
+            confidence = float(data.get("confidence", interpretation.get("confidence", 0.5)) or 0.5)
+        except (TypeError, ValueError):
+            confidence = float(interpretation.get("confidence") or 0.5)
+
+        allowed_observation_ids = {int(observation_id)}
+        metadata_out = data.get("metadata", {})
+        if not isinstance(metadata_out, dict):
+            metadata_out = {}
+        if interpretation_type == "task":
+            task_metadata = self._normalize_task_metadata(metadata_out, allow_stale=True)
+            task_metadata["task_source"] = "inferred_from_interpretation"
+            metadata_out = task_metadata
+        else:
+            metadata_out = {
+                key: value
+                for key, value in metadata_out.items()
+                if key not in {"task_status", "task_source", "goal", "steps", "next_action"}
+            }
+        metadata_out = {
+            "source": "interpretation_update",
+            **metadata_out,
+        }
+        return {
+            "claim": claim,
+            "subject_text": str(data.get("subject_text") or interpretation.get("subject_text") or "agent").strip() or "agent",
+            "target_text": str(data.get("target_text") or interpretation.get("target_text") or "").strip(),
+            "scope": str(data.get("scope") or interpretation.get("scope") or "general").strip() or "general",
+            "interpretation_type": interpretation_type,
+            "polarity": polarity,
+            "strength": max(0.0, min(1.0, strength)),
+            "confidence": max(0.0, min(1.0, confidence)),
+            "status": status,
+            "conflict_status": conflict_status,
+            "resolution": str(data.get("resolution") or interpretation.get("resolution") or "").strip(),
+            "action_implication": action_implication,
+            "evidence_node_ids": self._filter_int_ids(
+                data.get("evidence_node_ids", list(allowed_node_ids)),
+                allowed_node_ids,
+            ),
+            "evidence_observation_ids": self._filter_int_ids(
+                data.get("evidence_observation_ids", [observation_id]),
+                allowed_observation_ids,
+            ) or [int(observation_id)],
+            "counter_evidence_node_ids": self._filter_int_ids(
+                data.get("counter_evidence_node_ids", []),
+                allowed_node_ids,
+            ),
+            "counter_evidence_observation_ids": self._filter_int_ids(
+                data.get("counter_evidence_observation_ids", []),
+                allowed_observation_ids,
+            ),
+            "metadata": metadata_out,
+        }
+
     @staticmethod
     def _interpretation_family(interpretation_type: Any) -> str:
         text = str(interpretation_type or "").strip().lower().replace("-", "_").replace(" ", "_")
@@ -2227,18 +2278,40 @@ class MemoryNodeManager:
         return "insight"
 
     @classmethod
+    def _candidate_interpretation_families(
+        cls,
+        observation: Dict[str, Any],
+        source_nodes: List[Dict[str, Any]],
+    ) -> List[str]:
+        metadata = cls._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
+        families = cls._metadata_candidate_types(metadata.get("candidate_interpretation_types"))
+        if not families:
+            families = cls._candidate_interpretation_types_for_observation_kind(
+                str(metadata.get("observation_kind") or "context"),
+                source_nodes,
+            )
+        return [family for family in ("insight", "task", "preference") if family in set(families)]
+
+    @classmethod
     def _observation_family(cls, observation: Dict[str, Any], source_nodes: List[Dict[str, Any]]) -> str:
-        metadata = cls._json_dict(observation.get("metadata", {}))
+        metadata = cls._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
         observation_kind = str(metadata.get("observation_kind") or "").strip().lower()
+        candidate_families = cls._candidate_interpretation_families(observation, source_nodes)
         source_kinds = {
             str(node.get("fact_kind") or "").strip().lower()
             for node in source_nodes
         }
-        if any(cls._is_task_event_like_fact(node) for node in source_nodes):
+        if "task" in candidate_families and (
+            any(cls._is_task_event_like_fact(node) for node in source_nodes)
+            or observation_kind in {"task_signal", "goal_signal", "state_change", "outcome", "event_cluster"}
+        ):
             return "task"
-        if source_kinds & {"preference", "instruction"}:
+        if "preference" in candidate_families and (
+            source_kinds & {"preference", "instruction"}
+            or observation_kind in {"preference_signal", "constraint", "pattern"}
+        ):
             return "preference"
-        if observation_kind in {"timeline", "state_change", "outcome"} and source_kinds & {
+        if "task" in candidate_families and observation_kind in {"timeline", "state_change", "outcome"} and source_kinds & {
             "request", "action", "decision", "error",
         }:
             return "task"
@@ -2273,6 +2346,149 @@ class MemoryNodeManager:
             return 0.0
         return len(overlap) / max(1, min(len(left), len(right)))
 
+    @staticmethod
+    def _task_interpretation_status(interpretation: Dict[str, Any]) -> str:
+        metadata = interpretation.get("metadata", {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        status = str(metadata.get("task_status") or "").strip().lower()
+        return status if status in {"active", "blocked", "paused", "stale"} else ""
+
+    @classmethod
+    def _interpretation_entity_ids(cls, interpretation: Dict[str, Any]) -> set[int]:
+        metadata = cls._json_dict(interpretation.get("metadata", {}))
+        values = [
+            metadata.get("entity_id"),
+            interpretation.get("subject_entity_id"),
+            interpretation.get("target_entity_id"),
+        ]
+        out: set[int] = set()
+        for value in values:
+            try:
+                if value is not None:
+                    out.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    @classmethod
+    def _observation_interpretation_temporal_score(
+        cls,
+        *,
+        observation_metadata: Dict[str, Any],
+        interpretation: Dict[str, Any],
+        interpretation_family: str,
+    ) -> Tuple[float, str]:
+        temporal_scope = str(observation_metadata.get("temporal_scope") or "").strip().lower()
+        evidence_shape = str(observation_metadata.get("evidence_shape") or "").strip().lower()
+        if interpretation_family == "preference":
+            if temporal_scope in {"ongoing", "recurring"}:
+                return 0.08, "preference_scope"
+            if evidence_shape in {"repeated_pattern", "confirmation"}:
+                return 0.06, "preference_evidence_shape"
+        if interpretation_family == "task":
+            task_status = cls._task_interpretation_status(interpretation)
+            if task_status in {"active", "blocked", "paused"} and temporal_scope in {"momentary", "recent", "ongoing"}:
+                return 0.08, "task_temporal_state"
+            if evidence_shape in {"progression", "correction", "confirmation"}:
+                return 0.05, "task_evidence_shape"
+        if interpretation_family == "insight":
+            if evidence_shape in {"repeated_pattern", "contrast", "progression", "correction", "confirmation"}:
+                return 0.08, "insight_evidence_shape"
+            if temporal_scope in {"ongoing", "recurring", "historical"}:
+                return 0.05, "insight_scope"
+        return 0.0, ""
+
+    @classmethod
+    def _interpretation_type_specific_score(
+        cls,
+        *,
+        observation: Dict[str, Any],
+        source_nodes: List[Dict[str, Any]],
+        interpretation: Dict[str, Any],
+        interpretation_family: str,
+        observation_terms: set[str],
+        interpretation_terms: set[str],
+        observation_metadata: Dict[str, Any],
+    ) -> Tuple[float, List[str]]:
+        score = 0.0
+        reasons: List[str] = []
+        observation_kind = str(observation_metadata.get("observation_kind") or "").strip().lower()
+        evidence_shape = str(observation_metadata.get("evidence_shape") or "").strip().lower()
+        source_kinds = {
+            str(node.get("fact_kind") or "").strip().lower()
+            for node in source_nodes
+        }
+        source_subjects = {
+            str(node.get("fact_subject") or "").strip().lower()
+            for node in source_nodes
+        }
+
+        if interpretation_family == "preference":
+            if observation_kind in {"preference_signal", "constraint", "pattern"}:
+                score += 0.08
+                reasons.append("preference_kind")
+            if source_kinds & {"preference", "instruction"}:
+                score += 0.10
+                reasons.append("preference_evidence")
+            if source_subjects & {"user"}:
+                score += 0.04
+                reasons.append("user_subject")
+            target_terms = cls._match_terms(interpretation.get("target_text"), interpretation.get("scope"))
+            target_overlap = cls._term_overlap_score(observation_terms, target_terms)
+            if target_overlap:
+                score += min(0.08, target_overlap * 0.08)
+                reasons.append("preference_target")
+
+        elif interpretation_family == "task":
+            if observation_kind in {"task_signal", "goal_signal", "state_change", "outcome", "event_cluster"}:
+                score += 0.08
+                reasons.append("task_kind")
+            if any(cls._is_task_event_like_fact(node) for node in source_nodes) or source_kinds & {
+                "request", "action", "decision", "error", "recommendation",
+            }:
+                score += 0.10
+                reasons.append("task_evidence")
+            task_status = cls._task_interpretation_status(interpretation)
+            if task_status and task_status != "stale":
+                score += 0.04
+                reasons.append("task_active_state")
+            goal_terms = cls._match_terms(cls._json_dict(interpretation.get("metadata", {})).get("goal"))
+            goal_overlap = cls._term_overlap_score(observation_terms, goal_terms)
+            if goal_overlap:
+                score += min(0.08, goal_overlap * 0.08)
+                reasons.append("task_goal")
+
+        else:
+            if observation_kind in {"pattern", "event_cluster", "state_change", "outcome", "conflict", "context"}:
+                score += 0.06
+                reasons.append("insight_kind")
+            if evidence_shape in {"repeated_pattern", "contrast", "progression", "correction", "confirmation"}:
+                score += 0.08
+                reasons.append("insight_shape")
+            claim_overlap = cls._term_overlap_score(
+                observation_terms,
+                cls._match_terms(interpretation.get("claim"), interpretation.get("resolution")),
+            )
+            if claim_overlap:
+                score += min(0.08, claim_overlap * 0.08)
+                reasons.append("insight_claim")
+
+        temporal_score, temporal_reason = cls._observation_interpretation_temporal_score(
+            observation_metadata=observation_metadata,
+            interpretation=interpretation,
+            interpretation_family=interpretation_family,
+        )
+        if temporal_score:
+            score += temporal_score
+            reasons.append(temporal_reason)
+        return score, reasons
+
     def _interpretation_candidate_score(
         self,
         *,
@@ -2288,18 +2504,26 @@ class MemoryNodeManager:
 
         score = 0.0
         reasons: List[str] = []
+        observation_metadata = self._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
+        candidate_families = self._candidate_interpretation_families(observation, source_nodes)
         observation_family = self._observation_family(observation, source_nodes)
         interpretation_family = self._interpretation_family(interpretation.get("interpretation_type"))
+        if candidate_families and interpretation_family not in candidate_families:
+            return 0.0, "candidate_type_gate"
         if observation_family == interpretation_family:
-            score += 0.18
+            score += 0.24
             reasons.append("family")
         elif observation_family == "preference" and interpretation_family == "insight":
             score += 0.08
             reasons.append("preference_insight")
 
         observation_entity_id = observation.get("entity_id")
-        if observation_entity_id is not None and metadata.get("entity_id") == observation_entity_id:
-            score += 0.28
+        try:
+            observation_entity_id_int = int(observation_entity_id) if observation_entity_id is not None else None
+        except (TypeError, ValueError):
+            observation_entity_id_int = None
+        if observation_entity_id_int is not None and observation_entity_id_int in self._interpretation_entity_ids(interpretation):
+            score += 0.18
             reasons.append("entity")
         observation_topic = self._topic_key(observation.get("topic_key") or observation.get("topic_label") or "")
         interpretation_topic = self._topic_key(
@@ -2309,7 +2533,7 @@ class MemoryNodeManager:
             or ""
         )
         if observation_topic and interpretation_topic and observation_topic == interpretation_topic:
-            score += 0.28
+            score += 0.20
             reasons.append("topic")
 
         observation_terms = self._match_terms(
@@ -2326,25 +2550,26 @@ class MemoryNodeManager:
         )
         overlap = self._term_overlap_score(observation_terms, interpretation_terms)
         if overlap:
-            score += min(0.24, overlap * 0.24)
+            score += min(0.20, overlap * 0.20)
             reasons.append("term_overlap")
 
-        source_kinds = {
-            str(node.get("fact_kind") or "").strip().lower()
-            for node in source_nodes
-        }
-        if interpretation_family == "preference" and source_kinds & {"preference", "instruction"}:
-            score += 0.16
-            reasons.append("preference_evidence")
-        if interpretation_family == "task" and any(self._is_task_event_like_fact(node) for node in source_nodes):
-            score += 0.12
-            reasons.append("task_event")
+        type_score, type_reasons = self._interpretation_type_specific_score(
+            observation=observation,
+            source_nodes=source_nodes,
+            interpretation=interpretation,
+            interpretation_family=interpretation_family,
+            observation_terms=observation_terms,
+            interpretation_terms=interpretation_terms,
+            observation_metadata=observation_metadata,
+        )
+        score += type_score
+        reasons.extend(type_reasons)
 
         try:
             confidence = float(interpretation.get("confidence") or 0.0)
         except (TypeError, ValueError):
             confidence = 0.0
-        score += min(0.08, confidence * 0.08)
+        score += min(0.05, confidence * 0.05)
         return min(1.0, score), "+".join(reasons) or "weak"
 
     def _interpretation_candidates_for_observation(
@@ -2406,7 +2631,7 @@ class MemoryNodeManager:
         source_nodes: List[Dict[str, Any]],
         observation_id: int,
         source_node_ids: List[int],
-        auto_link_threshold: float = 0.72,
+        auto_link_threshold: float = 0.78,
     ) -> Optional[int]:
         if not self._db or not observation_id:
             return None
@@ -2443,6 +2668,27 @@ class MemoryNodeManager:
             int(observation_id),
         ]))
         metadata = self._json_dict(best.get("metadata", {}))
+        updated_interpretation = None
+        if reason != "existing_observation_evidence":
+            updated_interpretation = self._update_existing_interpretation_from_observation(
+                interpretation=best,
+                observation=observation,
+                source_nodes=source_nodes,
+                observation_id=int(observation_id),
+            )
+        if updated_interpretation:
+            evidence_node_ids = list(dict.fromkeys([
+                *evidence_node_ids,
+                *updated_interpretation.get("evidence_node_ids", []),
+            ]))
+            evidence_observation_ids = list(dict.fromkeys([
+                *evidence_observation_ids,
+                *updated_interpretation.get("evidence_observation_ids", []),
+            ]))
+            metadata = {
+                **metadata,
+                **(updated_interpretation.get("metadata") or {}),
+            }
         link_metadata = self._json_dict(metadata.get("cheap_linker", {}))
         metadata["cheap_linker"] = {
             **link_metadata,
@@ -2450,27 +2696,34 @@ class MemoryNodeManager:
             "last_match_reason": reason,
             "last_observation_id": int(observation_id),
             "linker_version": 1,
+            "content_updated": bool(updated_interpretation),
         }
         interpretation_id = self._db.memory_upsert_interpretation(
             interpretation_id=int(best["id"]),
-            claim=best.get("claim", ""),
+            claim=(updated_interpretation or {}).get("claim", best.get("claim", "")),
             subject_entity_id=best.get("subject_entity_id"),
             target_entity_id=best.get("target_entity_id"),
-            subject_text=best.get("subject_text", ""),
-            target_text=best.get("target_text", ""),
-            scope=best.get("scope", "general"),
-            interpretation_type=best.get("interpretation_type", "behavior_pattern"),
-            polarity=best.get("polarity", "neutral"),
-            strength=best.get("strength", 0.5),
-            confidence=best.get("confidence", 0.5),
-            status=best.get("status", "current"),
-            conflict_status=best.get("conflict_status", "none"),
-            resolution=best.get("resolution", ""),
-            action_implication=best.get("action_implication", ""),
+            subject_text=(updated_interpretation or {}).get("subject_text", best.get("subject_text", "")),
+            target_text=(updated_interpretation or {}).get("target_text", best.get("target_text", "")),
+            scope=(updated_interpretation or {}).get("scope", best.get("scope", "general")),
+            interpretation_type=(updated_interpretation or {}).get("interpretation_type", best.get("interpretation_type", "behavior_pattern")),
+            polarity=(updated_interpretation or {}).get("polarity", best.get("polarity", "neutral")),
+            strength=(updated_interpretation or {}).get("strength", best.get("strength", 0.5)),
+            confidence=(updated_interpretation or {}).get("confidence", best.get("confidence", 0.5)),
+            status=(updated_interpretation or {}).get("status", best.get("status", "current")),
+            conflict_status=(updated_interpretation or {}).get("conflict_status", best.get("conflict_status", "none")),
+            resolution=(updated_interpretation or {}).get("resolution", best.get("resolution", "")),
+            action_implication=(updated_interpretation or {}).get("action_implication", best.get("action_implication", "")),
             evidence_node_ids=evidence_node_ids,
             evidence_observation_ids=evidence_observation_ids,
-            counter_evidence_node_ids=best.get("counter_evidence_node_ids", []),
-            counter_evidence_observation_ids=best.get("counter_evidence_observation_ids", []),
+            counter_evidence_node_ids=list(dict.fromkeys([
+                *best.get("counter_evidence_node_ids", []),
+                *((updated_interpretation or {}).get("counter_evidence_node_ids", [])),
+            ])),
+            counter_evidence_observation_ids=list(dict.fromkeys([
+                *best.get("counter_evidence_observation_ids", []),
+                *((updated_interpretation or {}).get("counter_evidence_observation_ids", [])),
+            ])),
             metadata=metadata,
         )
         self._log_reflect_error("interpretation_linked", {
@@ -2480,34 +2733,178 @@ class MemoryNodeManager:
             "score": best_score,
             "reason": reason,
             "interpretation_type": best.get("interpretation_type"),
+            "content_updated": bool(updated_interpretation),
         })
         return int(interpretation_id)
 
-    def _maybe_generate_interpretation_from_observation(
-        self,
-        *,
+    @classmethod
+    def _should_generate_interpretation_for_observation(
+        cls,
         observation: Dict[str, Any],
         source_nodes: List[Dict[str, Any]],
-        observation_id: int,
-        source_node_ids: List[int],
+        family: str,
+    ) -> Tuple[bool, str]:
+        metadata = cls._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
+        observation_kind = str(metadata.get("observation_kind") or "context").strip().lower()
+        evidence_shape = str(metadata.get("evidence_shape") or "single_event").strip().lower()
+        temporal_scope = str(metadata.get("temporal_scope") or "recent").strip().lower()
+        source_kinds = {
+            str(node.get("fact_kind") or "").strip().lower()
+            for node in source_nodes
+        }
+
+        if family == "task":
+            if observation_kind in {"task_signal", "goal_signal", "state_change", "outcome", "event_cluster"}:
+                return True, "task_observation_kind"
+            if any(cls._is_task_event_like_fact(node) for node in source_nodes):
+                return True, "task_event_evidence"
+            if source_kinds & {"request", "action", "decision", "error", "recommendation"}:
+                return True, "task_fact_kind"
+            return False, "weak_task_signal"
+
+        if family == "preference":
+            if source_kinds & {"instruction"}:
+                return True, "explicit_instruction"
+            if observation_kind in {"preference_signal", "constraint"}:
+                return True, "preference_observation_kind"
+            if evidence_shape in {"repeated_pattern", "confirmation"} and source_kinds & {"preference"}:
+                return True, "repeated_preference_evidence"
+            if temporal_scope in {"ongoing", "recurring"} and source_kinds & {"preference", "instruction"}:
+                return True, "stable_preference_scope"
+            return False, "weak_preference_signal"
+
+        if observation_kind in {"conflict", "state_change", "outcome", "pattern"}:
+            return True, "insight_observation_kind"
+        if evidence_shape in {"repeated_pattern", "contrast", "progression", "correction", "confirmation"}:
+            return True, "insight_evidence_shape"
+        if len(source_nodes) >= 2 and temporal_scope in {"ongoing", "historical", "recurring", "recent"}:
+            return True, "multi_evidence_insight"
+        return False, "weak_insight_signal"
+
+    def _observation_interpretation_cluster_family(
+        self,
+        observation: Dict[str, Any],
+        source_nodes: List[Dict[str, Any]],
+    ) -> str:
+        return self._observation_family(observation, source_nodes)
+
+    def _observation_interpretation_clusters(
+        self,
+        items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        buckets: Dict[Tuple[str, Any, str], Dict[str, Any]] = {}
+        for item in items:
+            observation = item["observation"]
+            source_nodes = item.get("source_nodes", [])
+            family = self._observation_interpretation_cluster_family(observation, source_nodes)
+            topic_key = self._topic_key(observation.get("topic_key") or observation.get("topic_label") or "general")
+            cluster_topic = "task-chain" if family == "task" else (topic_key or "general")
+            key = (family, observation.get("entity_id"), cluster_topic)
+            bucket = buckets.setdefault(key, {
+                "family": family,
+                "entity_id": observation.get("entity_id"),
+                "topic_key": cluster_topic,
+                "items": [],
+            })
+            bucket["items"].append(item)
+        clusters = list(buckets.values())
+        clusters.sort(key=lambda cluster: (len(cluster["items"]), cluster["family"], cluster["topic_key"]), reverse=True)
+        return clusters
+
+    @staticmethod
+    def _dedupe_source_nodes(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: set[int] = set()
+        for node in nodes:
+            node_id = node.get("id", node.get("node_id"))
+            try:
+                int_node_id = int(node_id)
+            except (TypeError, ValueError):
+                continue
+            if int_node_id in seen:
+                continue
+            seen.add(int_node_id)
+            out.append(node)
+        return out
+
+    def _generate_interpretation_from_observation_cluster(
+        self,
+        cluster: Dict[str, Any],
     ) -> Optional[int]:
-        if not self._db or not observation_id:
+        items = cluster.get("items") or []
+        if not items:
             return None
-        linked_id = self._link_observation_to_existing_interpretation(
-            observation=observation,
-            source_nodes=source_nodes,
-            observation_id=int(observation_id),
-            source_node_ids=source_node_ids,
-        )
-        if linked_id is not None:
-            return linked_id
-        interpretation = self._generate_interpretation(
-            observation=observation,
-            source_nodes=source_nodes,
-            observation_id=int(observation_id),
-        )
+        family = str(cluster.get("family") or "insight")
+        all_source_nodes = self._dedupe_source_nodes([
+            node
+            for item in items
+            for node in item.get("source_nodes", [])
+        ])
+        observation_ids = [
+            int(item["observation_id"])
+            for item in items
+            if item.get("observation_id") is not None
+        ]
+        if not observation_ids:
+            return None
+
+        if len(items) == 1:
+            observation = items[0]["observation"]
+            should_generate, reason = self._should_generate_interpretation_for_observation(
+                observation,
+                all_source_nodes,
+                family,
+            )
+            if not should_generate:
+                self._log_reflect_error("interpretation_generation_deferred", {
+                    "observation_id": observation_ids[0],
+                    "family": family,
+                    "reason": reason,
+                })
+                return None
+            interpretation = self._generate_interpretation(
+                observation=observation,
+                source_nodes=all_source_nodes,
+                observation_id=observation_ids[0],
+                observation_ids=observation_ids,
+            )
+            representative = observation
+        else:
+            summaries = []
+            for index, item in enumerate(items, 1):
+                observation = item["observation"]
+                summary = str(observation.get("summary") or "").strip()
+                if summary:
+                    summaries.append(f"{index}. id={item['observation_id']} {summary}")
+            representative = dict(items[0]["observation"])
+            representative_metadata = self._json_dict(representative.get("metadata", {}))
+            representative["summary"] = "Clustered observations:\n" + "\n".join(summaries)
+            representative["metadata"] = {
+                **representative_metadata,
+                "interpretation_cluster_family": family,
+                "clustered_observation_ids": observation_ids,
+            }
+            interpretation = self._generate_interpretation(
+                observation=representative,
+                source_nodes=all_source_nodes,
+                observation_id=observation_ids[0],
+                observation_ids=observation_ids,
+            )
         if not interpretation:
             return None
+
+        source_node_ids = [int(node["id"]) for node in all_source_nodes if node.get("id") is not None]
+        metadata = {
+            **(interpretation["metadata"] or {}),
+            "observation_id": int(observation_ids[0]),
+            "observation_ids": observation_ids,
+            "entity_id": representative.get("entity_id"),
+            "entity_name": representative.get("entity_name"),
+            "topic_key": representative.get("topic_key"),
+            "topic_label": representative.get("topic_label"),
+            "observation_type": representative.get("observation_type", "observation"),
+            "interpretation_cluster_family": family,
+        }
         interpretation_id = self._db.memory_upsert_interpretation(
             claim=interpretation["claim"],
             subject_text=interpretation["subject_text"],
@@ -2522,27 +2919,20 @@ class MemoryNodeManager:
             resolution=interpretation["resolution"],
             action_implication=interpretation["action_implication"],
             evidence_node_ids=interpretation["evidence_node_ids"] or source_node_ids,
-            evidence_observation_ids=interpretation["evidence_observation_ids"],
+            evidence_observation_ids=interpretation["evidence_observation_ids"] or observation_ids,
             counter_evidence_node_ids=interpretation["counter_evidence_node_ids"],
             counter_evidence_observation_ids=interpretation["counter_evidence_observation_ids"],
-            metadata={
-                **(interpretation["metadata"] or {}),
-                "observation_id": int(observation_id),
-                "entity_id": observation.get("entity_id"),
-                "entity_name": observation.get("entity_name"),
-                "topic_key": observation.get("topic_key"),
-                "topic_label": observation.get("topic_label"),
-                "observation_type": observation.get("observation_type", "observation"),
-            },
+            metadata=metadata,
         )
         self._log_reflect_error("interpretation_generated", {
             "interpretation_id": interpretation_id,
-            "observation_id": observation_id,
+            "observation_ids": observation_ids,
             "source_node_ids": source_node_ids,
+            "cluster_family": family,
             "generated_interpretation": interpretation,
         })
         return int(interpretation_id)
-
+    
     def _generate_interpretations_for_observations(self, observation_ids: List[int]) -> int:
         if not self._db:
             return 0
@@ -2559,16 +2949,28 @@ class MemoryNodeManager:
             per_observation=12,
         ) if observations else {}
         generated = 0
+        unmatched: List[Dict[str, Any]] = []
         for observation in observations:
             observation_id = int(observation["id"])
             source_nodes = supporting_by_observation.get(observation_id, [])
             source_node_ids = [int(node["id"]) for node in source_nodes if node.get("id") is not None]
-            interpretation_id = self._maybe_generate_interpretation_from_observation(
+            linked_id = self._link_observation_to_existing_interpretation(
                 observation=observation,
                 source_nodes=source_nodes,
                 observation_id=observation_id,
                 source_node_ids=source_node_ids,
             )
+            if linked_id is not None:
+                generated += 1
+                continue
+            unmatched.append({
+                "observation": observation,
+                "observation_id": observation_id,
+                "source_nodes": source_nodes,
+                "source_node_ids": source_node_ids,
+            })
+        for cluster in self._observation_interpretation_clusters(unmatched):
+            interpretation_id = self._generate_interpretation_from_observation_cluster(cluster)
             if interpretation_id is not None:
                 generated += 1
         return generated
@@ -3171,142 +3573,7 @@ class MemoryNodeManager:
             },
         })
         return int(observation_id)
-
-    def _maybe_consolidate_observations(
-        self,
-        *,
-        node_id: int,
-        topics: List[str],
-        linked_entities: List[Tuple[int, str]],
-        min_sources: int = 3,
-        min_new_sources: int = 2,
-        changed_observation_ids: Optional[List[int]] = None,
-        generate_interpretation: bool = True,
-    ) -> int:
-        if not self._db or not linked_entities:
-            return 0
-        consolidated = 0
-        for entity_id, entity_name in linked_entities:
-            for topic_key in topics:
-                topic_label = topic_key
-                topic_terms = [topic_key]
-                try:
-                    source_nodes = self._db.memory_observation_source_nodes(
-                        entity_id=entity_id,
-                        topic_key=topic_key,
-                        limit=12,
-                    )
-                    source_ids = [int(node["id"]) for node in source_nodes]
-                    if node_id not in source_ids:
-                        continue
-                    existing_observation, pending_source_ids = self._db.memory_observation_pending_sources(
-                        entity_id=entity_id,
-                        topic_key=topic_key,
-                        candidate_node_ids=source_ids,
-                    )
-                    if existing_observation is None and len(source_ids) < min_sources:
-                        continue
-                    if existing_observation is not None and len(pending_source_ids) < min_new_sources:
-                        continue
-                    nodes_for_llm = source_nodes
-                    if existing_observation is not None:
-                        pending_set = set(pending_source_ids)
-                        nodes_for_llm = [node for node in source_nodes if int(node["id"]) in pending_set]
-                    observation = self._generate_observation(
-                        entity_name=entity_name,
-                        topic_label=topic_label,
-                        source_nodes=nodes_for_llm,
-                        existing_observation=existing_observation,
-                    )
-                    if not observation:
-                        continue
-                    observation_metadata = {
-                        "source": "memory_node_manager",
-                        **(observation.get("metadata") or {}),
-                    }
-                    observation_id = None
-                    action = "create"
-                    stored_source_ids = source_ids
-                    if existing_observation is not None:
-                        observation_id = int(existing_observation["id"])
-                        action = "update"
-                        existing_source_ids = self._db.memory_observation_source_ids(observation_id)
-                        stored_source_ids = list(dict.fromkeys(existing_source_ids + source_ids))
-                        self._db.memory_replace_observation_group(
-                            keep_observation_id=int(existing_observation["id"]),
-                            remove_observation_ids=[],
-                            observation_type=observation["observation_type"],
-                            summary=observation["summary"],
-                            keywords=observation["keywords"] or topic_terms,
-                            confidence=observation["confidence"],
-                            source_node_ids=stored_source_ids,
-                            metadata=observation_metadata,
-                        )
-                    else:
-                        observation_id = self._db.memory_upsert_observation(
-                            entity_id=entity_id,
-                            topic_key=topic_key,
-                            topic_label=topic_label,
-                            observation_type=observation["observation_type"],
-                            summary=observation["summary"],
-                            keywords=observation["keywords"] or topic_terms,
-                            source_node_ids=stored_source_ids,
-                            confidence=observation["confidence"],
-                            metadata=observation_metadata,
-                        )
-                    stored_observation = {
-                        "id": int(observation_id),
-                        "entity_id": entity_id,
-                        "entity_name": entity_name,
-                        "topic_key": topic_key,
-                        "topic_label": topic_label,
-                        "observation_type": observation["observation_type"],
-                        "summary": observation["summary"],
-                        "keywords": observation["keywords"] or topic_terms,
-                        "confidence": observation["confidence"],
-                        "metadata": observation_metadata,
-                    }
-                    if changed_observation_ids is not None:
-                        changed_observation_ids.append(int(observation_id))
-                    if generate_interpretation:
-                        self._maybe_generate_interpretation_from_observation(
-                            observation=stored_observation,
-                            source_nodes=source_nodes,
-                            observation_id=int(observation_id),
-                            source_node_ids=stored_source_ids,
-                        )
-                    self._log_reflect_error("observation_generated", {
-                        "action": action,
-                        "observation_id": observation_id,
-                        "entity_id": entity_id,
-                        "entity_name": entity_name,
-                        "topic_key": topic_key,
-                        "existing_observation_id": (
-                            int(existing_observation["id"])
-                            if existing_observation is not None
-                            else None
-                        ),
-                        "trigger_node_id": node_id,
-                        "llm_source_facts": self._reflect_fact_log_items(nodes_for_llm),
-                        "stored_source_node_ids": stored_source_ids,
-                        "pending_source_node_ids": pending_source_ids,
-                        "generated_observation": {
-                            **self._reflect_observation_log_item(observation),
-                            "metadata": observation_metadata,
-                        },
-                    })
-                    consolidated += 1
-                    return consolidated
-                except Exception as exc:
-                    logger.debug(
-                        "Failed to consolidate observation for node %d entity %s topic %s: %s",
-                        node_id,
-                        entity_name,
-                        topic_key,
-                        exc,
-                    )
-        return consolidated
-
+    
     def _reflect_generate_observations(
         self,
         *,
