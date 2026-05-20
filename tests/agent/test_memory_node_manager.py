@@ -1670,6 +1670,198 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
     assert len(sources) == 3
 
 
+def test_unmatched_fact_clusters_match_generalized_topic_with_time_window(db):
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    facts = [
+        {
+            "node_id": 1,
+            "time_key": "2026-05-01 10:00:00+00:00#00",
+            "summary": "用户讨论家庭情况。",
+            "topics": ["家庭"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+        {
+            "node_id": 2,
+            "time_key": "2026-05-01 10:30:00+00:00#00",
+            "summary": "用户讨论家庭关系。",
+            "topics": ["家庭关系"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+    ]
+
+    clusters = mgr._unmatched_fact_clusters(facts, excluded_node_ids=set())
+
+    normalized = [
+        cluster for cluster in clusters
+        if cluster.get("topic_key") == "家庭" and cluster.get("topic_match") == "normalized"
+    ]
+    assert normalized
+    assert normalized[0]["raw_topic_keys"] == ["家庭", "家庭关系"]
+    assert normalized[0]["source_node_ids"] == [1, 2]
+
+
+def test_unmatched_fact_clusters_do_not_match_different_specific_family_topics(db):
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    facts = [
+        {
+            "node_id": 1,
+            "time_key": "2026-05-01 10:00:00+00:00#00",
+            "summary": "用户讨论家庭关系。",
+            "topics": ["家庭关系"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+        {
+            "node_id": 2,
+            "time_key": "2026-05-01 10:30:00+00:00#00",
+            "summary": "用户讨论家庭互动。",
+            "topics": ["家庭互动"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+    ]
+
+    clusters = mgr._unmatched_fact_clusters(facts, excluded_node_ids=set())
+
+    assert not [
+        cluster for cluster in clusters
+        if cluster.get("topic_key") == "家庭" and cluster.get("topic_match") == "normalized"
+    ]
+
+
+def test_unmatched_fact_clusters_require_time_window_for_generalized_topic_match(db):
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    facts = [
+        {
+            "node_id": 1,
+            "time_key": "2026-05-01 10:00:00+00:00#00",
+            "summary": "用户讨论健康。",
+            "topics": ["健康"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+        {
+            "node_id": 2,
+            "time_key": "2026-05-01 13:30:00+00:00#00",
+            "summary": "用户讨论健康管理。",
+            "topics": ["健康管理"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+    ]
+
+    clusters = mgr._unmatched_fact_clusters(facts, excluded_node_ids=set())
+
+    assert not [
+        cluster for cluster in clusters
+        if cluster.get("topic_key") == "健康" and cluster.get("topic_match") == "normalized"
+    ]
+
+
+def test_unmatched_fact_clusters_filter_suffix_facts_outside_time_window(db):
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    facts = [
+        {
+            "node_id": 1,
+            "time_key": "2026-05-01 10:00:00+00:00#00",
+            "summary": "用户讨论健康。",
+            "topics": ["健康"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+        {
+            "node_id": 2,
+            "time_key": "2026-05-01 10:30:00+00:00#00",
+            "summary": "用户讨论健康管理。",
+            "topics": ["健康管理"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+        {
+            "node_id": 3,
+            "time_key": "2026-05-01 13:30:00+00:00#00",
+            "summary": "用户很晚后再次讨论健康管理。",
+            "topics": ["健康管理"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+    ]
+
+    clusters = mgr._unmatched_fact_clusters(facts, excluded_node_ids=set())
+
+    normalized = [
+        cluster for cluster in clusters
+        if cluster.get("topic_key") == "健康" and cluster.get("topic_match") == "normalized"
+    ]
+    assert normalized
+    assert normalized[0]["source_node_ids"] == [1, 2]
+
+
+def test_unmatched_fact_clusters_match_suffix_fact_to_nearest_bare_fact(db):
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    facts = [
+        {
+            "node_id": 1,
+            "time_key": "2026-05-01 10:00:00+00:00#00",
+            "summary": "用户早上讨论健康。",
+            "topics": ["健康"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+        {
+            "node_id": 2,
+            "time_key": "2026-05-01 16:00:00+00:00#00",
+            "summary": "用户下午再次讨论健康。",
+            "topics": ["健康"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+        {
+            "node_id": 3,
+            "time_key": "2026-05-01 16:30:00+00:00#00",
+            "summary": "用户下午讨论健康管理。",
+            "topics": ["健康管理"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+    ]
+
+    clusters = mgr._unmatched_fact_clusters(facts, excluded_node_ids=set())
+
+    normalized = [
+        cluster for cluster in clusters
+        if cluster.get("topic_key") == "健康" and cluster.get("topic_match") == "normalized"
+    ]
+    assert normalized
+    assert normalized[0]["source_node_ids"] == [1, 2, 3]
+
+
 def test_reflect_generates_interpretation_from_consolidated_observation(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     node_ids = []

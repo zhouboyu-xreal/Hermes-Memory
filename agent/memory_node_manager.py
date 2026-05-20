@@ -2825,6 +2825,58 @@ class MemoryNodeManager:
             reasons.append("error_signal")
         return min(1.0, score), "+".join(reasons)
 
+    _GENERALIZABLE_TOPIC_SUFFIXES = {
+        "关系",   # 家庭 <-> 家庭关系；夫妻 <-> 夫妻关系
+        "管理",   # 健康 <-> 健康管理；时间 <-> 时间管理
+        "状态",   # 身体 <-> 身体状态；项目 <-> 项目状态
+        "情况",   # 家庭 <-> 家庭情况；工作 <-> 工作情况
+        "问题",   # 健康 <-> 健康问题；沟通 <-> 沟通问题
+    }
+    _NORMALIZED_TOPIC_CLUSTER_WINDOW_SECONDS = 2 * 60 * 60
+
+    @classmethod
+    def _split_generalizable_topic(cls, topic: Any) -> Tuple[str, Optional[str]]:
+        topic_key = cls._topic_key(topic)
+        for suffix in cls._GENERALIZABLE_TOPIC_SUFFIXES:
+            if topic_key.endswith(suffix) and len(topic_key) > len(suffix):
+                head = topic_key[: -len(suffix)].strip("-_ ")
+                if len(head) >= 2:
+                    return head, suffix
+        return topic_key, None
+
+    @staticmethod
+    def _fact_time_seconds(fact: Dict[str, Any]) -> Optional[float]:
+        raw = str(fact.get("time_key") or "").strip()
+        if not raw:
+            return None
+        raw = raw.split("#", 1)[0].replace(" ", "T", 1)
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+
+    @classmethod
+    def _facts_within_normalized_topic_window(
+        cls,
+        bare_facts: List[Dict[str, Any]],
+        suffix_fact: Dict[str, Any],
+    ) -> bool:
+        suffix_time = cls._fact_time_seconds(suffix_fact)
+        if suffix_time is None:
+            return False
+        bare_times = [
+            time
+            for fact in bare_facts
+            if (time := cls._fact_time_seconds(fact)) is not None
+        ]
+        if not bare_times or len(bare_times) != len(bare_facts):
+            return False
+        nearest_bare_time = min(bare_times, key=lambda time: abs(time - suffix_time))
+        return abs(nearest_bare_time - suffix_time) <= cls._NORMALIZED_TOPIC_CLUSTER_WINDOW_SECONDS
+
     def _unmatched_fact_clusters(
         self,
         facts: List[Dict[str, Any]],
@@ -2832,7 +2884,8 @@ class MemoryNodeManager:
         excluded_node_ids: set[int],
         min_cluster_score: float = 0.66,
     ) -> List[Dict[str, Any]]:
-        buckets: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+        buckets: Dict[Tuple[int, str, str, str], Dict[str, Any]] = {}
+        normalized_candidates: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
         for fact in facts:
             node_id = self._node_id(fact)
             if node_id is None or node_id in excluded_node_ids:
@@ -2843,7 +2896,7 @@ class MemoryNodeManager:
                 for topic in topics:
                     topic_key = self._topic_key(topic)
                     for bucket_family in (family, "mixed"):
-                        key = (int(entity_id), topic_key, bucket_family)
+                        key = (int(entity_id), topic_key, bucket_family, "raw")
                         bucket = buckets.setdefault(
                             key,
                             {
@@ -2851,6 +2904,8 @@ class MemoryNodeManager:
                                 "entity_name": entity_name,
                                 "topic_key": topic_key,
                                 "topic_label": topic_key,
+                                "topic_match": "raw",
+                                "raw_topic_keys": [topic_key],
                                 "cluster_family": bucket_family,
                                 "facts": [],
                                 "node_ids": set(),
@@ -2860,6 +2915,80 @@ class MemoryNodeManager:
                             continue
                         bucket["node_ids"].add(node_id)
                         bucket["facts"].append(fact)
+
+                        normalized_head, suffix = self._split_generalizable_topic(topic_key)
+                        if suffix is not None or topic_key == normalized_head:
+                            normalized_key = (int(entity_id), normalized_head, bucket_family)
+                            candidate = normalized_candidates.setdefault(
+                                normalized_key,
+                                {
+                                    "entity_id": int(entity_id),
+                                    "entity_name": entity_name,
+                                    "topic_key": normalized_head,
+                                    "topic_label": normalized_head,
+                                    "topic_match": "normalized",
+                                    "cluster_family": bucket_family,
+                                    "bare_facts": [],
+                                    "bare_node_ids": set(),
+                                    "suffix_facts": {},
+                                    "suffix_node_ids": {},
+                                    "raw_topic_keys": [],
+                                },
+                            )
+                            if topic_key not in candidate["raw_topic_keys"]:
+                                candidate["raw_topic_keys"].append(topic_key)
+                            if suffix is None and topic_key == normalized_head:
+                                if node_id not in candidate["bare_node_ids"]:
+                                    candidate["bare_node_ids"].add(node_id)
+                                    candidate["bare_facts"].append(fact)
+                            elif suffix is not None:
+                                suffix_facts = candidate["suffix_facts"].setdefault(suffix, [])
+                                suffix_node_ids = candidate["suffix_node_ids"].setdefault(suffix, set())
+                                if node_id not in suffix_node_ids:
+                                    suffix_node_ids.add(node_id)
+                                    suffix_facts.append(fact)
+
+        for candidate in normalized_candidates.values():
+            bare_facts = candidate.get("bare_facts", [])
+            bare_node_ids = candidate.get("bare_node_ids", set())
+            if not bare_facts:
+                continue
+            for suffix, suffix_facts in candidate.get("suffix_facts", {}).items():
+                filtered_suffix_facts = [
+                    fact
+                    for fact in suffix_facts
+                    if self._facts_within_normalized_topic_window(list(bare_facts), fact)
+                ]
+                suffix_node_ids = {
+                    self._node_id(fact)
+                    for fact in filtered_suffix_facts
+                    if self._node_id(fact) is not None
+                }
+                combined_node_ids = set(bare_node_ids) | set(suffix_node_ids)
+                if len(combined_node_ids) < 2:
+                    continue
+                combined_facts = list(bare_facts) + filtered_suffix_facts
+                key = (
+                    int(candidate["entity_id"]),
+                    str(candidate["topic_key"]),
+                    str(candidate["cluster_family"]),
+                    f"normalized:{suffix}",
+                )
+                buckets[key] = {
+                    "entity_id": candidate["entity_id"],
+                    "entity_name": candidate["entity_name"],
+                    "topic_key": candidate["topic_key"],
+                    "topic_label": candidate["topic_label"],
+                    "topic_match": candidate["topic_match"],
+                    "cluster_family": candidate["cluster_family"],
+                    "raw_topic_keys": [
+                        key
+                        for key in candidate.get("raw_topic_keys", [])
+                        if key == candidate["topic_key"] or key == f"{candidate['topic_key']}{suffix}"
+                    ],
+                    "facts": combined_facts,
+                    "node_ids": combined_node_ids,
+                }
 
         clusters: List[Dict[str, Any]] = []
         for bucket in buckets.values():
@@ -2871,7 +3000,9 @@ class MemoryNodeManager:
             if score < min_cluster_score:
                 continue
             clusters.append({
-                **{key: value for key, value in bucket.items() if key not in {"facts", "node_ids"}},
+                **{key: value for key, value in bucket.items() if key not in {
+                    "facts", "node_ids", "bare_facts", "bare_node_ids", "suffix_facts", "suffix_node_ids",
+                }},
                 "source_nodes": facts_for_cluster,
                 "source_node_ids": [self._node_id(fact) for fact in facts_for_cluster if self._node_id(fact) is not None],
                 "cluster_score": score,
