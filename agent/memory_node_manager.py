@@ -398,10 +398,6 @@ source facts:
   }}
 }}"""
 
-# Backward-compatible names for callers/tests that still import the old constants.
-INSIGHT_CONSOLIDATION_PROMPT = OBSERVATION_CONSOLIDATION_PROMPT
-TASK_CONSOLIDATION_PROMPT = OBSERVATION_CONSOLIDATION_PROMPT
-
 OBSERVATION_UPDATE_PROMPT = """你是长期记忆 observation consolidation 模块。
 
 你需要根据新的记忆事实，以及可能因 entity 合并带来的相关既有 observation，更新同一 entity/topic 下已有的 observation。
