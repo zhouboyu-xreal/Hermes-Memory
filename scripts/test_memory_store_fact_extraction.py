@@ -33,6 +33,8 @@ from hermes_state import EMBEDDING_DIM, SessionDB
 
 DEFAULT_INPUT = Path("/Users/zhouboyu/Downloads/history_dialogue.json")
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "tmp" / "memory_store_fact_test"
+DEFAULT_LOG_PATH = REPO_ROOT / "tmp" / "memory_store_fact_test" / "memory_store_extraction_test.log"
+
 SAMPLE_ID_RE = re.compile(r"(?:^|_)sample(\d+)$")
 
 
@@ -213,6 +215,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--db-name", default="memory_store_fact_test.db")
+    parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
     parser.add_argument("--limit", type=int, default=0, help="Limit turns for smoke testing; 0 means all.")
     parser.add_argument("--start", type=int, default=0, help="Start offset in flattened turns.")
     parser.add_argument("--overwrite", action="store_true", help="Replace existing output DB/report files.")
@@ -226,7 +229,7 @@ def parse_args() -> argparse.Namespace:
         help='Enable reflect',
     )
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--manager-log-level", default="CRITICAL")
+    parser.add_argument("--manager-log-level", default="INFO")
     return parser.parse_args()
 
 
@@ -244,12 +247,7 @@ def remove_existing_outputs(db_path: Path, report_path: Path, overwrite: bool) -
     for path in existing:
         path.unlink()
 
-
-def main() -> int:
-    load_dotenv(REPO_ROOT / ".env")
-    load_dotenv(Path.home() / ".hermes" / ".env")
-
-    args = parse_args()
+def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_hermes_config()
     model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
     embedding_config = config.get("embedding", {}) if isinstance(config.get("embedding"), dict) else {}
@@ -280,14 +278,31 @@ def main() -> int:
         or ""
     )
     args.llm_timeout = args.llm_timeout or int(os.getenv("HERMES_MEMORY_LLM_TIMEOUT", "120"))
-    logging.basicConfig(
-        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+
+def configure_logging(log_path: Path, log_level: str, manager_log_level: str) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(getattr(logging, str(log_level).upper(), logging.INFO))
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    root.addHandler(stream_handler)
     logging.getLogger("agent.memory_node_manager").setLevel(
-        getattr(logging, str(args.manager_log_level).upper(), logging.CRITICAL)
+        getattr(logging, str(manager_log_level).upper(), logging.INFO)
     )
 
+def main() -> int:
+    load_dotenv(REPO_ROOT / ".env")
+    load_dotenv(Path.home() / ".hermes" / ".env")
+
+    args = parse_args()
+    resolve_llm_args(args)
+    configure_logging(args.log_path, args.log_level, args.manager_log_level)
+    
     if not args.llm_api_key and args.llm_base_url.rstrip("/") == DEFAULT_LLM_BASE_URL:
         raise RuntimeError(
             "No OPENAI_API_KEY/HERMES_LLM_API_KEY found. Set one or pass --llm-base-url for a local compatible endpoint."

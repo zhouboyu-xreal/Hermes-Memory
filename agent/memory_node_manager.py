@@ -1115,10 +1115,7 @@ class MemoryNodeManager:
 
         data: Optional[Dict[str, Any]] = None
         for attempt in range(2):
-            logger.error("input user_message: " + user_message)
-            logger.error("input assistant_response: " + assistant_response)
             result = self._call_llm(prompt)
-            logger.error("output from LLM \n" + result)
             data = self._json_object_from_llm_text(result or "")
             if data is not None:
                 break
@@ -1277,7 +1274,6 @@ class MemoryNodeManager:
                 summary1=cur_summary,
                 summary2=node.get("summary", ""),
             )
-            logger.error("cur chosen similar node, summary, " + node.get("summary", ""))
             result = self._call_llm(prompt)
 
             if not result:
@@ -1560,21 +1556,21 @@ class MemoryNodeManager:
         }
 
     @classmethod
-    def _log_reflect_error(cls, event: str, payload: Dict[str, Any]) -> None:
+    def _log_info(cls, scope: str, event: str, payload: Dict[str, Any]) -> None:
         record = {
-            "scope": "memory_reflect",
+            "scope": scope,
             "event": event,
             "payload": payload,
         }
         try:
-            body = json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2, default=str)
+            body = json.dumps(record, ensure_ascii=False, sort_keys=False, indent=2, default=str)
         except (TypeError, ValueError):
             body = json.dumps({
-                "scope": "memory_reflect",
+                "scope": scope,
                 "event": event,
                 "payload": str(payload),
             }, ensure_ascii=False, sort_keys=True, indent=2)
-        logger.error("\n%s", body)
+        logger.info("\n%s", body)
 
     @classmethod
     def _normalize_task_steps(cls, value: Any, *, limit: int = 12) -> List[Dict[str, Any]]:
@@ -2879,11 +2875,15 @@ class MemoryNodeManager:
         try:
             self._db.memory_update_observation_metadata(int(observation["id"]), metadata)
         except AttributeError:
-            self._log_reflect_error("interpretation_state_update_unsupported", {
-                "observation_id": observation.get("id"),
-                "status": status,
-                "reason": reason,
-            })
+            self._log_info(
+                "memory_reflect",
+                "interpretation_state_update_unsupported", 
+                {
+                    "observation_id": observation.get("id"),
+                    "status": status,
+                    "reason": reason,
+                }
+            )
             return
         observation["metadata"] = metadata
 
@@ -3044,20 +3044,28 @@ class MemoryNodeManager:
         scored.sort(key=lambda item: (item[0], item[2].get("updated_at") or ""), reverse=True)
         best_score, reason, best = scored[0]
         if best_score < auto_link_threshold:
-            self._log_reflect_error("interpretation_link_skipped", {
-                "observation": self._reflect_observation_log_item(observation),
-                "best_interpretation_id": best.get("id"),
-                "best_score": best_score,
-                "reason": reason,
-            })
+            self._log_info(
+                "memory_reflect",
+                "interpretation_link_skipped", 
+                {
+                    "observation": self._reflect_observation_log_item(observation),
+                    "best_interpretation_id": best.get("id"),
+                    "best_score": best_score,
+                    "reason": reason,
+                }
+            )
             return None
         if not allow_content_update and reason != "existing_observation_evidence":
-            self._log_reflect_error("interpretation_link_deferred", {
-                "observation": self._reflect_observation_log_item(observation),
-                "best_interpretation_id": best.get("id"),
-                "best_score": best_score,
-                "reason": "llm_budget_exhausted_before_update",
-            })
+            self._log_info(
+                "memory_reflect",
+                "interpretation_link_deferred", 
+                {
+                    "observation": self._reflect_observation_log_item(observation),
+                    "best_interpretation_id": best.get("id"),
+                    "best_score": best_score,
+                    "reason": "llm_budget_exhausted_before_update",
+                }
+            )
             return None
 
         evidence_node_ids = list(dict.fromkeys([
@@ -3151,15 +3159,19 @@ class MemoryNodeManager:
             embedding_text=embedding_text,
             metadata=metadata,
         )
-        self._log_reflect_error("interpretation_linked", {
-            "interpretation_id": interpretation_id,
-            "observation_id": observation_id,
-            "source_node_ids": source_node_ids,
-            "score": best_score,
-            "reason": reason,
-            "interpretation_type": best.get("interpretation_type"),
-            "content_updated": bool(updated_interpretation),
-        })
+        self._log_info(
+            "memory_reflect",
+            "interpretation_linked", 
+            {
+                "interpretation_id": interpretation_id,
+                "observation_id": observation_id,
+                "source_node_ids": source_node_ids,
+                "score": best_score,
+                "reason": reason,
+                "interpretation_type": best.get("interpretation_type"),
+                "content_updated": bool(updated_interpretation),
+            }
+        )
         if return_details:
             return {
                 "interpretation_id": int(interpretation_id),
@@ -3297,11 +3309,15 @@ class MemoryNodeManager:
                 family,
             )
             if not should_generate:
-                self._log_reflect_error("interpretation_generation_deferred", {
-                    "observation_id": observation_ids[0],
-                    "family": family,
-                    "reason": reason,
-                })
+                self._log_info(
+                    "memory_reflect",
+                    "interpretation_generation_deferred", 
+                    {
+                        "observation_id": observation_ids[0],
+                        "family": family,
+                        "reason": reason,
+                    }
+                )
                 return None
             interpretation = self._generate_interpretation(
                 observation=observation,
@@ -3380,13 +3396,17 @@ class MemoryNodeManager:
             embedding_text=embedding_text,
             metadata=metadata,
         )
-        self._log_reflect_error("interpretation_generated", {
-            "interpretation_id": interpretation_id,
-            "observation_ids": observation_ids,
-            "source_node_ids": source_node_ids,
-            "cluster_family": family,
-            "generated_interpretation": interpretation,
-        })
+        self._log_info(
+            "memory_reflect",
+            "interpretation_generated", 
+            {
+                "interpretation_id": interpretation_id,
+                "observation_ids": observation_ids,
+                "source_node_ids": source_node_ids,
+                "cluster_family": family,
+                "generated_interpretation": interpretation,
+            }
+        )
         return int(interpretation_id)
 
     @classmethod
@@ -3430,11 +3450,15 @@ class MemoryNodeManager:
             metadata = self._json_dict(observation.get("metadata", {}))
             basis_hash = self._interpretation_basis_hash(observation, source_nodes)
             if self._interpretation_state_is_final_for_basis(metadata, basis_hash):
-                self._log_reflect_error("interpretation_observation_skipped", {
-                    "observation_id": observation_id,
-                    "status": self._interpretation_state(metadata),
-                    "reason": "basis_already_processed",
-                })
+                self._log_info(
+                    "memory_reflect",
+                    "interpretation_observation_skipped", 
+                    {
+                        "observation_id": observation_id,
+                        "status": self._interpretation_state(metadata),
+                        "reason": "basis_already_processed",
+                    }
+                )
                 continue
             observation["metadata"] = metadata
             family = self._observation_interpretation_cluster_family(observation, source_nodes)
@@ -3771,12 +3795,16 @@ class MemoryNodeManager:
         scored.sort(key=lambda item: (item[0], item[2].get("last_supported_at") or ""), reverse=True)
         best_score, reason, best, supporting_nodes = scored[0]
         if best_score < auto_update_threshold:
-            self._log_reflect_error("fact_observation_match_skipped", {
-                "fact": self._reflect_fact_log_items([fact], limit=1),
-                "best_observation_id": best.get("id"),
-                "best_score": round(best_score, 4),
-                "reason": reason,
-            })
+            self._log_info(
+                "memory_reflect",
+                "fact_observation_match_skipped", 
+                {
+                    "fact": self._reflect_fact_log_items([fact], limit=1),
+                    "best_observation_id": best.get("id"),
+                    "best_score": round(best_score, 4),
+                    "reason": reason,
+                }
+            )
             return None
         return best, best_score, reason, supporting_nodes
 
@@ -3843,7 +3871,9 @@ class MemoryNodeManager:
         )
         if changed_observation_ids is not None:
             changed_observation_ids.append(observation_id)
-        self._log_reflect_error("fact_observation_matched", {
+        self._log_info(
+            
+            "fact_observation_matched", {
             "observation_id": observation_id,
             "fact_node_id": fact_id,
             "score": score,
@@ -4147,13 +4177,17 @@ class MemoryNodeManager:
             candidate_node_ids=source_node_ids,
         )
         if existing_observation is not None:
-            self._log_reflect_error("fact_cluster_skipped_existing_observation", {
-                "entity_id": entity_id,
-                "topic_key": topic_key,
-                "cluster_family": cluster.get("cluster_family"),
-                "source_node_ids": source_node_ids,
-                "existing_observation_id": existing_observation.get("id"),
-            })
+            self._log_info(
+                "memory_reflect",
+                "fact_cluster_skipped_existing_observation", 
+                {
+                    "entity_id": entity_id,
+                    "topic_key": topic_key,
+                    "cluster_family": cluster.get("cluster_family"),
+                    "source_node_ids": source_node_ids,
+                    "existing_observation_id": existing_observation.get("id"),
+                }
+            )
             return None
 
         observation = self._generate_observation(
@@ -4200,21 +4234,25 @@ class MemoryNodeManager:
         if changed_observation_ids is not None:
             changed_observation_ids.append(int(observation_id))
         consumed_node_ids.update(source_node_ids)
-        self._log_reflect_error("fact_cluster_observation_generated", {
-            "observation_id": observation_id,
-            "entity_id": entity_id,
-            "entity_name": cluster.get("entity_name"),
-            "topic_key": topic_key,
-            "cluster_family": cluster.get("cluster_family"),
-            "cluster_score": cluster.get("cluster_score"),
-            "cluster_reason": cluster.get("cluster_reason"),
-            "source_node_ids": source_node_ids,
-            "source_facts": self._reflect_fact_log_items(source_nodes),
-            "generated_observation": {
-                **self._reflect_observation_log_item(observation),
-                "metadata": observation_metadata,
-            },
-        })
+        self._log_info(
+            "memory_reflect",
+            "fact_cluster_observation_generated", 
+            {
+                "observation_id": observation_id,
+                "entity_id": entity_id,
+                "entity_name": cluster.get("entity_name"),
+                "topic_key": topic_key,
+                "cluster_family": cluster.get("cluster_family"),
+                "cluster_score": cluster.get("cluster_score"),
+                "cluster_reason": cluster.get("cluster_reason"),
+                "source_node_ids": source_node_ids,
+                "source_facts": self._reflect_fact_log_items(source_nodes),
+                "generated_observation": {
+                    **self._reflect_observation_log_item(observation),
+                    "metadata": observation_metadata,
+                },
+            }
+        )
         return int(observation_id)
     
     def _reflect_generate_observations(
@@ -4234,13 +4272,17 @@ class MemoryNodeManager:
             for entity_id, _entity_name in item.get("linked_entities", [])
         ))
         merge_entity_ids = list(dict.fromkeys(int(entity_id) for entity_id in entity_ids))
-        self._log_reflect_error("fact_candidates_for_observation", {
-            "dry_run": dry_run,
-            "limit": limit,
-            "candidate_count": len(unprocessed_fact_candidates),
-            "touched_entity_ids": touched_entity_ids,
-            "facts": self._reflect_fact_log_items(unprocessed_fact_candidates, limit=limit),
-        })
+        self._log_info(
+            "memory_reflect",
+            "fact_candidates_for_observation", 
+            {
+                "dry_run": dry_run,
+                "limit": limit,
+                "candidate_count": len(unprocessed_fact_candidates),
+                "touched_entity_ids": touched_entity_ids,
+                "facts": self._reflect_fact_log_items(unprocessed_fact_candidates, limit=limit),
+            }
+        )
         if dry_run:
             return {
                 "candidate_count": len(unprocessed_fact_candidates),
@@ -4289,29 +4331,32 @@ class MemoryNodeManager:
                 self._augment_observation_merge_group_with_pending_sources(group)
                 for group in groups
             ]
-            self._log_reflect_error("observation_merge_candidates", {
-                "entity_ids": merge_entity_ids,
-                "group_count": len(augmented_groups),
-                "groups": [
-                    {
-                        "entity_id": group.get("entity_id"),
-                        "entity_name": group.get("entity_name"),
-                        "topic_key": group.get("topic_key"),
-                        "topic_label": group.get("topic_label"),
-                        "observation_type": group.get("observation_type"),
-                        "observation_ids": [
-                            observation.get("id")
-                            for observation in group.get("observations", [])
-                        ],
-                        "source_node_ids": [
-                            node.get("id")
-                            for node in group.get("source_nodes", [])
-                        ],
-                        "pending_source_node_ids": group.get("pending_source_node_ids", []),
-                    }
-                    for group in augmented_groups
-                ],
-            })
+            self._log_info(
+                "memory_reflect",
+                "observation_merge_candidates", 
+                {
+                    "entity_ids": merge_entity_ids,
+                    "group_count": len(augmented_groups),
+                    "groups": [
+                        {
+                            "entity_id": group.get("entity_id"),
+                            "entity_name": group.get("entity_name"),
+                            "topic_key": group.get("topic_key"),
+                            "topic_label": group.get("topic_label"),
+                            "observation_type": group.get("observation_type"),
+                            "observation_ids": [
+                                observation.get("id")
+                                for observation in group.get("observations", [])
+                            ],
+                            "source_node_ids": [
+                                node.get("id")
+                                for node in group.get("source_nodes", [])
+                            ],
+                            "pending_source_node_ids": group.get("pending_source_node_ids", []),
+                        }
+                        for group in augmented_groups
+                    ],
+                })
             for group in augmented_groups:
                 try:
                     before_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
@@ -4359,21 +4404,24 @@ class MemoryNodeManager:
             excluded_node_ids=consumed_for_clusters,
         )
         fact_clusters_considered = len(clusters)
-        self._log_reflect_error("fact_cluster_candidates", {
-            "cluster_count": fact_clusters_considered,
-            "clusters": [
-                {
-                    "entity_id": cluster.get("entity_id"),
-                    "entity_name": cluster.get("entity_name"),
-                    "topic_key": cluster.get("topic_key"),
-                    "cluster_family": cluster.get("cluster_family"),
-                    "cluster_score": cluster.get("cluster_score"),
-                    "cluster_reason": cluster.get("cluster_reason"),
-                    "source_node_ids": cluster.get("source_node_ids", []),
-                }
-                for cluster in clusters
-            ],
-        })
+        self._log_info(
+            "memory_reflect",
+            "fact_cluster_candidates", 
+            {
+                "cluster_count": fact_clusters_considered,
+                "clusters": [
+                    {
+                        "entity_id": cluster.get("entity_id"),
+                        "entity_name": cluster.get("entity_name"),
+                        "topic_key": cluster.get("topic_key"),
+                        "cluster_family": cluster.get("cluster_family"),
+                        "cluster_score": cluster.get("cluster_score"),
+                        "cluster_reason": cluster.get("cluster_reason"),
+                        "source_node_ids": cluster.get("source_node_ids", []),
+                    }
+                    for cluster in clusters
+                ],
+            })
         for cluster in clusters:
             before_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
             try:
@@ -4553,7 +4601,6 @@ class MemoryNodeManager:
             if not retain_data:
                 logger.debug("Skipping memory node — retain extraction returned no data")
                 return False
-            logger.error("finish store: facts extracing")
             facts = retain_data.get("facts", [])
             stored_nodes: List[Tuple[int, str, np.ndarray, List[str]]] = []
             node_ids: List[int] = []
@@ -4565,13 +4612,34 @@ class MemoryNodeManager:
                 keywords = self._normalize_keywords(fact.get("keywords", []))
                 raw_topics = self._normalize_keywords(fact.get("topic", keywords))
                 topics = self._topic_keys(raw_topics)
-
+                
+                self._log_info(
+                    "memory_store",
+                    "extract_facts", 
+                    {
+                        "user_message": user_message,
+                        "assistant_response": assistant_response, 
+                        "summary": summary,
+                        "keywords": keywords,
+                        "topics": topics,
+                        "entity_names": [
+                            str(entity.get("name", "")).strip()
+                            for entity in fact.get("entities", [])
+                            if isinstance(entity, dict) and str(entity.get("name", "")).strip()
+                            ],
+                        "fact_type": fact.get("fact_type", "semantic"),
+                        "fact_subject": fact.get("fact_subject", "other"),
+                        "fact_kind": fact.get("fact_kind", "other"),
+                        "task_event_like": fact.get("task_event_like"),
+                        "task_event_subject": fact.get("task_event_subject", ""),
+                        "task_relevance": fact.get("task_relevance", ""),
+                    }
+                )
                 # ── Step 2: Generate embedding (SYNC) ──
                 embedding = self._embedding_client.embed_text(summary)
                 if embedding is None:
                     logger.info("Skipping memory fact — embedding generation failed")
                     continue
-                logger.error("finish store: query embedding")
                 
                 # ── Step 3: Store the new node (SYNC) ──
                 node_id = self._db.memory_add_node(
@@ -4598,11 +4666,9 @@ class MemoryNodeManager:
                         if isinstance(entity, dict) and str(entity.get("name", "")).strip()
                     ],
                 )
-                logger.error("finish store: memory node construction")
 
                 fact_entities = fact.get("entities", [])
                 self._link_fact_entities(node_id, fact_entities)
-                logger.error("finish store: entity linking")
                 
                 stored_nodes.append((node_id, summary, embedding, keywords))
                 node_ids.append(node_id)
@@ -4764,27 +4830,30 @@ class MemoryNodeManager:
         )
 
         remove_ids = [int(observation["id"]) for observation in observations[1:]]
-        self._log_reflect_error("observation_merge", {
-            "entity_id": group.get("entity_id"),
-            "entity_name": group.get("entity_name", ""),
-            "topic_key": group.get("topic_key"),
-            "topic_label": group.get("topic_label", group.get("topic_key", "")),
-            "observation_type": category,
-            "keep_observation_id": int(keep_observation["id"]),
-            "remove_observation_ids": remove_ids,
-            "input_observations": [
-                self._reflect_observation_log_item(observation)
-                for observation in observations
-            ],
-            "supporting_facts": self._reflect_fact_log_items(source_nodes),
-            "merged_observation": {
-                "summary": self._reflect_log_text(generated["summary"]),
+        self._log_info(
+            "memory_reflect",
+            "observation_merge", 
+            {
+                "entity_id": group.get("entity_id"),
+                "entity_name": group.get("entity_name", ""),
+                "topic_key": group.get("topic_key"),
+                "topic_label": group.get("topic_label", group.get("topic_key", "")),
                 "observation_type": category,
-                "keywords": keywords,
-                "confidence": generated["confidence"],
-                "metadata": metadata,
-            },
-        })
+                "keep_observation_id": int(keep_observation["id"]),
+                "remove_observation_ids": remove_ids,
+                "input_observations": [
+                    self._reflect_observation_log_item(observation)
+                    for observation in observations
+                ],
+                "supporting_facts": self._reflect_fact_log_items(source_nodes),
+                "merged_observation": {
+                    "summary": self._reflect_log_text(generated["summary"]),
+                    "observation_type": category,
+                    "keywords": keywords,
+                    "confidence": generated["confidence"],
+                    "metadata": metadata,
+                },
+            })
         self._db.memory_replace_observation_group(
             keep_observation_id=int(keep_observation["id"]),
             remove_observation_ids=remove_ids,
@@ -4828,15 +4897,18 @@ class MemoryNodeManager:
                 "observations_consolidated": 0,
                 "error": "memory database unavailable",
             }
-        self._log_reflect_error("start", {
-            "dry_run": dry_run,
-            "limit": limit,
-            "fact_half_life_days": fact_half_life_days,
-            "experience_half_life_days": experience_half_life_days,
-            "observation_decay_threshold": observation_decay_threshold,
-            "task_active_to_paused_days": task_active_to_paused_days,
-            "task_stale_days": task_stale_days,
-        })
+        self._log_info(
+            "memory_reflect",
+            "start", 
+            {
+                "dry_run": dry_run,
+                "limit": limit,
+                "fact_half_life_days": fact_half_life_days,
+                "experience_half_life_days": experience_half_life_days,
+                "observation_decay_threshold": observation_decay_threshold,
+                "task_active_to_paused_days": task_active_to_paused_days,
+                "task_stale_days": task_stale_days,
+            })
         unprocessed_fact_candidates = self._db.memory_unobserved_nodes_for_observation(limit=limit)
         new_entity_ids = list(dict.fromkeys(
             int(entity_id)
@@ -4849,30 +4921,36 @@ class MemoryNodeManager:
             limit=limit,
             anchor_entity_ids=new_entity_ids,
         )
-        self._log_reflect_error("entity_merge_candidates", {
-            "dry_run": dry_run,
-            "anchor_entity_ids": new_entity_ids,
-            "candidate_count": entity_merging_report.get("candidate_count", 0),
-            "merge_candidates": entity_merging_report.get("merge_candidates", 0),
-            "merged": entity_merging_report.get("merged", 0),
-            "candidates": entity_merging_report.get("candidates", []),
-        })
+        self._log_info(
+            "memory_reflect",
+            "entity_merge_candidates", 
+            {
+                "dry_run": dry_run,
+                "anchor_entity_ids": new_entity_ids,
+                "candidate_count": entity_merging_report.get("candidate_count", 0),
+                "merge_candidates": entity_merging_report.get("merge_candidates", 0),
+                "merged": entity_merging_report.get("merged", 0),
+                "candidates": entity_merging_report.get("candidates", []),
+            })
         for candidate in entity_merging_report.get("candidates", []):
             if candidate.get("action") != "merge":
                 continue
-            self._log_reflect_error("entity_merge", {
-                "dry_run": dry_run,
-                "canonical_id": candidate.get("canonical_id"),
-                "canonical_name": candidate.get("canonical_name"),
-                "duplicate_id": candidate.get("duplicate_id"),
-                "duplicate_name": candidate.get("duplicate_name"),
-                "confidence": candidate.get("confidence"),
-                "reason": candidate.get("reason"),
-                "risk": candidate.get("risk"),
-                "name_score": candidate.get("name_score"),
-                "type_score": candidate.get("type_score"),
-                "co_entities_score": candidate.get("co_entities_score"),
-            })
+            self._log_info(
+                "memory_reflect",
+                "entity_merge", 
+                {
+                    "dry_run": dry_run,
+                    "canonical_id": candidate.get("canonical_id"),
+                    "canonical_name": candidate.get("canonical_name"),
+                    "duplicate_id": candidate.get("duplicate_id"),
+                    "duplicate_name": candidate.get("duplicate_name"),
+                    "confidence": candidate.get("confidence"),
+                    "reason": candidate.get("reason"),
+                    "risk": candidate.get("risk"),
+                    "name_score": candidate.get("name_score"),
+                    "type_score": candidate.get("type_score"),
+                    "co_entities_score": candidate.get("co_entities_score"),
+                })
 
         merged_entity_ids: List[int] = []
         if not dry_run and entity_merging_report.get("merged"):
@@ -4926,18 +5004,21 @@ class MemoryNodeManager:
         report["observations_would_inactivate"] = decay_report.get("would_inactivate", 0)
         report["tasks_paused"] = task_inactivity_report.get("paused", 0)
         report["tasks_stale"] = task_inactivity_report.get("stale", 0)
-        self._log_reflect_error("finish", {
-            "dry_run": dry_run,
-            "observations_consolidated": report.get("observations_consolidated", 0),
-            "task_matched": observation_report.get("task_matched", 0),
-            "task_updates": observation_report.get("task_updates", 0),
-            "entity_merged": report.get("merged", 0),
-            "observation_groups_merged": report.get("observation_groups_merged", 0),
-            "interpretations_generated": report.get("interpretations_generated", 0),
-            "observations_inactivated": report.get("observations_inactivated", 0),
-            "tasks_paused": report.get("tasks_paused", 0),
-            "tasks_stale": report.get("tasks_stale", 0),
-        })
+        self._log_info(
+            "memory_reflect",
+            "finish", 
+            {
+                "dry_run": dry_run,
+                "observations_consolidated": report.get("observations_consolidated", 0),
+                "task_matched": observation_report.get("task_matched", 0),
+                "task_updates": observation_report.get("task_updates", 0),
+                "entity_merged": report.get("merged", 0),
+                "observation_groups_merged": report.get("observation_groups_merged", 0),
+                "interpretations_generated": report.get("interpretations_generated", 0),
+                "observations_inactivated": report.get("observations_inactivated", 0),
+                "tasks_paused": report.get("tasks_paused", 0),
+                "tasks_stale": report.get("tasks_stale", 0),
+            })
         return report
 
     # ── Recall relevant memory nodes ──────────────────────────────────────
@@ -5057,7 +5138,6 @@ class MemoryNodeManager:
             
             # Generate summary for the query (for keyword extraction)
             summary_data = self._summarize_turn(search_query, "")
-            logger.error("finish recall: query summary")
             
             if not summary_data:
                 logger.debug("Skipping recall — summarisation returned no data")
@@ -5080,7 +5160,6 @@ class MemoryNodeManager:
                 top_k=layer_limits["interpretations"],
                 query_embedding=query_embedding,
             )
-            logger.error("finish recall: interpretations searching")
 
             observation_nodes = self._db.memory_search_observations(
                 keywords,
@@ -5088,7 +5167,6 @@ class MemoryNodeManager:
                 top_k=layer_limits["observations"],
                 query_embedding=query_embedding,
             )
-            logger.error("finish recall: observations searching")
 
             observation_ids_from_interpretation: List[int] = []
             fact_ids_from_interpretation: List[int] = []
@@ -5126,7 +5204,6 @@ class MemoryNodeManager:
                 tags=tags,
                 fact_types=["semantic"],
             )
-            logger.error("finish recall: semantic_nodes searching")
 
             episodic_nodes = self._db.memory_search_facts(
                 keywords, query_embedding, top_k=layer_limits["facts"], budget=b,
@@ -5134,7 +5211,6 @@ class MemoryNodeManager:
                 tags=tags,
                 fact_types=["episodic"],
             )
-            logger.error("finish recall: episodic_nodes searching")
 
             fact_ids_from_observation = {
                 node["id"]
