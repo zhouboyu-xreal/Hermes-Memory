@@ -11,6 +11,7 @@ from agent.memory_node_manager import (
     OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE,
     OBSERVATION_CONSOLIDATION_PROMPT,
     OBSERVATION_METADATA_GUIDANCE,
+    OBSERVATION_SUPPORT_SECTION_HEADER,
     OBSERVATION_SOURCE_FACT_GUIDANCE,
     OBSERVATION_TIME_GUIDANCE,
     OBSERVATION_MERGE_PROMPT,
@@ -243,6 +244,9 @@ def test_memory_interpretations_store_current_agent_interpretations(db):
         for row in db._conn.execute("PRAGMA table_info(memory_interpretations)").fetchall()
     }
     assert "entity_id" in columns
+    assert "embedding" in columns
+    assert "embedding_text" in columns
+    assert "embedding_updated_at" in columns
     assert "subject_entity_id" not in columns
     assert "target_entity_id" not in columns
 
@@ -290,6 +294,38 @@ def test_memory_interpretations_store_current_agent_interpretations(db):
     assert [item["id"] for item in results] == [interpretation_id]
     assert results[0]["claim"] == "用户当前更偏好 deterministic heuristic 控制 task fact 选择。"
     assert results[0]["evidence_node_ids"] == [1, 2]
+
+
+def test_memory_search_interpretations_uses_embedding_similarity(db):
+    matching_id = db.memory_upsert_interpretation(
+        claim="Design calibration should happen before implementation.",
+        target_text="implementation workflow",
+        scope="workflow",
+        interpretation_type="inferred_preference",
+        confidence=0.75,
+        action_implication="Discuss design before editing code.",
+        embedding=np.array([[1.0, 0.0]], dtype=np.float32),
+        embedding_text="design calibration before implementation",
+    )
+    db.memory_upsert_interpretation(
+        claim="Calendar cleanup is unrelated.",
+        target_text="calendar cleanup",
+        scope="calendar",
+        interpretation_type="insight",
+        confidence=0.95,
+        action_implication="Use calendar context.",
+        embedding=np.array([[0.0, 1.0]], dtype=np.float32),
+        embedding_text="calendar cleanup",
+    )
+
+    results = db.memory_search_interpretations(
+        ["alignment"],
+        top_k=5,
+        query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
+    )
+
+    assert [item["id"] for item in results] == [matching_id]
+    assert results[0]["embedding_similarity"] == pytest.approx(1.0)
 
 
 def test_memory_search_interpretations_separates_content_and_entity_matches(db):
@@ -951,6 +987,11 @@ def test_summarize_turn_returns_entities(db):
 
 
 def test_memory_search_observations_uses_entities(db):
+    columns = {
+        row["name"]
+        for row in db._conn.execute("PRAGMA table_info(memory_observations)").fetchall()
+    }
+    assert {"embedding", "embedding_text", "embedding_updated_at"}.issubset(columns)
     node_id = _add_memory_node(
         db,
         time_key="2026-05-01 10:00:00",
@@ -976,6 +1017,49 @@ def test_memory_search_observations_uses_entities(db):
     )
 
     assert [row["entity_name"] for row in results] == ["Alice"]
+
+
+def test_memory_search_observations_uses_embedding_similarity(db):
+    source_id = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="The user asked to discuss architecture before code.",
+        keywords=["architecture"],
+    )
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
+    matching_id = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="workflow",
+        topic_label="workflow",
+        observation_type="preference",
+        summary="The workflow favors design calibration before implementation.",
+        keywords=["architecture"],
+        source_node_ids=[source_id],
+        confidence=0.8,
+        embedding=np.array([[1.0, 0.0]], dtype=np.float32),
+        embedding_text="design calibration before implementation",
+    )
+    db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="calendar",
+        topic_label="calendar",
+        observation_type="insight",
+        summary="Calendar cleanup is unrelated.",
+        keywords=["calendar"],
+        source_node_ids=[source_id],
+        confidence=0.95,
+        embedding=np.array([[0.0, 1.0]], dtype=np.float32),
+        embedding_text="calendar cleanup",
+    )
+
+    results = db.memory_search_observations(
+        ["alignment"],
+        top_k=5,
+        query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
+    )
+
+    assert [item["id"] for item in results] == [matching_id]
+    assert results[0]["embedding_similarity"] == pytest.approx(1.0)
 
 
 def test_memory_search_observations_rejects_weak_family_term_entity_mismatch(db):
@@ -1619,6 +1703,78 @@ def test_recall_formats_current_interpretations_before_evidence(db, monkeypatch)
     assert "用户当前倾向先用 heuristic 控制 task fact 选择" in context
     assert "action implication: 后续先讨论 heuristic/data-flow，再考虑 prompt guidance。" in context
     assert context.index(INTERPRETATION_SECTION_HEADER) < context.index("[Semantic memories")
+
+
+def test_recall_expands_interpretation_to_evidence_observations(db, monkeypatch):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    source_id = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice repeatedly asked to discuss architecture before code changes.",
+        keywords=["architecture", "discussion"],
+        fact_type="episodic",
+    )
+    db.entity_link_node(source_id, alice)
+    observation_id = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="architecture-first",
+        topic_label="Architecture-first workflow",
+        observation_type="preference",
+        summary="Alice's workflow favors design discussion before implementation.",
+        keywords=["architecture", "discussion"],
+        source_node_ids=[source_id],
+    )
+    db.memory_upsert_interpretation(
+        claim="Alice currently prefers calibration before implementation.",
+        entity_id=alice,
+        target_text="implementation workflow",
+        scope="workflow",
+        interpretation_type="preference",
+        confidence=0.8,
+        evidence_observation_ids=[observation_id],
+    )
+    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps({"summary": "calibration implementation", "keywords": ["calibration", "implementation"]})],
+    )
+
+    context = mgr.recall("calibration implementation")
+
+    assert "Alice currently prefers calibration before implementation." in context
+    assert "Alice's workflow favors design discussion before implementation." in context
+    assert "Alice repeatedly asked to discuss architecture before code changes." in context
+
+
+def test_recall_formats_interpretation_direct_evidence_once(db, monkeypatch):
+    evidence_id = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="The recall router should connect interpretations to evidence facts.",
+        keywords=["recall", "router", "evidence"],
+        fact_type="semantic",
+    )
+    db.memory_upsert_interpretation(
+        claim="Recall routing should expose evidence facts for interpretation hits.",
+        target_text="recall routing",
+        scope="memory-recall",
+        interpretation_type="insight",
+        confidence=0.82,
+        evidence_node_ids=[evidence_id],
+    )
+    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps({"summary": "recall router evidence", "keywords": ["recall", "router", "evidence"]})],
+    )
+
+    context = mgr.recall("recall router evidence")
+
+    assert INTERPRETATION_SECTION_HEADER in context
+    assert OBSERVATION_SUPPORT_SECTION_HEADER in context
+    assert context.count("The recall router should connect interpretations to evidence facts.") == 1
 
 
 def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):

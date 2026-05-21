@@ -328,6 +328,9 @@ CREATE TABLE IF NOT EXISTS memory_observations (
     last_supported_at TEXT,
     source_time_start TEXT,
     source_time_end TEXT,
+    embedding BLOB,
+    embedding_text TEXT NOT NULL DEFAULT '',
+    embedding_updated_at TEXT,
     metadata TEXT DEFAULT '{}'
 );
 
@@ -369,6 +372,9 @@ CREATE TABLE IF NOT EXISTS memory_interpretations (
     evidence_observation_ids TEXT DEFAULT '[]',
     counter_evidence_node_ids TEXT DEFAULT '[]',
     counter_evidence_observation_ids TEXT DEFAULT '[]',
+    embedding BLOB,
+    embedding_text TEXT NOT NULL DEFAULT '',
+    embedding_updated_at TEXT,
     metadata TEXT DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -816,6 +822,18 @@ class SessionDB:
         cursor.executescript(MEMORY_OBSERVATIONS_SQL)
         self._drop_legacy_memory_entity_columns(cursor)
         cursor.executescript(MEMORY_INTERPRETATIONS_SQL)
+        for table_name in ("memory_observations", "memory_interpretations"):
+            for col_name, col_type in {
+                "embedding": "BLOB",
+                "embedding_text": "TEXT NOT NULL DEFAULT ''",
+                "embedding_updated_at": "TEXT",
+            }.items():
+                try:
+                    cursor.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
+                    )
+                except sqlite3.OperationalError:
+                    pass
         self._migrate_memory_opinions_to_interpretations(cursor)
         self._repair_graph_created_at_placeholders(cursor)
 
@@ -2581,6 +2599,18 @@ class SessionDB:
             "node_relations": node_relations,
         }
 
+    def memory_nodes_by_ids(self, node_ids: List[int]) -> List[Dict[str, Any]]:
+        """Fetch memory fact nodes by id, preserving caller order."""
+        clean_ids = self._json_int_list(node_ids)
+        if not clean_ids:
+            return []
+        out: List[Dict[str, Any]] = []
+        for node_id in clean_ids:
+            node = self._memory_get_node(node_id)
+            if node:
+                out.append(node)
+        return out
+
     @staticmethod
     def _memory_node_filter_sql(
         *,
@@ -4281,6 +4311,43 @@ class SessionDB:
         text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "-", text).strip("-")
         return text or "general"
 
+    @staticmethod
+    def _embedding_to_blob(embedding: Optional[np.ndarray]) -> Optional[bytes]:
+        if embedding is None:
+            return None
+        try:
+            vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        if vector.size == 0:
+            return None
+        return vector.tobytes()
+
+    @staticmethod
+    def _embedding_similarity(
+        query_embedding: Optional[np.ndarray],
+        stored_embedding: Any,
+    ) -> Optional[float]:
+        if query_embedding is None or stored_embedding is None:
+            return None
+        try:
+            query = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+            if isinstance(stored_embedding, np.ndarray):
+                candidate = np.asarray(stored_embedding, dtype=np.float32).reshape(-1)
+            else:
+                candidate = np.frombuffer(bytes(stored_embedding), dtype=np.float32)
+        except (TypeError, ValueError):
+            return None
+        if query.size == 0 or candidate.size == 0 or query.shape != candidate.shape:
+            return None
+        denom = float(np.linalg.norm(query) * np.linalg.norm(candidate))
+        if denom <= 0.0:
+            return None
+        score = float(np.dot(query, candidate) / denom)
+        if not math.isfinite(score):
+            return None
+        return max(-1.0, min(1.0, score))
+
     # ── Memory interpretations ──────────────────────────────────────────
 
     def memory_upsert_interpretation(
@@ -4303,6 +4370,8 @@ class SessionDB:
         evidence_observation_ids: Optional[List[int]] = None,
         counter_evidence_node_ids: Optional[List[int]] = None,
         counter_evidence_observation_ids: Optional[List[int]] = None,
+        embedding: Optional[np.ndarray] = None,
+        embedding_text: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         interpretation_id: Optional[int] = None,
     ) -> int:
@@ -4346,6 +4415,8 @@ class SessionDB:
             metadata_dict = {}
         clean_entity_id = entity_id or self._coerce_int_or_none(metadata_dict.get("entity_id"))
         metadata_str = json.dumps(metadata_dict, ensure_ascii=False)
+        embedding_blob = self._embedding_to_blob(embedding)
+        clean_embedding_text = None if embedding_text is None else str(embedding_text or "").strip()
 
         def _do(conn):
             existing_id = interpretation_id
@@ -4370,7 +4441,8 @@ class SessionDB:
             if existing_id is not None:
                 existing_row = conn.execute(
                     "SELECT evidence_node_ids, evidence_observation_ids, "
-                    "counter_evidence_node_ids, counter_evidence_observation_ids "
+                    "counter_evidence_node_ids, counter_evidence_observation_ids, "
+                    "embedding, embedding_text, embedding_updated_at "
                     "FROM memory_interpretations WHERE id = ?",
                     (existing_id,),
                 ).fetchone()
@@ -4394,6 +4466,20 @@ class SessionDB:
                     if existing_row
                     else []
                 )
+                stored_embedding = existing_row["embedding"] if existing_row else None
+                stored_embedding_text = existing_row["embedding_text"] if existing_row else ""
+                stored_embedding_updated_at = existing_row["embedding_updated_at"] if existing_row else None
+                next_embedding = embedding_blob if embedding_blob is not None else stored_embedding
+                next_embedding_text = (
+                    clean_embedding_text
+                    if clean_embedding_text is not None
+                    else (stored_embedding_text or "")
+                )
+                next_embedding_updated_at = (
+                    now_text
+                    if embedding_blob is not None
+                    else stored_embedding_updated_at
+                )
                 conn.execute(
                     "UPDATE memory_interpretations SET "
                     "entity_id = ?, subject_text = ?, target_text = ?, "
@@ -4402,6 +4488,7 @@ class SessionDB:
                     "conflict_status = ?, resolution = ?, action_implication = ?, "
                     "evidence_node_ids = ?, evidence_observation_ids = ?, "
                     "counter_evidence_node_ids = ?, counter_evidence_observation_ids = ?, "
+                    "embedding = ?, embedding_text = ?, embedding_updated_at = ?, "
                     "metadata = ?, updated_at = ?, last_supported_at = ? "
                     "WHERE id = ?",
                     (
@@ -4430,6 +4517,9 @@ class SessionDB:
                             if counter_observations is not None
                             else stored_counter_observations
                         ),
+                        next_embedding,
+                        next_embedding_text,
+                        next_embedding_updated_at,
                         metadata_str,
                         now_text,
                         now_text,
@@ -4444,8 +4534,9 @@ class SessionDB:
                 "status, conflict_status, resolution, action_implication, "
                 "evidence_node_ids, evidence_observation_ids, "
                 "counter_evidence_node_ids, counter_evidence_observation_ids, "
+                "embedding, embedding_text, embedding_updated_at, "
                 "metadata, created_at, updated_at, last_supported_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     clean_entity_id,
                     clean_subject,
@@ -4464,6 +4555,9 @@ class SessionDB:
                     json.dumps(evidence_observations or []),
                     json.dumps(counter_nodes or []),
                     json.dumps(counter_observations or []),
+                    embedding_blob,
+                    clean_embedding_text or "",
+                    now_text if embedding_blob is not None else None,
                     metadata_str,
                     now_text,
                     now_text,
@@ -4482,6 +4576,7 @@ class SessionDB:
         top_k: int = 3,
         statuses: Optional[List[str]] = None,
         min_confidence: float = 0.4,
+        query_embedding: Optional[np.ndarray] = None,
     ) -> List[Dict[str, Any]]:
         """Search current/conflicted agent interpretations relevant to a query."""
         keyword_query = " ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
@@ -4529,18 +4624,34 @@ class SessionDB:
                 if term in entity_haystack and term not in matched_terms
             ]
             entity_matches = sum(1 for term in entity_terms if term in entity_haystack)
+            embedding_similarity = self._embedding_similarity(query_embedding, item.get("embedding"))
+            embedding_match = embedding_similarity is not None and embedding_similarity >= 0.35
+            strong_embedding_match = embedding_similarity is not None and embedding_similarity >= 0.55
             if terms or entity_terms:
-                if not matched_terms and not matched_entity_name_terms and entity_matches <= 0:
+                if entity_terms:
+                    if (
+                        entity_matches <= 0
+                        and not matched_terms
+                        and not matched_entity_name_terms
+                        and not strong_embedding_match
+                    ):
+                        continue
+                elif not matched_terms and not matched_entity_name_terms and not embedding_match:
                     continue
             else:
                 matched_terms = ["_"]
+            keyword_score = (len(matched_terms) * 1.2) + (len(matched_entity_name_terms) * 0.6)
+            embedding_score = max(0.0, float(embedding_similarity or 0.0))
             score = (
-                (len(matched_terms) * 1.2)
-                + (len(matched_entity_name_terms) * 0.6)
+                keyword_score
                 + (entity_matches * 1.5)
+                + (embedding_score * 1.4)
                 + float(item.get("confidence") or 0.0)
                 + (0.5 if item.get("status") == "current" else 0.0)
             )
+            if embedding_similarity is not None:
+                item["embedding_similarity"] = round(float(embedding_similarity), 4)
+            item.pop("embedding", None)
             scored.append((score, item))
         scored.sort(key=lambda pair: (pair[0], pair[1].get("last_supported_at") or ""), reverse=True)
         return [item for _, item in scored[:max(1, int(top_k or 3))]]
@@ -4805,6 +4916,8 @@ class SessionDB:
         keywords: List[str],
         source_node_ids: List[int],
         confidence: float = 1.0,
+        embedding: Optional[np.ndarray] = None,
+        embedding_text: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Create or update the active observation for an entity/topic/type."""
@@ -4830,21 +4943,35 @@ class SessionDB:
         keywords_str = " ".join(keywords) if isinstance(keywords, list) else str(keywords or "")
         metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
         confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
+        embedding_blob = self._embedding_to_blob(embedding)
+        clean_embedding_text = None if embedding_text is None else str(embedding_text or "").strip()
 
         def _do(conn):
             existing = conn.execute(
-                "SELECT id FROM memory_observations "
+                "SELECT id, embedding, embedding_text, embedding_updated_at FROM memory_observations "
                 "WHERE entity_id = ? AND topic_key = ? AND observation_type = ? AND status = 'active' "
                 "ORDER BY updated_at DESC, id DESC LIMIT 1",
                 (entity_id, topic_key, observation_type),
             ).fetchone()
             if existing:
                 observation_id = existing["id"] if isinstance(existing, sqlite3.Row) else existing[0]
+                next_embedding = embedding_blob if embedding_blob is not None else existing["embedding"]
+                next_embedding_text = (
+                    clean_embedding_text
+                    if clean_embedding_text is not None
+                    else (existing["embedding_text"] or "")
+                )
+                next_embedding_updated_at = (
+                    now_text
+                    if embedding_blob is not None
+                    else existing["embedding_updated_at"]
+                )
                 conn.execute(
                     "UPDATE memory_observations SET "
                     "topic_label = ?, summary = ?, keywords = ?, confidence = ?, "
                     "updated_at = ?, last_supported_at = ?, source_time_start = ?, "
-                    "source_time_end = ?, metadata = ? "
+                    "source_time_end = ?, embedding = ?, embedding_text = ?, "
+                    "embedding_updated_at = ?, metadata = ? "
                     "WHERE id = ?",
                     (
                         topic_label,
@@ -4855,6 +4982,9 @@ class SessionDB:
                         now_text,
                         source_time_start,
                         source_time_end,
+                        next_embedding,
+                        next_embedding_text,
+                        next_embedding_updated_at,
                         metadata_str,
                         observation_id,
                     ),
@@ -4864,8 +4994,9 @@ class SessionDB:
                     "INSERT INTO memory_observations "
                     "(entity_id, topic_key, topic_label, observation_type, summary, keywords, "
                     "confidence, status, created_at, updated_at, last_supported_at, "
-                    "source_time_start, source_time_end, metadata) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+                    "source_time_start, source_time_end, embedding, embedding_text, "
+                    "embedding_updated_at, metadata) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         entity_id,
                         topic_key,
@@ -4879,6 +5010,9 @@ class SessionDB:
                         now_text,
                         source_time_start,
                         source_time_end,
+                        embedding_blob,
+                        clean_embedding_text or "",
+                        now_text if embedding_blob is not None else None,
                         metadata_str,
                     ),
                 )
@@ -4956,6 +5090,7 @@ class SessionDB:
         entities: Optional[List[Any]] = None,
         top_k: int = 3,
         entity_ids: Optional[List[int]] = None,
+        query_embedding: Optional[np.ndarray] = None,
     ) -> List[Dict[str, Any]]:
         """Search active observations by keyword/topic/entity."""
         keyword_query = " ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
@@ -4995,20 +5130,28 @@ class SessionDB:
                 for term in entity_terms
                 if term in entity_name_text or term in haystack
             )
+            embedding_similarity = self._embedding_similarity(query_embedding, item.get("embedding"))
+            embedding_match = embedding_similarity is not None and embedding_similarity >= 0.35
+            strong_embedding_match = embedding_similarity is not None and embedding_similarity >= 0.55
             if terms or entity_terms:
                 if entity_terms:
-                    if entity_matches <= 0 and strong_keyword_matches < 2:
+                    if entity_matches <= 0 and strong_keyword_matches < 2 and not strong_embedding_match:
                         continue
-                elif strong_keyword_matches <= 0 and len(matched_terms) < 2:
+                elif strong_keyword_matches <= 0 and len(matched_terms) < 2 and not embedding_match:
                     continue
             else:
                 strong_keyword_matches = 1
+            embedding_score = max(0.0, float(embedding_similarity or 0.0))
             score = (
                 strong_keyword_matches
                 + (weak_keyword_matches * 0.25)
                 + (entity_matches * 1.5)
+                + (embedding_score * 1.4)
                 + float(item.get("confidence") or 0.0)
             )
+            if embedding_similarity is not None:
+                item["embedding_similarity"] = round(float(embedding_similarity), 4)
+            item.pop("embedding", None)
             scored.append((score, item))
         scored.sort(key=lambda pair: (pair[0], pair[1].get("last_supported_at") or ""), reverse=True)
         return [item for _, item in scored[:top_k]]
@@ -5456,6 +5599,8 @@ class SessionDB:
         keywords: List[str],
         confidence: float,
         source_node_ids: List[int],
+        embedding: Optional[np.ndarray] = None,
+        embedding_text: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Replace a duplicate observation group with one reflected observation."""
@@ -5477,15 +5622,34 @@ class SessionDB:
         keywords_str = " ".join(keywords) if isinstance(keywords, list) else str(keywords or "")
         confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
         metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
+        embedding_blob = self._embedding_to_blob(embedding)
+        clean_embedding_text = None if embedding_text is None else str(embedding_text or "").strip()
         source_time_start = time_rows["start_time"] if time_rows else None
         source_time_end = time_rows["end_time"] if time_rows else None
 
         def _do(conn):
+            existing = conn.execute(
+                "SELECT embedding, embedding_text, embedding_updated_at "
+                "FROM memory_observations WHERE id = ?",
+                (keep_observation_id,),
+            ).fetchone()
+            next_embedding = embedding_blob if embedding_blob is not None else (existing["embedding"] if existing else None)
+            next_embedding_text = (
+                clean_embedding_text
+                if clean_embedding_text is not None
+                else ((existing["embedding_text"] or "") if existing else "")
+            )
+            next_embedding_updated_at = (
+                now_text
+                if embedding_blob is not None
+                else (existing["embedding_updated_at"] if existing else None)
+            )
             conn.execute(
                 "UPDATE memory_observations SET "
                 "observation_type = ?, summary = ?, keywords = ?, confidence = ?, "
                 "updated_at = ?, last_supported_at = ?, source_time_start = ?, "
-                "source_time_end = ?, metadata = ? "
+                "source_time_end = ?, embedding = ?, embedding_text = ?, "
+                "embedding_updated_at = ?, metadata = ? "
                 "WHERE id = ?",
                 (
                     observation_type,
@@ -5496,6 +5660,9 @@ class SessionDB:
                     now_text,
                     source_time_start,
                     source_time_end,
+                    next_embedding,
+                    next_embedding_text,
+                    next_embedding_updated_at,
                     metadata_str,
                     keep_observation_id,
                 ),

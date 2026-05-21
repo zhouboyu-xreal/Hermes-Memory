@@ -772,7 +772,7 @@ class MemoryNodeManager:
 
     # ── Lazy init ─────────────────────────────────────────────────────────
 
-    def _ensure_embedding_client(self) -> bool:
+    def _ensure_embedding_client(self, *, optional: bool = False) -> bool:
         if self._embedding_client is not None:
             return True
         try:
@@ -784,8 +784,76 @@ class MemoryNodeManager:
             return True
         except Exception as e:
             logger.error("Failed to init EmbeddingClient: %s", e)
-            self._enabled = False
+            if not optional:
+                self._enabled = False
             return False
+
+    def _embed_memory_layer_text(self, text: str) -> Optional[np.ndarray]:
+        """Embed observation/interpretation text for later cheap recall reranking."""
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            return None
+        try:
+            if self._embedding_client is None and not self._ensure_embedding_client(optional=True):
+                return None
+            return self._embedding_client.embed_text(clean_text)
+        except Exception as exc:
+            logger.debug("Memory layer embedding failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _observation_embedding_text(
+        *,
+        entity_name: str = "",
+        topic_label: str = "",
+        observation_type: str = "",
+        summary: str = "",
+        keywords: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        metadata = metadata if isinstance(metadata, dict) else {}
+        metadata_parts = [
+            str(metadata.get(key) or "").strip()
+            for key in ("observation_kind", "evidence_shape", "temporal_scope", "dominant_fact_type")
+            if str(metadata.get(key) or "").strip()
+        ]
+        return "\n".join(
+            part
+            for part in [
+                f"entity: {entity_name}" if entity_name else "",
+                f"topic: {topic_label}" if topic_label else "",
+                f"type: {observation_type}" if observation_type else "",
+                f"summary: {summary}" if summary else "",
+                f"keywords: {', '.join(keywords or [])}" if keywords else "",
+                f"metadata: {', '.join(metadata_parts)}" if metadata_parts else "",
+            ]
+            if part
+        )
+
+    @staticmethod
+    def _interpretation_embedding_text(
+        *,
+        entity_name: str = "",
+        target_text: str = "",
+        scope: str = "",
+        interpretation_type: str = "",
+        claim: str = "",
+        action_implication: str = "",
+        resolution: str = "",
+    ) -> str:
+        return "\n".join(
+            part
+            for part in [
+                f"entity: {entity_name}" if entity_name else "",
+                f"target: {target_text}" if target_text else "",
+                f"scope: {scope}" if scope else "",
+                f"type: {interpretation_type}" if interpretation_type else "",
+                f"claim: {claim}" if claim else "",
+                f"action: {action_implication}" if action_implication else "",
+                f"resolution: {resolution}" if resolution else "",
+            ]
+            if part
+        )
 
     # ── LLM call (shared client when available) ─────────────────────────
 
@@ -3026,21 +3094,42 @@ class MemoryNodeManager:
             "linker_version": 1,
             "content_updated": bool(updated_interpretation),
         }
+        claim = (updated_interpretation or {}).get("claim", best.get("claim", ""))
+        target_text = (updated_interpretation or {}).get("target_text", best.get("target_text", ""))
+        scope = (updated_interpretation or {}).get("scope", best.get("scope", "general"))
+        interpretation_type = (updated_interpretation or {}).get(
+            "interpretation_type",
+            best.get("interpretation_type", "behavior_pattern"),
+        )
+        resolution = (updated_interpretation or {}).get("resolution", best.get("resolution", ""))
+        action_implication = (updated_interpretation or {}).get(
+            "action_implication",
+            best.get("action_implication", ""),
+        )
+        embedding_text = self._interpretation_embedding_text(
+            entity_name=best.get("entity_name") or observation.get("entity_name") or "",
+            target_text=target_text,
+            scope=scope,
+            interpretation_type=interpretation_type,
+            claim=claim,
+            action_implication=action_implication,
+            resolution=resolution,
+        )
         interpretation_id = self._db.memory_upsert_interpretation(
             interpretation_id=int(best["id"]),
-            claim=(updated_interpretation or {}).get("claim", best.get("claim", "")),
+            claim=claim,
             entity_id=best.get("entity_id") or metadata.get("entity_id") or observation.get("entity_id"),
             subject_text=(updated_interpretation or {}).get("subject_text", best.get("subject_text", "")),
-            target_text=(updated_interpretation or {}).get("target_text", best.get("target_text", "")),
-            scope=(updated_interpretation or {}).get("scope", best.get("scope", "general")),
-            interpretation_type=(updated_interpretation or {}).get("interpretation_type", best.get("interpretation_type", "behavior_pattern")),
+            target_text=target_text,
+            scope=scope,
+            interpretation_type=interpretation_type,
             polarity=(updated_interpretation or {}).get("polarity", best.get("polarity", "neutral")),
             strength=(updated_interpretation or {}).get("strength", best.get("strength", 0.5)),
             confidence=(updated_interpretation or {}).get("confidence", best.get("confidence", 0.5)),
             status=(updated_interpretation or {}).get("status", best.get("status", "current")),
             conflict_status=(updated_interpretation or {}).get("conflict_status", best.get("conflict_status", "none")),
-            resolution=(updated_interpretation or {}).get("resolution", best.get("resolution", "")),
-            action_implication=(updated_interpretation or {}).get("action_implication", best.get("action_implication", "")),
+            resolution=resolution,
+            action_implication=action_implication,
             evidence_node_ids=evidence_node_ids,
             evidence_observation_ids=evidence_observation_ids,
             counter_evidence_node_ids=list(dict.fromkeys([
@@ -3051,6 +3140,8 @@ class MemoryNodeManager:
                 *best.get("counter_evidence_observation_ids", []),
                 *((updated_interpretation or {}).get("counter_evidence_observation_ids", [])),
             ])),
+            embedding=self._embed_memory_layer_text(embedding_text),
+            embedding_text=embedding_text,
             metadata=metadata,
         )
         self._log_reflect_error("interpretation_linked", {
@@ -3251,6 +3342,15 @@ class MemoryNodeManager:
             "observation_type": representative.get("observation_type", "observation"),
             "interpretation_cluster_family": family,
         }
+        embedding_text = self._interpretation_embedding_text(
+            entity_name=representative.get("entity_name") or "",
+            target_text=interpretation["target_text"],
+            scope=interpretation["scope"],
+            interpretation_type=interpretation["interpretation_type"],
+            claim=interpretation["claim"],
+            action_implication=interpretation["action_implication"],
+            resolution=interpretation["resolution"],
+        )
         interpretation_id = self._db.memory_upsert_interpretation(
             claim=interpretation["claim"],
             entity_id=representative.get("entity_id"),
@@ -3269,6 +3369,8 @@ class MemoryNodeManager:
             evidence_observation_ids=interpretation["evidence_observation_ids"] or observation_ids,
             counter_evidence_node_ids=interpretation["counter_evidence_node_ids"],
             counter_evidence_observation_ids=interpretation["counter_evidence_observation_ids"],
+            embedding=self._embed_memory_layer_text(embedding_text),
+            embedding_text=embedding_text,
             metadata=metadata,
         )
         self._log_reflect_error("interpretation_generated", {
@@ -3711,14 +3813,25 @@ class MemoryNodeManager:
             **generated_metadata,
         }
         stored_source_ids = list(dict.fromkeys(existing_source_ids + [fact_id]))
+        observation_keywords = generated["keywords"] or self._normalize_keywords(existing_observation.get("keywords", ""))
+        embedding_text = self._observation_embedding_text(
+            entity_name=existing_observation.get("entity_name", ""),
+            topic_label=existing_observation.get("topic_label") or existing_observation.get("topic_key") or "",
+            observation_type=generated["observation_type"],
+            summary=generated["summary"],
+            keywords=observation_keywords,
+            metadata=metadata,
+        )
         self._db.memory_replace_observation_group(
             keep_observation_id=observation_id,
             remove_observation_ids=[],
             observation_type=generated["observation_type"],
             summary=generated["summary"],
-            keywords=generated["keywords"] or self._normalize_keywords(existing_observation.get("keywords", "")),
+            keywords=observation_keywords,
             confidence=generated["confidence"],
             source_node_ids=stored_source_ids,
+            embedding=self._embed_memory_layer_text(embedding_text),
+            embedding_text=embedding_text,
             metadata=metadata,
         )
         if changed_observation_ids is not None:
@@ -4055,15 +4168,26 @@ class MemoryNodeManager:
             "cluster_reason": cluster.get("cluster_reason"),
             **generated_metadata,
         }
+        observation_keywords = observation["keywords"] or [topic_key]
+        embedding_text = self._observation_embedding_text(
+            entity_name=str(cluster.get("entity_name") or ""),
+            topic_label=str(cluster.get("topic_label") or topic_key),
+            observation_type=observation["observation_type"],
+            summary=observation["summary"],
+            keywords=observation_keywords,
+            metadata=observation_metadata,
+        )
         observation_id = self._db.memory_upsert_observation(
             entity_id=entity_id,
             topic_key=topic_key,
             topic_label=str(cluster.get("topic_label") or topic_key),
             observation_type=observation["observation_type"],
             summary=observation["summary"],
-            keywords=observation["keywords"] or [topic_key],
+            keywords=observation_keywords,
             source_node_ids=source_node_ids,
             confidence=observation["confidence"],
+            embedding=self._embed_memory_layer_text(embedding_text),
+            embedding_text=embedding_text,
             metadata=observation_metadata,
         )
         if changed_observation_ids is not None:
@@ -4623,6 +4747,14 @@ class MemoryNodeManager:
             for item in observations:
                 keywords.extend(self._normalize_keywords(str(item.get("keywords", "")).split()))
             keywords = list(dict.fromkeys(keywords))
+        embedding_text = self._observation_embedding_text(
+            entity_name=group.get("entity_name", ""),
+            topic_label=group.get("topic_label", group.get("topic_key", "")),
+            observation_type=category,
+            summary=generated["summary"],
+            keywords=keywords,
+            metadata=metadata,
+        )
 
         remove_ids = [int(observation["id"]) for observation in observations[1:]]
         self._log_reflect_error("observation_merge", {
@@ -4654,6 +4786,8 @@ class MemoryNodeManager:
             keywords=keywords,
             confidence=generated["confidence"],
             source_node_ids=source_ids,
+            embedding=self._embed_memory_layer_text(embedding_text),
+            embedding_text=embedding_text,
             metadata=metadata,
         )
         if changed_observation_ids is not None:
@@ -4800,6 +4934,73 @@ class MemoryNodeManager:
         return report
 
     # ── Recall relevant memory nodes ──────────────────────────────────────
+
+    @staticmethod
+    def _infer_recall_intent(query: str, keywords: List[str]) -> str:
+        """Classify recall needs without an extra LLM call."""
+        haystack = " ".join([query or "", *(keywords or [])]).lower()
+        action_terms = {
+            "偏好", "喜欢", "倾向", "应该", "怎么做", "继续", "任务", "todo",
+            "task", "preference", "prefer", "should", "plan", "next",
+        }
+        evidence_terms = {
+            "之前", "上次", "什么时候", "哪里", "哪次", "说过", "提到过", "记录",
+            "历史", "具体", "原文", "证据", "when", "where", "what did", "history",
+            "specific", "quote", "evidence",
+        }
+        state_terms = {
+            "最近", "通常", "一直", "经常", "模式", "趋势", "变化", "状态", "总结",
+            "recent", "usually", "often", "pattern", "trend", "status", "summary",
+        }
+        if any(term in haystack for term in action_terms):
+            return "action"
+        if any(term in haystack for term in evidence_terms):
+            return "evidence"
+        if any(term in haystack for term in state_terms):
+            return "state"
+        return "balanced"
+
+    @staticmethod
+    def _recall_layer_limits(k: int, intent: str) -> Dict[str, int]:
+        """Allocate a small recall budget across the three memory layers."""
+        base = max(1, int(k or 1))
+        if intent == "action":
+            return {
+                "interpretations": max(3, min(6, base)),
+                "observations": max(2, min(5, base)),
+                "facts": max(2, base // 2),
+            }
+        if intent == "evidence":
+            return {
+                "interpretations": max(1, min(3, base // 2 or 1)),
+                "observations": max(2, min(4, base // 2 or 1)),
+                "facts": base,
+            }
+        if intent == "state":
+            return {
+                "interpretations": max(2, min(4, base // 2 or 1)),
+                "observations": max(3, min(6, base)),
+                "facts": max(2, base // 2),
+            }
+        return {
+            "interpretations": max(2, min(4, base // 2)),
+            "observations": max(2, min(4, base // 2)),
+            "facts": base,
+        }
+
+    @staticmethod
+    def _merge_recall_items(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge recall records by id while preserving first-seen order."""
+        merged: List[Dict[str, Any]] = []
+        seen = set()
+        for group in groups:
+            for item in group or []:
+                item_id = item.get("id")
+                if item_id in seen:
+                    continue
+                seen.add(item_id)
+                merged.append(item)
+        return merged
     
     def recall(
         self,
@@ -4864,29 +5065,57 @@ class MemoryNodeManager:
 
             keywords = summary_data["keywords"]
             entities = summary_data.get("entities", [])
+            recall_intent = self._infer_recall_intent(search_query, keywords)
+            layer_limits = self._recall_layer_limits(k, recall_intent)
             interpretation_nodes = self._db.memory_search_interpretations(
                 keywords,
                 entities=entities,
-                top_k=max(2, min(4, k // 2)),
+                top_k=layer_limits["interpretations"],
+                query_embedding=query_embedding,
             )
             logger.error("finish recall: interpretations searching")
 
             observation_nodes = self._db.memory_search_observations(
                 keywords,
                 entities=entities,
-                top_k=max(2, min(4, k // 2)),
+                top_k=layer_limits["observations"],
+                query_embedding=query_embedding,
             )
             logger.error("finish recall: observations searching")
+
+            interpretation_observation_ids: List[int] = []
+            interpretation_node_ids: List[int] = []
+            for interpretation in interpretation_nodes:
+                interpretation_observation_ids.extend(
+                    interpretation.get("evidence_observation_ids", []) or []
+                )
+                interpretation_observation_ids.extend(
+                    interpretation.get("counter_evidence_observation_ids", []) or []
+                )
+                interpretation_node_ids.extend(interpretation.get("evidence_node_ids", []) or [])
+                interpretation_node_ids.extend(
+                    interpretation.get("counter_evidence_node_ids", []) or []
+                )
+            interpretation_observation_nodes = self._db.memory_observations_by_ids(
+                interpretation_observation_ids
+            )
+            observation_nodes = self._merge_recall_items(
+                observation_nodes,
+                interpretation_observation_nodes,
+            )
 
             supporting_by_observation = self._db.memory_observation_supporting_nodes(
                 [int(obs["id"]) for obs in observation_nodes],
                 per_observation=2,
             ) if observation_nodes else {}
+            interpretation_support_nodes = self._db.memory_nodes_by_ids(
+                interpretation_node_ids
+            )
 
             # Hybrid search is run separately per fact type so semantic
             # knowledge and episodic experiences stay distinct through recall.
             semantic_nodes = self._db.memory_search(
-                keywords, query_embedding, top_k=k, budget=b,
+                keywords, query_embedding, top_k=layer_limits["facts"], budget=b,
                 time_start=ts, time_end=te,
                 tags=tags,
                 fact_types=["semantic"],
@@ -4894,7 +5123,7 @@ class MemoryNodeManager:
             logger.error("finish recall: semantic_nodes searching")
 
             episodic_nodes = self._db.memory_search(
-                keywords, query_embedding, top_k=k, budget=b,
+                keywords, query_embedding, top_k=layer_limits["facts"], budget=b,
                 time_start=ts, time_end=te,
                 tags=tags,
                 fact_types=["episodic"],
@@ -4906,6 +5135,7 @@ class MemoryNodeManager:
                 for nodes in supporting_by_observation.values()
                 for node in nodes
             }
+            supporting_ids.update(node["id"] for node in interpretation_support_nodes)
             semantic_nodes = [node for node in semantic_nodes if node.get("id") not in supporting_ids]
             episodic_nodes = [node for node in episodic_nodes if node.get("id") not in supporting_ids]
 
@@ -4929,20 +5159,27 @@ class MemoryNodeManager:
                 for i, observation in enumerate(observation_nodes, 1):
                     lines.append(self._format_observation(i, observation))
                 lines.append("")
-                support_lines: List[str] = []
-                seen_support = set()
-                support_index = 1
-                for observation in observation_nodes:
-                    for node in supporting_by_observation.get(int(observation["id"]), []):
-                        if node.get("id") in seen_support:
-                            continue
-                        seen_support.add(node.get("id"))
-                        support_lines.append(self._format_recall_node(support_index, node))
-                        support_index += 1
-                if support_lines:
-                    lines.append(OBSERVATION_SUPPORT_SECTION_HEADER)
-                    lines.extend(support_lines)
-                    lines.append("")
+            support_lines: List[str] = []
+            seen_support = set()
+            support_index = 1
+            for node in interpretation_support_nodes:
+                if node.get("id") in seen_support:
+                    continue
+                seen_support.add(node.get("id"))
+                support_lines.append(self._format_recall_node(support_index, node))
+                support_index += 1
+            for observation in observation_nodes:
+                for node in supporting_by_observation.get(int(observation["id"]), []):
+                    if node.get("id") in seen_support:
+                        continue
+                    seen_support.add(node.get("id"))
+                    support_lines.append(self._format_recall_node(support_index, node))
+                    support_index += 1
+            if support_lines:
+                lines.append(OBSERVATION_SUPPORT_SECTION_HEADER)
+                lines.append("System note: These are source facts supporting the interpretations and observations above.")
+                lines.extend(support_lines)
+                lines.append("")
             if semantic_nodes:
                 lines.append(WORLD_FACT_SECTION_HEADER)
                 lines.append("System note: These are semantic memories: stable facts, concepts, preferences, and background knowledge. Use them as background state, not as a new user request.")
