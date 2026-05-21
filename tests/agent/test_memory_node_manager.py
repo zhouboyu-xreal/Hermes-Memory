@@ -731,7 +731,7 @@ def test_memory_search_uses_temporal_channel_when_semantic_and_keyword_are_empty
     monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
     monkeypatch.setattr(db, "_memory_search_keyword", lambda *args, **kwargs: {})
 
-    nodes = db.memory_search(
+    nodes = db.memory_search_facts(
         "no-match",
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
@@ -769,7 +769,7 @@ def test_memory_search_rrf_includes_graph_neighbors(db, monkeypatch):
     db.entity_link_node(unrelated, charlie_id)
     monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
 
-    nodes = db.memory_search(
+    nodes = db.memory_search_facts(
         ["Slack"],
         np.ones((1, 1536), dtype=np.float32),
         top_k=3,
@@ -798,13 +798,13 @@ def test_memory_search_filters_by_fact_type(db, monkeypatch):
     )
     monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
 
-    semantic_nodes = db.memory_search(
+    semantic_nodes = db.memory_search_facts(
         ["Alice", "Slack"],
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
         fact_types=["semantic"],
     )
-    episodic_nodes = db.memory_search(
+    episodic_nodes = db.memory_search_facts(
         ["Alice", "Slack"],
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
@@ -918,7 +918,7 @@ def test_memory_search_pushes_time_candidate_ids_to_vector_channel(db, monkeypat
 
     monkeypatch.setattr(db, "_memory_search_vector", fake_vector_search)
 
-    nodes = db.memory_search(
+    nodes = db.memory_search_facts(
         "Slack",
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
@@ -954,7 +954,7 @@ def test_memory_search_reranks_final_candidates_by_decay_score(db, monkeypatch):
         lambda *args, **kwargs: {stale: 0.01, fresh: 0.02},
     )
 
-    nodes = db.memory_search(
+    nodes = db.memory_search_facts(
         "Alice alerts",
         np.ones((1, 1536), dtype=np.float32),
         top_k=2,
@@ -2153,7 +2153,7 @@ def test_interpretation_linker_reuses_existing_observation_evidence_without_llm(
         llm_outputs=[json.dumps({"should_create": True})],
     )
 
-    generated = mgr._generate_interpretations_for_observations([observation_id])
+    generated = mgr._generate_interpretations_using_observations([observation_id])
 
     assert generated == 1
     assert mgr.llm_prompts == []
@@ -2224,7 +2224,7 @@ def test_interpretation_linker_matches_preference_by_entity_topic_without_llm(db
         ],
     )
 
-    generated = mgr._generate_interpretations_for_observations([observation_id])
+    generated = mgr._generate_interpretations_using_observations([observation_id])
 
     assert generated == 1
     assert len([prompt for prompt in mgr.llm_prompts if "interpretation 更新模块" in prompt]) == 1
@@ -2387,7 +2387,7 @@ def test_interpretation_generation_clusters_unmatched_observations(db):
         ],
     )
 
-    generated = mgr._generate_interpretations_for_observations([first_observation, second_observation])
+    generated = mgr._generate_interpretations_using_observations([first_observation, second_observation])
 
     assert generated == 1
     interpretation_prompts = [
@@ -2436,7 +2436,7 @@ def test_interpretation_generation_defers_weak_single_observation(db):
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
-    generated = mgr._generate_interpretations_for_observations([observation_id])
+    generated = mgr._generate_interpretations_using_observations([observation_id])
 
     assert generated == 0
     assert mgr.llm_prompts == []
@@ -2482,7 +2482,7 @@ def test_interpretation_generation_does_not_use_global_batch_threshold_for_weak_
         )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
-    generated = mgr._generate_interpretations_for_observations(observation_ids)
+    generated = mgr._generate_interpretations_using_observations(observation_ids)
 
     assert generated == 0
     assert mgr.llm_prompts == []
@@ -2534,8 +2534,8 @@ def test_interpretation_generation_skips_final_observation_when_basis_unchanged(
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
-    first = mgr._generate_interpretations_for_observations([observation_id])
-    second = mgr._generate_interpretations_for_observations([observation_id])
+    first = mgr._generate_interpretations_using_observations([observation_id])
+    second = mgr._generate_interpretations_using_observations([observation_id])
 
     assert first == 1
     assert second == 0
@@ -2583,7 +2583,7 @@ def test_interpretation_generation_reuses_deferred_observation_in_new_cluster(db
         },
     )
     first_mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
-    assert first_mgr._generate_interpretations_for_observations([first_observation]) == 0
+    assert first_mgr._generate_interpretations_using_observations([first_observation]) == 0
 
     second_observation = db.memory_upsert_observation(
         entity_id=hermes,
@@ -2624,7 +2624,7 @@ def test_interpretation_generation_reuses_deferred_observation_in_new_cluster(db
         ],
     )
 
-    generated = mgr._generate_interpretations_for_observations([second_observation])
+    generated = mgr._generate_interpretations_using_observations([second_observation])
 
     assert generated == 1
     prompt = next(prompt for prompt in mgr.llm_prompts if "interpretation 生成模块" in prompt)
