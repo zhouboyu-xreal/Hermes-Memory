@@ -544,8 +544,11 @@ supporting facts:
 - scope 是这条解释适用的范围，尽量短，如 "memory-system-design"。
 - target_text 是解释指向的对象、方案、习惯、项目状态或风险。
 - action_implication 描述这条解释未来如何影响 Agent 行为；如果没有明确行动含义，应 should_create=false。
-- evidence_node_ids 和 evidence_observation_ids 只能使用输入中出现的 id。
-- counter_evidence_* 只在存在反证或 unresolved conflict 时填写。
+- evidence_node_ids 是直接支持该 interpretation 的底层 fact id，表示“为什么 Agent 相信这个解释”；只能使用 supporting facts 中出现的 id。
+- evidence_observation_ids 是支持该 interpretation 的 observation id，表示“哪些中层归纳支撑这个解释”；只能使用输入 observation 的 id。
+- counter_evidence_node_ids 是反驳、削弱、限定或造成冲突的底层 fact id；只有存在明确反证、例外、边界条件或 unresolved conflict 时填写。
+- counter_evidence_observation_ids 是反驳、削弱、限定或造成冲突的 observation id；只有存在明确反证、例外、边界条件或 unresolved conflict 时填写。
+- 如果只是证据不足，不要把无关事实放入 counter_evidence_*；应降低 confidence 或 should_create=false。
 
 只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
@@ -613,7 +616,11 @@ supporting facts:
 - 如果 interpretation_type 不是 task，不要填写 task_status、goal、steps、next_action。
 - 不要改变 interpretation_type，除非原类型明显错误；若必须改变，只能使用合法类型。
 - 不要编造没有证据支持的新目标、偏好或风险。
-- evidence_node_ids 和 evidence_observation_ids 只能使用输入中出现的 id。
+- evidence_node_ids 是直接支持更新后 interpretation 的底层 fact id，表示“为什么 Agent 现在仍然相信这个解释”；只能使用 supporting facts 中出现的 id。
+- evidence_observation_ids 是支持更新后 interpretation 的 observation id，表示“哪些中层归纳支撑这个解释”；通常应包含新的 observation id，只能使用输入 observation 的 id。
+- counter_evidence_node_ids 是反驳、削弱、限定或造成冲突的底层 fact id；只有新 observation 或 supporting facts 提供明确反证、例外、边界条件或 unresolved conflict 时填写。
+- counter_evidence_observation_ids 是反驳、削弱、限定或造成冲突的 observation id；只有存在明确反证、例外、边界条件或 unresolved conflict 时填写。
+- 如果新 evidence 只是范围变窄或条件更明确，可以更新 claim/action_implication/resolution，不必一定放入 counter_evidence_*。
 - 如果没有任何内容需要更新，只输出 {{"should_update": false}}。
 
 字段要求：

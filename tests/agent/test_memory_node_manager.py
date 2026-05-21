@@ -3219,10 +3219,16 @@ def test_interpretation_generation_prompt_defines_interpretation_contract():
     assert "should_create=false" in INTERPRETATION_GENERATION_PROMPT
     assert "action_implication" in INTERPRETATION_GENERATION_PROMPT
     assert "evidence_node_ids" in INTERPRETATION_GENERATION_PROMPT
+    assert "evidence_observation_ids 是支持该 interpretation 的 observation id" in INTERPRETATION_GENERATION_PROMPT
+    assert "counter_evidence_node_ids 是反驳、削弱、限定或造成冲突的底层 fact id" in INTERPRETATION_GENERATION_PROMPT
+    assert "如果只是证据不足，不要把无关事实放入 counter_evidence_*" in INTERPRETATION_GENERATION_PROMPT
     assert "interpretation_type 只能是 insight、task" in INTERPRETATION_GENERATION_PROMPT
     assert "conflict_resolution" in INTERPRETATION_GENERATION_PROMPT
     assert "更新一条已经存在的 interpretation" in INTERPRETATION_UPDATE_PROMPT
     assert "新的 observation" in INTERPRETATION_UPDATE_PROMPT
+    assert "evidence_node_ids 是直接支持更新后 interpretation 的底层 fact id" in INTERPRETATION_UPDATE_PROMPT
+    assert "evidence_observation_ids 是支持更新后 interpretation 的 observation id" in INTERPRETATION_UPDATE_PROMPT
+    assert "counter_evidence_observation_ids 是反驳、削弱、限定或造成冲突的 observation id" in INTERPRETATION_UPDATE_PROMPT
 
 
 def test_reflect_error_log_message_is_json(caplog):
