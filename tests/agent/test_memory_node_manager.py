@@ -238,9 +238,18 @@ def test_memory_interpretations_store_current_agent_interpretations(db):
         ).fetchall()
     }
     assert "memory_interpretations" in tables
+    columns = {
+        row["name"]
+        for row in db._conn.execute("PRAGMA table_info(memory_interpretations)").fetchall()
+    }
+    assert "entity_id" in columns
+    assert "subject_entity_id" not in columns
+    assert "target_entity_id" not in columns
 
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
     interpretation_id = db.memory_upsert_interpretation(
         claim="用户当前倾向先用 heuristic 控制 task fact 选择，再谨慎修改 prompt。",
+        entity_id=hermes,
         subject_text="user",
         target_text="memory task fact selection",
         scope="memory-system-design",
@@ -254,10 +263,11 @@ def test_memory_interpretations_store_current_agent_interpretations(db):
     )
 
     row = db._conn.execute(
-        "SELECT claim, interpretation_type, status, confidence, evidence_node_ids, metadata "
+        "SELECT claim, entity_id, interpretation_type, status, confidence, evidence_node_ids, metadata "
         "FROM memory_interpretations WHERE id = ?",
         (interpretation_id,),
     ).fetchone()
+    assert row["entity_id"] == hermes
     assert row["interpretation_type"] == "task"
     assert row["status"] == "current"
     assert row["confidence"] == pytest.approx(0.86)
@@ -266,6 +276,7 @@ def test_memory_interpretations_store_current_agent_interpretations(db):
 
     updated_id = db.memory_upsert_interpretation(
         claim="用户当前更偏好 deterministic heuristic 控制 task fact 选择。",
+        entity_id=hermes,
         subject_text="user",
         target_text="memory task fact selection",
         scope="memory-system-design",
@@ -293,7 +304,7 @@ def test_memory_search_interpretations_separates_content_and_entity_matches(db):
     )
     entity_only = db.memory_upsert_interpretation(
         claim="User has a current collaboration preference.",
-        subject_entity_id=alice,
+        entity_id=alice,
         target_text="collaboration",
         scope="workflow",
         interpretation_type="inferred_preference",
@@ -651,6 +662,7 @@ def _add_task_interpretation(
         task_metadata["observation_id"] = observation_id
     interpretation_id = db.memory_upsert_interpretation(
         claim=summary,
+        entity_id=entity_id,
         target_text=topic_label,
         scope=topic_key,
         interpretation_type="task",
@@ -1922,11 +1934,12 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
 
     assert report["observations_consolidated"] == 1
     interpretation = db._conn.execute(
-        "SELECT claim, target_text, scope, interpretation_type, confidence, "
+        "SELECT claim, entity_id, target_text, scope, interpretation_type, confidence, "
         "action_implication, evidence_node_ids, evidence_observation_ids, metadata "
         "FROM memory_interpretations"
     ).fetchone()
     observation_id = db._conn.execute("SELECT id FROM memory_observations").fetchone()["id"]
+    assert interpretation["entity_id"] == alice
     assert interpretation["interpretation_type"] == "insight"
     assert interpretation["target_text"] == "urgent alert routing"
     assert interpretation["scope"] == "alert-workflow"
@@ -2570,6 +2583,9 @@ def test_store_turn_can_consolidate_task_observation(db):
     assert metadata["evidence_shape"] == "progression"
     assert metadata["temporal_scope"] == "recent"
     assert metadata["candidate_interpretation_types"] == ["insight", "task"]
+    assert metadata["source_fact_type_distribution"] == {"semantic": 2, "episodic": 1}
+    assert metadata["dominant_fact_type"] == "semantic"
+    assert metadata["evidence_mixture"] == "semantic_dominant"
     interpretation = db._conn.execute(
         "SELECT interpretation_type, claim, metadata FROM memory_interpretations"
     ).fetchone()
@@ -2912,10 +2928,31 @@ def test_reflect_updates_existing_observation_by_entity_topic(db):
     assert db.memory_observation_source_ids(observation_id) == [old_node, new_matching_node]
     assert unrelated_task_node not in db.memory_observed_source_node_ids([unrelated_task_node])
     row = db._conn.execute(
-        "SELECT summary FROM memory_observations WHERE id = ?",
+        "SELECT summary, metadata FROM memory_observations WHERE id = ?",
         (observation_id,),
     ).fetchone()
     assert row["summary"] == "Alice has continued refining alert routing over time."
+    metadata = json.loads(row["metadata"])
+    assert metadata["source_fact_type_distribution"] == {"semantic": 2, "episodic": 0}
+    assert metadata["dominant_fact_type"] == "semantic"
+    assert metadata["evidence_mixture"] == "semantic_only"
+
+
+def test_observation_metadata_tracks_fact_type_mixture():
+    metadata = MemoryNodeManager._normalize_observation_metadata(
+        {"observation_kind": "context"},
+        [
+            {"fact_type": "semantic", "fact_kind": "context"},
+            {"fact_type": "episodic", "fact_kind": "action"},
+            {"fact_type": "episodic", "fact_kind": "error"},
+        ],
+    )
+
+    assert metadata["source_fact_type_distribution"] == {"semantic": 1, "episodic": 2}
+    assert metadata["dominant_fact_type"] == "episodic"
+    assert metadata["evidence_mixture"] == "episodic_dominant"
+
+
 def test_task_metadata_normalizes_steps():
     metadata = MemoryNodeManager._normalize_task_metadata({
         "task_status": "stale",
@@ -2989,6 +3026,9 @@ def test_observation_prompts_explain_fact_type_and_kind_labels():
     assert "observation_kind 表示 observation 的信息性质" in OBSERVATION_METADATA_GUIDANCE
     assert "evidence_shape 表示支撑 observation 的证据形态" in OBSERVATION_METADATA_GUIDANCE
     assert "temporal_scope 表示 observation 的时间范围" in OBSERVATION_METADATA_GUIDANCE
+    assert "source_fact_type_distribution 表示 supporting facts" in OBSERVATION_METADATA_GUIDANCE
+    assert "dominant_fact_type 表示主要证据形态" in OBSERVATION_METADATA_GUIDANCE
+    assert "evidence_mixture 表示证据混合形态" in OBSERVATION_METADATA_GUIDANCE
     assert "source facts 行中的 time 表示该事实的证据时间" in OBSERVATION_TIME_GUIDANCE
     assert "source_time_start/source_time_end 表示已有 observation 的证据覆盖范围" in OBSERVATION_TIME_GUIDANCE
     assert "created_at/updated_at 表示 observation 记录的存储生命周期" in OBSERVATION_TIME_GUIDANCE
@@ -3010,6 +3050,9 @@ def test_observation_prompts_explain_fact_type_and_kind_labels():
         assert "candidate_interpretation_types" in prompt
         assert "evidence_shape" in prompt
         assert "temporal_scope" in prompt
+        assert "source_fact_type_distribution" in prompt
+        assert "dominant_fact_type" in prompt
+        assert "evidence_mixture" in prompt
         assert "preference_signal" in prompt
 
 

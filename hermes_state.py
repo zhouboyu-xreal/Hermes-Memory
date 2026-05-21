@@ -352,8 +352,7 @@ ON memory_observation_sources(node_id);
 MEMORY_INTERPRETATIONS_SQL = """
 CREATE TABLE IF NOT EXISTS memory_interpretations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    subject_entity_id INTEGER REFERENCES entity_nodes(id),
-    target_entity_id INTEGER REFERENCES entity_nodes(id),
+    entity_id INTEGER REFERENCES entity_nodes(id),
     subject_text TEXT NOT NULL DEFAULT '',
     target_text TEXT NOT NULL DEFAULT '',
     scope TEXT NOT NULL DEFAULT 'general',
@@ -379,11 +378,8 @@ CREATE TABLE IF NOT EXISTS memory_interpretations (
 CREATE INDEX IF NOT EXISTS idx_memory_interpretations_status
 ON memory_interpretations(status);
 
-CREATE INDEX IF NOT EXISTS idx_memory_interpretations_subject
-ON memory_interpretations(subject_entity_id, subject_text, status);
-
-CREATE INDEX IF NOT EXISTS idx_memory_interpretations_target
-ON memory_interpretations(target_entity_id, target_text, status);
+CREATE INDEX IF NOT EXISTS idx_memory_interpretations_entity
+ON memory_interpretations(entity_id, status);
 
 CREATE INDEX IF NOT EXISTS idx_memory_interpretations_type_scope
 ON memory_interpretations(interpretation_type, scope, status);
@@ -818,6 +814,7 @@ class SessionDB:
         except sqlite3.OperationalError:
             cursor.executescript(ENTITY_FTS_SQL)
         cursor.executescript(MEMORY_OBSERVATIONS_SQL)
+        self._drop_legacy_memory_entity_columns(cursor)
         cursor.executescript(MEMORY_INTERPRETATIONS_SQL)
         self._migrate_memory_opinions_to_interpretations(cursor)
         self._repair_graph_created_at_placeholders(cursor)
@@ -1008,6 +1005,54 @@ class SessionDB:
         except sqlite3.OperationalError:
             pass
 
+    @staticmethod
+    def _table_columns(cursor: sqlite3.Cursor, table_name: str) -> List[str]:
+        try:
+            rows = cursor.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [
+            row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            for row in rows
+        ]
+
+    @staticmethod
+    def _coerce_int_or_none(value: Any) -> Optional[int]:
+        try:
+            if value is not None and str(value).strip():
+                return int(value)
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    def _drop_legacy_memory_entity_columns(self, cursor: sqlite3.Cursor) -> None:
+        """Remove old subject/target entity id columns; no legacy data backfill."""
+        interpretation_columns = set(self._table_columns(cursor, "memory_interpretations"))
+        if interpretation_columns and "entity_id" not in interpretation_columns:
+            try:
+                cursor.execute("ALTER TABLE memory_interpretations ADD COLUMN entity_id INTEGER REFERENCES entity_nodes(id)")
+            except sqlite3.OperationalError as exc:
+                logger.debug("add memory_interpretations.entity_id skipped: %s", exc)
+
+        for index_name in (
+            "idx_memory_interpretations_subject",
+            "idx_memory_interpretations_target",
+        ):
+            try:
+                cursor.execute(f"DROP INDEX IF EXISTS {index_name}")
+            except sqlite3.OperationalError:
+                pass
+
+        for table_name in ("memory_observations", "memory_interpretations"):
+            columns = set(self._table_columns(cursor, table_name))
+            for column in ("subject_entity_id", "target_entity_id"):
+                if column not in columns:
+                    continue
+                try:
+                    cursor.execute(f"ALTER TABLE {table_name} DROP COLUMN {column}")
+                except sqlite3.OperationalError as exc:
+                    logger.debug("drop legacy %s.%s skipped: %s", table_name, column, exc)
+
     def _migrate_memory_opinions_to_interpretations(self, cursor: sqlite3.Cursor) -> None:
         """Copy rows from the short-lived opinion table name to interpretations."""
         try:
@@ -1016,15 +1061,17 @@ class SessionDB:
             ).fetchone()
             if not has_opinions:
                 return
+            opinion_columns = set(self._table_columns(cursor, "memory_opinions"))
+            entity_expr = "entity_id" if "entity_id" in opinion_columns else "NULL"
             cursor.execute(
                 "INSERT INTO memory_interpretations "
-                "(id, subject_entity_id, target_entity_id, subject_text, target_text, "
+                "(id, entity_id, subject_text, target_text, "
                 "scope, interpretation_type, claim, polarity, strength, confidence, "
                 "status, conflict_status, resolution, action_implication, "
                 "evidence_node_ids, evidence_observation_ids, "
                 "counter_evidence_node_ids, counter_evidence_observation_ids, "
                 "metadata, created_at, updated_at, last_supported_at) "
-                "SELECT id, subject_entity_id, target_entity_id, subject_text, target_text, "
+                f"SELECT id, {entity_expr}, subject_text, target_text, "
                 "scope, interpretation_type, claim, polarity, strength, confidence, "
                 "status, conflict_status, resolution, action_implication, "
                 "evidence_node_ids, evidence_observation_ids, "
@@ -2479,6 +2526,8 @@ class SessionDB:
             except json.JSONDecodeError:
                 metadata = {}
         item["metadata"] = metadata if isinstance(metadata, dict) else {}
+        if self._coerce_int_or_none(item.get("entity_id")) is None:
+            item["entity_id"] = self._coerce_int_or_none(item["metadata"].get("entity_id"))
         return item
 
     def _memory_get_node(self, node_id: int) -> Optional[Dict[str, Any]]:
@@ -4057,6 +4106,10 @@ class SessionDB:
                 "UPDATE memory_observations SET entity_id = ? WHERE entity_id = ?",
                 (canonical_id, duplicate_id),
             )
+            conn.execute(
+                "UPDATE memory_interpretations SET entity_id = ? WHERE entity_id = ?",
+                (canonical_id, duplicate_id),
+            )
             conn.execute("DELETE FROM entity_nodes WHERE id = ?", (duplicate_id,))
 
         self._execute_write(_do)
@@ -4234,8 +4287,7 @@ class SessionDB:
         self,
         *,
         claim: str,
-        subject_entity_id: Optional[int] = None,
-        target_entity_id: Optional[int] = None,
+        entity_id: Optional[int] = None,
         subject_text: str = "",
         target_text: str = "",
         scope: str = "general",
@@ -4289,21 +4341,24 @@ class SessionDB:
             if counter_evidence_observation_ids is None
             else self._json_int_list(counter_evidence_observation_ids)
         )
-        metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
+        metadata_dict = metadata or {}
+        if not isinstance(metadata_dict, dict):
+            metadata_dict = {}
+        clean_entity_id = entity_id or self._coerce_int_or_none(metadata_dict.get("entity_id"))
+        metadata_str = json.dumps(metadata_dict, ensure_ascii=False)
 
         def _do(conn):
             existing_id = interpretation_id
             if existing_id is None:
                 existing = conn.execute(
                     "SELECT id FROM memory_interpretations "
-                    "WHERE subject_entity_id IS ? AND target_entity_id IS ? "
+                    "WHERE entity_id IS ? "
                     "AND subject_text = ? AND target_text = ? "
                     "AND scope = ? AND interpretation_type = ? "
                     "AND status IN ('current', 'conflicted') "
                     "ORDER BY updated_at DESC, id DESC LIMIT 1",
                     (
-                        subject_entity_id,
-                        target_entity_id,
+                        clean_entity_id,
                         clean_subject,
                         clean_target,
                         clean_scope,
@@ -4341,8 +4396,8 @@ class SessionDB:
                 )
                 conn.execute(
                     "UPDATE memory_interpretations SET "
-                    "subject_entity_id = ?, target_entity_id = ?, subject_text = ?, "
-                    "target_text = ?, scope = ?, interpretation_type = ?, claim = ?, "
+                    "entity_id = ?, subject_text = ?, target_text = ?, "
+                    "scope = ?, interpretation_type = ?, claim = ?, "
                     "polarity = ?, strength = ?, confidence = ?, status = ?, "
                     "conflict_status = ?, resolution = ?, action_implication = ?, "
                     "evidence_node_ids = ?, evidence_observation_ids = ?, "
@@ -4350,8 +4405,7 @@ class SessionDB:
                     "metadata = ?, updated_at = ?, last_supported_at = ? "
                     "WHERE id = ?",
                     (
-                        subject_entity_id,
-                        target_entity_id,
+                        clean_entity_id,
                         clean_subject,
                         clean_target,
                         clean_scope,
@@ -4385,16 +4439,15 @@ class SessionDB:
                 return int(existing_id)
             cursor = conn.execute(
                 "INSERT INTO memory_interpretations "
-                "(subject_entity_id, target_entity_id, subject_text, target_text, "
+                "(entity_id, subject_text, target_text, "
                 "scope, interpretation_type, claim, polarity, strength, confidence, "
                 "status, conflict_status, resolution, action_implication, "
                 "evidence_node_ids, evidence_observation_ids, "
                 "counter_evidence_node_ids, counter_evidence_observation_ids, "
                 "metadata, created_at, updated_at, last_supported_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    subject_entity_id,
-                    target_entity_id,
+                    clean_entity_id,
                     clean_subject,
                     clean_target,
                     clean_scope,
@@ -4448,10 +4501,9 @@ class SessionDB:
         normalized_statuses = list(dict.fromkeys(normalized_statuses))
         placeholders = ",".join("?" for _ in normalized_statuses)
         rows = self._conn.execute(
-            "SELECT mo.*, se.name AS subject_entity_name, te.name AS target_entity_name "
+            "SELECT mo.*, en.name AS entity_name "
             "FROM memory_interpretations mo "
-            "LEFT JOIN entity_nodes se ON se.id = mo.subject_entity_id "
-            "LEFT JOIN entity_nodes te ON te.id = mo.target_entity_id "
+            "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
             f"WHERE mo.status IN ({placeholders}) AND mo.confidence >= ?",
             [*normalized_statuses, max(0.0, min(1.0, float(min_confidence or 0.0)))],
         ).fetchall()
@@ -4468,7 +4520,7 @@ class SessionDB:
             entity_haystack = " ".join(
                 str(item.get(key) or "")
                 for key in (
-                    "subject_entity_name", "target_entity_name",
+                    "entity_name",
                 )
             ).lower()
             matched_terms = [term for term in terms if term in content_haystack]
@@ -4496,10 +4548,9 @@ class SessionDB:
     def memory_active_task_interpretations(self, *, limit: int = 50) -> List[Dict[str, Any]]:
         """Return current task interpretations for fact-to-task matching."""
         rows = self._conn.execute(
-            "SELECT mi.*, se.name AS subject_entity_name, te.name AS target_entity_name "
+            "SELECT mi.*, en.name AS entity_name "
             "FROM memory_interpretations mi "
-            "LEFT JOIN entity_nodes se ON se.id = mi.subject_entity_id "
-            "LEFT JOIN entity_nodes te ON te.id = mi.target_entity_id "
+            "LEFT JOIN entity_nodes en ON en.id = mi.entity_id "
             "WHERE mi.status IN ('current', 'conflicted') "
             "AND mi.interpretation_type = 'task' "
             "ORDER BY mi.updated_at DESC, mi.id DESC "
@@ -4510,8 +4561,8 @@ class SessionDB:
         for row in rows:
             item = self._memory_interpretation_from_row(row)
             metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-            item["entity_id"] = metadata.get("entity_id")
-            item["entity_name"] = metadata.get("entity_name") or item.get("target_entity_name") or ""
+            item["entity_id"] = item.get("entity_id") or metadata.get("entity_id")
+            item["entity_name"] = item.get("entity_name") or metadata.get("entity_name") or ""
             item["topic_key"] = metadata.get("topic_key") or item.get("scope") or "general"
             item["topic_label"] = metadata.get("topic_label") or item.get("target_text") or item.get("scope") or "general"
             item["summary"] = item.get("claim") or ""
@@ -4539,10 +4590,9 @@ class SessionDB:
         except (TypeError, ValueError):
             return []
         rows = self._conn.execute(
-            "SELECT mi.*, se.name AS subject_entity_name, te.name AS target_entity_name "
+            "SELECT mi.*, en.name AS entity_name "
             "FROM memory_interpretations mi "
-            "LEFT JOIN entity_nodes se ON se.id = mi.subject_entity_id "
-            "LEFT JOIN entity_nodes te ON te.id = mi.target_entity_id "
+            "LEFT JOIN entity_nodes en ON en.id = mi.entity_id "
             "WHERE mi.status IN ('current', 'conflicted') "
             "AND (mi.evidence_observation_ids LIKE ? OR mi.metadata LIKE ?) "
             "ORDER BY mi.updated_at DESC, mi.id DESC "

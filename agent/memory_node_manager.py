@@ -346,7 +346,10 @@ fact_kind 类别说明：
 OBSERVATION_METADATA_GUIDANCE = """observation metadata 字段含义：
 - observation_kind 表示 observation 的信息性质，也就是它在描述什么类型的历史归纳，例如模式、事件簇、状态变化、结果、冲突、偏好信号、任务信号、约束、目标信号、情绪信号或关系信号。
 - evidence_shape 表示支撑 observation 的证据形态，也就是它是由单个事件、多次重复、对比、逐步推进、修正还是确认形成的。
-- temporal_scope 表示 observation 的时间范围，也就是它是瞬时、近期、持续、历史还是反复发生的。"""
+- temporal_scope 表示 observation 的时间范围，也就是它是瞬时、近期、持续、历史还是反复发生的。
+- source_fact_type_distribution 表示 supporting facts 中 semantic/episodic 的数量分布，用来说明 observation 是由稳定知识、具体经历还是二者共同支持。
+- dominant_fact_type 表示主要证据形态：semantic 表示稳定知识占主导，episodic 表示具体经历占主导，mixed 表示二者相近，unknown 表示没有足够来源事实。
+- evidence_mixture 表示证据混合形态：semantic_only、episodic_only、semantic_dominant、episodic_dominant、balanced_mixed 或 unknown。它帮助 interpretation 判断一次经历、稳定事实、多次经历上升为模式等不同路径。"""
 
 OBSERVATION_TIME_GUIDANCE = """时间字段说明：
 - source facts 行中的 time 表示该事实的证据时间或记忆时间，用于判断事件先后、重复出现、近期性和历史性。
@@ -394,7 +397,7 @@ source facts:
 - evidence_shape 只能是 single_event、repeated_pattern、contrast、progression、correction、confirmation。
 - temporal_scope 只能是 momentary、recent、ongoing、historical、recurring。
 - candidate_interpretation_types 只能包含 insight、task、preference。
-- metadata 中只填写 observation_kind、evidence_shape、temporal_scope、candidate_interpretation_types、has_conflict、source_note。
+- metadata 中只填写 observation_kind、evidence_shape、temporal_scope、candidate_interpretation_types、has_conflict、source_fact_type_distribution、dominant_fact_type、evidence_mixture、source_note。
 
 只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
@@ -408,6 +411,9 @@ source facts:
     "temporal_scope": "momentary | recent | ongoing | historical | recurring",
     "candidate_interpretation_types": ["insight"],
     "has_conflict": false,
+    "source_fact_type_distribution": {{"semantic": 0, "episodic": 0}},
+    "dominant_fact_type": "semantic | episodic | mixed | unknown",
+    "evidence_mixture": "semantic_only | episodic_only | semantic_dominant | episodic_dominant | balanced_mixed | unknown",
     "source_note": "可选，简短说明该 observation 的证据性质"
   }}
 }}"""
@@ -468,6 +474,7 @@ topic: {topic_label}
 - evidence_shape 只能是 single_event、repeated_pattern、contrast、progression、correction、confirmation。
 - temporal_scope 只能是 momentary、recent、ongoing、historical、recurring。
 - candidate_interpretation_types 只能包含 insight、task、preference。
+- metadata 中可填写 source_fact_type_distribution、dominant_fact_type、evidence_mixture；系统会根据实际 source facts 做最终校正。
 
 只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
@@ -481,6 +488,9 @@ topic: {topic_label}
     "temporal_scope": "momentary | recent | ongoing | historical | recurring",
     "candidate_interpretation_types": ["insight"],
     "has_conflict": false,
+    "source_fact_type_distribution": {{"semantic": 0, "episodic": 0}},
+    "dominant_fact_type": "semantic | episodic | mixed | unknown",
+    "evidence_mixture": "semantic_only | episodic_only | semantic_dominant | episodic_dominant | balanced_mixed | unknown",
     "source_note": "可选，简短说明该 observation 的证据性质"
   }}
 }}"""
@@ -580,7 +590,6 @@ conflict_status: {conflict_status}
 polarity: {polarity}
 strength: {strength}
 confidence: {confidence}
-subject_text: {subject_text}
 target_text: {target_text}
 scope: {scope}
 claim: {claim}
@@ -1679,6 +1688,47 @@ class MemoryNodeManager:
         return out
 
     @classmethod
+    def _metadata_fact_type_distribution(cls, value: Any) -> Dict[str, int]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value or "{}")
+            except (TypeError, ValueError):
+                value = {}
+        if not isinstance(value, dict):
+            return {"semantic": 0, "episodic": 0}
+        out = {"semantic": 0, "episodic": 0}
+        for key in ("semantic", "episodic"):
+            try:
+                out[key] = max(0, int(value.get(key, 0) or 0))
+            except (TypeError, ValueError):
+                out[key] = 0
+        return out
+
+    @classmethod
+    def _fact_type_distribution_from_facts(cls, facts: List[Dict[str, Any]]) -> Dict[str, int]:
+        out = {"semantic": 0, "episodic": 0}
+        for fact in facts or []:
+            fact_type = cls._normalize_fact_type(fact.get("fact_type", "semantic"))
+            out[fact_type] = out.get(fact_type, 0) + 1
+        return out
+
+    @staticmethod
+    def _fact_type_evidence_summary(distribution: Dict[str, int]) -> Tuple[str, str]:
+        semantic = max(0, int(distribution.get("semantic", 0) or 0))
+        episodic = max(0, int(distribution.get("episodic", 0) or 0))
+        if semantic <= 0 and episodic <= 0:
+            return "unknown", "unknown"
+        if semantic > 0 and episodic <= 0:
+            return "semantic", "semantic_only"
+        if episodic > 0 and semantic <= 0:
+            return "episodic", "episodic_only"
+        if semantic == episodic:
+            return "mixed", "balanced_mixed"
+        if semantic > episodic:
+            return "semantic", "semantic_dominant"
+        return "episodic", "episodic_dominant"
+
+    @classmethod
     def _normalize_observation_metadata(cls, metadata: Any, source_nodes: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         metadata = cls._json_dict(metadata)
         source_nodes = source_nodes or []
@@ -1713,12 +1763,33 @@ class MemoryNodeManager:
         if not candidate_types:
             candidate_types = cls._candidate_interpretation_types_for_observation_kind(observation_kind, source_nodes)
 
+        if source_nodes:
+            fact_type_distribution = cls._fact_type_distribution_from_facts(source_nodes)
+        else:
+            fact_type_distribution = cls._metadata_fact_type_distribution(
+                metadata.get("source_fact_type_distribution")
+            )
+        dominant_fact_type, evidence_mixture = cls._fact_type_evidence_summary(fact_type_distribution)
+        if dominant_fact_type == "unknown":
+            metadata_dominant = str(metadata.get("dominant_fact_type") or "").strip().lower()
+            if metadata_dominant in {"semantic", "episodic", "mixed"}:
+                dominant_fact_type = metadata_dominant
+            metadata_mixture = str(metadata.get("evidence_mixture") or "").strip().lower()
+            if metadata_mixture in {
+                "semantic_only", "episodic_only", "semantic_dominant",
+                "episodic_dominant", "balanced_mixed",
+            }:
+                evidence_mixture = metadata_mixture
+
         return {
             "observation_kind": observation_kind,
             "evidence_shape": evidence_shape,
             "temporal_scope": temporal_scope,
             "candidate_interpretation_types": candidate_types,
             "has_conflict": bool(metadata.get("has_conflict", observation_kind == "conflict")),
+            "source_fact_type_distribution": fact_type_distribution,
+            "dominant_fact_type": dominant_fact_type,
+            "evidence_mixture": evidence_mixture,
             "source_note": str(metadata.get("source_note") or "").strip(),
         }
 
@@ -2165,7 +2236,6 @@ class MemoryNodeManager:
             polarity=interpretation.get("polarity", "neutral"),
             strength=interpretation.get("strength", 0.5),
             confidence=interpretation.get("confidence", 0.5),
-            subject_text=interpretation.get("subject_text", ""),
             target_text=interpretation.get("target_text", ""),
             scope=interpretation.get("scope", "general"),
             claim=interpretation.get("claim", ""),
@@ -2243,7 +2313,7 @@ class MemoryNodeManager:
         }
         return {
             "claim": claim,
-            "subject_text": str(data.get("subject_text") or interpretation.get("subject_text") or "agent").strip() or "agent",
+            "subject_text": str(interpretation.get("subject_text") or "agent").strip() or "agent",
             "target_text": str(data.get("target_text") or interpretation.get("target_text") or "").strip(),
             "scope": str(data.get("scope") or interpretation.get("scope") or "general").strip() or "general",
             "interpretation_type": interpretation_type,
@@ -2368,9 +2438,8 @@ class MemoryNodeManager:
     def _interpretation_entity_ids(cls, interpretation: Dict[str, Any]) -> set[int]:
         metadata = cls._json_dict(interpretation.get("metadata", {}))
         values = [
+            interpretation.get("entity_id"),
             metadata.get("entity_id"),
-            interpretation.get("subject_entity_id"),
-            interpretation.get("target_entity_id"),
         ]
         out: set[int] = set()
         for value in values:
@@ -2425,6 +2494,8 @@ class MemoryNodeManager:
         reasons: List[str] = []
         observation_kind = str(observation_metadata.get("observation_kind") or "").strip().lower()
         evidence_shape = str(observation_metadata.get("evidence_shape") or "").strip().lower()
+        dominant_fact_type = str(observation_metadata.get("dominant_fact_type") or "").strip().lower()
+        evidence_mixture = str(observation_metadata.get("evidence_mixture") or "").strip().lower()
         source_kinds = {
             str(node.get("fact_kind") or "").strip().lower()
             for node in source_nodes
@@ -2444,6 +2515,12 @@ class MemoryNodeManager:
             if source_subjects & {"user"}:
                 score += 0.04
                 reasons.append("user_subject")
+            if dominant_fact_type == "semantic" or evidence_mixture in {"semantic_only", "semantic_dominant"}:
+                score += 0.04
+                reasons.append("semantic_preference_memory")
+            elif evidence_mixture in {"balanced_mixed", "episodic_dominant"} and evidence_shape in {"repeated_pattern", "confirmation"}:
+                score += 0.04
+                reasons.append("episodic_preference_pattern")
             target_terms = cls._match_terms(interpretation.get("target_text"), interpretation.get("scope"))
             target_overlap = cls._term_overlap_score(observation_terms, target_terms)
             if target_overlap:
@@ -2463,6 +2540,9 @@ class MemoryNodeManager:
             if task_status and task_status != "stale":
                 score += 0.04
                 reasons.append("task_active_state")
+            if dominant_fact_type == "episodic" or evidence_mixture in {"episodic_only", "episodic_dominant", "balanced_mixed"}:
+                score += 0.04
+                reasons.append("episodic_task_memory")
             goal_terms = cls._match_terms(cls._json_dict(interpretation.get("metadata", {})).get("goal"))
             goal_overlap = cls._term_overlap_score(observation_terms, goal_terms)
             if goal_overlap:
@@ -2476,6 +2556,9 @@ class MemoryNodeManager:
             if evidence_shape in {"repeated_pattern", "contrast", "progression", "correction", "confirmation"}:
                 score += 0.08
                 reasons.append("insight_shape")
+            if evidence_mixture in {"semantic_dominant", "episodic_dominant", "balanced_mixed"}:
+                score += 0.04
+                reasons.append("mixed_fact_type_evidence")
             claim_overlap = cls._term_overlap_score(
                 observation_terms,
                 cls._match_terms(interpretation.get("claim"), interpretation.get("resolution")),
@@ -2657,6 +2740,9 @@ class MemoryNodeManager:
                 "temporal_scope": normalized_metadata.get("temporal_scope"),
                 "candidate_interpretation_types": normalized_metadata.get("candidate_interpretation_types", []),
                 "has_conflict": normalized_metadata.get("has_conflict", False),
+                "source_fact_type_distribution": normalized_metadata.get("source_fact_type_distribution", {}),
+                "dominant_fact_type": normalized_metadata.get("dominant_fact_type"),
+                "evidence_mixture": normalized_metadata.get("evidence_mixture"),
             },
             "source_node_ids": sorted(set(source_node_ids)),
         }
@@ -2737,6 +2823,8 @@ class MemoryNodeManager:
         observation_kind = str(metadata.get("observation_kind") or "context")
         evidence_shape = str(metadata.get("evidence_shape") or "single_event")
         temporal_scope = str(metadata.get("temporal_scope") or "recent")
+        dominant_fact_type = str(metadata.get("dominant_fact_type") or "unknown")
+        evidence_mixture = str(metadata.get("evidence_mixture") or "unknown")
         source_kinds = {
             str(node.get("fact_kind") or "").strip().lower()
             for node in source_nodes
@@ -2748,17 +2836,23 @@ class MemoryNodeManager:
                 return "high", "preference_signal"
             if evidence_shape in {"repeated_pattern", "confirmation"} or temporal_scope in {"ongoing", "recurring"}:
                 return "high", "stable_preference_signal"
+            if evidence_mixture in {"semantic_dominant", "balanced_mixed"}:
+                return "medium", "mixed_preference_evidence"
             return "medium", "weak_preference_signal"
         if family == "task":
             if observation_kind in {"task_signal", "goal_signal", "state_change", "outcome"}:
                 return "high", "task_state_signal"
             if any(cls._is_task_event_like_fact(node) for node in source_nodes):
                 return "high", "task_event_evidence"
+            if dominant_fact_type == "episodic" or evidence_mixture in {"episodic_only", "episodic_dominant"}:
+                return "medium", "episodic_task_context"
             return "medium", "weak_task_signal"
         if observation_kind in {"conflict", "state_change", "outcome"}:
             return "high", "material_insight_change"
         if evidence_shape in {"repeated_pattern", "contrast", "progression", "correction", "confirmation"}:
             return "medium", "structured_insight_evidence"
+        if evidence_mixture in {"semantic_dominant", "episodic_dominant", "balanced_mixed"}:
+            return "medium", "mixed_fact_type_evidence"
         return "low", "ordinary_insight"
 
     def _deferred_interpretation_items_for_observation(
@@ -2935,8 +3029,7 @@ class MemoryNodeManager:
         interpretation_id = self._db.memory_upsert_interpretation(
             interpretation_id=int(best["id"]),
             claim=(updated_interpretation or {}).get("claim", best.get("claim", "")),
-            subject_entity_id=best.get("subject_entity_id"),
-            target_entity_id=best.get("target_entity_id"),
+            entity_id=best.get("entity_id") or metadata.get("entity_id") or observation.get("entity_id"),
             subject_text=(updated_interpretation or {}).get("subject_text", best.get("subject_text", "")),
             target_text=(updated_interpretation or {}).get("target_text", best.get("target_text", "")),
             scope=(updated_interpretation or {}).get("scope", best.get("scope", "general")),
@@ -2990,6 +3083,8 @@ class MemoryNodeManager:
         observation_kind = str(metadata.get("observation_kind") or "context").strip().lower()
         evidence_shape = str(metadata.get("evidence_shape") or "single_event").strip().lower()
         temporal_scope = str(metadata.get("temporal_scope") or "recent").strip().lower()
+        dominant_fact_type = str(metadata.get("dominant_fact_type") or "unknown").strip().lower()
+        evidence_mixture = str(metadata.get("evidence_mixture") or "unknown").strip().lower()
         source_kinds = {
             str(node.get("fact_kind") or "").strip().lower()
             for node in source_nodes
@@ -3002,6 +3097,8 @@ class MemoryNodeManager:
                 return True, "task_event_evidence"
             if source_kinds & {"request", "action", "decision", "error", "recommendation"}:
                 return True, "task_fact_kind"
+            if dominant_fact_type == "episodic" and temporal_scope in {"momentary", "recent", "ongoing"}:
+                return True, "episodic_task_context"
             return False, "weak_task_signal"
 
         if family == "preference":
@@ -3013,12 +3110,16 @@ class MemoryNodeManager:
                 return True, "repeated_preference_evidence"
             if temporal_scope in {"ongoing", "recurring"} and source_kinds & {"preference", "instruction"}:
                 return True, "stable_preference_scope"
+            if evidence_mixture in {"semantic_dominant", "balanced_mixed"} and evidence_shape in {"repeated_pattern", "confirmation"}:
+                return True, "stable_fact_type_preference_evidence"
             return False, "weak_preference_signal"
 
         if observation_kind in {"conflict", "state_change", "outcome", "pattern"}:
             return True, "insight_observation_kind"
         if evidence_shape in {"repeated_pattern", "contrast", "progression", "correction", "confirmation"}:
             return True, "insight_evidence_shape"
+        if evidence_mixture in {"semantic_dominant", "episodic_dominant", "balanced_mixed"} and len(source_nodes) >= 2:
+            return True, "mixed_fact_type_insight"
         if len(source_nodes) >= 2 and temporal_scope in {"ongoing", "historical", "recurring", "recent"}:
             return True, "multi_evidence_insight"
         return False, "weak_insight_signal"
@@ -3119,7 +3220,10 @@ class MemoryNodeManager:
                 if summary:
                     summaries.append(f"{index}. id={item['observation_id']} {summary}")
             representative = dict(items[0]["observation"])
-            representative_metadata = self._json_dict(representative.get("metadata", {}))
+            representative_metadata = self._normalize_observation_metadata(
+                representative.get("metadata", {}),
+                all_source_nodes,
+            )
             representative["summary"] = "Clustered observations:\n" + "\n".join(summaries)
             representative["metadata"] = {
                 **representative_metadata,
@@ -3149,6 +3253,7 @@ class MemoryNodeManager:
         }
         interpretation_id = self._db.memory_upsert_interpretation(
             claim=interpretation["claim"],
+            entity_id=representative.get("entity_id"),
             subject_text=interpretation["subject_text"],
             target_text=interpretation["target_text"],
             scope=interpretation["scope"],
@@ -3445,12 +3550,26 @@ class MemoryNodeManager:
 
         fact_type = str(fact.get("fact_type") or "semantic").strip().lower()
         temporal_scope = str(metadata.get("temporal_scope") or "")
+        dominant_fact_type = str(metadata.get("dominant_fact_type") or "unknown").strip().lower()
+        evidence_mixture = str(metadata.get("evidence_mixture") or "unknown").strip().lower()
         if fact_type == "semantic" and temporal_scope in {"ongoing", "recurring", "historical"}:
             score += 0.06
             reasons.append("semantic_scope")
         elif fact_type == "episodic" and temporal_scope in {"momentary", "recent", "recurring"}:
             score += 0.06
             reasons.append("episodic_scope")
+        if fact_type == "semantic" and (
+            dominant_fact_type in {"semantic", "mixed"}
+            or evidence_mixture in {"semantic_only", "semantic_dominant", "balanced_mixed"}
+        ):
+            score += 0.04
+            reasons.append("semantic_evidence_shape")
+        elif fact_type == "episodic" and (
+            dominant_fact_type in {"episodic", "mixed"}
+            or evidence_mixture in {"episodic_only", "episodic_dominant", "balanced_mixed"}
+        ):
+            score += 0.04
+            reasons.append("episodic_evidence_shape")
 
         if self._is_task_event_like_fact(fact) and "task" in candidate_types:
             score += 0.08
@@ -3581,11 +3700,15 @@ class MemoryNodeManager:
         )
         if not generated:
             return None
+        generated_metadata = self._normalize_observation_metadata(
+            generated.get("metadata") or {},
+            supporting_nodes + [fact],
+        )
         metadata = {
             "source": "memory_fact_observation_match",
             "fact_match_score": round(float(score), 4),
             "fact_match_reason": reason,
-            **(generated.get("metadata") or {}),
+            **generated_metadata,
         }
         stored_source_ids = list(dict.fromkeys(existing_source_ids + [fact_id]))
         self._db.memory_replace_observation_group(
@@ -3921,12 +4044,16 @@ class MemoryNodeManager:
         )
         if not observation:
             return None
+        generated_metadata = self._normalize_observation_metadata(
+            observation.get("metadata") or {},
+            source_nodes,
+        )
         observation_metadata = {
             "source": "memory_unmatched_fact_cluster",
             "cluster_family": cluster.get("cluster_family"),
             "cluster_score": round(float(cluster.get("cluster_score") or 0.0), 4),
             "cluster_reason": cluster.get("cluster_reason"),
-            **(observation.get("metadata") or {}),
+            **generated_metadata,
         }
         observation_id = self._db.memory_upsert_observation(
             entity_id=entity_id,
@@ -4483,9 +4610,13 @@ class MemoryNodeManager:
         if not generated:
             return False
         category = generated["observation_type"]
+        generated_metadata = self._normalize_observation_metadata(
+            generated.get("metadata") or {},
+            source_nodes,
+        )
         metadata = {
             "source": "memory_reflect_observation_merge",
-            **(generated.get("metadata") or {}),
+            **generated_metadata,
         }
         keywords = generated["keywords"]
         if not keywords:
