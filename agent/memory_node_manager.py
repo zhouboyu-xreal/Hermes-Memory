@@ -32,6 +32,7 @@ Usage::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -58,6 +59,10 @@ SEMANTIC_RELATION_TYPE = "semantic"
 TEMPORAL_RELATION_TYPE = "temporal"
 CAUSAL_RELATION_GRAPH_TYPE = "causal"
 SEMANTIC_RELATION_THRESHOLD = 0.82
+
+INTERPRETATION_MIN_OBSERVATIONS_FOR_BATCH = 3
+INTERPRETATION_MIN_CLUSTER_SIZE = 2
+INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT = 30
 
 # ── Shared causal relation guidance ───────────────────────────────────────
 
@@ -2624,6 +2629,223 @@ class MemoryNodeManager:
             seen.add(item_id)
         return candidates
 
+    @classmethod
+    def _interpretation_basis_hash(
+        cls,
+        observation: Dict[str, Any],
+        source_nodes: List[Dict[str, Any]],
+    ) -> str:
+        """Hash the observation fields that matter for interpretation decisions."""
+        normalized_metadata = cls._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
+        source_node_ids = []
+        for node in source_nodes:
+            node_id = node.get("id", node.get("node_id"))
+            try:
+                source_node_ids.append(int(node_id))
+            except (TypeError, ValueError):
+                continue
+        basis = {
+            "summary": str(observation.get("summary") or "").strip(),
+            "keywords": cls._string_list(observation.get("keywords", []), limit=20),
+            "entity_id": observation.get("entity_id"),
+            "topic_key": observation.get("topic_key"),
+            "topic_label": observation.get("topic_label"),
+            "observation_type": observation.get("observation_type", "observation"),
+            "metadata": {
+                "observation_kind": normalized_metadata.get("observation_kind"),
+                "evidence_shape": normalized_metadata.get("evidence_shape"),
+                "temporal_scope": normalized_metadata.get("temporal_scope"),
+                "candidate_interpretation_types": normalized_metadata.get("candidate_interpretation_types", []),
+                "has_conflict": normalized_metadata.get("has_conflict", False),
+            },
+            "source_node_ids": sorted(set(source_node_ids)),
+        }
+        payload = json.dumps(basis, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _interpretation_state(metadata: Dict[str, Any]) -> str:
+        state = str(metadata.get("interpretation_status") or "pending").strip().lower()
+        if state not in {"pending", "deferred", "linked", "generated", "ignored"}:
+            return "pending"
+        return state
+
+    @classmethod
+    def _interpretation_state_is_final_for_basis(
+        cls,
+        metadata: Dict[str, Any],
+        basis_hash: str,
+    ) -> bool:
+        return (
+            cls._interpretation_state(metadata) in {"linked", "generated", "ignored"}
+            and str(metadata.get("interpretation_basis_hash") or "") == basis_hash
+        )
+
+    def _update_observation_interpretation_state(
+        self,
+        observation: Dict[str, Any],
+        *,
+        status: str,
+        basis_hash: str,
+        reason: str,
+        interpretation_id: Optional[int] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self._db or not observation.get("id"):
+            return
+        metadata = self._json_dict(observation.get("metadata", {}))
+        status = status if status in {"pending", "deferred", "linked", "generated", "ignored"} else "pending"
+        metadata.update({
+            "interpretation_status": status,
+            "interpretation_basis_hash": basis_hash,
+            "interpretation_checked_at": datetime.now(timezone.utc).isoformat(),
+            "interpretation_reason": str(reason or "")[:256],
+        })
+        if interpretation_id is not None:
+            linked_ids = []
+            for value in metadata.get("linked_interpretation_ids", []):
+                try:
+                    linked_ids.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            if int(interpretation_id) not in linked_ids:
+                linked_ids.append(int(interpretation_id))
+            metadata["linked_interpretation_ids"] = linked_ids
+            if status == "generated":
+                metadata["generated_interpretation_id"] = int(interpretation_id)
+        if extra:
+            metadata.update(extra)
+        try:
+            self._db.memory_update_observation_metadata(int(observation["id"]), metadata)
+        except AttributeError:
+            self._log_reflect_error("interpretation_state_update_unsupported", {
+                "observation_id": observation.get("id"),
+                "status": status,
+                "reason": reason,
+            })
+            return
+        observation["metadata"] = metadata
+
+    @classmethod
+    def _interpretation_trigger_priority(
+        cls,
+        observation: Dict[str, Any],
+        source_nodes: List[Dict[str, Any]],
+        family: str,
+    ) -> Tuple[str, str]:
+        metadata = cls._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
+        observation_kind = str(metadata.get("observation_kind") or "context")
+        evidence_shape = str(metadata.get("evidence_shape") or "single_event")
+        temporal_scope = str(metadata.get("temporal_scope") or "recent")
+        source_kinds = {
+            str(node.get("fact_kind") or "").strip().lower()
+            for node in source_nodes
+        }
+        if family == "preference":
+            if source_kinds & {"instruction"}:
+                return "high", "explicit_instruction"
+            if observation_kind in {"preference_signal", "constraint"}:
+                return "high", "preference_signal"
+            if evidence_shape in {"repeated_pattern", "confirmation"} or temporal_scope in {"ongoing", "recurring"}:
+                return "high", "stable_preference_signal"
+            return "medium", "weak_preference_signal"
+        if family == "task":
+            if observation_kind in {"task_signal", "goal_signal", "state_change", "outcome"}:
+                return "high", "task_state_signal"
+            if any(cls._is_task_event_like_fact(node) for node in source_nodes):
+                return "high", "task_event_evidence"
+            return "medium", "weak_task_signal"
+        if observation_kind in {"conflict", "state_change", "outcome"}:
+            return "high", "material_insight_change"
+        if evidence_shape in {"repeated_pattern", "contrast", "progression", "correction", "confirmation"}:
+            return "medium", "structured_insight_evidence"
+        return "low", "ordinary_insight"
+
+    def _deferred_interpretation_items_for_observation(
+        self,
+        item: Dict[str, Any],
+        supporting_by_observation: Dict[int, List[Dict[str, Any]]],
+        seen_observation_ids: set[int],
+    ) -> List[Dict[str, Any]]:
+        if not self._db:
+            return []
+        observation = item["observation"]
+        query = " ".join(
+            str(part or "").strip()
+            for part in [
+                observation.get("summary"),
+                observation.get("keywords"),
+                observation.get("topic_label"),
+                observation.get("topic_key"),
+            ]
+            if str(part or "").strip()
+        )
+        try:
+            candidates = self._db.memory_search_observations(
+                query,
+                entities=[observation.get("entity_name")] if observation.get("entity_name") else [],
+                entity_ids=[int(observation["entity_id"])] if observation.get("entity_id") is not None else None,
+                top_k=8,
+            )
+        except Exception:
+            return []
+
+        deferred_items: List[Dict[str, Any]] = []
+        missing_support_ids: List[int] = []
+        for candidate in candidates:
+            try:
+                candidate_id = int(candidate["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if candidate_id in seen_observation_ids:
+                continue
+            metadata = self._json_dict(candidate.get("metadata", {}))
+            if self._interpretation_state(metadata) != "deferred":
+                continue
+            missing_support_ids.append(candidate_id)
+            candidate["metadata"] = metadata
+
+        if missing_support_ids:
+            try:
+                fetched_support = self._db.memory_observation_supporting_nodes(
+                    missing_support_ids,
+                    per_observation=12,
+                )
+                supporting_by_observation.update(fetched_support)
+            except Exception:
+                pass
+
+        for candidate in candidates:
+            try:
+                candidate_id = int(candidate["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if candidate_id in seen_observation_ids:
+                continue
+            metadata = self._json_dict(candidate.get("metadata", {}))
+            if self._interpretation_state(metadata) != "deferred":
+                continue
+            source_nodes = supporting_by_observation.get(candidate_id, [])
+            family = self._observation_interpretation_cluster_family(candidate, source_nodes)
+            if family != item.get("family"):
+                continue
+            basis_hash = self._interpretation_basis_hash(candidate, source_nodes)
+            if str(metadata.get("interpretation_basis_hash") or "") != basis_hash:
+                continue
+            seen_observation_ids.add(candidate_id)
+            deferred_items.append({
+                "observation": candidate,
+                "observation_id": candidate_id,
+                "source_nodes": source_nodes,
+                "source_node_ids": [int(node["id"]) for node in source_nodes if node.get("id") is not None],
+                "basis_hash": basis_hash,
+                "family": family,
+                "priority": "deferred",
+                "priority_reason": "previously_deferred",
+                "is_deferred_context": True,
+            })
+        return deferred_items
+
     def _link_observation_to_existing_interpretation(
         self,
         *,
@@ -2632,7 +2854,9 @@ class MemoryNodeManager:
         observation_id: int,
         source_node_ids: List[int],
         auto_link_threshold: float = 0.78,
-    ) -> Optional[int]:
+        allow_content_update: bool = True,
+        return_details: bool = False,
+    ) -> Optional[Any]:
         if not self._db or not observation_id:
             return None
         candidates = self._interpretation_candidates_for_observation(observation, int(observation_id))
@@ -2658,6 +2882,14 @@ class MemoryNodeManager:
                 "reason": reason,
             })
             return None
+        if not allow_content_update and reason != "existing_observation_evidence":
+            self._log_reflect_error("interpretation_link_deferred", {
+                "observation": self._reflect_observation_log_item(observation),
+                "best_interpretation_id": best.get("id"),
+                "best_score": best_score,
+                "reason": "llm_budget_exhausted_before_update",
+            })
+            return None
 
         evidence_node_ids = list(dict.fromkeys([
             *best.get("evidence_node_ids", []),
@@ -2669,7 +2901,9 @@ class MemoryNodeManager:
         ]))
         metadata = self._json_dict(best.get("metadata", {}))
         updated_interpretation = None
-        if reason != "existing_observation_evidence":
+        content_update_attempted = False
+        if allow_content_update and reason != "existing_observation_evidence":
+            content_update_attempted = True
             updated_interpretation = self._update_existing_interpretation_from_observation(
                 interpretation=best,
                 observation=observation,
@@ -2735,6 +2969,14 @@ class MemoryNodeManager:
             "interpretation_type": best.get("interpretation_type"),
             "content_updated": bool(updated_interpretation),
         })
+        if return_details:
+            return {
+                "interpretation_id": int(interpretation_id),
+                "content_update_attempted": content_update_attempted,
+                "content_updated": bool(updated_interpretation),
+                "reason": reason,
+                "score": best_score,
+            }
         return int(interpretation_id)
 
     @classmethod
@@ -2932,7 +3174,24 @@ class MemoryNodeManager:
             "generated_interpretation": interpretation,
         })
         return int(interpretation_id)
-    
+
+    @classmethod
+    def _interpretation_cluster_should_run(
+        cls,
+        cluster: Dict[str, Any],
+    ) -> Tuple[bool, str]:
+        items = cluster.get("items") or []
+        changed_items = [item for item in items if not item.get("is_deferred_context")]
+        if not changed_items:
+            return False, "no_changed_observation"
+        if any(item.get("priority") == "high" for item in changed_items):
+            return True, "high_priority_observation"
+        if len(changed_items) >= INTERPRETATION_MIN_OBSERVATIONS_FOR_BATCH:
+            return True, "cluster_changed_batch_threshold"
+        if len(items) >= INTERPRETATION_MIN_CLUSTER_SIZE:
+            return True, "cluster_size_threshold"
+        return False, "trigger_threshold_not_met"
+
     def _generate_interpretations_for_observations(self, observation_ids: List[int]) -> int:
         if not self._db:
             return 0
@@ -2949,30 +3208,156 @@ class MemoryNodeManager:
             per_observation=12,
         ) if observations else {}
         generated = 0
-        unmatched: List[Dict[str, Any]] = []
+        candidate_items: List[Dict[str, Any]] = []
         for observation in observations:
             observation_id = int(observation["id"])
             source_nodes = supporting_by_observation.get(observation_id, [])
             source_node_ids = [int(node["id"]) for node in source_nodes if node.get("id") is not None]
-            linked_id = self._link_observation_to_existing_interpretation(
+            metadata = self._json_dict(observation.get("metadata", {}))
+            basis_hash = self._interpretation_basis_hash(observation, source_nodes)
+            if self._interpretation_state_is_final_for_basis(metadata, basis_hash):
+                self._log_reflect_error("interpretation_observation_skipped", {
+                    "observation_id": observation_id,
+                    "status": self._interpretation_state(metadata),
+                    "reason": "basis_already_processed",
+                })
+                continue
+            observation["metadata"] = metadata
+            family = self._observation_interpretation_cluster_family(observation, source_nodes)
+            priority, priority_reason = self._interpretation_trigger_priority(
                 observation=observation,
                 source_nodes=source_nodes,
-                observation_id=observation_id,
-                source_node_ids=source_node_ids,
+                family=family,
             )
-            if linked_id is not None:
-                generated += 1
-                continue
-            unmatched.append({
+            candidate_items.append({
                 "observation": observation,
                 "observation_id": observation_id,
                 "source_nodes": source_nodes,
                 "source_node_ids": source_node_ids,
+                "basis_hash": basis_hash,
+                "family": family,
+                "priority": priority,
+                "priority_reason": priority_reason,
+                "is_deferred_context": False,
             })
-        for cluster in self._observation_interpretation_clusters(unmatched):
-            interpretation_id = self._generate_interpretation_from_observation_cluster(cluster)
+
+        if not candidate_items:
+            return 0
+
+        seen_observation_ids = {int(item["observation_id"]) for item in candidate_items}
+        cluster_context_items = list(candidate_items)
+        for item in list(candidate_items):
+            deferred_items = self._deferred_interpretation_items_for_observation(
+                item,
+                supporting_by_observation,
+                seen_observation_ids,
+            )
+            cluster_context_items.extend(deferred_items)
+
+        llm_calls_used = 0
+        for cluster in self._observation_interpretation_clusters(cluster_context_items):
+            should_run, reason = self._interpretation_cluster_should_run(cluster)
+            changed_items = [
+                item
+                for item in cluster.get("items") or []
+                if not item.get("is_deferred_context")
+            ]
+            deferred_context_items = [
+                item
+                for item in cluster.get("items") or []
+                if item.get("is_deferred_context")
+            ]
+            if not should_run:
+                for item in changed_items:
+                    self._update_observation_interpretation_state(
+                        item["observation"],
+                        status="deferred",
+                        basis_hash=item["basis_hash"],
+                        reason=reason,
+                        extra={
+                            "interpretation_priority": item.get("priority"),
+                            "interpretation_priority_reason": item.get("priority_reason"),
+                        },
+                    )
+                continue
+
+            unmatched_items: List[Dict[str, Any]] = []
+            for item in changed_items:
+                observation_id = int(item["observation_id"])
+                allow_content_update = llm_calls_used < INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT
+                link_result = self._link_observation_to_existing_interpretation(
+                    observation=item["observation"],
+                    source_nodes=item["source_nodes"],
+                    observation_id=observation_id,
+                    source_node_ids=item["source_node_ids"],
+                    allow_content_update=allow_content_update,
+                    return_details=True,
+                )
+                if link_result is not None:
+                    linked_id = int(link_result["interpretation_id"])
+                    if link_result.get("content_update_attempted"):
+                        llm_calls_used += 1
+                    self._update_observation_interpretation_state(
+                        item["observation"],
+                        status="linked",
+                        basis_hash=item["basis_hash"],
+                        reason=str(link_result.get("reason") or "linked_existing_interpretation"),
+                        interpretation_id=linked_id,
+                        extra={
+                            "interpretation_priority": item.get("priority"),
+                            "interpretation_priority_reason": item.get("priority_reason"),
+                        },
+                    )
+                    generated += 1
+                    continue
+                unmatched_items.append(item)
+
+            if not unmatched_items:
+                continue
+
+            if llm_calls_used >= INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT:
+                for item in unmatched_items:
+                    self._update_observation_interpretation_state(
+                        item["observation"],
+                        status="deferred",
+                        basis_hash=item["basis_hash"],
+                        reason="llm_budget_exhausted",
+                    )
+                continue
+
+            generation_items = unmatched_items + deferred_context_items
+            generation_cluster = {
+                **cluster,
+                "items": generation_items,
+            }
+            interpretation_id = self._generate_interpretation_from_observation_cluster(generation_cluster)
+            llm_calls_used += 1
             if interpretation_id is not None:
                 generated += 1
+                for item in generation_items:
+                    self._update_observation_interpretation_state(
+                        item["observation"],
+                        status="generated",
+                        basis_hash=item["basis_hash"],
+                        reason="generated_from_observation_cluster",
+                        interpretation_id=interpretation_id,
+                        extra={
+                            "interpretation_cluster_family": cluster.get("family"),
+                            "interpretation_cluster_topic": cluster.get("topic_key"),
+                        },
+                    )
+            else:
+                for item in unmatched_items:
+                    self._update_observation_interpretation_state(
+                        item["observation"],
+                        status="deferred",
+                        basis_hash=item["basis_hash"],
+                        reason="generation_not_created",
+                        extra={
+                            "interpretation_cluster_family": cluster.get("family"),
+                            "interpretation_cluster_topic": cluster.get("topic_key"),
+                        },
+                    )
         return generated
 
     @staticmethod

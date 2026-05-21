@@ -4728,6 +4728,22 @@ class SessionDB:
         by_id = {int(row["id"]): dict(row) for row in rows}
         return [by_id[observation_id] for observation_id in clean_ids if observation_id in by_id]
 
+    def memory_update_observation_metadata(
+        self,
+        observation_id: int,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """Update observation metadata without changing evidence timestamps."""
+        metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE memory_observations SET metadata = ? WHERE id = ?",
+                (metadata_str, int(observation_id)),
+            )
+
+        self._execute_write(_do)
+
     def memory_upsert_observation(
         self,
         *,

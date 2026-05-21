@@ -2240,6 +2240,237 @@ def test_interpretation_generation_clusters_unmatched_observations(db):
     assert metadata["interpretation_cluster_family"] == "task"
 
 
+def test_interpretation_generation_defers_weak_single_observation(db):
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
+    source = _add_memory_node(
+        db,
+        time_key="2026-05-06 10:00:00",
+        summary="Hermes memory recall discussion mentioned indexing context.",
+        keywords=["memory", "indexing"],
+        fact_kind="context",
+    )
+    db.entity_link_node(source, hermes)
+    observation_id = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="memory-indexing",
+        topic_label="memory indexing",
+        observation_type="observation",
+        summary="Hermes memory recall discussion has indexing context.",
+        keywords=["memory", "indexing"],
+        source_node_ids=[source],
+        metadata={
+            "observation_kind": "context",
+            "evidence_shape": "single_event",
+            "temporal_scope": "recent",
+            "candidate_interpretation_types": ["insight"],
+        },
+    )
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    generated = mgr._generate_interpretations_for_observations([observation_id])
+
+    assert generated == 0
+    assert mgr.llm_prompts == []
+    metadata = json.loads(
+        db._conn.execute(
+            "SELECT metadata FROM memory_observations WHERE id = ?",
+            (observation_id,),
+        ).fetchone()["metadata"]
+    )
+    assert metadata["interpretation_status"] == "deferred"
+    assert metadata["interpretation_reason"] == "trigger_threshold_not_met"
+    assert metadata["interpretation_basis_hash"]
+
+
+def test_interpretation_generation_does_not_use_global_batch_threshold_for_weak_singletons(db):
+    observation_ids = []
+    for index in range(3):
+        entity = db.entity_add_entity(f"Hermes Area {index}", "PROJECT")
+        source = _add_memory_node(
+            db,
+            time_key=f"2026-05-06 1{index}:00:00",
+            summary=f"Hermes area {index} discussion mentioned ordinary context.",
+            keywords=[f"area-{index}", "ordinary"],
+            fact_kind="context",
+        )
+        db.entity_link_node(source, entity)
+        observation_ids.append(
+            db.memory_upsert_observation(
+                entity_id=entity,
+                topic_key=f"ordinary-context-{index}",
+                topic_label=f"ordinary context {index}",
+                observation_type="observation",
+                summary=f"Hermes area {index} has ordinary context.",
+                keywords=[f"area-{index}", "ordinary"],
+                source_node_ids=[source],
+                metadata={
+                    "observation_kind": "context",
+                    "evidence_shape": "single_event",
+                    "temporal_scope": "recent",
+                    "candidate_interpretation_types": ["insight"],
+                },
+            )
+        )
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    generated = mgr._generate_interpretations_for_observations(observation_ids)
+
+    assert generated == 0
+    assert mgr.llm_prompts == []
+    rows = db._conn.execute(
+        "SELECT metadata FROM memory_observations WHERE id IN (?, ?, ?) ORDER BY id",
+        tuple(observation_ids),
+    ).fetchall()
+    for row in rows:
+        metadata = json.loads(row["metadata"])
+        assert metadata["interpretation_status"] == "deferred"
+        assert metadata["interpretation_reason"] == "trigger_threshold_not_met"
+
+
+def test_interpretation_generation_skips_final_observation_when_basis_unchanged(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    source = _add_memory_node(
+        db,
+        time_key="2026-05-07 10:00:00",
+        summary="Alice prefers brief architecture notes before code changes.",
+        keywords=["architecture", "brief"],
+        fact_kind="preference",
+    )
+    db.entity_link_node(source, alice)
+    observation_id = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="architecture-notes",
+        topic_label="architecture notes",
+        observation_type="observation",
+        summary="Alice prefers brief architecture notes before code changes.",
+        keywords=["architecture", "brief"],
+        source_node_ids=[source],
+        metadata={
+            "observation_kind": "preference_signal",
+            "evidence_shape": "single_event",
+            "temporal_scope": "ongoing",
+            "candidate_interpretation_types": ["preference"],
+        },
+    )
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="Alice prefers brief architecture notes before code changes.",
+        target_text="architecture notes",
+        scope="architecture-notes",
+        interpretation_type="explicit_preference",
+        confidence=0.86,
+        action_implication="Start complex code changes with brief architecture notes.",
+        evidence_node_ids=[source],
+        evidence_observation_ids=[observation_id],
+        metadata={"entity_id": alice, "topic_key": "architecture-notes"},
+    )
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    first = mgr._generate_interpretations_for_observations([observation_id])
+    second = mgr._generate_interpretations_for_observations([observation_id])
+
+    assert first == 1
+    assert second == 0
+    assert mgr.llm_prompts == []
+    row = db._conn.execute(
+        "SELECT metadata FROM memory_observations WHERE id = ?",
+        (observation_id,),
+    ).fetchone()
+    metadata = json.loads(row["metadata"])
+    assert metadata["interpretation_status"] == "linked"
+    assert metadata["linked_interpretation_ids"] == [interpretation_id]
+
+
+def test_interpretation_generation_reuses_deferred_observation_in_new_cluster(db):
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
+    first_source = _add_memory_node(
+        db,
+        time_key="2026-05-08 10:00:00",
+        summary="Hermes memory recall discussion mentioned indexing context.",
+        keywords=["memory", "indexing"],
+        fact_kind="context",
+    )
+    second_source = _add_memory_node(
+        db,
+        time_key="2026-05-08 11:00:00",
+        summary="Hermes memory recall discussion later connected indexing context to recall quality.",
+        keywords=["memory", "indexing"],
+        fact_kind="context",
+    )
+    db.entity_link_node(first_source, hermes)
+    db.entity_link_node(second_source, hermes)
+    first_observation = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="memory-indexing",
+        topic_label="memory indexing",
+        observation_type="observation",
+        summary="Hermes memory recall discussion has indexing context.",
+        keywords=["memory", "indexing"],
+        source_node_ids=[first_source],
+        metadata={
+            "observation_kind": "context",
+            "evidence_shape": "single_event",
+            "temporal_scope": "recent",
+            "candidate_interpretation_types": ["insight"],
+        },
+    )
+    first_mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    assert first_mgr._generate_interpretations_for_observations([first_observation]) == 0
+
+    second_observation = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="memory-indexing",
+        topic_label="memory indexing followup",
+        observation_type="observation_followup",
+        summary="Hermes memory recall discussion connected indexing context to recall quality.",
+        keywords=["memory", "indexing", "recall"],
+        source_node_ids=[second_source],
+        metadata={
+            "observation_kind": "context",
+            "evidence_shape": "single_event",
+            "temporal_scope": "recent",
+            "candidate_interpretation_types": ["insight"],
+        },
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "should_create": True,
+                "claim": "Hermes memory recall quality is currently tied to indexing context.",
+                "target_text": "memory indexing",
+                "scope": "memory-indexing",
+                "interpretation_type": "insight",
+                "polarity": "neutral",
+                "strength": 0.72,
+                "confidence": 0.76,
+                "status": "current",
+                "conflict_status": "none",
+                "action_implication": "Use indexing context when reasoning about memory recall quality.",
+                "evidence_node_ids": [first_source, second_source],
+                "evidence_observation_ids": [second_observation, first_observation],
+                "counter_evidence_node_ids": [],
+                "counter_evidence_observation_ids": [],
+            })
+        ],
+    )
+
+    generated = mgr._generate_interpretations_for_observations([second_observation])
+
+    assert generated == 1
+    prompt = next(prompt for prompt in mgr.llm_prompts if "interpretation 生成模块" in prompt)
+    assert "Clustered observations" in prompt
+    assert f"id={first_observation}" in prompt
+    assert f"id={second_observation}" in prompt
+    rows = db._conn.execute(
+        "SELECT id, metadata FROM memory_observations WHERE id IN (?, ?) ORDER BY id",
+        (first_observation, second_observation),
+    ).fetchall()
+    metadata_by_id = {row["id"]: json.loads(row["metadata"]) for row in rows}
+    assert metadata_by_id[first_observation]["interpretation_status"] == "generated"
+    assert metadata_by_id[second_observation]["interpretation_status"] == "generated"
+
+
 def test_store_turn_can_consolidate_task_observation(db):
     retain_payload = {
         "facts": [
