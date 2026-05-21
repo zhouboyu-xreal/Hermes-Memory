@@ -2933,7 +2933,7 @@ class MemoryNodeManager:
     def _deferred_interpretation_items_for_observation(
         self,
         item: Dict[str, Any],
-        supporting_by_observation: Dict[int, List[Dict[str, Any]]],
+        supporting_facts_from_observation: Dict[int, List[Dict[str, Any]]],
         seen_observation_ids: set[int],
     ) -> List[Dict[str, Any]]:
         if not self._db:
@@ -2980,7 +2980,7 @@ class MemoryNodeManager:
                     missing_support_ids,
                     per_observation=12,
                 )
-                supporting_by_observation.update(fetched_support)
+                supporting_facts_from_observation.update(fetched_support)
             except Exception:
                 pass
 
@@ -2994,7 +2994,7 @@ class MemoryNodeManager:
             metadata = self._json_dict(candidate.get("metadata", {}))
             if self._interpretation_state(metadata) != "deferred":
                 continue
-            source_nodes = supporting_by_observation.get(candidate_id, [])
+            source_nodes = supporting_facts_from_observation.get(candidate_id, [])
             family = self._observation_interpretation_cluster_family(candidate, source_nodes)
             if family != item.get("family"):
                 continue
@@ -3406,7 +3406,7 @@ class MemoryNodeManager:
             return True, "cluster_size_threshold"
         return False, "trigger_threshold_not_met"
 
-    def _generate_interpretations_for_observations(self, observation_ids: List[int]) -> int:
+    def _generate_interpretations_using_observations(self, observation_ids: List[int]) -> int:
         if not self._db:
             return 0
         clean_ids = list(dict.fromkeys(
@@ -3417,7 +3417,7 @@ class MemoryNodeManager:
         if not clean_ids:
             return 0
         observations = self._db.memory_observations_by_ids(clean_ids)
-        supporting_by_observation = self._db.memory_observation_supporting_nodes(
+        supporting_facts_from_observation = self._db.memory_observation_supporting_nodes(
             [int(observation["id"]) for observation in observations],
             per_observation=12,
         ) if observations else {}
@@ -3425,7 +3425,7 @@ class MemoryNodeManager:
         candidate_items: List[Dict[str, Any]] = []
         for observation in observations:
             observation_id = int(observation["id"])
-            source_nodes = supporting_by_observation.get(observation_id, [])
+            source_nodes = supporting_facts_from_observation.get(observation_id, [])
             source_node_ids = [int(node["id"]) for node in source_nodes if node.get("id") is not None]
             metadata = self._json_dict(observation.get("metadata", {}))
             basis_hash = self._interpretation_basis_hash(observation, source_nodes)
@@ -3463,7 +3463,7 @@ class MemoryNodeManager:
         for item in list(candidate_items):
             deferred_items = self._deferred_interpretation_items_for_observation(
                 item,
-                supporting_by_observation,
+                supporting_facts_from_observation,
                 seen_observation_ids,
             )
             cluster_context_items.extend(deferred_items)
@@ -3754,14 +3754,14 @@ class MemoryNodeManager:
         candidates = self._candidate_observations_for_fact(fact)
         if not candidates:
             return None
-        supporting_by_observation = self._db.memory_observation_supporting_nodes(
+        supporting_facts_from_observation = self._db.memory_observation_supporting_nodes(
             [int(item["id"]) for item in candidates],
             per_observation=8,
         )
         scored: List[Tuple[float, str, Dict[str, Any], List[Dict[str, Any]]]] = []
         for candidate in candidates:
             observation_id = int(candidate["id"])
-            supporting_nodes = supporting_by_observation.get(observation_id, [])
+            supporting_nodes = supporting_facts_from_observation.get(observation_id, [])
             score, reason = self._observation_match_score(
                 fact=fact,
                 observation=candidate,
@@ -4898,7 +4898,7 @@ class MemoryNodeManager:
         ))
         report["interpretations_generated"] = 0
         if not dry_run:
-            report["interpretations_generated"] = self._generate_interpretations_for_observations(
+            report["interpretations_generated"] = self._generate_interpretations_using_observations(
                 report["changed_observation_ids"]
             )
         reflect_now = datetime.now().astimezone()
@@ -5090,38 +5090,37 @@ class MemoryNodeManager:
             )
             logger.error("finish recall: observations searching")
 
-            interpretation_observation_ids: List[int] = []
-            interpretation_node_ids: List[int] = []
+            observation_ids_from_interpretation: List[int] = []
+            fact_ids_from_interpretation: List[int] = []
             for interpretation in interpretation_nodes:
-                interpretation_observation_ids.extend(
+                observation_ids_from_interpretation.extend(
                     interpretation.get("evidence_observation_ids", []) or []
                 )
-                interpretation_observation_ids.extend(
+                observation_ids_from_interpretation.extend(
                     interpretation.get("counter_evidence_observation_ids", []) or []
                 )
-                interpretation_node_ids.extend(interpretation.get("evidence_node_ids", []) or [])
-                interpretation_node_ids.extend(
+                fact_ids_from_interpretation.extend(interpretation.get("evidence_node_ids", []) or [])
+                fact_ids_from_interpretation.extend(
                     interpretation.get("counter_evidence_node_ids", []) or []
                 )
-            interpretation_observation_nodes = self._db.memory_observations_by_ids(
-                interpretation_observation_ids
+            observation_nodes_from_interpretation = self._db.memory_observations_by_ids(
+                observation_ids_from_interpretation
             )
             observation_nodes = self._merge_recall_items(
                 observation_nodes,
-                interpretation_observation_nodes,
+                observation_nodes_from_interpretation,
             )
-
-            supporting_by_observation = self._db.memory_observation_supporting_nodes(
+            fact_nodes_from_observation = self._db.memory_observation_supporting_nodes(
                 [int(obs["id"]) for obs in observation_nodes],
                 per_observation=2,
             ) if observation_nodes else {}
-            interpretation_support_nodes = self._db.memory_nodes_by_ids(
-                interpretation_node_ids
+            fact_nodes_from_interpretation = self._db.memory_nodes_by_ids(
+                fact_ids_from_interpretation
             )
 
             # Hybrid search is run separately per fact type so semantic
             # knowledge and episodic experiences stay distinct through recall.
-            semantic_nodes = self._db.memory_search(
+            semantic_nodes = self._db.memory_search_facts(
                 keywords, query_embedding, top_k=layer_limits["facts"], budget=b,
                 time_start=ts, time_end=te,
                 tags=tags,
@@ -5129,7 +5128,7 @@ class MemoryNodeManager:
             )
             logger.error("finish recall: semantic_nodes searching")
 
-            episodic_nodes = self._db.memory_search(
+            episodic_nodes = self._db.memory_search_facts(
                 keywords, query_embedding, top_k=layer_limits["facts"], budget=b,
                 time_start=ts, time_end=te,
                 tags=tags,
@@ -5137,14 +5136,14 @@ class MemoryNodeManager:
             )
             logger.error("finish recall: episodic_nodes searching")
 
-            supporting_ids = {
+            fact_ids_from_observation = {
                 node["id"]
-                for nodes in supporting_by_observation.values()
+                for nodes in fact_nodes_from_observation.values()
                 for node in nodes
             }
-            supporting_ids.update(node["id"] for node in interpretation_support_nodes)
-            semantic_nodes = [node for node in semantic_nodes if node.get("id") not in supporting_ids]
-            episodic_nodes = [node for node in episodic_nodes if node.get("id") not in supporting_ids]
+            fact_ids_from_observation.update(node["id"] for node in fact_nodes_from_interpretation)
+            semantic_nodes = [node for node in semantic_nodes if node.get("id") not in fact_ids_from_observation]
+            episodic_nodes = [node for node in episodic_nodes if node.get("id") not in fact_ids_from_observation]
 
             if not interpretation_nodes and not observation_nodes and not semantic_nodes and not episodic_nodes:
                 logger.debug("No relevant memory nodes found for query")
@@ -5169,14 +5168,14 @@ class MemoryNodeManager:
             support_lines: List[str] = []
             seen_support = set()
             support_index = 1
-            for node in interpretation_support_nodes:
+            for node in fact_nodes_from_interpretation:
                 if node.get("id") in seen_support:
                     continue
                 seen_support.add(node.get("id"))
                 support_lines.append(self._format_recall_node(support_index, node))
                 support_index += 1
             for observation in observation_nodes:
-                for node in supporting_by_observation.get(int(observation["id"]), []):
+                for node in fact_nodes_from_observation.get(int(observation["id"]), []):
                     if node.get("id") in seen_support:
                         continue
                     seen_support.add(node.get("id"))

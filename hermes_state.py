@@ -3462,7 +3462,7 @@ class SessionDB:
             node_ids.append(candidate_id)
         return nodes, node_ids
 
-    def memory_search(
+    def memory_search_facts(
         self, keyword: str, query_embedding: np.ndarray, top_k: int = None,
         budget: str = "mid",
         time_start: Optional[str] = None,
