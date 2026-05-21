@@ -13403,7 +13403,7 @@ class AIAgent:
             try:
                 _reflect_interval = max(1, int(getattr(self, "_memory_node_reflect_interval", 5) or 5))
                 if self._user_turn_count % _reflect_interval == 0:
-                    _reflect_report = self._memory_node_manager.reflect(dry_run=False)
+                    _reflect_report = self._memory_node_manager.reflect()
                     logger.debug("MemoryNodeManager reflect report: %s", _reflect_report)
             except Exception as exc:
                 logger.debug("MemoryNodeManager reflect skipped: %s", exc)
