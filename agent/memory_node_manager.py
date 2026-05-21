@@ -4258,7 +4258,6 @@ class MemoryNodeManager:
     def _reflect_generate_observations(
         self,
         *,
-        dry_run: bool,
         limit: int,
         entity_ids: List[int],
         unprocessed_fact_candidates: List[Dict[str, Any]],
@@ -4276,36 +4275,13 @@ class MemoryNodeManager:
             "memory_reflect",
             "fact_candidates_for_observation", 
             {
-                "dry_run": dry_run,
                 "limit": limit,
                 "candidate_count": len(unprocessed_fact_candidates),
                 "touched_entity_ids": touched_entity_ids,
                 "facts": self._reflect_fact_log_items(unprocessed_fact_candidates, limit=limit),
             }
         )
-        if dry_run:
-            return {
-                "candidate_count": len(unprocessed_fact_candidates),
-                "consolidated": 0,
-                "entity_topic_updates": 0,
-                "entity_topic_node_count": 0,
-                "observation_groups_merged": 0,
-                "fact_observation_matches": 0,
-                "fact_observation_node_count": 0,
-                "fact_clusters_considered": 0,
-                "fact_clusters_consolidated": 0,
-                "fact_cluster_node_count": 0,
-                "changed_observation_ids": [],
-                "touched_entity_ids": touched_entity_ids,
-                "candidates": [
-                    {
-                        "node_id": item["node_id"],
-                        "topics": item.get("topics", []),
-                        "entity_count": len(item.get("linked_entities", [])),
-                    }
-                    for item in unprocessed_fact_candidates
-                ],
-            }
+
         unprocessed_fact_candidates = self._db.memory_unobserved_nodes_for_observation(limit=limit)
         touched_entity_ids = list(dict.fromkeys(
             int(entity_id)
@@ -4873,7 +4849,6 @@ class MemoryNodeManager:
     def reflect(
         self,
         *,
-        dry_run: bool = True,
         limit: int = 100,
         fact_half_life_days: Optional[float] = None,
         experience_half_life_days: Optional[float] = None,
@@ -4890,7 +4865,6 @@ class MemoryNodeManager:
         """
         if not self._db:
             return {
-                "dry_run": dry_run,
                 "candidates": [],
                 "merged": 0,
                 "candidate_count": 0,
@@ -4901,7 +4875,6 @@ class MemoryNodeManager:
             "memory_reflect",
             "start", 
             {
-                "dry_run": dry_run,
                 "limit": limit,
                 "fact_half_life_days": fact_half_life_days,
                 "experience_half_life_days": experience_half_life_days,
@@ -4917,7 +4890,6 @@ class MemoryNodeManager:
         ))
 
         entity_merging_report = self._db.memory_reflect_entities(
-            dry_run=dry_run,
             limit=limit,
             anchor_entity_ids=new_entity_ids,
         )
@@ -4925,7 +4897,6 @@ class MemoryNodeManager:
             "memory_reflect",
             "entity_merge_candidates", 
             {
-                "dry_run": dry_run,
                 "anchor_entity_ids": new_entity_ids,
                 "candidate_count": entity_merging_report.get("candidate_count", 0),
                 "merge_candidates": entity_merging_report.get("merge_candidates", 0),
@@ -4939,7 +4910,6 @@ class MemoryNodeManager:
                 "memory_reflect",
                 "entity_merge", 
                 {
-                    "dry_run": dry_run,
                     "canonical_id": candidate.get("canonical_id"),
                     "canonical_name": candidate.get("canonical_name"),
                     "duplicate_id": candidate.get("duplicate_id"),
@@ -4953,7 +4923,7 @@ class MemoryNodeManager:
                 })
 
         merged_entity_ids: List[int] = []
-        if not dry_run and entity_merging_report.get("merged"):
+        if entity_merging_report.get("merged"):
             merged_entity_ids = [
                 int(candidate["canonical_id"])
                 for candidate in entity_merging_report.get("candidates", [])
@@ -4961,7 +4931,6 @@ class MemoryNodeManager:
             ]
         
         observation_report = self._reflect_generate_observations(
-            dry_run=dry_run,
             limit=limit,
             entity_ids=list(dict.fromkeys(merged_entity_ids)),
             unprocessed_fact_candidates=unprocessed_fact_candidates,
@@ -4975,24 +4944,20 @@ class MemoryNodeManager:
             observation_report.get("changed_observation_ids", [])
         ))
         report["interpretations_generated"] = 0
-        if not dry_run:
-            report["interpretations_generated"] = self._generate_interpretations_using_observations(
-                report["changed_observation_ids"]
-            )
+        report["interpretations_generated"] = self._generate_interpretations_using_observations(
+            report["changed_observation_ids"]
+        )
         reflect_now = datetime.now().astimezone()
         node_decay_report = self._db.memory_reflect_node_decay(
-            dry_run=dry_run,
             fact_half_life_days=fact_half_life_days,
             experience_half_life_days=experience_half_life_days,
             now=reflect_now,
         )
         decay_report = self._db.memory_reflect_observation_decay(
-            dry_run=dry_run,
             threshold=observation_decay_threshold,
             now=reflect_now,
         )
         task_inactivity_report = self._db.memory_reflect_task_inactivity(
-            dry_run=dry_run,
             active_to_paused_days=task_active_to_paused_days,
             stale_days=task_stale_days,
             now=reflect_now,
@@ -5008,7 +4973,6 @@ class MemoryNodeManager:
             "memory_reflect",
             "finish", 
             {
-                "dry_run": dry_run,
                 "observations_consolidated": report.get("observations_consolidated", 0),
                 "task_matched": observation_report.get("task_matched", 0),
                 "task_updates": observation_report.get("task_updates", 0),
