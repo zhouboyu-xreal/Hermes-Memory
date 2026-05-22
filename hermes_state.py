@@ -4871,7 +4871,7 @@ class SessionDB:
         ).fetchall()
         return [int(row["node_id"]) for row in rows]
 
-    def memory_observations_by_ids(self, observation_ids: List[int]) -> List[Dict[str, Any]]:
+    def get_observations_by_ids(self, observation_ids: List[int]) -> List[Dict[str, Any]]:
         """Return active observations by id, including entity names."""
         clean_ids = self._json_int_list(observation_ids)
         if not clean_ids:

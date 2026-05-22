@@ -28,6 +28,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from agent.memory_node_manager import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, MemoryNodeManager
+from hermes_constants import get_hermes_home
 from hermes_state import EMBEDDING_DIM, SessionDB
 
 
@@ -201,7 +202,7 @@ def iter_stored_nodes(db: SessionDB, start_id: int) -> Iterable[Dict[str, Any]]:
 
 
 def load_hermes_config() -> Dict[str, Any]:
-    config_path = Path.home() / ".hermes" / "config.yaml"
+    config_path = get_hermes_home() / "config.yaml"
     if not config_path.exists():
         return {}
     loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
@@ -297,7 +298,7 @@ def configure_logging(log_path: Path, log_level: str, manager_log_level: str) ->
 
 def main() -> int:
     load_dotenv(REPO_ROOT / ".env")
-    load_dotenv(Path.home() / ".hermes" / ".env")
+    load_dotenv(get_hermes_home() / ".env")
 
     args = parse_args()
     resolve_llm_args(args)
@@ -389,7 +390,7 @@ def main() -> int:
                         "Running reflect after sample %s",
                         sample_id,
                     )
-                    reflect_report = manager.reflect(dry_run=False)
+                    reflect_report = manager.reflect()
                     reflect_runs += 1
                     reflect_row = {
                         "event": "reflect",

@@ -3872,7 +3872,7 @@ class MemoryNodeManager:
         if changed_observation_ids is not None:
             changed_observation_ids.append(observation_id)
         self._log_info(
-            
+            "memory_reflect",
             "fact_observation_matched", {
             "observation_id": observation_id,
             "fact_node_id": fact_id,

@@ -19,9 +19,12 @@ from agent.memory_node_manager import (
     INTERPRETATION_GENERATION_PROMPT,
     INTERPRETATION_UPDATE_PROMPT,
     INTERPRETATION_SECTION_HEADER,
+    EXPERIENCE_SECTION_HEADER,
+    OBSERVATION_SECTION_HEADER,
     RELATION_PROMPT_TEMPLATE,
     RETAIN_FACT_EXTRACTION_PROMPT,
     TASK_CONSOLIDATION_PROMPT,
+    WORLD_FACT_SECTION_HEADER,
 )
 from hermes_state import SessionDB
 
@@ -1123,7 +1126,7 @@ def test_memory_reflect_reports_entity_merge_conditions(db):
     _ = alice
     _ = hermes
 
-    report = db.memory_reflect_entities(dry_run=True, limit=10)
+    report = db.reflect_merging_entities(limit=10)
 
     by_duplicate = {item["duplicate_id"]: item for item in report["candidates"]}
     assert by_duplicate[alice_spaced]["action"] == "merge"
@@ -1145,8 +1148,7 @@ def test_memory_reflect_entities_can_scope_candidates_to_anchor_entities(db):
     hermes_agent = db.entity_add_entity("Hermes Agent", "PRODUCT")
     _ = alice
 
-    report = db.memory_reflect_entities(
-        dry_run=True,
+    report = db.reflect_merging_entities(
         limit=10,
         anchor_entity_ids=[alice_spaced],
     )
@@ -1161,7 +1163,7 @@ def test_memory_reflect_entities_can_scope_candidates_to_anchor_entities(db):
 
 
 def test_memory_node_manager_reflect_delegates_to_db(db):
-    db.entity_add_entity("Alice", "PERSON")
+    alice = db.entity_add_entity("Alice", "PERSON")
     alice_spaced = db.entity_add_entity(" alice ", "PERSON")
     node_id = _add_memory_node(
         db,
@@ -1172,10 +1174,9 @@ def test_memory_node_manager_reflect_delegates_to_db(db):
     db.entity_link_node(node_id, alice_spaced)
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
-    report = mgr.reflect(dry_run=True, limit=5)
+    report = mgr.reflect(limit=5)
 
-    assert report["dry_run"] is True
-    assert report["observation_reflect"]["touched_entity_ids"] == [alice_spaced]
+    assert report["observation_reflect"]["touched_entity_ids"] == [alice]
     assert report["merge_candidates"] == 1
 
 
@@ -1190,7 +1191,7 @@ def test_memory_reflect_can_merge_normalized_entity_duplicates(db):
     alice_spaced = db.entity_add_entity(" alice ", "PERSON")
     db.entity_link_node(node_id, alice_spaced)
 
-    report = db.memory_reflect_entities(dry_run=False, limit=10)
+    report = db.reflect_merging_entities(limit=10)
 
     assert report["merged"] == 1
     assert db._conn.execute(
@@ -1277,7 +1278,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         ],
     )
 
-    report = mgr.reflect(dry_run=False, limit=10)
+    report = mgr.reflect(limit=10)
 
     assert report["merged"] == 1
     assert report["observation_groups_merged"] == 1
@@ -1364,7 +1365,7 @@ def test_reflect_keeps_insight_and_task_observations_separate(db):
         },
     )
 
-    groups = db.memory_duplicate_observation_groups(entity_ids=[alice])
+    groups = db.find_duplicated_observation_groups(entity_ids=[alice])
 
     assert groups == []
     rows = db._conn.execute(
@@ -1412,13 +1413,11 @@ def test_reflect_observation_decay_uses_fact_type_half_lives(db):
     )
 
     node_report = db.memory_reflect_node_decay(
-        dry_run=False,
         fact_half_life_days=365,
         experience_half_life_days=30,
         now=datetime(2026, 4, 1, 0, 0, 0),
     )
     report = db.memory_reflect_observation_decay(
-        dry_run=False,
         threshold=0.3,
         now=datetime(2026, 4, 1, 0, 0, 0),
     )
@@ -1486,7 +1485,6 @@ def test_task_inactivity_policy_pauses_and_stales_idle_tasks(db):
     recent_active = add_task("active", now - timedelta(days=1), node_ids[3])
 
     report = db.memory_reflect_task_inactivity(
-        dry_run=False,
         active_to_paused_days=7,
         stale_days=30,
         now=now,
@@ -1542,7 +1540,6 @@ def test_memory_node_manager_reflect_reports_task_inactivity(db):
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
     report = mgr.reflect(
-        dry_run=False,
         limit=10,
         task_active_to_paused_days=7,
         task_stale_days=30,
@@ -1621,7 +1618,6 @@ def test_memory_node_manager_reflect_inactivates_stale_observations(db):
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
     report = mgr.reflect(
-        dry_run=False,
         experience_half_life_days=7,
         observation_decay_threshold=0.9,
     )
@@ -1664,8 +1660,8 @@ def test_recall_formats_semantic_and_episodic_sections(db, monkeypatch):
 
     context = mgr.recall("Alice Slack alerts")
 
-    assert "[Semantic memories" in context
-    assert "[Episodic memories" in context
+    assert WORLD_FACT_SECTION_HEADER in context
+    assert EXPERIENCE_SECTION_HEADER in context
     assert "semantic memories" in context
     assert "episodic memories" in context
     assert "Alice prefers Slack for urgent alerts." in context
@@ -1702,7 +1698,7 @@ def test_recall_formats_current_interpretations_before_evidence(db, monkeypatch)
     assert "agent interpretations derived from memory evidence" in context
     assert "用户当前倾向先用 heuristic 控制 task fact 选择" in context
     assert "action implication: 后续先讨论 heuristic/data-flow，再考虑 prompt guidance。" in context
-    assert context.index(INTERPRETATION_SECTION_HEADER) < context.index("[Semantic memories")
+    assert context.index(INTERPRETATION_SECTION_HEADER) < context.index(WORLD_FACT_SECTION_HEADER)
 
 
 def test_recall_expands_interpretation_to_evidence_observations(db, monkeypatch):
@@ -1822,11 +1818,10 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
     assert mgr.store_turn("Alice urgent alerts", "Use Slack.") is True
     assert db._conn.execute("SELECT COUNT(*) FROM memory_observations").fetchone()[0] == 0
 
-    report = mgr.reflect(dry_run=False, limit=10)
+    report = mgr.reflect(limit=10)
     assert report["observation_reflect"]["candidate_count"] == 3
     assert report["observations_consolidated"] == 1
     assert report["observation_reflect"]["fact_clusters_consolidated"] == 1
-    assert report["observation_reflect"]["fact_cluster_node_count"] == 3
 
     observation = db._conn.execute(
         "SELECT mo.summary, mo.topic_key, mo.observation_type, mo.metadata, en.name AS entity_name "
@@ -1867,7 +1862,7 @@ def test_unmatched_fact_clusters_match_generalized_topic_with_time_window(db):
         },
     ]
 
-    clusters = mgr._unmatched_fact_clusters(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
 
     normalized = [
         cluster for cluster in clusters
@@ -1903,7 +1898,7 @@ def test_unmatched_fact_clusters_do_not_match_different_specific_family_topics(d
         },
     ]
 
-    clusters = mgr._unmatched_fact_clusters(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
 
     assert not [
         cluster for cluster in clusters
@@ -1936,7 +1931,7 @@ def test_unmatched_fact_clusters_require_time_window_for_generalized_topic_match
         },
     ]
 
-    clusters = mgr._unmatched_fact_clusters(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
 
     assert not [
         cluster for cluster in clusters
@@ -1979,7 +1974,7 @@ def test_unmatched_fact_clusters_filter_suffix_facts_outside_time_window(db):
         },
     ]
 
-    clusters = mgr._unmatched_fact_clusters(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
 
     normalized = [
         cluster for cluster in clusters
@@ -2024,7 +2019,7 @@ def test_unmatched_fact_clusters_match_suffix_fact_to_nearest_bare_fact(db):
         },
     ]
 
-    clusters = mgr._unmatched_fact_clusters(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
 
     normalized = [
         cluster for cluster in clusters
@@ -2086,7 +2081,7 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
         ],
     )
 
-    report = mgr.reflect(dry_run=False, limit=10)
+    report = mgr.reflect(limit=10)
 
     assert report["observations_consolidated"] == 1
     interpretation = db._conn.execute(
@@ -2287,7 +2282,7 @@ def test_interpretation_linker_respects_observation_candidate_type_gate(db):
         },
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
-    source_nodes = db.memory_observation_supporting_nodes([observation_id])[observation_id]
+    source_nodes = db.get_observation_supporting_nodes([observation_id])[observation_id]
 
     linked = mgr._link_observation_to_existing_interpretation(
         observation=dict(db._conn.execute("SELECT * FROM memory_observations WHERE id = ?", (observation_id,)).fetchone()),
@@ -2726,7 +2721,7 @@ def test_store_turn_can_consolidate_task_observation(db):
     assert mgr.store_turn("继续改记忆系统", "我们来调整 observation 分类。") is True
     assert db._conn.execute("SELECT COUNT(*) FROM memory_observations").fetchone()[0] == 0
 
-    report = mgr.reflect(dry_run=False, limit=10)
+    report = mgr.reflect(limit=10)
     assert report["observations_consolidated"] == 1
 
     observation = db._conn.execute(
@@ -2800,7 +2795,7 @@ def test_reflect_updates_observation_by_entity_and_topic(db):
         ],
     )
 
-    report = mgr.reflect(dry_run=False, limit=10)
+    report = mgr.reflect(limit=10)
 
     assert report["observation_reflect"].get("task_matched", 0) == 0
     assert report["observation_reflect"]["fact_observation_matches"] == 1
@@ -2867,7 +2862,7 @@ def test_reflect_excludes_non_task_fact_kind_from_existing_task_match(db):
         ],
     )
 
-    report = mgr.reflect(dry_run=False, limit=10)
+    report = mgr.reflect(limit=10)
 
     assert report["observation_reflect"].get("task_matched", 0) == 0
     assert report["observation_reflect"]["fact_observation_matches"] == 0
@@ -2921,7 +2916,7 @@ def test_reflect_no_longer_matches_observation_by_high_task_embedding_similarity
     )
     mgr._embedding_client = _KeywordEmbeddingClient()
 
-    report = mgr.reflect(dry_run=False, limit=10)
+    report = mgr.reflect(limit=10)
 
     assert report["observation_reflect"].get("task_matched", 0) == 0
     assert report["observation_reflect"]["entity_topic_updates"] == 0
@@ -2973,7 +2968,7 @@ def test_reflect_no_longer_matches_fact_to_single_recent_active_task(db):
     )
     mgr._embedding_client = _OrthogonalTaskEmbeddingClient()
 
-    report = mgr.reflect(dry_run=False, limit=10)
+    report = mgr.reflect(limit=10)
 
     assert report["observation_reflect"].get("task_matched", 0) == 0
     assert report["observation_reflect"]["entity_topic_updates"] == 0
@@ -3009,7 +3004,7 @@ def test_reflect_leaves_unmatched_non_action_fact_for_regular_observation_flow(d
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
     mgr._embedding_client = _OrthogonalTaskEmbeddingClient()
 
-    report = mgr.reflect(dry_run=False, limit=10)
+    report = mgr.reflect(limit=10)
 
     assert report["observation_reflect"].get("task_matched", 0) == 0
     assert db.memory_observation_source_ids(observation_id) == [source_node]
@@ -3075,14 +3070,14 @@ def test_reflect_updates_existing_observation_by_entity_topic(db):
     )
     mgr._embedding_client = _OrthogonalTaskEmbeddingClient()
 
-    report = mgr.reflect(dry_run=False, limit=10)
+    report = mgr.reflect(limit=10)
 
     assert report["observation_reflect"]["fact_observation_matches"] == 1
     assert report["observation_reflect"]["fact_observation_node_count"] == 1
     assert report["observation_reflect"]["entity_topic_updates"] == 0
     assert report["observation_reflect"]["entity_topic_node_count"] == 1
     assert db.memory_observation_source_ids(observation_id) == [old_node, new_matching_node]
-    assert unrelated_task_node not in db.memory_observed_source_node_ids([unrelated_task_node])
+    assert unrelated_task_node not in db.find_observed_source_node_ids([unrelated_task_node])
     row = db._conn.execute(
         "SELECT summary, metadata FROM memory_observations WHERE id = ?",
         (observation_id,),
@@ -3231,9 +3226,9 @@ def test_interpretation_generation_prompt_defines_interpretation_contract():
     assert "counter_evidence_observation_ids 是反驳、削弱、限定或造成冲突的 observation id" in INTERPRETATION_UPDATE_PROMPT
 
 
-def test_reflect_error_log_message_is_json(caplog):
-    with caplog.at_level(logging.ERROR, logger="agent.memory_node_manager"):
-        MemoryNodeManager._log_reflect_error("sample_event", {"fact": "用户修改 prompt"})
+def test_structured_memory_log_message_is_json(caplog):
+    with caplog.at_level(logging.INFO, logger="agent.memory_node_manager"):
+        MemoryNodeManager._log_info("memory_reflect", "sample_event", {"fact": "用户修改 prompt"})
 
     messages = [
         record.getMessage()
@@ -3318,7 +3313,7 @@ def test_recall_includes_observations_and_supporting_facts(db, monkeypatch):
 
     context = mgr.recall("Alice Slack alerts")
 
-    assert "[Observations" in context
+    assert OBSERVATION_SECTION_HEADER in context
     assert "Alice's urgent alert workflow is Slack-centered." in context
     assert "[Supporting facts for observations]" in context
     assert "Alice prefers Slack for urgent alerts." in context
