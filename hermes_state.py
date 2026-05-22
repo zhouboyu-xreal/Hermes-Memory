@@ -3853,7 +3853,7 @@ class SessionDB:
         return len(left_ids & right_ids) / len(union)
 
     @staticmethod
-    def _entity_reflection_action(
+    def _entity_merging_action(
         *,
         confidence: float,
         reason: str,
@@ -3866,7 +3866,7 @@ class SessionDB:
             return "merge"
         return "candidate"
 
-    def _entity_reflection_candidate_for_pair(
+    def _reflection_entity_merging_candidate_for_pair(
         self,
         left: sqlite3.Row,
         right: sqlite3.Row,
@@ -3879,7 +3879,7 @@ class SessionDB:
             return None
         co_score = self._entity_cooccurrence_similarity(left["co_entities"], right["co_entities"])
         confidence = max(0.0, min(1.0, (name_score * 0.72) + (type_score * 0.20) + (co_score * 0.08)))
-        action = self._entity_reflection_action(
+        action = self._entity_merging_action(
             confidence=confidence,
             reason=reason,
             risk=risk,
@@ -3903,7 +3903,7 @@ class SessionDB:
             "action": action,
         }
 
-    def _entity_reflection_candidates(
+    def _reflection_entity_merging_candidates(
         self,
         limit: int = 100,
         anchor_entity_ids: Optional[List[int]] = None,
@@ -3948,7 +3948,7 @@ class SessionDB:
             pair_iter = _anchored_pairs()
 
         for left, right in pair_iter:
-            candidate = self._entity_reflection_candidate_for_pair(left, right)
+            candidate = self._reflection_entity_merging_candidate_for_pair(left, right)
             if candidate is not None:
                 candidates.append(candidate)
         candidates.sort(key=lambda item: (-item["confidence"], item["risk"], item["canonical_id"]))
@@ -3974,10 +3974,9 @@ class SessionDB:
             return left, right
         return (left, right) if int(left["id"]) <= int(right["id"]) else (right, left)
 
-    def memory_reflect_entities(
+    def reflect_merging_entities(
         self,
         *,
-        dry_run: bool = True,
         limit: int = 100,
         anchor_entity_ids: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
@@ -3988,24 +3987,23 @@ class SessionDB:
         co-occurring entity profiles. Only low-risk normalized-name matches are
         merged automatically; other similar names are reported as candidates.
         """
-        candidates = self._entity_reflection_candidates(
+        candidates = self._reflection_entity_merging_candidates(
             limit=limit,
             anchor_entity_ids=anchor_entity_ids,
         )
         merged: List[Dict[str, Any]] = []
-        if not dry_run:
-            for candidate in candidates:
-                if candidate["action"] != "merge":
-                    continue
-                self.entity_merge(
-                    canonical_id=candidate["canonical_id"],
-                    duplicate_id=candidate["duplicate_id"],
-                    reason=candidate["reason"],
-                    confidence=float(candidate["confidence"]),
-                )
-                merged.append(candidate)
+        for candidate in candidates:
+            if candidate["action"] != "merge":
+                continue
+            self.entity_merge(
+                canonical_id=candidate["canonical_id"],
+                duplicate_id=candidate["duplicate_id"],
+                reason=candidate["reason"],
+                confidence=float(candidate["confidence"]),
+            )
+            merged.append(candidate)
+        
         return {
-            "dry_run": dry_run,
             "candidates": candidates,
             "merged": len(merged),
             "merge_candidates": sum(1 for candidate in candidates if candidate["action"] == "merge"),
@@ -4689,7 +4687,7 @@ class SessionDB:
             out.append(item)
         return out
 
-    def memory_interpretations_for_observation(
+    def get_interpretations_for_observation(
         self,
         observation_id: int,
         *,
@@ -4770,7 +4768,7 @@ class SessionDB:
                 break
         return out
 
-    def memory_unobserved_nodes_for_observation(
+    def get_unobserved_nodes_for_observation(
         self,
         *,
         date_key: Optional[str] = None,
@@ -4860,7 +4858,7 @@ class SessionDB:
         ).fetchall()
         return [int(row["node_id"]) for row in rows]
 
-    def memory_observed_source_node_ids(self, node_ids: List[int]) -> List[int]:
+    def find_observed_source_node_ids(self, node_ids: List[int]) -> List[int]:
         """Return node ids that already support at least one observation."""
         clean_ids = self._json_int_list(node_ids)
         if not clean_ids:
@@ -5156,7 +5154,7 @@ class SessionDB:
         scored.sort(key=lambda pair: (pair[0], pair[1].get("last_supported_at") or ""), reverse=True)
         return [item for _, item in scored[:top_k]]
 
-    def memory_observation_supporting_nodes(
+    def get_observation_supporting_nodes(
         self,
         observation_ids: List[int],
         *,
@@ -5200,7 +5198,7 @@ class SessionDB:
             out[observation_id] = nodes
         return out
 
-    def memory_duplicate_observation_groups(
+    def find_duplicated_observation_groups(
         self,
         entity_ids: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
@@ -5222,7 +5220,7 @@ class SessionDB:
         grouped: Dict[Tuple[int, str, str], List[Dict[str, Any]]] = {}
         for row in rows:
             item = dict(row)
-            category = str(item.get("observation_type") or "insight")
+            category = str(item.get("observation_type") or "observation")
             grouped.setdefault(
                 (int(item["entity_id"]), str(item["topic_key"]), category),
                 [],
@@ -5264,7 +5262,6 @@ class SessionDB:
     def memory_reflect_node_decay(
         self,
         *,
-        dry_run: bool = True,
         fact_half_life_days: Optional[float] = None,
         experience_half_life_days: Optional[float] = None,
         now: Optional[datetime] = None,
@@ -5300,7 +5297,7 @@ class SessionDB:
                 "half_life_days": half_life,
             })
 
-        if not dry_run and nodes:
+        if nodes:
             def _do(conn):
                 for item in nodes:
                     conn.execute(
@@ -5317,9 +5314,8 @@ class SessionDB:
             self._execute_write(_do)
 
         return {
-            "dry_run": dry_run,
             "evaluated": len(nodes),
-            "updated": len(nodes) if not dry_run else 0,
+            "updated": len(nodes),
             "fact_half_life_days": fact_half_life,
             "experience_half_life_days": experience_half_life,
             "evaluated_at": evaluated_at,
@@ -5329,7 +5325,6 @@ class SessionDB:
     def memory_reflect_observation_decay(
         self,
         *,
-        dry_run: bool = True,
         threshold: Optional[float] = None,
         now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
@@ -5418,7 +5413,7 @@ class SessionDB:
 
         to_deactivate = [item for item in evaluated if item["action"] == "deactivate"]
 
-        if not dry_run and evaluated:
+        if evaluated:
             evaluated_at = now_dt.isoformat()
 
             def _do(conn):
@@ -5453,9 +5448,8 @@ class SessionDB:
             self._execute_write(_do)
 
         return {
-            "dry_run": dry_run,
             "evaluated": len(evaluated),
-            "inactivated": len(to_deactivate) if not dry_run else 0,
+            "inactivated": len(to_deactivate),
             "would_inactivate": len(to_deactivate),
             "threshold": decay_threshold,
             "observations": evaluated,
@@ -5464,7 +5458,6 @@ class SessionDB:
     def memory_reflect_task_inactivity(
         self,
         *,
-        dry_run: bool = True,
         active_to_paused_days: Optional[float] = None,
         stale_days: Optional[float] = None,
         now: Optional[datetime] = None,
@@ -5556,7 +5549,7 @@ class SessionDB:
                 item["metadata"] = updated_metadata
                 to_update.append(item)
 
-        if not dry_run and to_update:
+        if to_update:
             def _do(conn):
                 for item in to_update:
                     conn.execute(
@@ -5573,12 +5566,11 @@ class SessionDB:
         paused = [item for item in to_update if item["new_status"] == "paused"]
         stale = [item for item in to_update if item["new_status"] == "stale"]
         return {
-            "dry_run": dry_run,
             "checked": len(evaluated),
-            "changed": 0 if dry_run else len(to_update),
+            "changed": len(to_update),
             "would_change": len(to_update),
-            "paused": 0 if dry_run else len(paused),
-            "stale": 0 if dry_run else len(stale),
+            "paused": len(paused),
+            "stale": len(stale),
             "would_pause": len(paused),
             "would_stale": len(stale),
             "active_to_paused_days": paused_after_days,

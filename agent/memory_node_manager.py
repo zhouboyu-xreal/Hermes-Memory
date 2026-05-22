@@ -2648,7 +2648,7 @@ class MemoryNodeManager:
             reasons.append(temporal_reason)
         return score, reasons
 
-    def _interpretation_candidate_score(
+    def _calculate_interpretation_candidate_score(
         self,
         *,
         observation: Dict[str, Any],
@@ -2731,7 +2731,7 @@ class MemoryNodeManager:
         score += min(0.05, confidence * 0.05)
         return min(1.0, score), "+".join(reasons) or "weak"
 
-    def _interpretation_candidates_for_observation(
+    def _search_interpretation_candidates_for_observation(
         self,
         observation: Dict[str, Any],
         observation_id: int,
@@ -2740,7 +2740,7 @@ class MemoryNodeManager:
         seen: set[int] = set()
 
         try:
-            existing = self._db.memory_interpretations_for_observation(int(observation_id), limit=10)
+            existing = self._db.get_interpretations_for_observation(int(observation_id), limit=10)
         except Exception:
             existing = []
         for item in existing:
@@ -2888,7 +2888,7 @@ class MemoryNodeManager:
         observation["metadata"] = metadata
 
     @classmethod
-    def _interpretation_trigger_priority(
+    def _interpretation_generation_trigger_priority(
         cls,
         observation: Dict[str, Any],
         source_nodes: List[Dict[str, Any]],
@@ -2930,7 +2930,7 @@ class MemoryNodeManager:
             return "medium", "mixed_fact_type_evidence"
         return "low", "ordinary_insight"
 
-    def _deferred_interpretation_items_for_observation(
+    def _get_similar_deferred_observation(
         self,
         item: Dict[str, Any],
         supporting_facts_from_observation: Dict[int, List[Dict[str, Any]]],
@@ -2976,7 +2976,7 @@ class MemoryNodeManager:
 
         if missing_support_ids:
             try:
-                fetched_support = self._db.memory_observation_supporting_nodes(
+                fetched_support = self._db.get_observation_supporting_nodes(
                     missing_support_ids,
                     per_observation=12,
                 )
@@ -3028,13 +3028,13 @@ class MemoryNodeManager:
     ) -> Optional[Any]:
         if not self._db or not observation_id:
             return None
-        candidates = self._interpretation_candidates_for_observation(observation, int(observation_id))
+        candidates = self._search_interpretation_candidates_for_observation(observation, int(observation_id))
         if not candidates:
             return None
 
         scored: List[Tuple[float, str, Dict[str, Any]]] = []
         for candidate in candidates:
-            score, reason = self._interpretation_candidate_score(
+            score, reason = self._calculate_interpretation_candidate_score(
                 observation=observation,
                 source_nodes=source_nodes,
                 interpretation=candidate,
@@ -3241,7 +3241,7 @@ class MemoryNodeManager:
     ) -> str:
         return self._observation_family(observation, source_nodes)
 
-    def _observation_interpretation_clusters(
+    def _cluster_observation_items_for_interpretation(
         self,
         items: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
@@ -3410,7 +3410,7 @@ class MemoryNodeManager:
         return int(interpretation_id)
 
     @classmethod
-    def _interpretation_cluster_should_run(
+    def _judge_observation_clustering_should_run(
         cls,
         cluster: Dict[str, Any],
     ) -> Tuple[bool, str]:
@@ -3436,8 +3436,8 @@ class MemoryNodeManager:
         ))
         if not clean_ids:
             return 0
-        observations = self._db.memory_observations_by_ids(clean_ids)
-        supporting_facts_from_observation = self._db.memory_observation_supporting_nodes(
+        observations = self._db.get_observations_by_ids(clean_ids)
+        supporting_facts_from_observation = self._db.get_observation_supporting_nodes(
             [int(observation["id"]) for observation in observations],
             per_observation=12,
         ) if observations else {}
@@ -3462,7 +3462,7 @@ class MemoryNodeManager:
                 continue
             observation["metadata"] = metadata
             family = self._observation_interpretation_cluster_family(observation, source_nodes)
-            priority, priority_reason = self._interpretation_trigger_priority(
+            priority, priority_reason = self._interpretation_generation_trigger_priority(
                 observation=observation,
                 source_nodes=source_nodes,
                 family=family,
@@ -3485,7 +3485,7 @@ class MemoryNodeManager:
         seen_observation_ids = {int(item["observation_id"]) for item in candidate_items}
         cluster_context_items = list(candidate_items)
         for item in list(candidate_items):
-            deferred_items = self._deferred_interpretation_items_for_observation(
+            deferred_items = self._get_similar_deferred_observation(
                 item,
                 supporting_facts_from_observation,
                 seen_observation_ids,
@@ -3493,8 +3493,8 @@ class MemoryNodeManager:
             cluster_context_items.extend(deferred_items)
 
         llm_calls_used = 0
-        for cluster in self._observation_interpretation_clusters(cluster_context_items):
-            should_run, reason = self._interpretation_cluster_should_run(cluster)
+        for cluster in self._cluster_observation_items_for_interpretation(cluster_context_items):
+            should_run, reason = self._judge_observation_clustering_should_run(cluster)
             changed_items = [
                 item
                 for item in cluster.get("items") or []
@@ -3778,7 +3778,7 @@ class MemoryNodeManager:
         candidates = self._candidate_observations_for_fact(fact)
         if not candidates:
             return None
-        supporting_facts_from_observation = self._db.memory_observation_supporting_nodes(
+        supporting_facts_from_observation = self._db.get_observation_supporting_nodes(
             [int(item["id"]) for item in candidates],
             per_observation=8,
         )
@@ -4007,7 +4007,7 @@ class MemoryNodeManager:
         nearest_bare_time = min(bare_times, key=lambda time: abs(time - suffix_time))
         return abs(nearest_bare_time - suffix_time) <= cls._NORMALIZED_TOPIC_CLUSTER_WINDOW_SECONDS
 
-    def _unmatched_fact_clusters(
+    def _cluster_unmatched_facts(
         self,
         facts: List[Dict[str, Any]],
         *,
@@ -4150,7 +4150,7 @@ class MemoryNodeManager:
         )
         return clusters
 
-    def _consolidate_unmatched_fact_cluster(
+    def _generate_observation_using_unmatched_fact_clusters(
         self,
         cluster: Dict[str, Any],
         *,
@@ -4260,17 +4260,19 @@ class MemoryNodeManager:
         *,
         limit: int,
         entity_ids: List[int],
-        unprocessed_fact_candidates: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Generate/update observations from today's facts not yet attached as sources."""
         if not self._db:
             return {"candidate_count": 0, "consolidated": 0}
+
+        merge_entity_ids = list(dict.fromkeys(int(entity_id) for entity_id in entity_ids))
+
+        unprocessed_fact_candidates = self._db.get_unobserved_nodes_for_observation(limit=limit)
         touched_entity_ids = list(dict.fromkeys(
             int(entity_id)
             for item in unprocessed_fact_candidates
             for entity_id, _entity_name in item.get("linked_entities", [])
         ))
-        merge_entity_ids = list(dict.fromkeys(int(entity_id) for entity_id in entity_ids))
         self._log_info(
             "memory_reflect",
             "fact_candidates_for_observation", 
@@ -4281,13 +4283,6 @@ class MemoryNodeManager:
                 "facts": self._reflect_fact_log_items(unprocessed_fact_candidates, limit=limit),
             }
         )
-
-        unprocessed_fact_candidates = self._db.memory_unobserved_nodes_for_observation(limit=limit)
-        touched_entity_ids = list(dict.fromkeys(
-            int(entity_id)
-            for item in unprocessed_fact_candidates
-            for entity_id, _entity_name in item.get("linked_entities", [])
-        ))
         consolidated = 0
         entity_topic_updates = 0
         entity_topic_node_ids: set[int] = set()
@@ -4302,7 +4297,7 @@ class MemoryNodeManager:
         observation_groups_merged = 0
         merge_consumed_node_ids: set[int] = set()
         if merge_entity_ids:
-            groups = self._db.memory_duplicate_observation_groups(entity_ids=merge_entity_ids)
+            groups = self._db.find_duplicated_observation_groups(entity_ids=merge_entity_ids)
             augmented_groups = [
                 self._augment_observation_merge_group_with_pending_sources(group)
                 for group in groups
@@ -4335,14 +4330,14 @@ class MemoryNodeManager:
                 })
             for group in augmented_groups:
                 try:
-                    before_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
-                    if self._merge_duplicate_observation_group(
+                    before_observed = set(self._db.find_observed_source_node_ids(candidate_node_ids))
+                    if self._merge_duplicated_observation_group(
                         group,
                         changed_observation_ids=changed_observation_ids,
                     ):
                         observation_groups_merged += 1
-                        after_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
-                        newly_observed = after_observed - before_observed
+                        after_observed = set(self._db.find_observed_source_node_ids(candidate_node_ids))
+                        newly_observed = after_observed - before_observed # to store nodes which are already consumed in observation merging step
                         merge_consumed_node_ids.update(newly_observed)
                         entity_topic_node_ids.update(newly_observed)
                 except Exception as exc:
@@ -4357,7 +4352,6 @@ class MemoryNodeManager:
             node_id = int(item["node_id"])
             if node_id in merge_consumed_node_ids:
                 continue
-            before_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
             try:
                 matched_observation_id = self._update_existing_observation_from_fact(
                     item,
@@ -4369,15 +4363,13 @@ class MemoryNodeManager:
             if matched_observation_id is None:
                 continue
             fact_observation_matches += 1
-            after_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
-            newly_observed = after_observed - before_observed
-            fact_observation_node_ids.update(newly_observed)
-            entity_topic_node_ids.update(newly_observed)
+            fact_observation_node_ids.add(node_id)
+            entity_topic_node_ids.add(node_id)
 
-        consumed_for_clusters = set(entity_topic_node_ids) | set(merge_consumed_node_ids)
-        clusters = self._unmatched_fact_clusters(
+        exlcuded_for_clusters = set(entity_topic_node_ids) | set(merge_consumed_node_ids)
+        clusters = self._cluster_unmatched_facts(
             unprocessed_fact_candidates,
-            excluded_node_ids=consumed_for_clusters,
+            excluded_node_ids=exlcuded_for_clusters,
         )
         fact_clusters_considered = len(clusters)
         self._log_info(
@@ -4399,11 +4391,10 @@ class MemoryNodeManager:
                 ],
             })
         for cluster in clusters:
-            before_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
             try:
-                observation_id = self._consolidate_unmatched_fact_cluster(
+                observation_id = self._generate_observation_using_unmatched_fact_clusters(
                     cluster,
-                    consumed_node_ids=consumed_for_clusters,
+                    consumed_node_ids=exlcuded_for_clusters,
                     changed_observation_ids=changed_observation_ids,
                 )
             except Exception as exc:
@@ -4417,10 +4408,15 @@ class MemoryNodeManager:
             if observation_id is None:
                 continue
             fact_clusters_consolidated += 1
-            after_observed = set(self._db.memory_observed_source_node_ids(candidate_node_ids))
-            newly_observed = after_observed - before_observed
-            fact_cluster_node_ids.update(newly_observed)
-            entity_topic_node_ids.update(newly_observed)
+
+            current_consumed_source_nodes = [
+                fact
+                for fact in cluster.get("source_nodes", [])
+                if (self._node_id(fact) is not None and self._node_id(fact) not in exlcuded_for_clusters)
+            ]
+            current_consumed_node_ids = [self._node_id(fact) for fact in current_consumed_source_nodes if self._node_id(fact) is not None]
+            fact_cluster_node_ids.update(current_consumed_node_ids)
+            entity_topic_node_ids.update(current_consumed_node_ids)
         consolidated += fact_observation_matches + fact_clusters_consolidated
         
         return {
@@ -4756,7 +4752,7 @@ class MemoryNodeManager:
         ]
         return augmented
 
-    def _merge_duplicate_observation_group(
+    def _merge_duplicated_observation_group(
         self,
         group: Dict[str, Any],
         *,
@@ -4882,14 +4878,14 @@ class MemoryNodeManager:
                 "task_active_to_paused_days": task_active_to_paused_days,
                 "task_stale_days": task_stale_days,
             })
-        unprocessed_fact_candidates = self._db.memory_unobserved_nodes_for_observation(limit=limit)
+        unprocessed_fact_candidates = self._db.get_unobserved_nodes_for_observation(limit=limit)
         new_entity_ids = list(dict.fromkeys(
             int(entity_id)
             for item in unprocessed_fact_candidates
             for entity_id, _entity_name in item.get("linked_entities", [])
         ))
 
-        entity_merging_report = self._db.memory_reflect_entities(
+        entity_merging_report = self._db.reflect_merging_entities(
             limit=limit,
             anchor_entity_ids=new_entity_ids,
         )
@@ -4933,7 +4929,6 @@ class MemoryNodeManager:
         observation_report = self._reflect_generate_observations(
             limit=limit,
             entity_ids=list(dict.fromkeys(merged_entity_ids)),
-            unprocessed_fact_candidates=unprocessed_fact_candidates,
         )
 
         report = entity_merging_report
@@ -5145,14 +5140,14 @@ class MemoryNodeManager:
                 fact_ids_from_interpretation.extend(
                     interpretation.get("counter_evidence_node_ids", []) or []
                 )
-            observation_nodes_from_interpretation = self._db.memory_observations_by_ids(
+            observation_nodes_from_interpretation = self._db.get_observations_by_ids(
                 observation_ids_from_interpretation
             )
             observation_nodes = self._merge_recall_items(
                 observation_nodes,
                 observation_nodes_from_interpretation,
             )
-            fact_nodes_from_observation = self._db.memory_observation_supporting_nodes(
+            fact_nodes_from_observation = self._db.get_observation_supporting_nodes(
                 [int(obs["id"]) for obs in observation_nodes],
                 per_observation=2,
             ) if observation_nodes else {}
