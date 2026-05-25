@@ -1785,6 +1785,9 @@ class AIAgent:
                     embedding_config=_merged_emb_cfg,
                     enabled=True,
                     llm_client=self.client,
+                    llm_model=self.model,
+                    llm_base_url=self.base_url,
+                    llm_api_key=self.api_key,
                 )
                 logger.info("MemoryNodeManager initialized (turn-based summarization + embedding)")
             except Exception as _mne:
@@ -10329,6 +10332,12 @@ class AIAgent:
         # Memory Node Manager: also recall relevant past summarized turns
         if self._memory_node_manager:
             try:
+                self._memory_node_manager.configure_llm(
+                    llm_client=self.client,
+                    llm_model=self.model,
+                    llm_base_url=self.base_url,
+                    llm_api_key=self.api_key,
+                )
                 _mem_node_query = original_user_message if isinstance(original_user_message, str) else ""
                 _mem_node_context = self._memory_node_manager.recall(_mem_node_query)
                 logger.error("cur_query is " + _mem_node_query)
@@ -13391,6 +13400,12 @@ class AIAgent:
         # with embedding + causal linking for future hybrid retrieval.
         if self._memory_node_manager and final_response and not interrupted:
             try:
+                self._memory_node_manager.configure_llm(
+                    llm_client=self.client,
+                    llm_model=self.model,
+                    llm_base_url=self.base_url,
+                    llm_api_key=self.api_key,
+                )
                 _store_msg = original_user_message if isinstance(original_user_message, str) else ""
                 _store_resp = final_response if isinstance(final_response, str) else ""
                 if _store_msg and _store_resp:
@@ -13403,6 +13418,12 @@ class AIAgent:
             try:
                 _reflect_interval = max(1, int(getattr(self, "_memory_node_reflect_interval", 5) or 5))
                 if self._user_turn_count % _reflect_interval == 0:
+                    self._memory_node_manager.configure_llm(
+                        llm_client=self.client,
+                        llm_model=self.model,
+                        llm_base_url=self.base_url,
+                        llm_api_key=self.api_key,
+                    )
                     _reflect_report = self._memory_node_manager.reflect()
                     logger.debug("MemoryNodeManager reflect report: %s", _reflect_report)
             except Exception as exc:

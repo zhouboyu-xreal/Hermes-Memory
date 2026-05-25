@@ -801,6 +801,9 @@ class MemoryNodeManager:
         embedding_config: Optional[Dict[str, Any]] = None,
         enabled: bool = True,
         llm_client: Any = None,  # OpenAI-compatible client (shares the project's API infra)
+        llm_model: Optional[str] = None,
+        llm_base_url: Optional[str] = None,
+        llm_api_key: Optional[str] = None,
     ) -> None:
         self._db = session_db
         self._enabled = enabled and bool(session_db)
@@ -809,13 +812,16 @@ class MemoryNodeManager:
 
         cfg = embedding_config or {}
 
-        # LLM model config (used regardless of client or raw HTTP)
-        self._llm_model = cfg.get("llm_model", cfg.get("summary_model", DEFAULT_LLM_MODEL))
+        # LLM model config (used regardless of client or raw HTTP). This is
+        # supplied by the owning agent so memory extraction uses the same model
+        # that answers the user's query, not embedding_config.
+        self._llm_model = str(llm_model or DEFAULT_LLM_MODEL)
         self._llm_timeout = int(cfg.get("llm_timeout", cfg.get("timeout", 120)))
 
-        # Raw HTTP fallback config (only used when llm_client is None)
-        self._llm_base_url = cfg.get("llm_base_url", cfg.get("base_url", DEFAULT_LLM_BASE_URL))
-        self._llm_api_key = cfg.get("llm_api_key", cfg.get("api_key", ""))
+        # Raw HTTP fallback config (only used when llm_client is None). These
+        # are supplied by the owning agent, not embedding_config.
+        self._llm_base_url = str(llm_base_url or DEFAULT_LLM_BASE_URL)
+        self._llm_api_key = "" if llm_api_key is None else str(llm_api_key)
 
         # Retrieval config
         self._top_k = int(cfg.get("retrieval_top_k", 8))
@@ -832,6 +838,24 @@ class MemoryNodeManager:
 
         # Async background thread for non-critical work (relation graph + entity extraction)
         self._async_thread: Optional[threading.Thread] = None
+
+    def configure_llm(
+        self,
+        *,
+        llm_client: Any = None,
+        llm_model: Optional[str] = None,
+        llm_base_url: Optional[str] = None,
+        llm_api_key: Optional[str] = None,
+    ) -> None:
+        """Refresh the shared LLM client/model from the owning agent."""
+        if llm_client is not None:
+            self._llm_client = llm_client
+        if llm_model:
+            self._llm_model = str(llm_model)
+        if llm_base_url:
+            self._llm_base_url = str(llm_base_url)
+        if llm_api_key is not None:
+            self._llm_api_key = str(llm_api_key)
 
     # ── Lazy init ─────────────────────────────────────────────────────────
 

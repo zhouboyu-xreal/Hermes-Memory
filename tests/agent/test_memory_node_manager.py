@@ -1032,6 +1032,37 @@ def test_summarize_turn_returns_entities(db):
     assert summary["entities"] == [{"name": "Alice", "type": "PERSON"}]
 
 
+def test_memory_node_manager_llm_config_comes_from_agent_not_embedding_config(db):
+    mgr = MemoryNodeManager(
+        db,
+        embedding_config={
+            "llm_model": "stale-memory-model",
+            "summary_model": "stale-summary-model",
+            "llm_base_url": "https://stale-memory.example/v1",
+            "base_url": "https://stale-base.example/v1",
+            "llm_api_key": "stale-memory-key",
+            "api_key": "stale-api-key",
+        },
+        llm_model="main-agent-model",
+        llm_base_url="https://main-agent.example/v1",
+        llm_api_key="main-agent-key",
+    )
+
+    assert mgr._llm_model == "main-agent-model"
+    assert mgr._llm_base_url == "https://main-agent.example/v1"
+    assert mgr._llm_api_key == "main-agent-key"
+
+    mgr.configure_llm(
+        llm_model="fallback-agent-model",
+        llm_base_url="https://fallback-agent.example/v1",
+        llm_api_key="fallback-agent-key",
+    )
+
+    assert mgr._llm_model == "fallback-agent-model"
+    assert mgr._llm_base_url == "https://fallback-agent.example/v1"
+    assert mgr._llm_api_key == "fallback-agent-key"
+
+
 def test_analyze_recall_query_accepts_legacy_summary_shape(db):
     mgr = _NoAsyncMemoryNodeManager(
         db,
