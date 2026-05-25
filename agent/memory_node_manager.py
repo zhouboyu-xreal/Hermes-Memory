@@ -63,6 +63,7 @@ SEMANTIC_RELATION_THRESHOLD = 0.82
 INTERPRETATION_MIN_OBSERVATIONS_FOR_BATCH = 3
 INTERPRETATION_MIN_CLUSTER_SIZE = 2
 INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT = 30
+INTERPRETATION_SINGLE_OBSERVATION_CONFIDENCE_CAP = 0.75
 
 # ── Shared causal relation guidance ───────────────────────────────────────
 
@@ -143,6 +144,54 @@ SUMMARY_SYSTEM_PROMPT = """你是一个对话摘要助手。请总结以下对�
 对话内容：
 用户：{user_message}
 助手：{assistant_response}"""
+
+# ── Recall query analysis prompt template ────────────────────────────────
+
+RECALL_QUERY_ANALYSIS_PROMPT = """你是长期记忆 recall 查询分析器。请分析用户当前查询，生成用于三层记忆检索的结构化策略。
+
+三层记忆含义：
+- interpretations: 从 observation 推导出的洞察、任务状态、偏好、策略或风险，适合回答"我应该怎么做/用户偏好是什么/当前任务状态是什么"
+- observations: 由多个 fact 汇总出的稳定模式、阶段性状态、事件簇或变化，适合回答"最近/通常/整体有什么趋势或状态"
+- facts: 原始事实记忆，包含 semantic 与 episodic 两类，适合回答"之前具体说过什么/什么时候/证据是什么"
+
+recall_intent 只能是：
+- action: 用户需要行动建议、任务推进、偏好约束、下一步策略
+- evidence: 用户需要历史证据、原始事实、具体时间地点人物、之前是否说过
+- state: 用户需要状态、趋势、长期模式、最近变化或总结
+- balanced: 意图不明显，需要均衡召回
+
+fact_type_preference 只能是：
+- semantic: 更需要事实、概念、背景、长期偏好或长期规则
+- episodic: 更需要具体经历、事件、时间线、上下文和证据
+- both: 两者都需要或无法判断
+
+要求：
+1. search_text 是用于 embedding 的检索表达，必须保留原始查询中的关键实体、事件、约束和意图；不要过度抽象。
+2. keywords 提取 2-8 个检索关键词，保留关键实体、产品、技术、动作、约束和主题词。
+3. entities 提取对召回有用的实体，遵守实体抽取规则；普通时间表达不要作为实体。
+4. layer_preference 是 interpretations/observations/facts 三层的偏好权重，数值在 0-1 之间，总和尽量接近 1。
+5. intent_confidence 是你对 recall_intent 判断的置信度，0-1。
+6. needs_evidence 表示回答是否需要展开 observation/interpretation 背后的事实证据。
+7. time_sensitivity 只能是 specific、recent、long_term、none。
+8. 仅返回 JSON，不要包含其他内容。
+
+""" + ENTITY_EXTRACTION_GUIDANCE + """
+
+输出格式：
+{{
+    "search_text": "用于 embedding 的检索表达", 
+    "keywords": ["关键词1", "关键词2"], 
+    "entities": [{{"name": "实体名", "type": "CONCEPT"}}], 
+    "recall_intent": "balanced", 
+    "intent_confidence": 0.0, 
+    "layer_preference": {{"interpretations": 0.34, "observations": 0.33, "facts": 0.33}}, 
+    "fact_type_preference": "both", 
+    "interpretation_type_preference": ["insight"], 
+    "needs_evidence": false, 
+    "time_sensitivity": "none"}}
+
+用户查询：
+{query}"""
 
 # ── HindSight-style retain prompt template ────────────────────────────────
 
@@ -523,6 +572,13 @@ supporting facts:
 - 项目当前状态、任务策略、风险、约束或冲突解决结论
 - 多个事实共同支持的行为模式或当前解释
 - observation 背后体现出可复用的 insight、task、策略、偏好、风险或状态判断
+
+单条 observation 的证据门槛：
+- task 可以由单条 observation 生成，但必须明确指向请求、目标、进展、阻塞、结果或下一步行动。
+- explicit_preference/explicit_instruction 可以由单条 observation 生成，但必须来自用户明确表达的偏好或指令；单次行为暗示只能作为 inferred_preference，且证据不足时 should_create=false。
+- insight、project_state、task_risk、strategy、behavior_pattern 默认需要多个 observation 或多个 supporting facts 支撑；如果只有单条 observation 且 evidence_shape=single_event，通常 should_create=false。
+- 不要把一次性事件、普通上下文或孤立事实上升为稳定洞察、长期偏好或行为模式。
+- 单条 observation 生成的 inferred 类型 confidence 不要超过 0.75。
 
 不要生成 interpretation 的情况：
 - observation 只是普通事实摘要，缺少未来行动含义
@@ -942,6 +998,136 @@ class MemoryNodeManager:
                 return None
             return {"summary": summary, "keywords": keywords, "entities": entities}
 
+        return None
+
+    # ── Recall query analysis ────────────────────────────────────────────
+
+    @staticmethod
+    def _clip_unit_float(value: Any, default: float = 0.0) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(0.0, min(1.0, number))
+
+    @classmethod
+    def _normalize_recall_layer_preference(cls, value: Any) -> Dict[str, float]:
+        if not isinstance(value, dict):
+            return {}
+        raw = {
+            "interpretations": cls._clip_unit_float(value.get("interpretations"), 0.0),
+            "observations": cls._clip_unit_float(value.get("observations"), 0.0),
+            "facts": cls._clip_unit_float(value.get("facts"), 0.0),
+        }
+        total = sum(raw.values())
+        if total <= 0:
+            return {}
+        return {key: round(score / total, 4) for key, score in raw.items() if score > 0}
+
+    @staticmethod
+    def _normalize_recall_intent(value: Any) -> str:
+        intent = str(value or "").strip().lower()
+        return intent if intent in {"action", "evidence", "state", "balanced"} else "balanced"
+
+    @staticmethod
+    def _normalize_fact_type_preference(value: Any) -> str:
+        fact_type = str(value or "").strip().lower()
+        return fact_type if fact_type in {"semantic", "episodic", "both"} else "both"
+
+    @staticmethod
+    def _normalize_time_sensitivity(value: Any) -> str:
+        sensitivity = str(value or "").strip().lower()
+        return sensitivity if sensitivity in {"specific", "recent", "long_term", "none"} else "none"
+
+    @staticmethod
+    def _normalize_string_list(value: Any, *, limit: int = 8) -> List[str]:
+        if isinstance(value, str):
+            raw = value.split(",")
+        elif isinstance(value, list):
+            raw = value
+        else:
+            raw = []
+        out: List[str] = []
+        seen = set()
+        for item in raw:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+            if len(out) >= limit:
+                break
+        return out
+
+    @staticmethod
+    def _fallback_query_keywords(query: str, *, limit: int = 8) -> List[str]:
+        keywords: List[str] = []
+        seen = set()
+        for item in re.split(r"\s+|,|，|;|；|。|\?|？", str(query or "")):
+            text = item.strip()
+            if len(text) <= 1 or text in seen:
+                continue
+            seen.add(text)
+            keywords.append(text)
+            if len(keywords) >= limit:
+                break
+        return keywords
+
+    def _normalize_recall_query_analysis(
+        self,
+        data: Dict[str, Any],
+        query: str,
+    ) -> Optional[Dict[str, Any]]:
+        search_text = str(data.get("search_text") or data.get("summary") or query or "").strip()
+        if not search_text:
+            return None
+        keywords = self._normalize_keywords(data.get("keywords"))
+        if not keywords:
+            keywords = self._fallback_query_keywords(query)
+        return {
+            "search_text": search_text,
+            "keywords": keywords[:8],
+            "entities": self._normalize_fact_entities(data.get("entities", [])),
+            "recall_intent": self._normalize_recall_intent(data.get("recall_intent")),
+            "intent_confidence": self._clip_unit_float(data.get("intent_confidence"), 0.0),
+            "layer_preference": self._normalize_recall_layer_preference(data.get("layer_preference")),
+            "fact_type_preference": self._normalize_fact_type_preference(data.get("fact_type_preference")),
+            "interpretation_type_preference": self._normalize_string_list(
+                data.get("interpretation_type_preference"),
+                limit=5,
+            ),
+            "needs_evidence": bool(data.get("needs_evidence", False)),
+            "time_sensitivity": self._normalize_time_sensitivity(data.get("time_sensitivity")),
+        }
+
+    def _analyze_recall_query(self, query: str) -> Optional[Dict[str, Any]]:
+        """Analyze a recall query in one LLM call.
+
+        Accepts the older ``{"summary", "keywords", "entities"}`` shape as a
+        compatibility fallback so recall remains best-effort if a model returns
+        the previous summary schema.
+        """
+        prompt = RECALL_QUERY_ANALYSIS_PROMPT.format(query=query)
+        for attempt in range(2):
+            result = self._call_llm(prompt)
+            if not result:
+                if attempt == 0:
+                    logger.debug("Recall query analysis attempt %d returned empty, retrying...", attempt)
+                    continue
+                return None
+            data = self._json_object_from_llm_text(result)
+            if data is None:
+                if attempt == 0:
+                    logger.debug("Recall query analysis JSON parse failed on attempt %d, retrying...", attempt)
+                    continue
+                logger.debug("Recall query analysis JSON parse failed after 2 attempts: %.120s", result)
+                return None
+            normalized = self._normalize_recall_query_analysis(data, query)
+            if normalized:
+                return normalized
+            if attempt == 0:
+                continue
+            return None
         return None
 
     @staticmethod
@@ -2221,6 +2407,25 @@ class MemoryNodeManager:
             data.get("evidence_observation_ids", sorted(allowed_observation_ids)),
             allowed_observation_ids,
         ) or sorted(allowed_observation_ids)
+        if len(evidence_observation_ids) == 1:
+            allowed, single_reason = self._single_observation_generation_allowed(
+                observation=observation,
+                source_nodes=source_nodes,
+                interpretation_family=self._interpretation_family(interpretation_type),
+            )
+            if not allowed:
+                self._log_info(
+                    "memory_reflect",
+                    "interpretation_generation_rejected",
+                    {
+                        "observation_id": evidence_observation_ids[0],
+                        "interpretation_type": interpretation_type,
+                        "reason": single_reason,
+                    },
+                )
+                return None
+            if interpretation_type not in {"task", "explicit_preference", "explicit_instruction"}:
+                confidence = min(confidence, INTERPRETATION_SINGLE_OBSERVATION_CONFIDENCE_CAP)
         metadata_out = data.get("metadata", {})
         if not isinstance(metadata_out, dict):
             metadata_out = {}
@@ -2238,6 +2443,10 @@ class MemoryNodeManager:
             "source": "interpretation_generation",
             **metadata_out,
         }
+        if len(evidence_observation_ids) == 1:
+            metadata_out.setdefault("evidence_shape", "single_observation")
+            if interpretation_type not in {"task", "explicit_preference", "explicit_instruction"}:
+                metadata_out.setdefault("stability", "tentative")
         return {
             "claim": claim,
             "subject_text": str(data.get("subject_text") or "agent").strip() or "agent",
@@ -2422,6 +2631,76 @@ class MemoryNodeManager:
         if text in {"explicit_preference", "explicit_instruction", "inferred_preference", "behavior_pattern"}:
             return "preference"
         return "insight"
+
+    @staticmethod
+    def _unique_source_node_count(source_nodes: List[Dict[str, Any]]) -> int:
+        node_ids: set[int] = set()
+        fallback_count = 0
+        for node in source_nodes:
+            node_id = node.get("id", node.get("node_id"))
+            try:
+                node_ids.add(int(node_id))
+            except (TypeError, ValueError):
+                fallback_count += 1
+        return len(node_ids) or fallback_count
+
+    @classmethod
+    def _single_observation_generation_allowed(
+        cls,
+        *,
+        observation: Dict[str, Any],
+        source_nodes: List[Dict[str, Any]],
+        interpretation_family: str,
+    ) -> Tuple[bool, str]:
+        metadata = cls._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
+        observation_kind = str(metadata.get("observation_kind") or "context").strip().lower()
+        evidence_shape = str(metadata.get("evidence_shape") or "single_event").strip().lower()
+        temporal_scope = str(metadata.get("temporal_scope") or "recent").strip().lower()
+        dominant_fact_type = str(metadata.get("dominant_fact_type") or "unknown").strip().lower()
+        evidence_mixture = str(metadata.get("evidence_mixture") or "unknown").strip().lower()
+        source_kinds = {
+            str(node.get("fact_kind") or "").strip().lower()
+            for node in source_nodes
+        }
+        source_count = cls._unique_source_node_count(source_nodes)
+
+        if interpretation_family == "task":
+            if observation_kind in {"task_signal", "goal_signal", "state_change", "outcome", "event_cluster"}:
+                return True, "task_observation_kind"
+            if any(cls._is_task_event_like_fact(node) for node in source_nodes):
+                return True, "task_event_evidence"
+            if source_kinds & {"request", "action", "decision", "error", "recommendation"}:
+                return True, "task_fact_kind"
+            if dominant_fact_type == "episodic" and temporal_scope in {"momentary", "recent", "ongoing"}:
+                return True, "episodic_task_context"
+            return False, "weak_task_signal"
+
+        if interpretation_family == "preference":
+            if source_kinds & {"instruction"}:
+                return True, "explicit_instruction"
+            if source_kinds & {"preference"} and observation_kind in {"preference_signal", "constraint", "pattern"}:
+                return True, "explicit_preference_signal"
+            if source_count >= 2 and evidence_shape in {"repeated_pattern", "confirmation"} and source_kinds & {"preference"}:
+                return True, "repeated_preference_evidence"
+            if source_count >= 2 and temporal_scope in {"ongoing", "recurring"} and source_kinds & {"preference", "instruction"}:
+                return True, "stable_preference_scope"
+            if (
+                source_count >= 2
+                and evidence_mixture in {"semantic_dominant", "balanced_mixed"}
+                and evidence_shape in {"repeated_pattern", "confirmation"}
+            ):
+                return True, "stable_fact_type_preference_evidence"
+            return False, "weak_preference_signal"
+
+        if source_count < 2:
+            return False, "single_fact_insight_signal"
+        if evidence_shape in {"repeated_pattern", "contrast", "progression", "correction", "confirmation"}:
+            return True, "structured_insight_evidence"
+        if observation_kind in {"conflict", "state_change", "outcome", "pattern"} and temporal_scope != "momentary":
+            return True, "material_insight_observation_kind"
+        if evidence_mixture in {"semantic_dominant", "episodic_dominant", "balanced_mixed"}:
+            return True, "mixed_fact_type_insight"
+        return False, "weak_insight_signal"
 
     @classmethod
     def _candidate_interpretation_families(
@@ -2763,7 +3042,7 @@ class MemoryNodeManager:
         )
         entities = [observation.get("entity_name")] if observation.get("entity_name") else []
         try:
-            searched = self._db.memory_search_interpretations(
+            searched = self._db.search_memory_interpretations(
                 query,
                 entities=entities,
                 top_k=12,
@@ -2950,7 +3229,7 @@ class MemoryNodeManager:
             if str(part or "").strip()
         )
         try:
-            candidates = self._db.memory_search_observations(
+            candidates = self._db.search_memory_observations(
                 query,
                 entities=[observation.get("entity_name")] if observation.get("entity_name") else [],
                 entity_ids=[int(observation["entity_id"])] if observation.get("entity_id") is not None else None,
@@ -3189,50 +3468,11 @@ class MemoryNodeManager:
         source_nodes: List[Dict[str, Any]],
         family: str,
     ) -> Tuple[bool, str]:
-        metadata = cls._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
-        observation_kind = str(metadata.get("observation_kind") or "context").strip().lower()
-        evidence_shape = str(metadata.get("evidence_shape") or "single_event").strip().lower()
-        temporal_scope = str(metadata.get("temporal_scope") or "recent").strip().lower()
-        dominant_fact_type = str(metadata.get("dominant_fact_type") or "unknown").strip().lower()
-        evidence_mixture = str(metadata.get("evidence_mixture") or "unknown").strip().lower()
-        source_kinds = {
-            str(node.get("fact_kind") or "").strip().lower()
-            for node in source_nodes
-        }
-
-        if family == "task":
-            if observation_kind in {"task_signal", "goal_signal", "state_change", "outcome", "event_cluster"}:
-                return True, "task_observation_kind"
-            if any(cls._is_task_event_like_fact(node) for node in source_nodes):
-                return True, "task_event_evidence"
-            if source_kinds & {"request", "action", "decision", "error", "recommendation"}:
-                return True, "task_fact_kind"
-            if dominant_fact_type == "episodic" and temporal_scope in {"momentary", "recent", "ongoing"}:
-                return True, "episodic_task_context"
-            return False, "weak_task_signal"
-
-        if family == "preference":
-            if source_kinds & {"instruction"}:
-                return True, "explicit_instruction"
-            if observation_kind in {"preference_signal", "constraint"}:
-                return True, "preference_observation_kind"
-            if evidence_shape in {"repeated_pattern", "confirmation"} and source_kinds & {"preference"}:
-                return True, "repeated_preference_evidence"
-            if temporal_scope in {"ongoing", "recurring"} and source_kinds & {"preference", "instruction"}:
-                return True, "stable_preference_scope"
-            if evidence_mixture in {"semantic_dominant", "balanced_mixed"} and evidence_shape in {"repeated_pattern", "confirmation"}:
-                return True, "stable_fact_type_preference_evidence"
-            return False, "weak_preference_signal"
-
-        if observation_kind in {"conflict", "state_change", "outcome", "pattern"}:
-            return True, "insight_observation_kind"
-        if evidence_shape in {"repeated_pattern", "contrast", "progression", "correction", "confirmation"}:
-            return True, "insight_evidence_shape"
-        if evidence_mixture in {"semantic_dominant", "episodic_dominant", "balanced_mixed"} and len(source_nodes) >= 2:
-            return True, "mixed_fact_type_insight"
-        if len(source_nodes) >= 2 and temporal_scope in {"ongoing", "historical", "recurring", "recent"}:
-            return True, "multi_evidence_insight"
-        return False, "weak_insight_signal"
+        return cls._single_observation_generation_allowed(
+            observation=observation,
+            source_nodes=source_nodes,
+            interpretation_family=family,
+        )
 
     def _observation_interpretation_cluster_family(
         self,
@@ -3418,6 +3658,13 @@ class MemoryNodeManager:
         changed_items = [item for item in items if not item.get("is_deferred_context")]
         if not changed_items:
             return False, "no_changed_observation"
+        if len(items) == 1 and len(changed_items) == 1:
+            item = changed_items[0]
+            return cls._single_observation_generation_allowed(
+                observation=item["observation"],
+                source_nodes=item.get("source_nodes", []),
+                interpretation_family=str(item.get("family") or cluster.get("family") or "insight"),
+            )
         if any(item.get("priority") == "high" for item in changed_items):
             return True, "high_priority_observation"
         if len(changed_items) >= INTERPRETATION_MIN_OBSERVATIONS_FOR_BATCH:
@@ -3750,7 +3997,7 @@ class MemoryNodeManager:
         seen: set[int] = set()
         for entity_id, entity_name in self._fact_entity_pairs(fact):
             try:
-                searched = self._db.memory_search_observations(
+                searched = self._db.search_memory_observations(
                     query,
                     entities=[entity_name] if entity_name else None,
                     entity_ids=[entity_id],
@@ -5007,6 +5254,24 @@ class MemoryNodeManager:
             return "state"
         return "balanced"
 
+    @classmethod
+    def _resolve_recall_intent(
+        cls,
+        query: str,
+        keywords: List[str],
+        llm_intent: str,
+        intent_confidence: float,
+    ) -> str:
+        """Combine cheap rule intent with LLM query-analysis intent."""
+        rule_intent = cls._infer_recall_intent(query, keywords)
+        normalized_llm_intent = cls._normalize_recall_intent(llm_intent)
+        confidence = cls._clip_unit_float(intent_confidence, 0.0)
+        if rule_intent == "evidence" and normalized_llm_intent != "evidence":
+            return "evidence"
+        if confidence >= 0.65:
+            return normalized_llm_intent
+        return rule_intent
+
     @staticmethod
     def _recall_layer_limits(k: int, intent: str) -> Dict[str, int]:
         """Allocate a small recall budget across the three memory layers."""
@@ -5035,6 +5300,68 @@ class MemoryNodeManager:
             "facts": base,
         }
 
+    @classmethod
+    def _apply_recall_layer_preference(
+        cls,
+        layer_limits: Dict[str, int],
+        layer_preference: Dict[str, float],
+    ) -> Dict[str, int]:
+        """Blend LLM layer preference into the rule-derived recall budget."""
+        if not layer_preference:
+            return dict(layer_limits)
+        keys = ("interpretations", "observations", "facts")
+        total_budget = max(1, sum(max(0, int(layer_limits.get(key, 0) or 0)) for key in keys))
+        base_total = max(1, sum(max(0, int(layer_limits.get(key, 0) or 0)) for key in keys))
+        base_share = {
+            key: max(0, int(layer_limits.get(key, 0) or 0)) / base_total
+            for key in keys
+        }
+        normalized_preference = cls._normalize_recall_layer_preference(layer_preference)
+        if not normalized_preference:
+            return dict(layer_limits)
+        blended = {
+            key: (base_share.get(key, 0.0) * 0.55) + (normalized_preference.get(key, 0.0) * 0.45)
+            for key in keys
+        }
+        limits = {
+            key: max(1, int(round(total_budget * blended.get(key, 0.0))))
+            for key in keys
+        }
+        diff = total_budget - sum(limits.values())
+        while diff != 0:
+            if diff > 0:
+                key = max(keys, key=lambda item: blended.get(item, 0.0))
+                limits[key] += 1
+                diff -= 1
+                continue
+            removable = [
+                key for key in keys
+                if limits.get(key, 0) > 1
+            ]
+            if not removable:
+                break
+            key = min(removable, key=lambda item: blended.get(item, 0.0))
+            limits[key] -= 1
+            diff += 1
+        return limits
+
+    @staticmethod
+    def _recall_embedding_text(query: str, analysis: Dict[str, Any]) -> str:
+        pieces = [str(query or "").strip(), str(analysis.get("search_text") or "").strip()]
+        keywords = analysis.get("keywords") or []
+        if keywords:
+            pieces.append("keywords: " + ", ".join(str(keyword) for keyword in keywords))
+        entities = analysis.get("entities") or []
+        entity_names = [
+            str(entity.get("name") or "").strip()
+            for entity in entities
+            if isinstance(entity, dict) and str(entity.get("name") or "").strip()
+        ]
+        if entity_names:
+            pieces.append("entities: " + ", ".join(entity_names))
+        text = "\n".join(piece for piece in pieces if piece)
+        return text or str(query or "")
+
     @staticmethod
     def _merge_recall_items(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Merge recall records by id while preserving first-seen order."""
@@ -5048,6 +5375,209 @@ class MemoryNodeManager:
                 seen.add(item_id)
                 merged.append(item)
         return merged
+
+    @classmethod
+    def _recall_search_terms(
+        cls,
+        query: str,
+        keywords: List[str],
+        entities: List[Any],
+    ) -> List[str]:
+        """Build compact terms for cheap cross-layer recall reranking."""
+        raw_terms: List[str] = []
+        raw_terms.extend(str(keyword or "") for keyword in keywords or [])
+        for entity in entities or []:
+            if isinstance(entity, dict):
+                raw_terms.append(str(entity.get("name") or ""))
+            else:
+                raw_terms.append(str(entity or ""))
+        raw_terms.extend(re.split(r"\s+|,|，|;|；", str(query or "")))
+
+        terms: List[str] = []
+        seen = set()
+        for term in raw_terms:
+            text = str(term or "").strip().lower()
+            if not text or len(text) <= 1 or text in seen:
+                continue
+            seen.add(text)
+            terms.append(text)
+            if len(terms) >= 16:
+                break
+        return terms
+
+    @staticmethod
+    def _recall_item_text(layer: str, item: Dict[str, Any]) -> str:
+        if layer == "interpretation":
+            keys = (
+                "claim", "action_implication", "subject_text", "target_text",
+                "scope", "interpretation_type", "resolution", "entity_name",
+            )
+        elif layer == "observation":
+            keys = (
+                "summary", "keywords", "topic_label", "topic_key",
+                "observation_type", "entity_name",
+            )
+        else:
+            keys = (
+                "summary", "keywords", "topic", "fact_type", "fact_kind",
+                "fact_subject", "task_relevance", "entity_names",
+            )
+        return " ".join(str(item.get(key) or "") for key in keys).lower()
+
+    @staticmethod
+    def _recall_layer_intent_weight(layer: str, intent: str, item: Dict[str, Any]) -> float:
+        if intent == "action":
+            if layer == "interpretation":
+                return 1.25
+            if layer == "observation":
+                return 1.0
+            return 0.8
+        if intent == "evidence":
+            if layer == "fact":
+                return 1.25
+            if layer == "observation":
+                return 1.0
+            return 0.75
+        if intent == "state":
+            if layer == "observation":
+                return 1.25
+            if layer == "interpretation":
+                return 1.0
+            return 0.85
+        return 1.0
+
+    @classmethod
+    def _recall_intent_bonus(cls, layer: str, intent: str, item: Dict[str, Any]) -> float:
+        if layer == "interpretation":
+            interpretation_type = str(item.get("interpretation_type") or "").lower()
+            if intent == "action" and interpretation_type in {
+                "task", "preference", "explicit_preference", "inferred_preference",
+            }:
+                return 0.45
+            if intent == "state" and interpretation_type in {
+                "insight", "behavior_pattern", "project_state", "strategy", "task_risk",
+            }:
+                return 0.35
+            if intent == "evidence":
+                return -0.2
+        if layer == "observation":
+            metadata = cls._json_dict(item.get("metadata", {}))
+            observation_kind = str(metadata.get("observation_kind") or item.get("observation_type") or "").lower()
+            temporal_scope = str(metadata.get("temporal_scope") or "").lower()
+            if intent == "action" and observation_kind in {"task_signal", "goal_signal", "preference_signal", "constraint"}:
+                return 0.35
+            if intent == "state" and (
+                observation_kind in {"state_change", "pattern", "timeline", "event_cluster", "outcome"}
+                or temporal_scope in {"ongoing", "recurring", "recent"}
+            ):
+                return 0.35
+            if intent == "evidence" and observation_kind in {"timeline", "event_cluster"}:
+                return 0.25
+        if layer == "fact":
+            fact_type = str(item.get("fact_type") or "").lower()
+            fact_kind = str(item.get("fact_kind") or "").lower()
+            if intent == "evidence" and fact_type == "episodic":
+                return 0.35
+            if intent == "action" and fact_kind in {"preference", "instruction", "request", "task"}:
+                return 0.3
+            if intent == "state" and fact_type == "semantic":
+                return 0.2
+        return 0.0
+
+    @classmethod
+    def _recall_candidate_score(
+        cls,
+        *,
+        layer: str,
+        item: Dict[str, Any],
+        rank: int,
+        terms: List[str],
+        intent: str,
+    ) -> float:
+        haystack = cls._recall_item_text(layer, item)
+        matched_terms = [term for term in terms if term and term in haystack]
+        keyword_score = min(2.0, len(matched_terms) * 0.35)
+        rank_score = 1.0 / max(1, rank)
+        embedding_score = max(0.0, float(item.get("embedding_similarity") or 0.0))
+        if layer in {"interpretation", "observation"}:
+            reliability = max(0.0, min(1.0, float(item.get("confidence") or 0.0)))
+        else:
+            reliability = max(0.0, min(1.0, float(item.get("decay_score") or 1.0)))
+        score = (
+            keyword_score
+            + (rank_score * 0.9)
+            + (embedding_score * 1.4)
+            + (reliability * 0.45)
+            + cls._recall_intent_bonus(layer, intent, item)
+        )
+        score *= cls._recall_layer_intent_weight(layer, intent, item)
+        return round(float(score), 4)
+
+    @classmethod
+    def _rank_recall_candidates(
+        cls,
+        *,
+        interpretations: List[Dict[str, Any]],
+        observations: List[Dict[str, Any]],
+        semantic_facts: List[Dict[str, Any]],
+        episodic_facts: List[Dict[str, Any]],
+        terms: List[str],
+        intent: str,
+        layer_limits: Dict[str, int],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Select final recall candidates while preserving each layer's own order."""
+        total_budget = max(1, sum(max(0, int(value or 0)) for value in layer_limits.values()))
+        flexible_cap = max(1, int(total_budget * 0.6))
+        caps = {
+            "interpretations": max(layer_limits.get("interpretations", 0), flexible_cap),
+            "observations": max(layer_limits.get("observations", 0), flexible_cap),
+            "semantic_facts": max(1, min(total_budget, flexible_cap)),
+            "episodic_facts": max(1, min(total_budget, flexible_cap)),
+        }
+        candidates: List[Tuple[float, int, str, Dict[str, Any]]] = []
+        sequence = 0
+        groups = [
+            ("interpretations", "interpretation", interpretations),
+            ("observations", "observation", observations),
+            ("semantic_facts", "fact", semantic_facts),
+            ("episodic_facts", "fact", episodic_facts),
+        ]
+        for bucket, layer, items in groups:
+            for rank, item in enumerate(items or [], 1):
+                sequence += 1
+                score = cls._recall_candidate_score(
+                    layer=layer,
+                    item=item,
+                    rank=rank,
+                    terms=terms,
+                    intent=intent,
+                )
+                item["_recall_score"] = score
+                item["_recall_rank"] = rank
+                candidates.append((score, sequence, bucket, item))
+
+        candidates.sort(key=lambda candidate: (-candidate[0], candidate[1]))
+        selected = {
+            "interpretations": [],
+            "observations": [],
+            "semantic_facts": [],
+            "episodic_facts": [],
+        }
+        selected_ids = {key: set() for key in selected}
+
+        for _score, _sequence, bucket, item in candidates:
+            if sum(len(values) for values in selected.values()) >= total_budget:
+                break
+            if len(selected[bucket]) >= caps[bucket]:
+                continue
+            item_id = item.get("id")
+            if item_id in selected_ids[bucket]:
+                continue
+            selected_ids[bucket].add(item_id)
+            selected[bucket].append(item)
+        for items in selected.values():
+            items.sort(key=lambda item: int(item.get("_recall_rank") or 0))
+        return selected
     
     def recall(
         self,
@@ -5094,38 +5624,91 @@ class MemoryNodeManager:
             ts = time_start or _parsed_time_start
             te = time_end or _parsed_time_end
             search_query = clean_query or query
-            
-            # Generate summary for the query (for keyword extraction)
-            summary_data = self._summarize_turn(search_query, "")
-            
-            if not summary_data:
-                logger.debug("Skipping recall — summarisation returned no data")
+
+            # Analyze the query once for embedding text, keywords, entities, and recall intent.
+            query_analysis = self._analyze_recall_query(search_query)
+
+            if not query_analysis:
+                logger.debug("Skipping recall — query analysis returned no data")
                 return ""
-            
-            # Generate embedding from the clean query
-            query_summary = summary_data["summary"]
-            query_embedding = self._embedding_client.embed_text(query_summary)
+
+            # Generate embedding from a retrieval-oriented query expression.
+            query_embedding_text = self._recall_embedding_text(search_query, query_analysis)
+            query_embedding = self._embedding_client.embed_text(query_embedding_text)
             if query_embedding is None:
                 logger.debug("Query embedding is None")
                 return ""
 
-            keywords = summary_data["keywords"]
-            entities = summary_data.get("entities", [])
-            recall_intent = self._infer_recall_intent(search_query, keywords)
-            layer_limits = self._recall_layer_limits(k, recall_intent)
-            interpretation_nodes = self._db.memory_search_interpretations(
+            keywords = query_analysis["keywords"]
+            entities = query_analysis.get("entities", [])
+            recall_intent = self._resolve_recall_intent(
+                search_query,
+                keywords,
+                query_analysis.get("recall_intent", "balanced"),
+                float(query_analysis.get("intent_confidence") or 0.0),
+            )
+            layer_limits = self._apply_recall_layer_preference(
+                self._recall_layer_limits(k, recall_intent),
+                query_analysis.get("layer_preference", {}),
+            )
+            recall_terms = self._recall_search_terms(search_query, keywords, entities)
+            candidate_limits = {
+                layer: max(limit * 3, limit + 4)
+                for layer, limit in layer_limits.items()
+            }
+            interpretation_candidates = self._db.search_memory_interpretations(
                 keywords,
                 entities=entities,
-                top_k=layer_limits["interpretations"],
+                top_k=candidate_limits["interpretations"],
                 query_embedding=query_embedding,
             )
 
-            observation_nodes = self._db.memory_search_observations(
+            observation_candidates = self._db.search_memory_observations(
                 keywords,
                 entities=entities,
-                top_k=layer_limits["observations"],
+                top_k=candidate_limits["observations"],
                 query_embedding=query_embedding,
             )
+
+            fact_candidate_limit = max(
+                candidate_limits["facts"],
+                layer_limits["facts"] * 3,
+                layer_limits["facts"] + 4,
+            )
+            fact_type_preference = query_analysis.get("fact_type_preference", "both")
+            semantic_candidate_limit = max(1, fact_candidate_limit)
+            episodic_candidate_limit = max(1, fact_candidate_limit)
+            if fact_type_preference == "semantic":
+                episodic_candidate_limit = max(1, layer_limits["facts"])
+            elif fact_type_preference == "episodic":
+                semantic_candidate_limit = max(1, layer_limits["facts"])
+            semantic_candidates = self._db.search_memory_facts(
+                keywords, query_embedding, top_k=semantic_candidate_limit, budget=b,
+                time_start=ts, time_end=te,
+                tags=tags,
+                fact_types=["semantic"],
+            )
+
+            episodic_candidates = self._db.search_memory_facts(
+                keywords, query_embedding, top_k=episodic_candidate_limit, budget=b,
+                time_start=ts, time_end=te,
+                tags=tags,
+                fact_types=["episodic"],
+            )
+
+            ranked_recall = self._rank_recall_candidates(
+                interpretations=interpretation_candidates,
+                observations=observation_candidates,
+                semantic_facts=semantic_candidates,
+                episodic_facts=episodic_candidates,
+                terms=recall_terms,
+                intent=recall_intent,
+                layer_limits=layer_limits,
+            )
+            interpretation_nodes = ranked_recall["interpretations"]
+            observation_nodes = ranked_recall["observations"]
+            semantic_nodes = ranked_recall["semantic_facts"]
+            episodic_nodes = ranked_recall["episodic_facts"]
 
             observation_ids_from_interpretation: List[int] = []
             fact_ids_from_interpretation: List[int] = []
@@ -5153,22 +5736,6 @@ class MemoryNodeManager:
             ) if observation_nodes else {}
             fact_nodes_from_interpretation = self._db.memory_nodes_by_ids(
                 fact_ids_from_interpretation
-            )
-
-            # Hybrid search is run separately per fact type so semantic
-            # knowledge and episodic experiences stay distinct through recall.
-            semantic_nodes = self._db.memory_search_facts(
-                keywords, query_embedding, top_k=layer_limits["facts"], budget=b,
-                time_start=ts, time_end=te,
-                tags=tags,
-                fact_types=["semantic"],
-            )
-
-            episodic_nodes = self._db.memory_search_facts(
-                keywords, query_embedding, top_k=layer_limits["facts"], budget=b,
-                time_start=ts, time_end=te,
-                tags=tags,
-                fact_types=["episodic"],
             )
 
             fact_ids_from_observation = {

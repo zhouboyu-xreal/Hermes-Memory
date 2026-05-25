@@ -36,6 +36,17 @@ class _FakeEmbeddingClient:
         return np.ones((1, 1536), dtype=np.float32)
 
 
+class _CapturingEmbeddingClient:
+    def __init__(self):
+        self.texts = []
+
+    def embed_text(self, text):
+        self.texts.append(text)
+        if not text:
+            return None
+        return np.ones((1, 1536), dtype=np.float32)
+
+
 class _KeywordEmbeddingClient:
     def embed_text(self, text):
         lowered = str(text or "").lower()
@@ -292,14 +303,14 @@ def test_memory_interpretations_store_current_agent_interpretations(db):
     )
     assert updated_id == interpretation_id
 
-    results = db.memory_search_interpretations(["heuristic", "task"], top_k=5)
+    results = db.search_memory_interpretations(["heuristic", "task"], top_k=5)
 
     assert [item["id"] for item in results] == [interpretation_id]
     assert results[0]["claim"] == "用户当前更偏好 deterministic heuristic 控制 task fact 选择。"
     assert results[0]["evidence_node_ids"] == [1, 2]
 
 
-def test_memory_search_interpretations_uses_embedding_similarity(db):
+def test_search_memory_interpretations_uses_embedding_similarity(db):
     matching_id = db.memory_upsert_interpretation(
         claim="Design calibration should happen before implementation.",
         target_text="implementation workflow",
@@ -321,7 +332,7 @@ def test_memory_search_interpretations_uses_embedding_similarity(db):
         embedding_text="calendar cleanup",
     )
 
-    results = db.memory_search_interpretations(
+    results = db.search_memory_interpretations(
         ["alignment"],
         top_k=5,
         query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
@@ -331,7 +342,7 @@ def test_memory_search_interpretations_uses_embedding_similarity(db):
     assert results[0]["embedding_similarity"] == pytest.approx(1.0)
 
 
-def test_memory_search_interpretations_separates_content_and_entity_matches(db):
+def test_search_memory_interpretations_separates_content_and_entity_matches(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     content_match = db.memory_upsert_interpretation(
         claim="The alert workflow prefers Slack escalation.",
@@ -351,11 +362,11 @@ def test_memory_search_interpretations_separates_content_and_entity_matches(db):
         action_implication="Consider person-specific collaboration context.",
     )
 
-    keyword_results = db.memory_search_interpretations(["Alice", "Slack"], top_k=5)
+    keyword_results = db.search_memory_interpretations(["Alice", "Slack"], top_k=5)
 
     assert [item["id"] for item in keyword_results[:2]] == [content_match, entity_only]
 
-    entity_results = db.memory_search_interpretations(
+    entity_results = db.search_memory_interpretations(
         "collaboration",
         entities=[{"name": "Alice"}],
         top_k=5,
@@ -731,10 +742,10 @@ def test_memory_search_uses_temporal_channel_when_semantic_and_keyword_are_empty
         summary="Outside the requested range.",
         keywords=["outside"],
     )
-    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
-    monkeypatch.setattr(db, "_memory_search_keyword", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "_search_memory_keyword", lambda *args, **kwargs: {})
 
-    nodes = db.memory_search_facts(
+    nodes = db.search_memory_facts(
         "no-match",
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
@@ -745,7 +756,38 @@ def test_memory_search_uses_temporal_channel_when_semantic_and_keyword_are_empty
     assert [n["id"] for n in nodes] == [newer, older]
 
 
-def test_memory_search_rrf_includes_graph_neighbors(db, monkeypatch):
+def test_memory_search_facts_excludes_graph_neighbors_by_default(db, monkeypatch):
+    slack = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Slack", "alerts"],
+    )
+    calendar = _add_memory_node(
+        db,
+        time_key="2026-05-02 10:00:00",
+        summary="Alice wants calendar reminders in the morning.",
+        keywords=["calendar"],
+    )
+    alice_id = db.entity_add_entity("Alice", "PERSON")
+    db.entity_link_node(slack, alice_id)
+    db.entity_link_node(calendar, alice_id)
+    db.memory_add_node_relation(slack, calendar, "semantic", confidence=0.9)
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
+
+    nodes = db.search_memory_facts(
+        ["Slack"],
+        np.ones((1, 1536), dtype=np.float32),
+        top_k=3,
+        budget="mid",
+    )
+
+    assert [n["id"] for n in nodes] == [slack]
+    assert "embedding_similarity" in nodes[0]
+    assert nodes[0]["keyword_score"] is not None
+
+
+def test_memory_search_rrf_includes_graph_neighbors_when_enabled(db, monkeypatch):
     slack = _add_memory_node(
         db,
         time_key="2026-05-01 10:00:00",
@@ -770,13 +812,14 @@ def test_memory_search_rrf_includes_graph_neighbors(db, monkeypatch):
     db.memory_add_node_relation(slack, calendar, "semantic", confidence=0.9)
     charlie_id = db.entity_add_entity("Charlie", "PERSON")
     db.entity_link_node(unrelated, charlie_id)
-    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
 
-    nodes = db.memory_search_facts(
+    nodes = db.search_memory_facts(
         ["Slack"],
         np.ones((1, 1536), dtype=np.float32),
         top_k=3,
         budget="mid",
+        include_graph=True,
     )
 
     ids = [n["id"] for n in nodes]
@@ -799,15 +842,15 @@ def test_memory_search_filters_by_fact_type(db, monkeypatch):
         keywords=["Alice", "Slack"],
         fact_type="episodic",
     )
-    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
 
-    semantic_nodes = db.memory_search_facts(
+    semantic_nodes = db.search_memory_facts(
         ["Alice", "Slack"],
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
         fact_types=["semantic"],
     )
-    episodic_nodes = db.memory_search_facts(
+    episodic_nodes = db.search_memory_facts(
         ["Alice", "Slack"],
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
@@ -840,7 +883,7 @@ def test_memory_keyword_search_keeps_cjk_terms_intact(db):
         keywords=["简洁"],
     )
 
-    results = db._memory_search_keyword("简洁回答", limit=10)
+    results = db._search_memory_keyword("简洁回答", limit=10)
 
     assert list(results) == [exact]
 
@@ -865,7 +908,7 @@ def test_memory_keyword_search_cjk_falls_back_to_all_characters(db):
         keywords=["回答"],
     )
 
-    results = db._memory_search_keyword("喜欢结论", limit=10)
+    results = db._search_memory_keyword("喜欢结论", limit=10)
 
     assert list(results) == [expected]
 
@@ -890,7 +933,7 @@ def test_memory_keyword_search_applies_time_range_before_ranking(db):
         keywords=["Alice", "Slack"],
     )
 
-    results = db._memory_search_keyword(
+    results = db._search_memory_keyword(
         "Slack",
         limit=10,
         time_start="2026-05-01 00:00:00",
@@ -919,9 +962,9 @@ def test_memory_search_pushes_time_candidate_ids_to_vector_channel(db, monkeypat
         seen["allowed_ids"] = set(kwargs.get("allowed_ids") or [])
         return {out_of_range: 1.0, in_range: 0.9}
 
-    monkeypatch.setattr(db, "_memory_search_vector", fake_vector_search)
+    monkeypatch.setattr(db, "_search_memory_vector", fake_vector_search)
 
-    nodes = db.memory_search_facts(
+    nodes = db.search_memory_facts(
         "Slack",
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
@@ -950,14 +993,14 @@ def test_memory_search_reranks_final_candidates_by_decay_score(db, monkeypatch):
         "UPDATE memory_nodes SET decay_score = CASE id WHEN ? THEN 0.0 WHEN ? THEN 1.0 ELSE decay_score END",
         (stale, fresh),
     )
-    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
     monkeypatch.setattr(
         db,
-        "_memory_search_keyword",
+        "_search_memory_keyword",
         lambda *args, **kwargs: {stale: 0.01, fresh: 0.02},
     )
 
-    nodes = db.memory_search_facts(
+    nodes = db.search_memory_facts(
         "Alice alerts",
         np.ones((1, 1536), dtype=np.float32),
         top_k=2,
@@ -989,7 +1032,45 @@ def test_summarize_turn_returns_entities(db):
     assert summary["entities"] == [{"name": "Alice", "type": "PERSON"}]
 
 
-def test_memory_search_observations_uses_entities(db):
+def test_analyze_recall_query_accepts_legacy_summary_shape(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "summary": "Alice Slack alerts",
+                "keywords": ["Alice", "Slack"],
+                "entities": [{"name": "Alice", "type": "PERSON"}],
+            })
+        ],
+    )
+
+    analysis = mgr._analyze_recall_query("Alice Slack alerts")
+
+    assert analysis["search_text"] == "Alice Slack alerts"
+    assert analysis["keywords"] == ["Alice", "Slack"]
+    assert analysis["entities"] == [{"name": "Alice", "type": "PERSON"}]
+    assert analysis["recall_intent"] == "balanced"
+    assert analysis["fact_type_preference"] == "both"
+
+
+def test_resolve_recall_intent_prefers_confident_llm_but_keeps_evidence_override():
+    assert MemoryNodeManager._resolve_recall_intent(
+        "我之后应该怎么处理 Slack 告警？",
+        ["Slack", "告警"],
+        "action",
+        0.9,
+    ) == "action"
+
+    assert MemoryNodeManager._resolve_recall_intent(
+        "之前我具体什么时候提到过 Slack 告警？",
+        ["Slack", "告警"],
+        "action",
+        0.9,
+    ) == "evidence"
+
+
+def test_search_memory_observations_uses_entities(db):
     columns = {
         row["name"]
         for row in db._conn.execute("PRAGMA table_info(memory_observations)").fetchall()
@@ -1013,7 +1094,7 @@ def test_memory_search_observations_uses_entities(db):
         confidence=0.8,
     )
 
-    results = db.memory_search_observations(
+    results = db.search_memory_observations(
         ["unrelated"],
         entities=[{"name": "Alice", "type": "PERSON"}],
         top_k=3,
@@ -1022,7 +1103,7 @@ def test_memory_search_observations_uses_entities(db):
     assert [row["entity_name"] for row in results] == ["Alice"]
 
 
-def test_memory_search_observations_uses_embedding_similarity(db):
+def test_search_memory_observations_uses_embedding_similarity(db):
     source_id = _add_memory_node(
         db,
         time_key="2026-05-01 10:00:00",
@@ -1055,7 +1136,7 @@ def test_memory_search_observations_uses_embedding_similarity(db):
         embedding_text="calendar cleanup",
     )
 
-    results = db.memory_search_observations(
+    results = db.search_memory_observations(
         ["alignment"],
         top_k=5,
         query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
@@ -1065,7 +1146,7 @@ def test_memory_search_observations_uses_embedding_similarity(db):
     assert results[0]["embedding_similarity"] == pytest.approx(1.0)
 
 
-def test_memory_search_observations_rejects_weak_family_term_entity_mismatch(db):
+def test_search_memory_observations_rejects_weak_family_term_entity_mismatch(db):
     node_id = _add_memory_node(
         db,
         time_key="2026-05-01 10:00:00",
@@ -1084,7 +1165,7 @@ def test_memory_search_observations_rejects_weak_family_term_entity_mismatch(db)
         confidence=0.7,
     )
 
-    results = db.memory_search_observations(
+    results = db.search_memory_observations(
         ["父亲", "中学", "校长"],
         entities=[{"name": "小张父亲", "type": "PERSON"}],
         top_k=3,
@@ -1555,7 +1636,7 @@ def test_memory_node_manager_reflect_reports_task_inactivity(db):
     assert metadata["task_status"] == "paused"
 
 
-def test_memory_search_observations_ignores_inactive_observations(db):
+def test_search_memory_observations_ignores_inactive_observations(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     active_node = _add_memory_node(
         db,
@@ -1592,7 +1673,7 @@ def test_memory_search_observations_ignores_inactive_observations(db):
         (inactive_observation,),
     )
 
-    results = db.memory_search_observations(["Alice", "alerts"], top_k=5)
+    results = db.search_memory_observations(["Alice", "alerts"], top_k=5)
 
     assert [item["id"] for item in results] == [active_observation]
 
@@ -1651,7 +1732,7 @@ def test_recall_formats_semantic_and_episodic_sections(db, monkeypatch):
         keywords=["Alice", "Slack"],
         fact_type="episodic",
     )
-    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
     mgr = _NoAsyncMemoryNodeManager(
         db,
         embedding_config={},
@@ -1666,6 +1747,71 @@ def test_recall_formats_semantic_and_episodic_sections(db, monkeypatch):
     assert "episodic memories" in context
     assert "Alice prefers Slack for urgent alerts." in context
     assert "Hermes recommended Slack alert routing for Alice." in context
+
+
+def test_recall_uses_query_analysis_search_text_for_embedding(db, monkeypatch):
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+        fact_type="semantic",
+    )
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
+    capture = _CapturingEmbeddingClient()
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "search_text": "Alice urgent Slack alert routing preference",
+                "keywords": ["Alice", "Slack", "alerts"],
+                "recall_intent": "action",
+                "intent_confidence": 0.91,
+                "layer_preference": {
+                    "interpretations": 0.6,
+                    "observations": 0.3,
+                    "facts": 0.1,
+                },
+            })
+        ],
+    )
+    mgr._embedding_client = capture
+
+    context = mgr.recall("What should I remember about Alice alerts?")
+
+    assert "Alice prefers Slack for urgent alerts." in context
+    assert capture.texts
+    assert "Alice urgent Slack alert routing preference" in capture.texts[0]
+    assert "keywords: Alice, Slack, alerts" in capture.texts[0]
+
+
+def test_recall_rerank_preserves_layer_order_after_selection():
+    ranked = MemoryNodeManager._rank_recall_candidates(
+        interpretations=[],
+        observations=[
+            {
+                "id": 1,
+                "summary": "Layer-local search ranked this observation first.",
+                "keywords": ["workflow"],
+                "confidence": 0.4,
+            },
+            {
+                "id": 2,
+                "summary": "Layer-local search ranked this observation second but it mentions calibration.",
+                "keywords": ["calibration"],
+                "confidence": 0.95,
+            },
+        ],
+        semantic_facts=[],
+        episodic_facts=[],
+        terms=["calibration"],
+        intent="balanced",
+        layer_limits={"interpretations": 0, "observations": 2, "facts": 0},
+    )
+
+    assert [item["id"] for item in ranked["observations"]] == [1, 2]
+    assert ranked["observations"][1]["_recall_score"] > ranked["observations"][0]["_recall_score"]
 
 
 def test_recall_formats_current_interpretations_before_evidence(db, monkeypatch):
@@ -1685,7 +1831,7 @@ def test_recall_formats_current_interpretations_before_evidence(db, monkeypatch)
         keywords=["heuristic", "task", "fact"],
         fact_type="semantic",
     )
-    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
     mgr = _NoAsyncMemoryNodeManager(
         db,
         embedding_config={},
@@ -1729,7 +1875,7 @@ def test_recall_expands_interpretation_to_evidence_observations(db, monkeypatch)
         confidence=0.8,
         evidence_observation_ids=[observation_id],
     )
-    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
     mgr = _NoAsyncMemoryNodeManager(
         db,
         embedding_config={},
@@ -1759,7 +1905,7 @@ def test_recall_formats_interpretation_direct_evidence_once(db, monkeypatch):
         confidence=0.82,
         evidence_node_ids=[evidence_id],
     )
-    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
     mgr = _NoAsyncMemoryNodeManager(
         db,
         embedding_config={},
@@ -2094,12 +2240,15 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
     assert interpretation["interpretation_type"] == "insight"
     assert interpretation["target_text"] == "urgent alert routing"
     assert interpretation["scope"] == "alert-workflow"
-    assert interpretation["confidence"] == pytest.approx(0.88)
+    assert interpretation["confidence"] == pytest.approx(0.75)
     assert "优先使用 Slack" in interpretation["claim"]
     assert "优先建议 Slack" in interpretation["action_implication"]
     assert json.loads(interpretation["evidence_node_ids"]) == node_ids[:2]
     assert json.loads(interpretation["evidence_observation_ids"]) == [observation_id]
-    assert json.loads(interpretation["metadata"])["source"] == "interpretation_generation"
+    metadata = json.loads(interpretation["metadata"])
+    assert metadata["source"] == "interpretation_generation"
+    assert metadata["evidence_shape"] == "single_observation"
+    assert metadata["stability"] == "tentative"
     assert any("interpretation 生成模块" in prompt for prompt in mgr.llm_prompts)
 
 
@@ -2442,8 +2591,72 @@ def test_interpretation_generation_defers_weak_single_observation(db):
         ).fetchone()["metadata"]
     )
     assert metadata["interpretation_status"] == "deferred"
-    assert metadata["interpretation_reason"] == "trigger_threshold_not_met"
+    assert metadata["interpretation_reason"] == "single_fact_insight_signal"
     assert metadata["interpretation_basis_hash"]
+
+
+def test_interpretation_generation_defers_single_fact_insight_before_llm(db):
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
+    source = _add_memory_node(
+        db,
+        time_key="2026-05-06 10:00:00",
+        summary="Hermes memory system changed one recall label.",
+        keywords=["memory", "recall"],
+        fact_kind="context",
+    )
+    db.entity_link_node(source, hermes)
+    observation_id = db.memory_upsert_observation(
+        entity_id=hermes,
+        topic_key="memory-recall",
+        topic_label="memory recall",
+        observation_type="observation",
+        summary="Hermes memory system changed one recall label.",
+        keywords=["memory", "recall"],
+        source_node_ids=[source],
+        metadata={
+            "observation_kind": "state_change",
+            "evidence_shape": "progression",
+            "temporal_scope": "recent",
+            "candidate_interpretation_types": ["insight"],
+        },
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "should_create": True,
+                "claim": "Hermes recall labels are now a stable design signal.",
+                "target_text": "memory recall labels",
+                "scope": "memory-recall",
+                "interpretation_type": "insight",
+                "polarity": "neutral",
+                "strength": 0.8,
+                "confidence": 0.88,
+                "status": "current",
+                "conflict_status": "none",
+                "action_implication": "Use recall label changes as a stable design signal.",
+                "evidence_node_ids": [source],
+                "evidence_observation_ids": [observation_id],
+                "counter_evidence_node_ids": [],
+                "counter_evidence_observation_ids": [],
+            })
+        ],
+    )
+
+    generated = mgr._generate_interpretations_using_observations([observation_id])
+
+    assert generated == 0
+    assert mgr.llm_prompts == []
+    assert db._conn.execute("SELECT COUNT(*) AS count FROM memory_interpretations").fetchone()["count"] == 0
+    metadata = json.loads(
+        db._conn.execute(
+            "SELECT metadata FROM memory_observations WHERE id = ?",
+            (observation_id,),
+        ).fetchone()["metadata"]
+    )
+    assert metadata["interpretation_status"] == "deferred"
+    assert metadata["interpretation_reason"] == "single_fact_insight_signal"
 
 
 def test_interpretation_generation_does_not_use_global_batch_threshold_for_weak_singletons(db):
@@ -2488,7 +2701,7 @@ def test_interpretation_generation_does_not_use_global_batch_threshold_for_weak_
     for row in rows:
         metadata = json.loads(row["metadata"])
         assert metadata["interpretation_status"] == "deferred"
-        assert metadata["interpretation_reason"] == "trigger_threshold_not_met"
+        assert metadata["interpretation_reason"] == "single_fact_insight_signal"
 
 
 def test_interpretation_generation_skips_final_observation_when_basis_unchanged(db):
@@ -3211,6 +3424,9 @@ def test_interpretation_generation_prompt_defines_interpretation_contract():
     assert "三层记忆架构" in INTERPRETATION_GENERATION_PROMPT
     assert "current best interpretation" in INTERPRETATION_GENERATION_PROMPT
     assert "不是用户原话" in INTERPRETATION_GENERATION_PROMPT
+    assert "单条 observation 的证据门槛" in INTERPRETATION_GENERATION_PROMPT
+    assert "evidence_shape=single_event，通常 should_create=false" in INTERPRETATION_GENERATION_PROMPT
+    assert "confidence 不要超过 0.75" in INTERPRETATION_GENERATION_PROMPT
     assert "should_create=false" in INTERPRETATION_GENERATION_PROMPT
     assert "action_implication" in INTERPRETATION_GENERATION_PROMPT
     assert "evidence_node_ids" in INTERPRETATION_GENERATION_PROMPT
@@ -3304,7 +3520,7 @@ def test_recall_includes_observations_and_supporting_facts(db, monkeypatch):
         keywords=["Slack", "alerts"],
         source_node_ids=source_ids,
     )
-    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
     mgr = _NoAsyncMemoryNodeManager(
         db,
         embedding_config={},
@@ -3359,7 +3575,7 @@ def test_memory_relation_candidates_use_entity_keyword_and_temporal_signals(db, 
     alice_id = db.entity_add_entity("Alice", "PERSON")
     db.entity_link_node(preference, alice_id)
     db.entity_link_node(current, alice_id)
-    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
 
     nodes, ids = db.memory_relation_candidates(
         node_id=current,
@@ -3401,7 +3617,7 @@ def test_memory_relation_candidates_stay_within_same_fact_type(db, monkeypatch):
     alice_id = db.entity_add_entity("Alice", "PERSON")
     for node_id in (world_prior, experience_prior, current_world):
         db.entity_link_node(node_id, alice_id)
-    monkeypatch.setattr(db, "_memory_search_vector", lambda *args, **kwargs: {})
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
 
     _nodes, ids = db.memory_relation_candidates(
         node_id=current_world,

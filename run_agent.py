@@ -2075,7 +2075,7 @@ class AIAgent:
             working_dir=os.getenv("TERMINAL_CWD") or None,
         )
         self._user_turn_count = 0
-        self._memory_node_reflect_interval = 5
+        self._memory_node_reflect_interval = 15
 
         # Cumulative token usage for the session
         self.session_prompt_tokens = 0
@@ -2195,7 +2195,7 @@ class AIAgent:
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
-        self._memory_node_reflect_interval = getattr(self, "_memory_node_reflect_interval", 5)
+        self._memory_node_reflect_interval = getattr(self, "_memory_node_reflect_interval", 15)
 
         # Context engine reset (works for both built-in compressor and plugins)
         if hasattr(self, "context_compressor") and self.context_compressor:

@@ -2641,7 +2641,7 @@ class SessionDB:
             return "", []
         return " AND " + " AND ".join(clauses), params
 
-    def _memory_search_keyword(
+    def _search_memory_keyword(
         self,
         keyword: str,
         limit: int = 20,
@@ -2773,7 +2773,7 @@ class SessionDB:
         )
         return {row[0]: row[1] for row in cursor.fetchall()}
 
-    def _memory_search_vector(
+    def _search_memory_vector(
         self,
         query_embedding: np.ndarray,
         top_k: int = 20,
@@ -2857,7 +2857,7 @@ class SessionDB:
         top_k = int(self._memory_faiss_index.ntotal)
         if top_k <= 0:
             return {}
-        scores = self._memory_search_vector(query_embedding, top_k=top_k)
+        scores = self._search_memory_vector(query_embedding, top_k=top_k)
         out: Dict[int, float] = {}
         for node_id, score in scores.items():
             if exclude_node_id is not None and node_id == exclude_node_id:
@@ -3398,7 +3398,7 @@ class SessionDB:
 
         keyword_query = " OR ".join(keywords or current.get("keywords", []))
         keyword_scores = (
-            self._memory_search_keyword(keyword_query, limit=search_limit, allowed_ids=allowed_ids)
+            self._search_memory_keyword(keyword_query, limit=search_limit, allowed_ids=allowed_ids)
             if keyword_query else {}
         )
         keyword_ranking = self._memory_filter_ranked_ids(
@@ -3406,7 +3406,7 @@ class SessionDB:
             allowed_ids=allowed_ids,
         )
 
-        semantic_scores = self._memory_search_vector(
+        semantic_scores = self._search_memory_vector(
             query_embedding,
             top_k=search_limit,
             allowed_ids=allowed_ids,
@@ -3462,7 +3462,7 @@ class SessionDB:
             node_ids.append(candidate_id)
         return nodes, node_ids
 
-    def memory_search_facts(
+    def search_memory_facts(
         self, keyword: str, query_embedding: np.ndarray, top_k: int = None,
         budget: str = "mid",
         time_start: Optional[str] = None,
@@ -3470,13 +3470,14 @@ class SessionDB:
         tags: Optional[List[str]] = None,
         tags_match: str = "any",
         fact_types: Optional[List[str]] = None,
+        include_graph: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Hybrid search: keyword + vector + temporal + graph retrieval with RRF.
+        """Search raw fact memories with keyword, vector, and temporal signals.
 
         *keyword* is passed to FTS5 MATCH (use ``" OR "``-joined terms).
         *query_embedding* is a (1, EMBEDDING_DIM) float32 numpy array.
         *top_k* overrides ``MEMORY_QUERY_TOP_K`` (default).
-        *budget* controls entity graph traversal depth: low=0, mid=1, high=3.
+        *budget* controls graph traversal depth only when ``include_graph`` is true.
         *time_start*, *time_end*: optional ISO timestamp strings (``"2026-04-20 10:00:00"``).
             When specified, time range is the PRIMARY filter — all nodes in range
             are candidates, and the pool is padded with newest nodes if semantic
@@ -3484,6 +3485,9 @@ class SessionDB:
         *tags*: optional list of tags to filter by (matches against JSON array in ``tags`` column).
         *tags_match*: ``"any"`` (default, node has at least one) or ``"all"`` (node has all).
         *fact_types*: optional list of normalized fact buckets (``semantic``/``episodic``).
+        *include_graph*: when true, expand from direct matches through memory-node
+            relations. Defaults to false so fact recall stays evidence-focused in
+            the fact/observation/interpretation memory architecture.
         """
         if top_k is None:
             top_k = self.MEMORY_QUERY_TOP_K
@@ -3508,7 +3512,7 @@ class SessionDB:
                 "SELECT id FROM memory_nodes WHERE {} ORDER BY time_key DESC".format(_time_sql),
                 _time_params,
             )
-            _temporal_ranking = [r[0] for r in _tc.fetchall()]
+            _temporal_ranking = [r[0] for r in _tc.fetchall()] # latest nodes will have larger weight
             _time_ids = set(_temporal_ranking)
             if not _time_ids:
                 return []  # No nodes in the requested time range
@@ -3569,7 +3573,7 @@ class SessionDB:
             # allowed_ids because FAISS has no native time predicate.
             keyword_allowed_ids = None
         fts_results = (
-            self._memory_search_keyword(
+            self._search_memory_keyword(
                 keyword_query,
                 limit=search_limit,
                 allowed_ids=keyword_allowed_ids,
@@ -3578,7 +3582,7 @@ class SessionDB:
             )
             if keyword_query else {}
         )
-        vec_results = self._memory_search_vector(
+        vec_results = self._search_memory_vector(
             query_embedding,
             top_k=search_limit,
             allowed_ids=allowed_ids,
@@ -3602,13 +3606,15 @@ class SessionDB:
             allowed_ids=allowed_ids,
         )
 
-        _graph_depth = {"low": 0, "mid": 1, "high": 3}.get(budget, 1)
-        graph_ranking = self._memory_graph_expand_ranked(
-            seed_ids,
-            depth=_graph_depth,
-            allowed_ids=allowed_ids,
-            limit=search_limit,
-        )
+        graph_ranking: List[int] = []
+        if include_graph:
+            _graph_depth = {"low": 0, "mid": 1, "high": 3}.get(budget, 1)
+            graph_ranking = self._memory_graph_expand_ranked(
+                seed_ids,
+                depth=_graph_depth,
+                allowed_ids=allowed_ids,
+                limit=search_limit,
+            )
 
         # ── Step 3: Reciprocal Rank Fusion ──
         rankings: List[Tuple[List[int], float]] = []
@@ -3619,7 +3625,7 @@ class SessionDB:
         if temporal_ranking:
             rankings.append((temporal_ranking, 0.9))
         if graph_ranking:
-            rankings.append((graph_ranking, 0.7))
+            rankings.append((graph_ranking, 0.45))
 
         rrf_scores, first_seen = self._memory_rrf_scores(rankings) if rankings else ({}, {})
         ranked_ids = sorted(
@@ -3650,6 +3656,20 @@ class SessionDB:
         for node_id in ranked_ids[:top_k]:
             node = self._memory_get_node(node_id)
             if node:
+                node["embedding_similarity"] = float(vec_results.get(node_id, 0.0) or 0.0)
+                node["keyword_score"] = (
+                    None if node_id not in fts_results else float(fts_results[node_id])
+                )
+                node["temporal_rank"] = (
+                    temporal_ranking.index(node_id) + 1
+                    if node_id in temporal_ranking else None
+                )
+                node["retrieval_score"] = float(rrf_scores.get(node_id, 0.0) or 0.0)
+                if graph_ranking:
+                    node["graph_rank"] = (
+                        graph_ranking.index(node_id) + 1
+                        if node_id in graph_ranking else None
+                    )
                 nodes.append(node)
         return nodes
 
@@ -4566,7 +4586,7 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-    def memory_search_interpretations(
+    def search_memory_interpretations(
         self,
         keyword: Any,
         *,
@@ -5081,7 +5101,7 @@ class SessionDB:
         )
         return (observation["id"] if observation else None), len(pending)
 
-    def memory_search_observations(
+    def search_memory_observations(
         self,
         keyword: Any,
         *,
