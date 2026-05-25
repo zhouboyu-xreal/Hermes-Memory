@@ -141,7 +141,10 @@ SUMMARY_SYSTEM_PROMPT = """你是一个对话摘要助手。请总结以下对�
 """ + ENTITY_EXTRACTION_GUIDANCE + """
 
 输出格式：
-{{"summary": "对话的核心内容概括", "keywords": ["关键词1", "关键词2"], "entities": [{{"name": "实体名", "type": "CONCEPT"}}]}}
+{{
+    "summary": "对话的核心内容概括", 
+    "keywords": ["关键词1", "关键词2"], 
+    "entities": [{{"name": "实体名", "type": "CONCEPT"}}]}}
 
 对话内容：
 用户：{user_message}
@@ -545,9 +548,6 @@ topic: {topic_label}
     "source_note": "可选，简短说明该 observation 的证据性质"
   }}
 }}"""
-
-# Backward-compatible name for callers/tests that still import the old constant.
-OBSERVATION_MERGE_PROMPT = OBSERVATION_UPDATE_PROMPT
 
 INTERPRETATION_GENERATION_PROMPT = """你是长期记忆 interpretation 生成模块。
 
