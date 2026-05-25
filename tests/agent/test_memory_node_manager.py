@@ -47,6 +47,78 @@ class _CapturingEmbeddingClient:
         return np.ones((1, 1536), dtype=np.float32)
 
 
+class _RejectingChatCompletions:
+    def __init__(self, content):
+        self.content = content
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if "temperature" in kwargs:
+            raise RuntimeError("Unsupported parameter: temperature")
+        if "max_tokens" in kwargs:
+            raise RuntimeError("Unsupported parameter: max_tokens")
+
+        class _Message:
+            pass
+
+        class _Choice:
+            pass
+
+        class _Response:
+            pass
+
+        message = _Message()
+        message.content = self.content
+        choice = _Choice()
+        choice.message = message
+        response = _Response()
+        response.choices = [choice]
+        return response
+
+
+class _RejectingLLMClient:
+    def __init__(self, content):
+        self.completions = _RejectingChatCompletions(content)
+
+        class _Chat:
+            pass
+
+        self.chat = _Chat()
+        self.chat.completions = self.completions
+
+
+class _ResponsesOnlyClient:
+    def __init__(self, content):
+        self.calls = []
+        self.content = content
+
+        class _ChatCompletions:
+            def create(_self, **_kwargs):
+                raise RuntimeError("unsupported_api_for_model: use Responses API")
+
+        class _Chat:
+            pass
+
+        class _Responses:
+            pass
+
+        self.chat = _Chat()
+        self.chat.completions = _ChatCompletions()
+        self.responses = _Responses()
+        self.responses.create = self._create_response
+
+    def _create_response(self, **kwargs):
+        self.calls.append(kwargs)
+
+        class _Response:
+            pass
+
+        response = _Response()
+        response.output_text = self.content
+        return response
+
+
 class _KeywordEmbeddingClient:
     def embed_text(self, text):
         lowered = str(text or "").lower()
@@ -1085,6 +1157,57 @@ def test_analyze_recall_query_accepts_legacy_summary_shape(db):
     assert analysis["fact_type_preference"] == "both"
 
 
+def test_analyze_recall_query_retries_when_model_rejects_chat_params(db):
+    payload = json.dumps({
+        "search_text": "Alice Slack alert preference",
+        "keywords": ["Alice", "Slack"],
+        "recall_intent": "state",
+        "intent_confidence": 0.8,
+    })
+    client = _RejectingLLMClient(payload)
+    mgr = MemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_client=client,
+        llm_model="gpt-5-test",
+        llm_base_url="https://api.openai.com/v1",
+    )
+
+    analysis = mgr._analyze_recall_query("Alice Slack alerts")
+
+    assert analysis["search_text"] == "Alice Slack alert preference"
+    assert analysis["keywords"] == ["Alice", "Slack"]
+    assert len(client.completions.calls) == 2
+    assert "temperature" in client.completions.calls[0]
+    assert "temperature" not in client.completions.calls[1]
+    assert "max_completion_tokens" in client.completions.calls[1]
+
+
+def test_analyze_recall_query_uses_responses_api_for_gpt5_models(db):
+    payload = json.dumps({
+        "search_text": "Alice Slack alert preference",
+        "keywords": ["Alice", "Slack"],
+        "recall_intent": "state",
+        "intent_confidence": 0.8,
+    })
+    client = _ResponsesOnlyClient(payload)
+    mgr = MemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_client=client,
+        llm_model="gpt-5.4",
+        llm_base_url="https://api.openai.com/v1",
+    )
+
+    analysis = mgr._analyze_recall_query("Alice Slack alerts")
+
+    assert analysis["search_text"] == "Alice Slack alert preference"
+    assert analysis["keywords"] == ["Alice", "Slack"]
+    assert len(client.calls) == 1
+    assert client.calls[0]["model"] == "gpt-5.4"
+    assert "max_output_tokens" in client.calls[0]
+
+
 def test_resolve_recall_intent_prefers_confident_llm_but_keeps_evidence_override():
     assert MemoryNodeManager._resolve_recall_intent(
         "我之后应该怎么处理 Slack 告警？",
@@ -1815,6 +1938,48 @@ def test_recall_uses_query_analysis_search_text_for_embedding(db, monkeypatch):
     assert capture.texts
     assert "Alice urgent Slack alert routing preference" in capture.texts[0]
     assert "keywords: Alice, Slack, alerts" in capture.texts[0]
+
+
+def test_recall_emits_structured_stage_logs(db, monkeypatch, caplog):
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+        fact_type="semantic",
+    )
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "search_text": "Alice Slack alerts preference",
+                "keywords": ["Alice", "Slack"],
+                "recall_intent": "state",
+                "intent_confidence": 0.8,
+            })
+        ],
+    )
+
+    with caplog.at_level(logging.INFO, logger="agent.memory_node_manager"):
+        context = mgr.recall("Alice Slack alerts")
+
+    assert "Alice prefers Slack for urgent alerts." in context
+    records = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "agent.memory_node_manager"
+        and '"scope": "memory_recall"' in record.getMessage()
+    ]
+    events = [record["event"] for record in records]
+    assert events[:3] == ["start", "query_prepared", "query_analyzed"]
+    assert "candidates_found" in events
+    assert "ranked" in events
+    assert events[-1] == "finish"
+    finish = records[-1]
+    assert finish["payload"]["status"] == "ok"
+    assert finish["payload"]["counts"]["semantic_facts"] == 1
 
 
 def test_recall_rerank_preserves_layer_order_after_selection():

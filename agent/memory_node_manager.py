@@ -37,8 +37,10 @@ import json
 import logging
 import re
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import numpy as np
 import requests
@@ -741,6 +743,96 @@ MEMORY_CONTEXT_BLOCK = """<memory-context>
 </memory-context>"""
 
 
+def _llm_base_host(base_url: str) -> str:
+    try:
+        parsed = urlparse(str(base_url or ""))
+    except Exception:
+        return ""
+    return (parsed.hostname or "").lower()
+
+
+def _llm_prefers_max_completion_tokens(base_url: str) -> bool:
+    host = _llm_base_host(base_url)
+    return host == "api.openai.com" or host.endswith(".openai.azure.com")
+
+
+def _llm_model_requires_responses_api(model: str) -> bool:
+    text = str(model or "").strip().lower()
+    if "/" in text:
+        text = text.rsplit("/", 1)[-1]
+    return text.startswith("gpt-5")
+
+
+def _llm_error_text(exc: Exception) -> str:
+    return str(exc or "").lower()
+
+
+def _llm_temperature_rejected(exc: Exception) -> bool:
+    text = _llm_error_text(exc)
+    return "temperature" in text and (
+        "unsupported" in text
+        or "not support" in text
+        or "invalid" in text
+        or "only the default" in text
+    )
+
+
+def _llm_max_tokens_rejected(exc: Exception) -> bool:
+    text = _llm_error_text(exc)
+    return (
+        "max_tokens" in text
+        or "max_completion_tokens" in text
+        or "unsupported_parameter" in text
+    )
+
+
+def _llm_unsupported_chat_api(exc: Exception) -> bool:
+    text = _llm_error_text(exc)
+    return "unsupported_api_for_model" in text or "responses api" in text
+
+
+def _response_output_text(response: Any) -> str:
+    output_text = getattr(response, "output_text", None)
+    if output_text:
+        return str(output_text)
+
+    parts: List[str] = []
+    output = getattr(response, "output", None)
+    if output is None and isinstance(response, dict):
+        output = response.get("output")
+    for item in output or []:
+        content = getattr(item, "content", None)
+        if content is None and isinstance(item, dict):
+            content = item.get("content")
+        for block in content or []:
+            text = getattr(block, "text", None)
+            if text is None and isinstance(block, dict):
+                text = block.get("text")
+            if text:
+                parts.append(str(text))
+    return "\n".join(parts)
+
+
+def _call_llm_responses_api(prompt: str, model: str, base_url: str, api_key: str,
+                            timeout: int = 120) -> Optional[str]:
+    url = f"{base_url.rstrip('/')}/responses"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {
+        "model": model,
+        "input": prompt,
+        "max_output_tokens": 2048,
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        return _response_output_text(resp.json()) or None
+    except requests.exceptions.RequestException as e:
+        logger.debug("Responses API LLM call failed: %s", e)
+        return None
+
+
 def _call_llm_api(prompt: str, model: str, base_url: str, api_key: str,
                   timeout: int = 120) -> Optional[str]:
     """Call an OpenAI-compatible chat completions API with a single user message.
@@ -752,6 +844,17 @@ def _call_llm_api(prompt: str, model: str, base_url: str, api_key: str,
     embedded directly in the prompt text).  Returns the response text, or
     ``None`` on failure.
     """
+    if _llm_model_requires_responses_api(model):
+        response_text = _call_llm_responses_api(
+            prompt,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+        )
+        if response_text:
+            return response_text
+
     url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -762,20 +865,47 @@ def _call_llm_api(prompt: str, model: str, base_url: str, api_key: str,
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 2048,
         "stream": False,
     }
-    try:
-        resp = requests.post(url, json=data, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        result = resp.json()
-        choices = result.get("choices", [])
-        if choices:
-            return choices[0].get("message", {}).get("content", "")
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.debug("LLM API call failed: %s", e)
-        return None
+    data.update(
+        {"max_completion_tokens": 2048}
+        if _llm_prefers_max_completion_tokens(base_url)
+        else {"max_tokens": 2048}
+    )
+
+    attempts = [data]
+    temperature_stripped = dict(data)
+    temperature_stripped.pop("temperature", None)
+    attempts.append(temperature_stripped)
+    token_swapped = dict(temperature_stripped)
+    if "max_tokens" in token_swapped:
+        token_swapped["max_completion_tokens"] = token_swapped.pop("max_tokens")
+    elif "max_completion_tokens" in token_swapped:
+        token_swapped["max_tokens"] = token_swapped.pop("max_completion_tokens")
+    attempts.append(token_swapped)
+
+    seen_payloads = set()
+    last_error: Optional[Exception] = None
+    for payload in attempts:
+        marker = json.dumps(sorted(payload.keys()), ensure_ascii=False)
+        if marker in seen_payloads:
+            continue
+        seen_payloads.add(marker)
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            result = resp.json()
+            choices = result.get("choices", [])
+            if choices:
+                return choices[0].get("message", {}).get("content", "")
+            return None
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if not (_llm_temperature_rejected(e) or _llm_max_tokens_rejected(e)):
+                break
+    if last_error is not None:
+        logger.debug("LLM API call failed: %s", last_error)
+    return None
 
 
 class MemoryNodeManager:
@@ -953,18 +1083,83 @@ class MemoryNodeManager:
         ``requests.post`` to an OpenAI-compatible ``/v1/chat/completions``).
         """
         if self._llm_client is not None:
-            try:
-                resp = self._llm_client.chat.completions.create(
-                    model=self._llm_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3,
-                    max_tokens=2048,
-                    timeout=self._llm_timeout,
-                )
-                return getattr(resp.choices[0].message, "content", "") or ""
-            except Exception as e:
-                logger.debug("Shared LLM client call failed: %s", e)
-                return None
+            if _llm_model_requires_responses_api(self._llm_model):
+                responses = getattr(self._llm_client, "responses", None)
+                create = getattr(responses, "create", None)
+                if create is not None:
+                    try:
+                        resp = create(
+                            model=self._llm_model,
+                            input=prompt,
+                            max_output_tokens=2048,
+                            timeout=self._llm_timeout,
+                        )
+                        text = _response_output_text(resp)
+                        if text:
+                            return text
+                    except Exception as e:
+                        logger.debug("Shared Responses API LLM call failed: %s", e)
+
+            base_kwargs = {
+                "model": self._llm_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "timeout": self._llm_timeout,
+            }
+            base_kwargs.update(
+                {"max_completion_tokens": 2048}
+                if _llm_prefers_max_completion_tokens(self._llm_base_url)
+                else {"max_tokens": 2048}
+            )
+            attempts = [base_kwargs]
+            temperature_stripped = dict(base_kwargs)
+            temperature_stripped.pop("temperature", None)
+            attempts.append(temperature_stripped)
+            token_swapped = dict(temperature_stripped)
+            if "max_tokens" in token_swapped:
+                token_swapped["max_completion_tokens"] = token_swapped.pop("max_tokens")
+            elif "max_completion_tokens" in token_swapped:
+                token_swapped["max_tokens"] = token_swapped.pop("max_completion_tokens")
+            attempts.append(token_swapped)
+
+            seen_payloads = set()
+            last_error: Optional[Exception] = None
+            for kwargs in attempts:
+                marker = json.dumps(sorted(kwargs.keys()), ensure_ascii=False)
+                if marker in seen_payloads:
+                    continue
+                seen_payloads.add(marker)
+                try:
+                    resp = self._llm_client.chat.completions.create(**kwargs)
+                    return getattr(resp.choices[0].message, "content", "") or ""
+                except Exception as e:
+                    last_error = e
+                    if _llm_unsupported_chat_api(e):
+                        responses = getattr(self._llm_client, "responses", None)
+                        create = getattr(responses, "create", None)
+                        if create is not None:
+                            try:
+                                resp = create(
+                                    model=self._llm_model,
+                                    input=prompt,
+                                    max_output_tokens=2048,
+                                    timeout=self._llm_timeout,
+                                )
+                                text = _response_output_text(resp)
+                                if text:
+                                    return text
+                            except Exception as responses_error:
+                                logger.debug(
+                                    "Shared Responses API retry failed: %s",
+                                    responses_error,
+                                )
+                        break
+                    if _llm_temperature_rejected(e) or _llm_max_tokens_rejected(e):
+                        logger.debug("Shared LLM client rejected params, retrying: %s", e)
+                        continue
+                    break
+            logger.debug("Shared LLM client call failed: %s", last_error)
+            return None
         return _call_llm_api(
             prompt,
             model=self._llm_model,
@@ -1780,7 +1975,7 @@ class MemoryNodeManager:
                 "event": event,
                 "payload": str(payload),
             }, ensure_ascii=False, sort_keys=True, indent=2)
-        logger.info("\n%s", body)
+        logger.error("\n%s", body)
 
     @classmethod
     def _normalize_task_steps(cls, value: Any, *, limit: int = 12) -> List[Dict[str, Any]]:
@@ -5387,6 +5582,35 @@ class MemoryNodeManager:
         return text or str(query or "")
 
     @staticmethod
+    def _recall_log_item_ids(items: List[Dict[str, Any]], *, limit: int = 20) -> List[Any]:
+        ids: List[Any] = []
+        for item in items or []:
+            item_id = item.get("id")
+            if item_id is None:
+                continue
+            ids.append(item_id)
+            if len(ids) >= limit:
+                break
+        return ids
+
+    @staticmethod
+    def _recall_log_entities(entities: List[Any], *, limit: int = 12) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for entity in entities or []:
+            if isinstance(entity, dict):
+                text = str(entity.get("name") or "").strip()
+            else:
+                text = str(entity or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(text)
+            if len(out) >= limit:
+                break
+        return out
+
+    @staticmethod
     def _merge_recall_items(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Merge recall records by id while preserving first-seen order."""
         merged: List[Dict[str, Any]] = []
@@ -5637,30 +5861,59 @@ class MemoryNodeManager:
             return ""
 
         if not self._ensure_embedding_client():
+            self._log_info("memory_recall", "skip", {
+                "reason": "embedding_client_unavailable",
+                "query": self._reflect_log_text(query, limit=300),
+            })
             return ""
 
+        started_at = time.monotonic()
         try:
             k = top_k or self._top_k
             b = budget or self._recall_budget
+            self._log_info("memory_recall", "start", {
+                "query": self._reflect_log_text(query, limit=300),
+                "top_k": k,
+                "budget": b,
+                "tags": tags or [],
+                "time_start": time_start,
+                "time_end": time_end,
+            })
 
             # Detect and extract time expressions from the query
             _parsed_time_start, _parsed_time_end, clean_query = self._parse_time_expression(query)
             ts = time_start or _parsed_time_start
             te = time_end or _parsed_time_end
             search_query = clean_query or query
+            self._log_info("memory_recall", "query_prepared", {
+                "search_query": self._reflect_log_text(search_query, limit=300),
+                "clean_query": self._reflect_log_text(clean_query, limit=300),
+                "parsed_time_start": _parsed_time_start,
+                "parsed_time_end": _parsed_time_end,
+                "effective_time_start": ts,
+                "effective_time_end": te,
+            })
 
             # Analyze the query once for embedding text, keywords, entities, and recall intent.
             query_analysis = self._analyze_recall_query(search_query)
-
             if not query_analysis:
-                logger.debug("Skipping recall — query analysis returned no data")
+                self._log_info("memory_recall", "skip", {
+                    "reason": "query_analysis_empty",
+                    "query": self._reflect_log_text(search_query, limit=300),
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+                })
                 return ""
 
             # Generate embedding from a retrieval-oriented query expression.
             query_embedding_text = self._recall_embedding_text(search_query, query_analysis)
             query_embedding = self._embedding_client.embed_text(query_embedding_text)
             if query_embedding is None:
-                logger.debug("Query embedding is None")
+                self._log_info("memory_recall", "skip", {
+                    "reason": "query_embedding_empty",
+                    "query": self._reflect_log_text(search_query, limit=300),
+                    "embedding_text": self._reflect_log_text(query_embedding_text, limit=300),
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+                })
                 return ""
 
             keywords = query_analysis["keywords"]
@@ -5680,6 +5933,21 @@ class MemoryNodeManager:
                 layer: max(limit * 3, limit + 4)
                 for layer, limit in layer_limits.items()
             }
+            self._log_info("memory_recall", "query_analyzed", {
+                "search_text": self._reflect_log_text(query_analysis.get("search_text"), limit=300),
+                "keywords": keywords,
+                "entities": self._recall_log_entities(entities),
+                "llm_recall_intent": query_analysis.get("recall_intent"),
+                "intent_confidence": query_analysis.get("intent_confidence"),
+                "resolved_intent": recall_intent,
+                "layer_preference": query_analysis.get("layer_preference", {}),
+                "fact_type_preference": query_analysis.get("fact_type_preference", "both"),
+                "time_sensitivity": query_analysis.get("time_sensitivity"),
+                "needs_evidence": query_analysis.get("needs_evidence"),
+                "layer_limits": layer_limits,
+                "candidate_limits": candidate_limits,
+                "embedding_text": self._reflect_log_text(query_embedding_text, limit=300),
+            })
             interpretation_candidates = self._db.search_memory_interpretations(
                 keywords,
                 entities=entities,
@@ -5719,6 +5987,26 @@ class MemoryNodeManager:
                 tags=tags,
                 fact_types=["episodic"],
             )
+            self._log_info("memory_recall", "candidates_found", {
+                "interpretations": {
+                    "count": len(interpretation_candidates),
+                    "ids": self._recall_log_item_ids(interpretation_candidates),
+                },
+                "observations": {
+                    "count": len(observation_candidates),
+                    "ids": self._recall_log_item_ids(observation_candidates),
+                },
+                "semantic_facts": {
+                    "count": len(semantic_candidates),
+                    "ids": self._recall_log_item_ids(semantic_candidates),
+                    "top_k": semantic_candidate_limit,
+                },
+                "episodic_facts": {
+                    "count": len(episodic_candidates),
+                    "ids": self._recall_log_item_ids(episodic_candidates),
+                    "top_k": episodic_candidate_limit,
+                },
+            })
 
             ranked_recall = self._rank_recall_candidates(
                 interpretations=interpretation_candidates,
@@ -5733,6 +6021,24 @@ class MemoryNodeManager:
             observation_nodes = ranked_recall["observations"]
             semantic_nodes = ranked_recall["semantic_facts"]
             episodic_nodes = ranked_recall["episodic_facts"]
+            self._log_info("memory_recall", "ranked", {
+                "interpretations": {
+                    "count": len(interpretation_nodes),
+                    "ids": self._recall_log_item_ids(interpretation_nodes),
+                },
+                "observations": {
+                    "count": len(observation_nodes),
+                    "ids": self._recall_log_item_ids(observation_nodes),
+                },
+                "semantic_facts": {
+                    "count": len(semantic_nodes),
+                    "ids": self._recall_log_item_ids(semantic_nodes),
+                },
+                "episodic_facts": {
+                    "count": len(episodic_nodes),
+                    "ids": self._recall_log_item_ids(episodic_nodes),
+                },
+            })
 
             observation_ids_from_interpretation: List[int] = []
             fact_ids_from_interpretation: List[int] = []
@@ -5770,9 +6076,28 @@ class MemoryNodeManager:
             fact_ids_from_observation.update(node["id"] for node in fact_nodes_from_interpretation)
             semantic_nodes = [node for node in semantic_nodes if node.get("id") not in fact_ids_from_observation]
             episodic_nodes = [node for node in episodic_nodes if node.get("id") not in fact_ids_from_observation]
+            self._log_info("memory_recall", "evidence_expanded", {
+                "observation_ids_from_interpretations": observation_ids_from_interpretation,
+                "fact_ids_from_interpretations": fact_ids_from_interpretation,
+                "observations_from_interpretations": {
+                    "count": len(observation_nodes_from_interpretation),
+                    "ids": self._recall_log_item_ids(observation_nodes_from_interpretation),
+                },
+                "supporting_facts_from_observations": {
+                    "observation_count": len(fact_nodes_from_observation),
+                    "fact_count": sum(len(nodes) for nodes in fact_nodes_from_observation.values()),
+                },
+                "direct_facts_removed_as_support": len(fact_ids_from_observation),
+                "remaining_semantic_facts": len(semantic_nodes),
+                "remaining_episodic_facts": len(episodic_nodes),
+            })
 
             if not interpretation_nodes and not observation_nodes and not semantic_nodes and not episodic_nodes:
-                logger.debug("No relevant memory nodes found for query")
+                self._log_info("memory_recall", "finish", {
+                    "status": "empty",
+                    "reason": "no_relevant_nodes",
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+                })
                 return ""
 
             # Format results as raw text (no <memory-context> wrapper)
@@ -5825,10 +6150,27 @@ class MemoryNodeManager:
                     lines.append(self._format_recall_node(i, node))
 
             memory_text = "\n".join(lines)
-            return memory_text.strip()
+            memory_text = memory_text.strip()
+            self._log_info("memory_recall", "finish", {
+                "status": "ok",
+                "counts": {
+                    "interpretations": len(interpretation_nodes),
+                    "observations": len(observation_nodes),
+                    "support_facts": len(support_lines),
+                    "semantic_facts": len(semantic_nodes),
+                    "episodic_facts": len(episodic_nodes),
+                },
+                "output_chars": len(memory_text),
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+            })
+            return memory_text
 
         except Exception as e:
-            logger.debug("Memory recall failed (non-fatal): %s", e)
+            self._log_info("memory_recall", "error", {
+                "error": str(e),
+                "query": self._reflect_log_text(query, limit=300),
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+            })
             return ""
 
     @staticmethod
