@@ -27,7 +27,7 @@ Usage::
     mgr = MemoryNodeManager(session_db, embedding_config=None)
     mgr.store_turn("用户问了什么", "助手回答了什么")
     context = mgr.recall("用户当前问题")
-    reflection = mgr.reflect("总结用户偏好")
+    reflection = mgr.reflect()
 """
 
 from __future__ import annotations
