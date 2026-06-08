@@ -538,13 +538,13 @@ def cmd_setup(args) -> None:
     _write_config(cfg)
     print(f"\n  Config written to {write_path}")
 
-    # --- Auto-enable Honcho as memory provider in config.yaml ---
+    # --- Auto-enable Honcho as memory provider in memory.yaml ---
     try:
         from hermes_cli.config import load_config, save_config
         hermes_config = load_config()
         hermes_config.setdefault("memory", {})["provider"] = "honcho"
         save_config(hermes_config)
-        print("  Memory provider set to 'honcho' in config.yaml")
+        print("  Memory provider set to 'honcho' in memory.yaml")
     except Exception as e:
         print(f"  Could not auto-enable in config.yaml: {e}")
         print("  Run: hermes config set memory.provider honcho")

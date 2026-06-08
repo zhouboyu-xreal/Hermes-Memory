@@ -10,7 +10,7 @@ the MemoryProvider ABC.  On name collisions, bundled providers take
 precedence.
 
 Only ONE provider can be active at a time, selected via
-``memory.provider`` in config.yaml.
+``memory.provider`` in memory.yaml.
 
 Usage:
     from plugins.memory import discover_memory_providers, load_memory_provider
@@ -305,7 +305,7 @@ class _ProviderCollector:
 
 
 def _get_active_memory_provider() -> Optional[str]:
-    """Read the active memory provider name from config.yaml.
+    """Read the active memory provider name from memory.yaml.
 
     Returns the provider name (e.g. ``"honcho"``) or None if no
     external provider is configured.  Lightweight — only reads config,
@@ -323,7 +323,7 @@ def discover_plugin_cli_commands() -> List[dict]:
     """Return CLI commands for the **active** memory plugin only.
 
     Only one memory provider can be active at a time (set via
-    ``memory.provider`` in config.yaml).  This function reads that
+    ``memory.provider`` in memory.yaml).  This function reads that
     value and only loads CLI registration for the matching plugin.
     If no provider is active, no commands are registered.
 

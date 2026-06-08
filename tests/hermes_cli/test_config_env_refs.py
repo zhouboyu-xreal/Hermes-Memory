@@ -11,6 +11,31 @@ def _read_config(tmp_path) -> str:
     return (tmp_path / "config.yaml").read_text(encoding="utf-8")
 
 
+def test_save_config_preserves_memory_env_refs(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("EMBEDDING_API_KEY", "embedding-secret")
+    (tmp_path / "memory.yaml").write_text(
+        textwrap.dedent(
+            """\
+            memory:
+              min_turns_before_store: 0
+            embedding:
+              provider: openai
+              api_key: ${EMBEDDING_API_KEY}
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config()
+    config["memory"]["min_turns_before_store"] = 5
+    save_config(config)
+
+    saved = (tmp_path / "memory.yaml").read_text(encoding="utf-8")
+    assert "api_key: ${EMBEDDING_API_KEY}" in saved
+    assert "embedding-secret" not in saved
+
+
 def test_save_config_preserves_env_refs_on_unrelated_change(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TU_ZI_API_KEY", "sk-realsecret")

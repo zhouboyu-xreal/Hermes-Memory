@@ -1186,11 +1186,27 @@ def run_doctor(args):
     _active_memory_provider = ""
     try:
         import yaml as _yaml
-        _mem_cfg_path = HERMES_HOME / "config.yaml"
-        if _mem_cfg_path.exists():
-            with open(_mem_cfg_path) as _f:
-                _raw_cfg = _yaml.safe_load(_f) or {}
-            _active_memory_provider = (_raw_cfg.get("memory") or {}).get("provider", "")
+
+        _memory_config = {}
+        from hermes_cli.config import get_memory_config_path
+
+        _memory_config_path = get_memory_config_path()
+        if _memory_config_path.exists():
+            with open(_memory_config_path, encoding="utf-8") as _f:
+                _memory_config = _yaml.safe_load(_f) or {}
+        else:
+            # Legacy fallback for profiles not yet loaded through the config
+            # migration path.
+            _legacy_config_path = HERMES_HOME / "config.yaml"
+            if _legacy_config_path.exists():
+                with open(_legacy_config_path, encoding="utf-8") as _f:
+                    _legacy_config = _yaml.safe_load(_f) or {}
+                _memory_config = {
+                    "memory": _legacy_config.get("memory") or {},
+                }
+        _active_memory_provider = (
+            (_memory_config.get("memory") or {}).get("provider", "")
+        )
     except Exception:
         pass
 

@@ -1776,13 +1776,11 @@ class AIAgent:
             try:
                 _mem_node_cfg = mem_config or {}
                 from agent.memory_node_manager import MemoryNodeManager as _MNN
-                # Merge top-level ``embedding:`` config with nested ``memory.embedding:``
                 _top_emb_cfg = _agent_cfg.get("embedding", {})
-                _nested_emb_cfg = _mem_node_cfg.get("embedding", {})
-                _merged_emb_cfg = {**_top_emb_cfg, **_nested_emb_cfg}
                 self._memory_node_manager = _MNN(
                     session_db=self._session_db,
-                    embedding_config=_merged_emb_cfg,
+                    embedding_config=_top_emb_cfg,
+                    memory_config=_mem_node_cfg,
                     enabled=True,
                     llm_client=self.client,
                     llm_model=self.model,
@@ -10340,8 +10338,6 @@ class AIAgent:
                 )
                 _mem_node_query = original_user_message if isinstance(original_user_message, str) else ""
                 _mem_node_context = self._memory_node_manager.recall(_mem_node_query)
-                logger.error("cur_query is " + _mem_node_query)
-                logger.error("recall context " + _mem_node_context)
                 if _mem_node_context:
                     if _ext_prefetch_cache:
                         _ext_prefetch_cache += "\n\n" + _mem_node_context

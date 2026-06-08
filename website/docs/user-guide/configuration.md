@@ -52,7 +52,9 @@ Settings are resolved in this order (highest priority first):
 4. **Built-in defaults** — hardcoded safe defaults when nothing else is set
 
 :::info Rule of Thumb
-Secrets (API keys, bot tokens, passwords) go in `.env`. Everything else (model, terminal backend, compression settings, memory limits, toolsets) goes in `config.yaml`. When both are set, `config.yaml` wins for non-secret settings.
+Secrets (API keys, bot tokens, passwords) go in `.env`. Memory and embedding
+settings go in the project-level `memory.yaml`; other non-secret settings go
+in `~/.hermes/config.yaml`.
 :::
 
 ## Environment Variable Substitution
@@ -405,12 +407,29 @@ For details on declaring config settings in your own skills, see [Creating Skill
 
 ## Memory Configuration
 
+Memory and embedding settings are stored in `memory.yaml` beside
+`run_agent.py`, separately from the general `~/.hermes/config.yaml`. This
+project-level file is shared by all profiles using the same Hermes checkout.
+
 ```yaml
 memory:
   memory_enabled: true
   user_profile_enabled: true
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
+  retrieval_top_k: 8
+  min_turns_before_store: 5  # Extract facts once per N completed turns
+  recall_budget: mid
+  enable_entity_extraction: true
+  llm_timeout: 120
+
+embedding:
+  provider: ollama
+  model: qwen3-embedding:8b
+  base_url: http://127.0.0.1:11434
+  dimensions: 4096
+  normalize: true
+  timeout: 120
 ```
 
 ## File Read Safety

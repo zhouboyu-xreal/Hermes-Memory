@@ -14,7 +14,6 @@ from agent.memory_node_manager import (
     OBSERVATION_SUPPORT_SECTION_HEADER,
     OBSERVATION_SOURCE_FACT_GUIDANCE,
     OBSERVATION_TIME_GUIDANCE,
-    OBSERVATION_MERGE_PROMPT,
     OBSERVATION_UPDATE_PROMPT,
     INTERPRETATION_GENERATION_PROMPT,
     INTERPRETATION_UPDATE_PROMPT,
@@ -484,7 +483,7 @@ def test_retain_and_relation_prompts_share_relation_type_contract():
     assert '"priority": 80' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"time_confidence": "explicit/inferred_from_turn/unknown"' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"task_event_like": true' in RETAIN_FACT_EXTRACTION_PROMPT
-    assert "对话发生时间：{turn_timestamp}" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "{dialogue_batch}" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "fact_kind 定义和判别边界" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "fact_type 判别边界" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "preference：用户长期或反复表达的喜好" in RETAIN_FACT_EXTRACTION_PROMPT
@@ -635,6 +634,64 @@ def test_store_turn_discards_low_priority_retain_facts(db):
 
     assert mgr.store_turn("随便聊一句", "好的。") is False
     assert db._conn.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0] == 0
+
+
+def test_store_turn_extracts_facts_every_configured_turn_batch(db):
+    retain_payload = {
+        "facts": [
+            {
+                "text": "用户连续推进了批量记忆提取方案。",
+                "keywords": ["批量提取", "记忆"],
+                "topic": ["记忆系统"],
+                "fact_type": "episodic",
+                "fact_subject": "user",
+                "fact_kind": "action",
+                "priority": 70,
+                "entities": [],
+            }
+        ],
+        "causal_relations": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"min_turns_before_store": 3},
+        llm_outputs=[json.dumps(retain_payload)],
+    )
+
+    assert mgr.store_turn("第一轮需求", "第一轮回答") is False
+    assert mgr.store_turn("第二轮补充", "第二轮回答") is False
+    assert mgr.llm_prompts == []
+
+    assert mgr.store_turn("第三轮确认", "第三轮回答") is True
+    assert len(mgr.llm_prompts) == 1
+    assert "[Turn 1]" in mgr.llm_prompts[0]
+    assert "第一轮需求" in mgr.llm_prompts[0]
+    assert "[Turn 2]" in mgr.llm_prompts[0]
+    assert "第二轮补充" in mgr.llm_prompts[0]
+    assert "[Turn 3]" in mgr.llm_prompts[0]
+    assert "第三轮确认" in mgr.llm_prompts[0]
+    assert mgr._pending_store_turns == []
+
+    original_dialog = json.loads(
+        db._conn.execute(
+            "SELECT original_dialog FROM memory_nodes"
+        ).fetchone()["original_dialog"]
+    )
+    assert len(original_dialog["source_dialog"]["turns"]) == 3
+
+
+def test_store_turn_keeps_pending_batch_when_extraction_fails(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"min_turns_before_store": 2},
+        llm_outputs=[],
+    )
+
+    assert mgr.store_turn("第一轮", "回答一") is False
+    assert mgr.store_turn("第二轮", "回答二") is False
+    assert len(mgr._pending_store_turns) == 2
 
 
 def test_store_turn_filters_plain_time_expressions_from_fact_entities(db):
@@ -1135,6 +1192,38 @@ def test_memory_node_manager_llm_config_comes_from_agent_not_embedding_config(db
     assert mgr._llm_api_key == "fallback-agent-key"
 
 
+def test_memory_node_manager_separates_embedding_and_memory_config(db):
+    embedding_config = {
+        "provider": "ollama",
+        "model": "qwen3-embedding:8b",
+        "timeout": 15,
+        "retrieval_top_k": 99,
+        "min_turns_before_store": 99,
+        "llm_timeout": 99,
+    }
+    memory_config = {
+        "retrieval_top_k": 12,
+        "min_turns_before_store": 3,
+        "recall_budget": "high",
+        "enable_entity_extraction": False,
+        "llm_timeout": 45,
+    }
+
+    mgr = MemoryNodeManager(
+        db,
+        embedding_config=embedding_config,
+        memory_config=memory_config,
+    )
+
+    assert mgr._embedding_cfg == embedding_config
+    assert mgr._memory_cfg == memory_config
+    assert mgr._top_k == 12
+    assert mgr._min_turns_before_store == 3
+    assert mgr._recall_budget == "high"
+    assert mgr._enable_entity_extraction is False
+    assert mgr._llm_timeout == 45
+
+
 def test_analyze_recall_query_accepts_legacy_summary_shape(db):
     mgr = _NoAsyncMemoryNodeManager(
         db,
@@ -1153,8 +1242,91 @@ def test_analyze_recall_query_accepts_legacy_summary_shape(db):
     assert analysis["search_text"] == "Alice Slack alerts"
     assert analysis["keywords"] == ["Alice", "Slack"]
     assert analysis["entities"] == [{"name": "Alice", "type": "PERSON"}]
+    assert analysis["needs_recall"] is True
     assert analysis["recall_intent"] == "balanced"
     assert analysis["fact_type_preference"] == "both"
+
+
+def test_recall_gate_skips_trivial_query_without_llm_or_embedding(db):
+    capture = _CapturingEmbeddingClient()
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    mgr._embedding_client = capture
+
+    assert mgr.recall("谢谢！") == ""
+    assert mgr.llm_prompts == []
+    assert capture.texts == []
+
+
+def test_recall_gate_explicit_history_reference_still_uses_llm_analysis(db, monkeypatch):
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+        fact_type="semantic",
+    )
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "needs_recall": True,
+                "recall_confidence": 0.96,
+                "recall_reason": "explicit_history_reference",
+                "search_text": "Alice Slack urgent alert preference",
+                "keywords": ["Alice", "Slack", "alerts"],
+                "recall_intent": "evidence",
+            })
+        ],
+    )
+
+    context = mgr.recall("你还记得我之前说过的 Slack 告警偏好吗？")
+
+    assert "Alice prefers Slack for urgent alerts." in context
+    assert len(mgr.llm_prompts) == 1
+    assert "你还记得我之前说过的 Slack 告警偏好吗" in mgr.llm_prompts[0]
+
+
+def test_recall_gate_respects_llm_skip_regardless_of_confidence(db):
+    capture = _CapturingEmbeddingClient()
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "needs_recall": False,
+                "recall_confidence": 0.2,
+                "recall_reason": "self_contained_general_knowledge",
+                "search_text": "Python list comprehension syntax",
+                "keywords": ["Python", "list comprehension"],
+            })
+        ],
+    )
+    mgr._embedding_client = capture
+
+    assert mgr.recall("Python 列表推导式的语法是什么？") == ""
+    assert len(mgr.llm_prompts) == 1
+    assert capture.texts == []
+
+
+def test_recall_gate_analysis_failure_stops_recall(db, monkeypatch):
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack"],
+        fact_type="semantic",
+    )
+    monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    capture = _CapturingEmbeddingClient()
+    mgr._embedding_client = capture
+
+    assert mgr.recall("Alice Slack alerts") == ""
+    assert len(mgr.llm_prompts) == 2
+    assert capture.texts == []
 
 
 def test_analyze_recall_query_retries_when_model_rejects_chat_params(db):
@@ -1973,7 +2145,7 @@ def test_recall_emits_structured_stage_logs(db, monkeypatch, caplog):
         and '"scope": "memory_recall"' in record.getMessage()
     ]
     events = [record["event"] for record in records]
-    assert events[:3] == ["start", "query_prepared", "query_analyzed"]
+    assert events[:4] == ["start", "query_prepared", "gate_decided", "query_analyzed"]
     assert "candidates_found" in events
     assert "ranked" in events
     assert events[-1] == "finish"
@@ -3560,7 +3732,7 @@ def test_task_metadata_normalizes_steps():
 def test_task_status_prompt_definitions_scope_stale_by_prompt_role():
     assert INSIGHT_CONSOLIDATION_PROMPT == OBSERVATION_CONSOLIDATION_PROMPT
     assert TASK_CONSOLIDATION_PROMPT == OBSERVATION_CONSOLIDATION_PROMPT
-    for prompt in (OBSERVATION_CONSOLIDATION_PROMPT, OBSERVATION_UPDATE_PROMPT, OBSERVATION_MERGE_PROMPT):
+    for prompt in (OBSERVATION_CONSOLIDATION_PROMPT, OBSERVATION_UPDATE_PROMPT):
         assert '"category": "observation"' in prompt
         assert "task_status、goal、steps、next_action、insight_type" in prompt
         assert '"task_status": "active | blocked | paused | stale"' not in prompt
@@ -3601,7 +3773,6 @@ def test_observation_prompts_explain_fact_type_and_kind_labels():
         INSIGHT_CONSOLIDATION_PROMPT,
         TASK_CONSOLIDATION_PROMPT,
         OBSERVATION_UPDATE_PROMPT,
-        OBSERVATION_MERGE_PROMPT,
     ):
         assert OBSERVATION_SOURCE_FACT_GUIDANCE in prompt
         assert OBSERVATION_METADATA_GUIDANCE in prompt

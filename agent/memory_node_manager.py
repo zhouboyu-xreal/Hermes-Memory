@@ -24,7 +24,11 @@ Usage::
 
     from agent.memory_node_manager import MemoryNodeManager
 
-    mgr = MemoryNodeManager(session_db, embedding_config=None)
+    mgr = MemoryNodeManager(
+        session_db,
+        embedding_config=None,
+        memory_config=None,
+    )
     mgr.store_turn("用户问了什么", "助手回答了什么")
     context = mgr.recall("用户当前问题")
     reflection = mgr.reflect()
@@ -210,7 +214,7 @@ needs_recall 判断标准：
 
 # ── HindSight-style retain prompt template ────────────────────────────────
 
-RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请把下面一轮对话转成 1-3 条自包含的叙事事实，用于 AI agent 的长期记忆。
+RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请把下面一批按时间顺序排列的连续对话转成 0-5 条自包含的叙事事实，用于 AI agent 的长期记忆。不要为了覆盖每一轮而强行生成 fact。
 
 要求：
 1. 不要按句子碎片化；每条 fact 必须能独立说明 who/what/when/where/why
@@ -270,7 +274,7 @@ fact_kind 冲突和主体规则：
 - 助手提出具体方案，通常是 recommendation；助手解释概念但没有可复用建议，不要抽取，若必须抽取最多为 context/other。
 
 硬丢弃规则：
-- 不要抽取助手泛泛解释概念、复述用户问题、客套话
+- 不要抽取助手泛泛解释概念、复述用户问题、客套话、以及用户与助手进行的问候、寒暄
 - 不要抽取没有未来复用价值的对话流水账
 - 不要抽取纯主观情绪，除非它改变了用户偏好、决策或任务状态
 - 不要抽取已被更高价值 fact 覆盖的重复信息
@@ -322,10 +326,8 @@ task_event_like 判断规则：
   ]
 }}
 
-对话内容：
-对话发生时间：{turn_timestamp}
-用户：{user_message}
-助手：{assistant_response}"""
+对话批次（按时间顺序）：
+{dialogue_batch}"""
 
 # ── Causal relation extraction prompt template ────────────────────────────
 # Adapted from AI_Glass_Agent relation_prompt.md
@@ -929,10 +931,19 @@ class MemoryNodeManager:
     Usage::
 
         # With shared AIAgent client:
-        mgr = MemoryNodeManager(session_db, embedding_config, llm_client=agent.client)
+        mgr = MemoryNodeManager(
+            session_db,
+            embedding_config=embedding_config,
+            memory_config=memory_config,
+            llm_client=agent.client,
+        )
 
         # Standalone (raw HTTP):
-        mgr = MemoryNodeManager(session_db, embedding_config)
+        mgr = MemoryNodeManager(
+            session_db,
+            embedding_config=embedding_config,
+            memory_config=memory_config,
+        )
     """
 
     def __init__(
@@ -944,19 +955,21 @@ class MemoryNodeManager:
         llm_model: Optional[str] = None,
         llm_base_url: Optional[str] = None,
         llm_api_key: Optional[str] = None,
+        memory_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._db = session_db
         self._enabled = enabled and bool(session_db)
         self._embedding_client: Any = None  # lazy init
         self._llm_client = llm_client
 
-        cfg = embedding_config or {}
+        embedding_cfg = embedding_config or {}
+        memory_cfg = memory_config or {}
 
         # LLM model config (used regardless of client or raw HTTP). This is
         # supplied by the owning agent so memory extraction uses the same model
         # that answers the user's query, not embedding_config.
         self._llm_model = str(llm_model or DEFAULT_LLM_MODEL)
-        self._llm_timeout = int(cfg.get("llm_timeout", cfg.get("timeout", 120)))
+        self._llm_timeout = int(memory_cfg.get("llm_timeout", 120))
 
         # Raw HTTP fallback config (only used when llm_client is None). These
         # are supplied by the owning agent, not embedding_config.
@@ -964,17 +977,25 @@ class MemoryNodeManager:
         self._llm_api_key = "" if llm_api_key is None else str(llm_api_key)
 
         # Retrieval config
-        self._top_k = int(cfg.get("retrieval_top_k", 8))
-        self._min_turns_before_store = int(cfg.get("min_turns_before_store", 0))
+        self._top_k = int(memory_cfg.get("retrieval_top_k", 8))
+        self._min_turns_before_store = max(
+            1,
+            int(memory_cfg.get("min_turns_before_store", 1) or 1),
+        )
+        self._pending_store_turns: List[Dict[str, Any]] = []
 
         # Default recall budget: "mid"
-        self._recall_budget = cfg.get("recall_budget", "mid")
+        self._recall_budget = memory_cfg.get("recall_budget", "mid")
 
         # Enable entity extraction (default: True if session_db available)
-        self._enable_entity_extraction = cfg.get("enable_entity_extraction", True)
+        self._enable_entity_extraction = memory_cfg.get(
+            "enable_entity_extraction",
+            True,
+        )
 
         self._turn_count = 0
-        self._embedding_cfg = cfg
+        self._embedding_cfg = embedding_cfg
+        self._memory_cfg = memory_cfg
 
         # Async background thread for non-critical work (relation graph + entity extraction)
         self._async_thread: Optional[threading.Thread] = None
@@ -1558,6 +1579,7 @@ class MemoryNodeManager:
         user_message: str,
         assistant_response: str,
         turn_timestamp: Optional[Any] = None,
+        source_turns: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Extract HindSight-style narrative facts for retain.
 
@@ -1571,10 +1593,29 @@ class MemoryNodeManager:
             turn_timestamp_text = turn_timestamp.astimezone().isoformat()
         else:
             turn_timestamp_text = str(turn_timestamp)
+        turns = source_turns or [{
+            "user_message": user_message,
+            "assistant_response": assistant_response,
+            "turn_timestamp": turn_timestamp_text,
+        }]
+
+        def _prompt_timestamp(turn: Dict[str, Any]) -> str:
+            value = turn.get("turn_timestamp")
+            if isinstance(value, datetime):
+                return value.isoformat()
+            return str(value or turn_timestamp_text)
+
+        dialogue_batch = "\n\n".join(
+            (
+                f"[Turn {index}]\n"
+                f"对话发生时间：{_prompt_timestamp(turn)}\n"
+                f"用户：{turn.get('user_message') or ''}\n"
+                f"助手：{turn.get('assistant_response') or ''}"
+            )
+            for index, turn in enumerate(turns, start=1)
+        )
         prompt = RETAIN_FACT_EXTRACTION_PROMPT.format(
-            turn_timestamp=turn_timestamp_text,
-            user_message=user_message,
-            assistant_response=assistant_response,
+            dialogue_batch=dialogue_batch,
         )
 
         data: Optional[Dict[str, Any]] = None
@@ -1807,6 +1848,7 @@ class MemoryNodeManager:
         user_message: str,
         assistant_response: str,
         fact: Dict[str, Any],
+        source_turns: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Store source dialog plus structured retain metadata in one field.
 
@@ -1818,6 +1860,21 @@ class MemoryNodeManager:
             "source_dialog": {
                 "user": user_message,
                 "assistant": assistant_response,
+                "turns": [
+                    {
+                        "user_message": str(turn.get("user_message") or ""),
+                        "assistant_response": str(
+                            turn.get("assistant_response") or ""
+                        ),
+                        "turn_timestamp": (
+                            turn.get("turn_timestamp").isoformat()
+                            if isinstance(turn.get("turn_timestamp"), datetime)
+                            else str(turn.get("turn_timestamp") or "")
+                        ),
+                        "tags": list(turn.get("tags") or []),
+                    }
+                    for turn in (source_turns or [])
+                ],
             },
             "retain_fact": {
                 "text": fact.get("text", ""),
@@ -5086,18 +5143,47 @@ class MemoryNodeManager:
             return False
 
         self._turn_count += 1
-        if self._turn_count <= self._min_turns_before_store:
+        self._pending_store_turns.append({
+            "user_message": user_message,
+            "assistant_response": assistant_response,
+            "turn_timestamp": turn_timestamp,
+            "tags": list(tags or []),
+        })
+        if len(self._pending_store_turns) < self._min_turns_before_store:
             return False
 
         if not self._ensure_embedding_client():
             return False
 
+        source_turns = list(self._pending_store_turns)
+        batch_user_message = "\n\n".join(
+            str(turn.get("user_message") or "")
+            for turn in source_turns
+        )
+        batch_assistant_response = "\n\n".join(
+            str(turn.get("assistant_response") or "")
+            for turn in source_turns
+        )
+        batch_tags = list(dict.fromkeys(
+            tag
+            for turn in source_turns
+            for tag in (turn.get("tags") or [])
+            if tag
+        ))
+        batch_timestamp = source_turns[-1].get("turn_timestamp")
+
         try:
             # ── Step 1: Extract narrative facts (SYNC) ──
-            retain_data = self._extract_retain_facts(user_message, assistant_response, turn_timestamp=turn_timestamp)
+            retain_data = self._extract_retain_facts(
+                batch_user_message,
+                batch_assistant_response,
+                turn_timestamp=batch_timestamp,
+                source_turns=source_turns,
+            )
             if not retain_data:
                 logger.debug("Skipping memory node — retain extraction returned no data")
                 return False
+            self._pending_store_turns.clear()
             facts = retain_data.get("facts", [])
             stored_nodes: List[Tuple[int, str, np.ndarray, List[str]]] = []
             node_ids: List[int] = []
@@ -5114,8 +5200,9 @@ class MemoryNodeManager:
                     "memory_store",
                     "extract_facts", 
                     {
-                        "user_message": user_message,
-                        "assistant_response": assistant_response, 
+                        "user_message": batch_user_message,
+                        "assistant_response": batch_assistant_response,
+                        "source_turn_count": len(source_turns),
                         "summary": summary,
                         "keywords": keywords,
                         "topics": topics,
@@ -5140,17 +5227,21 @@ class MemoryNodeManager:
                 
                 # ── Step 3: Store the new node (SYNC) ──
                 node_id = self._db.memory_add_node(
-                    time_key=self._memory_time_key(idx, turn_timestamp=turn_timestamp),
+                    time_key=self._memory_time_key(
+                        idx,
+                        turn_timestamp=batch_timestamp,
+                    ),
                     summary=summary,
                     keywords=keywords,
                     topic=topics,
                     original_dialog=self._original_dialog_payload(
-                        user_message=user_message,
-                        assistant_response=assistant_response,
+                        user_message=batch_user_message,
+                        assistant_response=batch_assistant_response,
                         fact=fact,
+                        source_turns=source_turns,
                     ),
                     query_embedding=embedding,
-                    tags=self._fact_tags(fact, tags),
+                    tags=self._fact_tags(fact, batch_tags),
                     fact_type=fact.get("fact_type", "semantic"),
                     fact_subject=fact.get("fact_subject", "other"),
                     fact_kind=fact.get("fact_kind", "other"),
@@ -5187,8 +5278,9 @@ class MemoryNodeManager:
                 )
 
             logger.debug(
-                "Retained %d memory fact node(s) from turn",
+                "Retained %d memory fact node(s) from %d turn(s)",
                 len(stored_nodes),
+                len(source_turns),
             )
             return True
 

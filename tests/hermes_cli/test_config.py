@@ -10,6 +10,8 @@ from hermes_cli.config import (
     DEFAULT_CONFIG,
     get_hermes_home,
     ensure_hermes_home,
+    get_memory_config_path,
+    get_project_root,
     get_compatible_custom_providers,
     load_config,
     load_env,
@@ -19,6 +21,7 @@ from hermes_cli.config import (
     save_env_value,
     save_env_value_secure,
     sanitize_env_file,
+    set_config_value,
     _sanitize_env_lines,
 )
 
@@ -34,6 +37,10 @@ class TestGetHermesHome:
         with patch.dict(os.environ, {"HERMES_HOME": "/custom/path"}):
             home = get_hermes_home()
             assert home == Path("/custom/path")
+
+    def test_memory_config_defaults_to_project_root(self, monkeypatch):
+        monkeypatch.delenv("HERMES_MEMORY_CONFIG_PATH", raising=False)
+        assert get_memory_config_path() == get_project_root() / "memory.yaml"
 
 
 class TestEnsureHermesHome:
@@ -70,6 +77,9 @@ class TestLoadConfigDefaults:
             assert "terminal" in config
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
+            assert config["memory"]["min_turns_before_store"] == 1
+            assert get_memory_config_path() == tmp_path / "memory.yaml"
+            assert get_memory_config_path().exists()
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
@@ -82,6 +92,61 @@ class TestLoadConfigDefaults:
 
 
 class TestSaveAndLoadRoundtrip:
+    def test_set_memory_value_writes_memory_file(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            set_config_value("memory.min_turns_before_store", "6")
+            set_config_value("embedding.model", "test-embedding")
+
+            memory_saved = yaml.safe_load((tmp_path / "memory.yaml").read_text())
+            assert memory_saved["memory"]["min_turns_before_store"] == 6
+            assert memory_saved["embedding"]["model"] == "test-embedding"
+            assert not (tmp_path / "config.yaml").exists()
+
+    def test_memory_and_embedding_are_saved_separately(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config()
+            config["memory"]["min_turns_before_store"] = 5
+            config["embedding"] = {
+                "provider": "ollama",
+                "model": "test-embedding",
+            }
+
+            save_config(config)
+
+            main_saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            memory_saved = yaml.safe_load((tmp_path / "memory.yaml").read_text())
+            assert "memory" not in main_saved
+            assert "embedding" not in main_saved
+            assert memory_saved["memory"]["min_turns_before_store"] == 5
+            assert memory_saved["embedding"]["model"] == "test-embedding"
+
+            reloaded = load_config()
+            assert reloaded["memory"]["min_turns_before_store"] == 5
+            assert reloaded["embedding"]["model"] == "test-embedding"
+
+    def test_legacy_memory_sections_are_migrated(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(
+                "model: test/model\n"
+                "memory:\n"
+                "  min_turns_before_store: 7\n"
+                "embedding:\n"
+                "  provider: ollama\n"
+                "  model: legacy-embedding\n",
+                encoding="utf-8",
+            )
+
+            config = load_config()
+
+            main_saved = yaml.safe_load((tmp_path / "config.yaml").read_text())
+            memory_saved = yaml.safe_load((tmp_path / "memory.yaml").read_text())
+            assert "memory" not in main_saved
+            assert "embedding" not in main_saved
+            assert memory_saved["memory"]["min_turns_before_store"] == 7
+            assert memory_saved["embedding"]["model"] == "legacy-embedding"
+            assert config["memory"]["min_turns_before_store"] == 7
+            assert config["embedding"]["model"] == "legacy-embedding"
+
     def test_roundtrip(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             config = load_config()

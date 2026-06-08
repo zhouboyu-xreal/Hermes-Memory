@@ -2,7 +2,7 @@
 
 Auto-detects installed memory providers via the plugin system.
 Interactive curses-based UI for provider selection, then walks through
-the provider's config schema. Writes config to config.yaml + .env.
+the provider's config schema. Writes config to memory.yaml + .env.
 """
 
 from __future__ import annotations
@@ -215,7 +215,7 @@ def cmd_setup_provider(provider_name: str) -> None:
     config["memory"]["provider"] = name
     save_config(config)
     print(f"\n  Memory provider: {name}")
-    print(f"  Activation saved to config.yaml\n")
+    print(f"  Activation saved to memory.yaml\n")
 
 
 def cmd_setup(args) -> None:
@@ -347,7 +347,7 @@ def cmd_setup(args) -> None:
         _write_env_vars(env_path, env_writes)
 
     print(f"\n  Memory provider: {name}")
-    print(f"  Activation saved to config.yaml")
+    print(f"  Activation saved to memory.yaml")
     if provider_config:
         print(f"  Provider config saved")
     if env_writes:

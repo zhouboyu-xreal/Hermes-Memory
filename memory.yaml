@@ -1,0 +1,20 @@
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 2200
+  user_char_limit: 1375
+  retrieval_top_k: 8
+  min_turns_before_store: 5  # Extract facts once per N completed turns.
+  recall_budget: mid
+  enable_entity_extraction: true
+  llm_timeout: 120
+  provider: ''
+  nudge_interval: 10
+  flush_min_turns: 6
+embedding:
+  provider: openai
+  model: text-embedding-3-small
+  base_url: https://openrouter.ai/api
+  api_key: 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
+  dimensions: 1536
+  normalize: true

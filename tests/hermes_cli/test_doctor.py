@@ -168,12 +168,19 @@ class TestDoctorMemoryProviderSection:
     """The ◆ Memory Provider section should respect memory.provider config."""
 
     def _make_hermes_home(self, tmp_path, provider=""):
-        """Create a minimal HERMES_HOME with config.yaml."""
+        """Create minimal general and project memory configuration."""
         home = tmp_path / ".hermes"
         home.mkdir(parents=True, exist_ok=True)
         import yaml
-        config = {"memory": {"provider": provider}} if provider else {"memory": {}}
-        (home / "config.yaml").write_text(yaml.dump(config))
+        (home / "config.yaml").write_text("{}\n")
+        memory_config = (
+            {"memory": {"provider": provider}}
+            if provider
+            else {"memory": {}}
+        )
+        from hermes_cli.config import get_memory_config_path
+
+        get_memory_config_path().write_text(yaml.dump(memory_config))
         return home
 
     def _run_doctor_and_capture(self, monkeypatch, tmp_path, provider=""):

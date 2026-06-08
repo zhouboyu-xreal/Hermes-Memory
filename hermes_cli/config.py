@@ -2,7 +2,8 @@
 Configuration management for Hermes Agent.
 
 Config files are stored in ~/.hermes/ for easy access:
-- ~/.hermes/config.yaml  - All settings (model, toolsets, terminal, etc.)
+- ~/.hermes/config.yaml  - General settings (model, toolsets, terminal, etc.)
+- <project>/memory.yaml  - Memory and embedding settings
 - ~/.hermes/.env         - API keys and secrets
 
 This module provides:
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 _IS_WINDOWS = platform.system() == "Windows"
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
+_LAST_EXPANDED_MEMORY_CONFIG_BY_PATH: Dict[str, Any] = {}
 # (path, mtime_ns, size) -> cached expanded config dict.
 # load_config() returns a deepcopy of the cached value when the file
 # hasn't changed since the last load, skipping yaml.safe_load +
@@ -37,7 +39,14 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # save_config() + migrate_config() write via atomic_yaml_write which
 # produces a fresh inode, so stat() sees a new mtime_ns and the next
 # load repopulates automatically — no explicit invalidation hook.
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+_LOAD_CONFIG_CACHE: Dict[
+    str,
+    Tuple[
+        Optional[Tuple[int, int]],
+        Optional[Tuple[int, int]],
+        Dict[str, Any],
+    ],
+] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -245,6 +254,13 @@ def get_config_path() -> Path:
     """Get the main config file path."""
     return get_hermes_home() / "config.yaml"
 
+def get_memory_config_path() -> Path:
+    """Get the memory and embedding config file path."""
+    override = os.getenv("HERMES_MEMORY_CONFIG_PATH", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return get_project_root() / "memory.yaml"
+
 def get_env_path() -> Path:
     """Get the .env file path (for API keys)."""
     return get_hermes_home() / ".env"
@@ -376,6 +392,23 @@ def _ensure_hermes_home_managed(home: Path):
 # =============================================================================
 # Config loading/saving
 # =============================================================================
+
+MEMORY_CONFIG_DEFAULTS = {
+    "memory": {
+        "memory_enabled": True,
+        "user_profile_enabled": True,
+        "memory_char_limit": 2200,
+        "user_char_limit": 1375,
+        "retrieval_top_k": 8,
+        "min_turns_before_store": 1,
+        "recall_budget": "mid",
+        "enable_entity_extraction": True,
+        "llm_timeout": 120,
+        "provider": "",
+    },
+    "embedding": {},
+}
+
 
 DEFAULT_CONFIG = {
     "model": "",
@@ -825,19 +858,6 @@ DEFAULT_CONFIG = {
         "engine": "compressor",
     },
 
-    # Persistent memory -- bounded curated memory injected into system prompt
-    "memory": {
-        "memory_enabled": True,
-        "user_profile_enabled": True,
-        "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
-        "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
-        # External memory provider plugin (empty = built-in only).
-        # Set to a provider name to activate: "openviking", "mem0",
-        # "hindsight", "holographic", "retaindb", "byterover".
-        # Only ONE external provider is allowed at a time.
-        "provider": "",
-    },
-
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
@@ -1028,6 +1048,20 @@ DEFAULT_CONFIG = {
         # 1 = serial (pre-v0.9 behaviour).
         # Also overridable via HERMES_CRON_MAX_PARALLEL env var.
         "max_parallel_jobs": None,
+    },
+
+    # Optional screen activity memory pipeline. When enabled, the gateway
+    # incrementally combines Screenpipe OCR and OpenChronicle AXTree captures.
+    "screen_memory": {
+        "enabled": False,
+        "screenpipe_db": "",
+        "openchronicle_db": "",
+        # Empty uses <HERMES_HOME>/screen_memory/memory.db.
+        "output_db": "",
+        "ingest_interval_minutes": 30,
+        "fact_clustering_interval_hours": 6,
+        "observation_interval_hours": 24,
+        "initial_lookback_minutes": 30,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
@@ -3485,36 +3519,164 @@ def read_raw_config() -> Dict[str, Any]:
     return data
 
 
-def load_config() -> Dict[str, Any]:
-    """Load configuration from ~/.hermes/config.yaml.
+def read_raw_memory_config() -> Dict[str, Any]:
+    """Read memory.yaml without defaults."""
+    memory_path = get_memory_config_path()
+    try:
+        with open(memory_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except (FileNotFoundError, OSError, yaml.YAMLError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
-    Cached on the config file's (mtime_ns, size). Returns a deepcopy of
-    the cached value when unchanged, since most call sites mutate the
-    result (e.g. ``cfg["model"]["default"] = ...`` before ``save_config``).
-    The cache is keyed on ``str(config_path)`` so profile switches
-    (which change ``HERMES_HOME`` and therefore ``get_config_path()``)
-    don't collide.
+
+def load_memory_config(
+    legacy_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Load memory and embedding settings from memory.yaml.
+
+    ``legacy_config`` is used only when the standalone file does not yet
+    exist, allowing older config.yaml files to keep working until migrated.
+    """
+    config = copy.deepcopy(MEMORY_CONFIG_DEFAULTS)
+    memory_path = get_memory_config_path()
+    if memory_path.exists():
+        return _deep_merge(config, read_raw_memory_config())
+    if legacy_config:
+        return _deep_merge(config, legacy_config)
+    return config
+
+
+def _migrate_legacy_memory_config() -> None:
+    """Move legacy user memory settings into the project memory.yaml."""
+    if is_managed():
+        return
+    config_path = get_config_path()
+    main_config: Dict[str, Any] = {}
+    if config_path.exists():
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                main_config = yaml.safe_load(f) or {}
+        except Exception:
+            return
+        if not isinstance(main_config, dict):
+            return
+
+    legacy = {
+        key: main_config.get(key)
+        for key in ("memory", "embedding")
+        if isinstance(main_config.get(key), dict)
+    }
+    old_memory_path = get_hermes_home() / "memory.yaml"
+    migration_marker = get_hermes_home() / ".project_memory_config_migrated"
+    old_memory_config: Dict[str, Any] = {}
+    memory_path = get_memory_config_path()
+    if (
+        old_memory_path != memory_path
+        and old_memory_path.exists()
+        and not migration_marker.exists()
+    ):
+        try:
+            with open(old_memory_path, encoding="utf-8") as f:
+                old_memory_config = yaml.safe_load(f) or {}
+        except Exception:
+            old_memory_config = {}
+        if not isinstance(old_memory_config, dict):
+            old_memory_config = {}
+
+    if not legacy and not old_memory_config:
+        return
+
+    from utils import atomic_yaml_write
+
+    memory_config = copy.deepcopy(MEMORY_CONFIG_DEFAULTS)
+    memory_config = _deep_merge(memory_config, read_raw_memory_config())
+    memory_config = _deep_merge(memory_config, legacy)
+    memory_config = _deep_merge(memory_config, old_memory_config)
+    atomic_yaml_write(memory_path, memory_config, sort_keys=False)
+    _secure_file(memory_path)
+    if old_memory_config:
+        migration_marker.write_text(str(memory_path), encoding="utf-8")
+        _secure_file(migration_marker)
+
+    if legacy:
+        main_config.pop("memory", None)
+        main_config.pop("embedding", None)
+        atomic_yaml_write(config_path, main_config, sort_keys=False)
+        _secure_file(config_path)
+        _RAW_CONFIG_CACHE.pop(str(config_path), None)
+        _LOAD_CONFIG_CACHE.pop(str(config_path), None)
+
+
+def _ensure_memory_config_file() -> None:
+    """Create memory.yaml with defaults when no memory config exists."""
+    memory_path = get_memory_config_path()
+    if memory_path.exists() or is_managed():
+        return
+    from utils import atomic_yaml_write
+
+    atomic_yaml_write(
+        memory_path,
+        copy.deepcopy(MEMORY_CONFIG_DEFAULTS),
+        sort_keys=False,
+    )
+    _secure_file(memory_path)
+
+
+def load_config() -> Dict[str, Any]:
+    """Load general config plus memory.yaml into one effective dictionary.
+
+    The cache tracks both config.yaml and memory.yaml. Callers continue to
+    receive ``memory`` and ``embedding`` at the top level, while persistence
+    keeps those sections in the standalone memory file.
     """
     ensure_hermes_home()
+    _migrate_legacy_memory_config()
+    _ensure_memory_config_file()
     config_path = get_config_path()
+    memory_path = get_memory_config_path()
     path_key = str(config_path)
 
     try:
         st = config_path.stat()
-        cache_key: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
+        config_cache_key: Optional[Tuple[int, int]] = (
+            st.st_mtime_ns,
+            st.st_size,
+        )
     except FileNotFoundError:
-        cache_key = None
+        config_cache_key = None
+    try:
+        memory_st = memory_path.stat()
+        memory_cache_key: Optional[Tuple[int, int]] = (
+            memory_st.st_mtime_ns,
+            memory_st.st_size,
+        )
+    except FileNotFoundError:
+        memory_cache_key = None
 
     cached = _LOAD_CONFIG_CACHE.get(path_key)
-    if cached is not None and cache_key is not None and cached[:2] == cache_key:
+    if (
+        cached is not None
+        and cached[0] == config_cache_key
+        and cached[1] == memory_cache_key
+    ):
         return copy.deepcopy(cached[2])
 
     config = copy.deepcopy(DEFAULT_CONFIG)
+    legacy_memory_config: Dict[str, Any] = {}
 
-    if cache_key is not None:
+    if config_cache_key is not None:
         try:
             with open(config_path, encoding="utf-8") as f:
                 user_config = yaml.safe_load(f) or {}
+
+            legacy_memory_config = {
+                key: user_config.get(key)
+                for key in ("memory", "embedding")
+                if isinstance(user_config.get(key), dict)
+            }
+            user_config.pop("memory", None)
+            user_config.pop("embedding", None)
 
             if "max_turns" in user_config:
                 agent_user_config = dict(user_config.get("agent") or {})
@@ -3527,13 +3689,22 @@ def load_config() -> Dict[str, Any]:
         except Exception as e:
             print(f"Warning: Failed to load config: {e}")
 
+    config = _deep_merge(
+        config,
+        load_memory_config(legacy_config=legacy_memory_config),
+    )
     normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
     expanded = _expand_env_vars(normalized)
     _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
-    if cache_key is not None:
-        _LOAD_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(expanded))
-    else:
-        _LOAD_CONFIG_CACHE.pop(path_key, None)
+    _LAST_EXPANDED_MEMORY_CONFIG_BY_PATH[str(memory_path)] = {
+        key: copy.deepcopy(expanded.get(key, {}))
+        for key in ("memory", "embedding")
+    }
+    _LOAD_CONFIG_CACHE[path_key] = (
+        config_cache_key,
+        memory_cache_key,
+        copy.deepcopy(expanded),
+    )
     return expanded
 
 
@@ -3611,7 +3782,7 @@ _COMMENTED_SECTIONS = """
 
 
 def save_config(config: Dict[str, Any]):
-    """Save configuration to ~/.hermes/config.yaml."""
+    """Save general settings to config.yaml and memory settings separately."""
     if is_managed():
         managed_error("save configuration")
         return
@@ -3620,7 +3791,12 @@ def save_config(config: Dict[str, Any]):
     ensure_hermes_home()
     config_path = get_config_path()
     current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
-    normalized = current_normalized
+    normalized = copy.deepcopy(current_normalized)
+    memory_sections = {
+        key: normalized.pop(key)
+        for key in ("memory", "embedding")
+        if key in normalized
+    }
     raw_existing = _normalize_root_model_keys(_normalize_max_turns_config(read_raw_config()))
     if raw_existing:
         normalized = _preserve_env_ref_templates(
@@ -3650,6 +3826,18 @@ def save_config(config: Dict[str, Any]):
         extra_content="".join(parts) if parts else None,
     )
     _secure_file(config_path)
+    if memory_sections:
+        memory_path = get_memory_config_path()
+        raw_memory = read_raw_memory_config()
+        memory_to_write = memory_sections
+        if raw_memory:
+            memory_to_write = _preserve_env_ref_templates(
+                memory_sections,
+                raw_memory,
+                _LAST_EXPANDED_MEMORY_CONFIG_BY_PATH.get(str(memory_path)),
+            )
+        atomic_yaml_write(memory_path, memory_to_write, sort_keys=False)
+        _secure_file(memory_path)
     _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
 
 
@@ -4243,10 +4431,16 @@ def set_config_value(key: str, value: str):
         print(f"✓ Set {key} in {get_env_path()}")
         return
     
-    # Otherwise it goes to config.yaml
+    # Memory and embedding settings live in memory.yaml. Everything else
+    # goes to config.yaml.
     # Read the raw user config (not merged with defaults) to avoid
     # dumping all default values back to the file
-    config_path = get_config_path()
+    top_level_key = key.split(".", 1)[0]
+    config_path = (
+        get_memory_config_path()
+        if top_level_key in {"memory", "embedding"}
+        else get_config_path()
+    )
     user_config = {}
     if config_path.exists():
         try:

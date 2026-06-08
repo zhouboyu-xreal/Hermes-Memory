@@ -3,6 +3,7 @@ Profile management for multiple isolated Hermes instances.
 
 Each profile is a fully independent HERMES_HOME directory with its own
 config.yaml, .env, memory, sessions, skills, gateway, cron, and logs.
+MemoryNodeManager settings are shared from the project-level memory.yaml.
 Profiles live under ``~/.hermes/profiles/<name>/`` by default.
 
 The "default" profile is ``~/.hermes`` itself — backward compatible,
@@ -11,7 +12,7 @@ zero migration needed.
 Usage::
 
     hermes profile create coder          # fresh profile + bundled skills
-    hermes profile create coder --clone  # also copy config, .env, SOUL.md
+    hermes profile create coder --clone  # also copy config files and SOUL.md
     hermes profile create coder --clone-all  # full copy of source profile
     coder chat                           # use via wrapper alias
     hermes -p coder chat                 # or via flag

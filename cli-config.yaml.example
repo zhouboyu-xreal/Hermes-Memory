@@ -396,63 +396,8 @@ prompt_caching:
 #                           # extra_body:
 #                           #   enable_thinking: false
 
-# =============================================================================
-# Persistent Memory
-# =============================================================================
-# Bounded curated memory injected into the system prompt every session.
-# Two stores: MEMORY.md (agent's notes) and USER.md (user profile).
-# Character limits keep the memory small and focused. The agent manages
-# pruning -- when at the limit, it must consolidate or replace entries.
-# Disabled by default in batch_runner and RL environments.
-#
-memory:
-  # Agent's personal notes: environment facts, conventions, things learned
-  memory_enabled: true
-  
-  # User profile: preferences, communication style, expectations
-  user_profile_enabled: true
-  
-  # Character limits (~2.75 chars per token, model-independent)
-  memory_char_limit: 2200   # ~800 tokens
-  user_char_limit: 1375     # ~500 tokens
-
-  # Periodic memory nudge: remind the agent to consider saving memories
-  # every N user turns. Set to 0 to disable. Only active when memory is enabled.
-  nudge_interval: 10        # Nudge every 10 user turns (0 = disabled)
-
-  # Memory flush: give the agent one turn to save memories before context is
-  # lost (compression, /new, /reset, exit). Set to 0 to disable.
-  # For exit/reset, only fires if the session had at least this many user turns.
-  flush_min_turns: 6        # Min user turns to trigger flush on exit/reset (0 = disabled)
-
-# =============================================================================
-# Embedding (for memory node vector search)
-# =============================================================================
-# Configures text embedding generation used by the memory node system
-# (SessionDB.memory_add_node / memory_search). Supports local and remote
-# embedding backends.
-#
-# Supported providers:
-#   "ollama" — Ollama's local /api/embeddings endpoint
-#   "openai" — Any OpenAI-compatible /v1/embeddings endpoint
-#
-# embedding:
-#   provider: "ollama"            # "ollama" | "openai"
-#   model: "qwen3-embedding:8b"  # Embedding model (EmbeddingClient)
-#   base_url: "http://127.0.0.1:11434"  # Embedding backend URL (Ollama default)
-#   api_key: ""                   # Only needed for OpenAI embedding backends
-#   dimensions: 4096              # Vector dimension (auto-detected for known models)
-#   normalize: true               # L2-normalize embeddings
-#   timeout: 120                  # Request timeout in seconds
-#   retrieval_top_k: 8            # Max memory nodes to recall per query
-#   min_turns_before_store: 0     # Skip storing for first N turns (0 = store from turn 1)
-#
-#   # LLM API for summarization & causal relation extraction (MemoryNodeManager)
-#   # Supports OpenAI, OpenRouter, DeepSeek, vLLM, and any OpenAI-compatible provider.
-#   # Falls back to embedding base_url/api_key if llm_* keys are omitted.
-#   llm_base_url: "https://api.openai.com/v1"  # Chat completions API base URL
-#   llm_model: "gpt-4o-mini"        # Model for summarization & causal extraction
-#   llm_api_key: ""                 # API key for the LLM endpoint
+# Memory and embedding settings are stored separately in:
+#   <hermes-agent project>/memory.yaml
 
 # =============================================================================
 # Session Reset Policy (Messaging Platforms)

@@ -550,13 +550,13 @@ class TestProviderDiscovery:
         assert result == "compressor"
 
     def test_save_memory_provider(self, tmp_path, monkeypatch):
-        """Saving a memory provider persists to config.yaml."""
+        """Saving a memory provider persists to memory.yaml."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         config_file = tmp_path / "config.yaml"
         config_file.write_text("memory:\n  provider: ''\n")
         from hermes_cli.plugins_cmd import _save_memory_provider
         _save_memory_provider("honcho")
-        content = yaml.safe_load(config_file.read_text())
+        content = yaml.safe_load((tmp_path / "memory.yaml").read_text())
         assert content["memory"]["provider"] == "honcho"
 
     def test_save_context_engine(self, tmp_path, monkeypatch):
