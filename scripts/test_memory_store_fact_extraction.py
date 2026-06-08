@@ -2,8 +2,9 @@
 """Run memory-node store fact extraction on a dialogue export.
 
 This script is intentionally standalone: it flattens all user/assistant turns
-from a history_dialogue.json file, calls MemoryNodeManager.store_turn() for
-each turn, and saves an isolated SessionDB under tmp/ by default.
+from a history_dialogue.json file, feeds them to MemoryNodeManager.store_turn(),
+and saves an isolated SessionDB under tmp/ by default. Fact extraction follows
+the batching interval configured in the project-level memory.yaml.
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
 import requests
-import yaml
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +28,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from agent.memory_node_manager import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, MemoryNodeManager
+from hermes_cli.config import load_config
 from hermes_constants import get_hermes_home
 from hermes_state import EMBEDDING_DIM, SessionDB
 
@@ -143,7 +144,7 @@ def sample_hour_offset(sample_id: str, fallback_offset: int) -> int:
     return fallback_offset
 
 
-def flatten_dialogue(path: Path) -> List[Tuple[str, int, str, str, int]]:
+def flatten_dialogue(path: Path) -> List[Tuple[str, int, str, str, int, bool]]:
     data = json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
     dialogue = data.get("dialogue") if isinstance(data, dict) else data
     if not isinstance(dialogue, list):
@@ -202,10 +203,8 @@ def iter_stored_nodes(db: SessionDB, start_id: int) -> Iterable[Dict[str, Any]]:
 
 
 def load_hermes_config() -> Dict[str, Any]:
-    config_path = get_hermes_home() / "config.yaml"
-    if not config_path.exists():
-        return {}
-    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    """Load general config merged with project-level memory.yaml."""
+    loaded = load_config()
     return loaded if isinstance(loaded, dict) else {}
 
 
@@ -224,6 +223,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-base-url")
     parser.add_argument("--llm-api-key")
     parser.add_argument("--llm-timeout", type=int)
+    parser.add_argument(
+        "--fact-extraction-interval",
+        type=int,
+        help=(
+            "Extract facts once per N completed turns. Defaults to "
+            "memory.min_turns_before_store from memory.yaml."
+        ),
+    )
     parser.add_argument(
         "--enable-reflect",
         action="store_true",
@@ -251,12 +258,11 @@ def remove_existing_outputs(db_path: Path, report_path: Path, overwrite: bool) -
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_hermes_config()
     model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
-    embedding_config = config.get("embedding", {}) if isinstance(config.get("embedding"), dict) else {}
+    memory_config = config.get("memory", {}) if isinstance(config.get("memory"), dict) else {}
     args.llm_model = (
         args.llm_model
         or os.getenv("HERMES_MEMORY_LLM_MODEL")
         or os.getenv("OPENAI_MODEL")
-        or str(embedding_config.get("llm_model") or "")
         or str(model_config.get("default") or "")
         or DEFAULT_LLM_MODEL
     )
@@ -278,7 +284,23 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
         or str(model_config.get("api_key") or "")
         or ""
     )
-    args.llm_timeout = args.llm_timeout or int(os.getenv("HERMES_MEMORY_LLM_TIMEOUT", "120"))
+    args.llm_timeout = (
+        args.llm_timeout
+        or int(
+            os.getenv(
+                "HERMES_MEMORY_LLM_TIMEOUT",
+                str(memory_config.get("llm_timeout", 120)),
+            )
+        )
+    )
+    args.fact_extraction_interval = max(
+        1,
+        int(
+            args.fact_extraction_interval
+            or memory_config.get("min_turns_before_store", 1)
+            or 1
+        ),
+    )
 
 def configure_logging(log_path: Path, log_level: str, manager_log_level: str) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -324,15 +346,27 @@ def main() -> int:
 
     report_rows: List[Dict[str, Any]] = []
     db = SessionDB(db_path=db_path)
+    config = load_hermes_config()
+    embedding_config = (
+        dict(config.get("embedding") or {})
+        if isinstance(config.get("embedding"), dict)
+        else {}
+    )
+    memory_config = (
+        dict(config.get("memory") or {})
+        if isinstance(config.get("memory"), dict)
+        else {}
+    )
+    memory_config["min_turns_before_store"] = args.fact_extraction_interval
+    memory_config["llm_timeout"] = args.llm_timeout
+    memory_config["enable_entity_extraction"] = False
     manager = StoreFactExtractionManager(
         db,
-        embedding_config={
-            "llm_model": args.llm_model,
-            "llm_base_url": args.llm_base_url,
-            "llm_api_key": args.llm_api_key,
-            "llm_timeout": args.llm_timeout,
-            "enable_entity_extraction": False,
-        },
+        embedding_config=embedding_config,
+        memory_config=memory_config,
+        llm_model=args.llm_model,
+        llm_base_url=args.llm_base_url,
+        llm_api_key=args.llm_api_key,
         report_rows=report_rows,
     )
 
@@ -349,6 +383,11 @@ def main() -> int:
                 # does not collide on "#00" across turns in the same sample.
                 turn_timestamp = base_turn_timestamp + timedelta(hours=hour_offset, seconds=turn_index)
                 before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_nodes").fetchone()["max_id"]
+                pending_before = list(manager._pending_store_turns)
+                extraction_due = (
+                    len(pending_before) + 1
+                    >= manager._min_turns_before_store
+                )
                 ok = manager.store_turn(
                     user,
                     assistant,
@@ -367,6 +406,12 @@ def main() -> int:
                     "sample_hour_offset": hour_offset,
                     "turn_second_offset": turn_index,
                     "turn_timestamp": turn_timestamp.isoformat(),
+                    "fact_extraction_interval": manager._min_turns_before_store,
+                    "fact_extraction_due": extraction_due,
+                    "source_turn_count": (
+                        len(pending_before) + 1 if extraction_due else 0
+                    ),
+                    "pending_turn_count": len(manager._pending_store_turns),
                     "stored": bool(ok),
                     "fact_count": len(nodes),
                     "user": user,
@@ -376,11 +421,15 @@ def main() -> int:
                 report.write(json.dumps(row, ensure_ascii=False) + "\n")
                 report.flush()
                 logging.info(
-                    "[%s/%s] %s turn=%s stored=%s facts=%s",
+                    "[%s/%s] %s turn=%s extraction_due=%s "
+                    "source_turns=%s pending=%s stored=%s facts=%s",
                     flat_index - args.start + 1,
                     len(turns),
                     sample_id,
                     turn_index,
+                    extraction_due,
+                    len(pending_before) + 1 if extraction_due else 0,
+                    len(manager._pending_store_turns),
                     ok,
                     len(nodes),
                 )
@@ -416,6 +465,8 @@ def main() -> int:
         "turns_processed": len(turns),
         "turns_with_facts": stored_turns,
         "facts_stored": stored_facts,
+        "fact_extraction_interval": manager._min_turns_before_store,
+        "pending_turns": len(manager._pending_store_turns),
         "reflect_runs": reflect_runs,
         "llm_model": args.llm_model,
         "llm_base_url": args.llm_base_url,

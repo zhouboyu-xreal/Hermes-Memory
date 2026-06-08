@@ -22,6 +22,7 @@ from agent.memory_node_manager import (
     OBSERVATION_SECTION_HEADER,
     RELATION_PROMPT_TEMPLATE,
     RETAIN_FACT_EXTRACTION_PROMPT,
+    SUMMARY_SYSTEM_PROMPT,
     TASK_CONSOLIDATION_PROMPT,
     WORLD_FACT_SECTION_HEADER,
 )
@@ -499,8 +500,16 @@ def test_retain_and_relation_prompts_share_relation_type_contract():
     assert '"以后回答都先给结论" 属于 instruction' in RETAIN_FACT_EXTRACTION_PROMPT
     assert "助手执行了工具、测试、修改、验证" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "硬丢弃规则" in RETAIN_FACT_EXTRACTION_PROMPT
-    assert "固定句式" in RETAIN_FACT_EXTRACTION_PROMPT
-    assert "用户要求 AI 以后回答/执行任务时" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "0-8 条可追溯、自包含、可独立召回的 facts" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "fact：原始证据层" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "不要把信息丰富的内容压缩成空泛的主题摘要" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "信息密集时宁可输出多条完整事实" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "禁止只写“讨论了某主题”" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "表达原则" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "不要求固定句式" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "输出前进行信息保真自检" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "MemoryNodeManager.store_turn" in RETAIN_FACT_EXTRACTION_PROMPT
+    assert "不能写成\"助手已经增加测试并验证通过\"" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "可能影响任务状态或步骤的事件" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "不要求已经知道具体属于哪个任务" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "实体不是只限传统 NER" in RETAIN_FACT_EXTRACTION_PROMPT
@@ -508,6 +517,21 @@ def test_retain_and_relation_prompts_share_relation_type_contract():
     assert "商务活动" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "经济负担" in RETAIN_FACT_EXTRACTION_PROMPT
     assert "每条长期记忆 fact 通常至少包含主体实体" in RETAIN_FACT_EXTRACTION_PROMPT
+
+
+def test_summary_prompt_preserves_recall_worthy_details():
+    assert "可追溯、自包含、可独立召回的证据性摘要" in SUMMARY_SYSTEM_PROMPT
+    assert "不要把信息丰富的内容压缩成空泛的主题摘要" in SUMMARY_SYSTEM_PROMPT
+    assert "summary 输出一条完整摘要，可以使用复句" in SUMMARY_SYSTEM_PROMPT
+    assert "项目、模块、文件、函数、配置项、参数" in SUMMARY_SYSTEM_PROMPT
+    assert "禁止只写“讨论了某主题”" in SUMMARY_SYSTEM_PROMPT
+    assert "提取 2-8 个关键词" in SUMMARY_SYSTEM_PROMPT
+    assert "MemoryNodeManager.store_turn" in SUMMARY_SYSTEM_PROMPT
+    assert "对话没有表明测试已经执行" in SUMMARY_SYSTEM_PROMPT
+    assert "输出前进行信息保真自检" in SUMMARY_SYSTEM_PROMPT
+    assert "{dialogue_batch}" in SUMMARY_SYSTEM_PROMPT
+    assert "{user_message}" not in SUMMARY_SYSTEM_PROMPT
+    assert "{assistant_response}" not in SUMMARY_SYSTEM_PROMPT
 
 
 def test_retain_fact_prompt_includes_turn_timestamp_context(db):
@@ -1155,10 +1179,59 @@ def test_summarize_turn_returns_entities(db):
         ],
     )
 
-    summary = mgr._summarize_turn("Alice wants Slack alerts", "")
+    summary = mgr._summarize_turn([
+        {
+            "user_message": "Alice wants Slack alerts",
+            "assistant_response": "",
+            "turn_timestamp": "2026-05-01T09:00:00+00:00",
+        }
+    ])
 
     assert summary["keywords"] == ["Slack", "alerts"]
     assert summary["entities"] == [{"name": "Alice", "type": "PERSON"}]
+    assert "[Turn 1]" in mgr.llm_prompts[0]
+    assert "对话发生时间：2026-05-01T09:00:00+00:00" in mgr.llm_prompts[0]
+    assert "用户：Alice wants Slack alerts" in mgr.llm_prompts[0]
+    assert "助手：" in mgr.llm_prompts[0]
+
+
+def test_retain_fallback_summary_receives_paired_source_turns(db):
+    summary_payload = {
+        "summary": "用户先提出批量提取需求，随后补充必须保留各轮问答对应关系。",
+        "keywords": ["批量提取", "轮次对应"],
+        "entities": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"min_turns_before_store": 2},
+        llm_outputs=["not json", "still not json", json.dumps(summary_payload)],
+    )
+
+    assert mgr.store_turn(
+        "第一轮需求",
+        "第一轮回答",
+        turn_timestamp="2026-05-01T09:00:00+00:00",
+    ) is False
+    assert mgr.store_turn(
+        "第二轮补充",
+        "第二轮回答",
+        turn_timestamp="2026-05-01T09:05:00+00:00",
+    ) is True
+
+    summary_prompt = mgr.llm_prompts[2]
+    assert (
+        "[Turn 1]\n"
+        "对话发生时间：2026-05-01T09:00:00+00:00\n"
+        "用户：第一轮需求\n"
+        "助手：第一轮回答"
+    ) in summary_prompt
+    assert (
+        "[Turn 2]\n"
+        "对话发生时间：2026-05-01T09:05:00+00:00\n"
+        "用户：第二轮补充\n"
+        "助手：第二轮回答"
+    ) in summary_prompt
 
 
 def test_memory_node_manager_llm_config_comes_from_agent_not_embedding_config(db):

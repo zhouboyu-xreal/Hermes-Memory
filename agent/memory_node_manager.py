@@ -134,13 +134,41 @@ Step 2：若有关联，再按优先级选择一个关系类型：
 
 # ── Summarisation prompt template ─────────────────────────────────────────
 
-SUMMARY_SYSTEM_PROMPT = """你是一个对话摘要助手。请总结以下对话，提取关键的主题和信息。
+SUMMARY_SYSTEM_PROMPT = """你是长期记忆系统的对话摘要模块。请根据以下对话生成一条可追溯、自包含、可独立召回的证据性摘要，并提取用于检索的关键词和实体。不要把信息丰富的内容压缩成空泛的主题摘要。
 
-要求：
-1. 用一句话精炼概括对话的核心内容
-2. 提取2-5个关键词（用逗号分隔）
-3. 提取对召回有用的实体，遵守实体抽取规则；普通时间表达不要作为实体
-4. 仅返回JSON格式，不要包含其他内容
+三层记忆架构：
+- fact：原始证据层，保存对话明确支持的事件、知识、决定、约束、错误、建议和结果。
+- observation：从多个 facts 中归纳历史模式、进展或状态变化；不要在摘要中提前归纳。
+- interpretation：对用户偏好、任务状态和行动策略的高层理解；不要生成无直接证据的推断。
+
+摘要要求：
+1. summary 输出一条完整摘要，可以使用复句，不要为了追求短而删除关键事实
+2. summary 必须脱离原始对话后仍能独立理解，并优先保留：
+   - 具体对象：项目、模块、文件、函数、配置项、参数、产品、人物或材料
+   - 具体动作或论点：提出、决定、修改、删除、实现、排查、验证、解释或反驳了什么
+   - 关键条件和约束：阈值、触发时机、适用范围、禁止事项、依赖和前置条件
+   - 原因、证据和目的：为什么采取该方案，什么现象支持该判断
+   - 结果和状态变化：成功、失败、通过、阻塞、待处理，以及修改前后的差异
+3. 对知识讲解、方案讨论和技术分析，不仅记录“谁讨论了什么”，还要保留其中明确出现的核心概念、方案、取舍、结论和适用条件
+4. 如果对话包含多个相互关联的高价值信息点，应在同一条 summary 中使用清晰复句完整表达；不要只保留上位主题
+5. 禁止只写“讨论了某主题”“要求优化相关代码”“助手提供了建议”“处理了某个问题”这类缺少实质内容的描述
+6. 只基于输入对话总结。不要把“建议修改”“计划测试”“正在排查”写成“已经修改”“测试通过”或“问题已解决”，除非对话明确提供了完成证据
+7. 不要保留问候、寒暄、客套话、助手复述问题、无复用价值的流水账，或已被更具体信息覆盖的重复内容
+8. 提取 2-8 个关键词，优先保留关键实体、产品、技术、动作、错误、结果和约束；输出为 JSON string 数组
+9. 提取对召回有用的实体，遵守实体抽取规则；普通时间表达不要作为实体
+10. 最终只返回一个合法 JSON object，不要包含 Markdown、代码块或其他说明
+
+详细程度示例：
+- 不合格："用户要求优化记忆提取逻辑。"
+- 合格："用户要求将 MemoryNodeManager.store_turn 从前 N 轮跳过提取改为每累计 N 轮批量提取一次，并保留未达到阈值的历史对话，避免只处理最新一轮造成信息丢失。"
+- 不合格："助手提供了测试建议。"
+- 合格："助手建议为批量 fact 提取增加达到轮数阈值和提取失败后保留 pending turns 的测试，但对话没有表明测试已经执行。"
+
+输出前进行信息保真自检：
+- summary 是否包含足以区别于同主题其他对话的具体对象、动作、约束或结论？
+- 删除函数名、参数、错误现象、关键条件或结果后是否会改变摘要含义？如果会，必须保留。
+- 是否退化成主题名称、对话行为或没有实质内容的概述？
+- 是否写入了输入对话没有明确支持的意图、原因、完成状态或结果？
 
 """ + ENTITY_EXTRACTION_GUIDANCE + """
 
@@ -150,9 +178,8 @@ SUMMARY_SYSTEM_PROMPT = """你是一个对话摘要助手。请总结以下对�
     "keywords": ["关键词1", "关键词2"], 
     "entities": [{{"name": "实体名", "type": "CONCEPT"}}]}}
 
-对话内容：
-用户：{user_message}
-助手：{assistant_response}"""
+对话批次（按时间顺序）：
+{dialogue_batch}"""
 
 # ── Recall query analysis prompt template ────────────────────────────────
 
@@ -214,40 +241,56 @@ needs_recall 判断标准：
 
 # ── HindSight-style retain prompt template ────────────────────────────────
 
-RETAIN_FACT_EXTRACTION_PROMPT = """你是一个长期记忆 retain 管道。请把下面一批按时间顺序排列的连续对话转成 0-5 条自包含的叙事事实，用于 AI agent 的长期记忆。不要为了覆盖每一轮而强行生成 fact。
+RETAIN_FACT_EXTRACTION_PROMPT = """你是长期记忆系统的 fact 提取模块。请从下面一批按时间顺序排列的连续对话中提取 0-8 条可追溯、自包含、可独立召回的 facts。不要为了覆盖每一轮而强行生成 fact，也不要把信息丰富的内容压缩成空泛的主题摘要。
 
-要求：
-1. 不要按句子碎片化；每条 fact 必须能独立说明 who/what/when/where/why
-2. 尽量保留用户偏好、约束、决定、失败经验、助手建议和明确原因
-3. 区分 fact_type（心理学意义上的记忆性质）:
+三层记忆架构：
+- fact：原始证据层，保存对话明确支持的事件、知识、决定、约束、错误、建议和结果，回答“具体发生了什么或具体说了什么”。
+- observation：从多个 facts 中归纳历史模式、进展或状态变化；不要在 fact 层提前归纳。
+- interpretation：对用户偏好、任务状态和行动策略的高层理解；不要在 fact 层生成无直接证据的推断。
+
+提取粒度和信息保真要求：
+1. 一个 fact 只表达一个可独立召回的事件、结论、约束、建议或知识点，但同一件事的主体、动作、对象、关键条件、原因和结果应尽量保存在同一条 fact 中，不要拆成失去上下文的句子碎片
+2. 同一批对话中不同的决定、错误、方案、知识结论或任务进展应拆成多个 facts；信息密集时宁可输出多条完整事实，不要合并成一个主题标签
+3. fact 的 text 必须脱离原始对话后仍能独立理解，并优先保留：
+   - 具体对象：项目、模块、文件、函数、配置项、参数、产品、人物或材料
+   - 具体动作或论点：提出、决定、修改、删除、实现、排查、验证、解释或反驳了什么
+   - 关键条件和约束：阈值、触发时机、适用范围、禁止事项、依赖和前置条件
+   - 原因、证据和目的：为什么采取该方案，什么现象支持该判断
+   - 结果和状态变化：成功、失败、通过、阻塞、待处理，以及修改前后的差异
+4. 禁止只写“讨论了某主题”“要求优化相关代码”“助手提供了建议”“处理了某个问题”这类缺少实质内容的描述
+5. 对知识讲解、方案讨论和技术分析，不仅记录“谁讨论了什么”，还要提取其中明确出现的核心概念、方案、取舍、结论和适用条件
+6. 区分事件背景和实质内容：用户提出请求可以是一条 episodic fact；对话确认的稳定技术结论可以单独成为 semantic fact；助手实际完成的修改、测试及其结果可以成为 episodic fact
+7. 只基于输入对话提取。不要把“建议修改”“计划测试”“正在排查”写成“已经修改”“测试通过”或“问题已解决”，除非对话明确提供了完成证据
+8. 尽量保留用户偏好、约束、决定、失败经验、助手建议和明确原因
+9. 区分 fact_type（心理学意义上的记忆性质）:
    - semantic: 语义记忆，关于事实、概念、常识、稳定背景、长期偏好或长期规则
    - episodic: 情景记忆，关于具体经历/事件，通常包含特定时间、地点、人物、行为、结果、情绪或状态变化
-4. occurred_start/occurred_end 如果对话没有明确日期，填空字符串
-5. time_confidence 只能是 explicit、inferred_from_turn、unknown：
+10. occurred_start/occurred_end 如果对话没有明确日期，填空字符串
+11. time_confidence 只能是 explicit、inferred_from_turn、unknown：
    - explicit: 对话中明确给出日期/时间或可无歧义换算
    - inferred_from_turn: 只能基于当前这轮对话发生时间推断
    - unknown: 无法确定时间
-6. entities 遵守下方统一实体提取规则；普通时间表达应写入 occurred_start/occurred_end，不进入 entities
-7. keywords 是用于检索这条 fact 的关键词，保留关键实体、产品、技术、动作和约束
-8. topic 是这条 fact 归属的主题词列表，用于后续 observation 分桶；不要把 entity name 本身当作唯一 topic
-9. fact_subject 只能是 user、assistant、world、project、system、other；表示这条记忆主要关于谁/什么主体
+12. entities 遵守下方统一实体提取规则；普通时间表达应写入 occurred_start/occurred_end，不进入 entities
+13. keywords 是用于检索这条 fact 的关键词，保留关键实体、产品、技术、动作和约束
+14. topic 是这条 fact 归属的主题词列表，用于后续 observation 分桶；不要把 entity name 本身当作唯一 topic
+15. fact_subject 只能是 user、assistant、world、project、system、other；表示这条记忆主要关于谁/什么主体
    - 如果 fact_subject 是 user 或 assistant，可以把 "用户" 或 "助手" 作为 OTHER entity 输出，便于后续按对话主体聚合
-10. fact_kind 只能是 preference、decision、request、recommendation、action、error、context、instruction、other
+16. fact_kind 只能是 preference、decision、request、recommendation、action、error、context、instruction、other
    - instruction 只用于用户明确要求 AI 长期遵守的行为规则、格式偏好、语气偏好或工作方式
    - 临时任务要求、当前轮的一次性请求不要标为 instruction
-11. priority 是 0-100 的整数，表示长期记忆价值：
+17. priority 是 0-100 的整数，表示长期记忆价值：
    - 80-100: 长期偏好、硬约束、健康/安全/核心项目事实、明确长期指令、重要任务进展
    - 60-79: 可复用经验、一般任务事件、明确决策、失败原因
    - <60: 普通闲聊、一次性问答、无后续价值、重复弱信息；不要输出这条 fact
-12. task_event_like 描述这条 fact 是否是一个可能影响任务状态或步骤的事件；它不要求已经知道具体属于哪个任务
-13. task_event_subject 只能是 user、assistant、both、other；表示任务事件的主体或主要来源
-14. task_relevance 只能是 none、weak、medium、strong：
+18. task_event_like 描述这条 fact 是否是一个可能影响任务状态或步骤的事件；它不要求已经知道具体属于哪个任务
+19. task_event_subject 只能是 user、assistant、both、other；表示任务事件的主体或主要来源
+20. task_relevance 只能是 none、weak、medium、strong：
    - none: 与任务状态或步骤无关
    - weak: 像一个事件，但不足以说明它会影响任务状态或步骤
    - medium: 可能影响某个任务的状态或步骤
    - strong: 明确表示用户正在发起、推进、完成、阻塞、暂停、恢复或决策某个任务
-15. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
-16. 只返回 JSON，不要 markdown，不要额外解释
+21. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
+22. 只返回 JSON，不要 markdown，不要额外解释
 
 fact_kind 定义和判别边界：
 - preference：用户长期或反复表达的喜好、偏好、禁忌、习惯、倾向；不是一次性选择。
@@ -279,6 +322,7 @@ fact_kind 冲突和主体规则：
 - 不要抽取纯主观情绪，除非它改变了用户偏好、决策或任务状态
 - 不要抽取已被更高价值 fact 覆盖的重复信息
 - 如果一条候选 fact 的 priority < 60，不要把它放进 facts 数组
+- 不要因为信息很多就只保留上位主题；应删除低价值信息，而不是删除高价值事实中的关键细节
 
 task_event_like 判断规则：
 - true: fact 描述了一个可能影响任务生命周期的事件，包括请求、计划、推进、修改、实现、排查、验证、完成、结果、失败、阻塞、暂停、恢复或决策
@@ -287,11 +331,27 @@ task_event_like 判断规则：
 - 助手执行测试、修改代码、总结方案可以是 task_event_like，但如果只是助手行为，task_relevance 通常不要超过 medium
 - 用户明确要求、计划、继续、完成、阻塞、暂停或恢复某个任务时，task_relevance 通常是 medium 或 strong
 
-固定句式：
-- preference/context: "用户长期/通常/明确偏好..." 或 "关于 [实体/项目]，长期有用背景是..."
-- decision/request/action: "用户在 [时间] 围绕 [topic] 决定/请求/推进..."
-- instruction: "用户要求 AI 以后回答/执行任务时..."
-- assistant episodic: "助手曾在 [时间] 围绕 [topic] 执行/建议/验证...，结果是..."
+表达原则：
+- 不要求固定句式；结构化字段已经保存时间、主体和类别，text 应优先承载具体内容
+- preference/context 应写清具体偏好、稳定背景及其适用范围
+- decision/request/action 应写清具体对象、采用或要求的方案、关键条件及结果
+- instruction 应写清 AI 今后需要长期遵守的具体行为
+- assistant episodic 只有在对话明确表明助手实际执行、建议或验证了具体内容时才提取，并保留执行对象和结果
+
+详细程度示例：
+- 不合格："用户要求优化记忆提取逻辑。"
+- 合格："用户要求将 MemoryNodeManager.store_turn 从前 N 轮跳过提取改为每累计 N 轮批量提取一次，并保留未达到阈值的历史对话，避免只处理最新一轮造成信息丢失。"
+- 不合格："双方讨论了 observation 和 interpretation 的匹配。"
+- 合格拆分 1："用户认为 observation 与 interpretation 的匹配不应仅依赖关键词，建议把 embedding 相似度作为候选匹配指标。"
+- 合格拆分 2："用户要求 observation 匹配已有 interpretation 后更新 interpretation 内容，而不是只建立证据关联。"
+- 证据保守："助手建议增加测试"不能写成"助手已经增加测试并验证通过"；只有对话明确出现执行和测试结果时才能记录完成状态。
+
+输出前进行信息保真自检：
+- text 是否包含足以区别于同主题其他事实的具体对象、动作、约束或结论？
+- 删除函数名、参数、错误现象、关键条件或结果后是否会改变事实含义？如果会，必须保留。
+- 是否把多个可独立召回的决定、错误、方案或知识结论错误合并成了一条？
+- 是否退化成主题名称、对话行为或没有实质内容的概述？
+- 是否写入了输入对话没有明确支持的意图、原因、完成状态或结果？
 
 """ + ENTITY_EXTRACTION_GUIDANCE + """
 
@@ -1201,16 +1261,46 @@ class MemoryNodeManager:
 
     # ── Summarisation ────────────────────────────────────────────────────
 
+    @staticmethod
+    def _dialogue_batch_for_prompt(
+        source_turns: List[Dict[str, Any]],
+        fallback_timestamp: Optional[Any] = None,
+    ) -> str:
+        """Format source turns without losing user/assistant pairing."""
+        if isinstance(fallback_timestamp, datetime):
+            fallback_timestamp_text = fallback_timestamp.isoformat()
+        else:
+            fallback_timestamp_text = str(fallback_timestamp or "")
+
+        def _turn_timestamp(turn: Dict[str, Any]) -> str:
+            value = turn.get("turn_timestamp")
+            if isinstance(value, datetime):
+                return value.isoformat()
+            return str(value or fallback_timestamp_text)
+
+        return "\n\n".join(
+            (
+                f"[Turn {index}]\n"
+                f"对话发生时间：{_turn_timestamp(turn)}\n"
+                f"用户：{turn.get('user_message') or ''}\n"
+                f"助手：{turn.get('assistant_response') or ''}"
+            )
+            for index, turn in enumerate(source_turns, start=1)
+        )
+
     def _summarize_turn(
-        self, user_message: str, assistant_response: str
+        self,
+        source_turns: List[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        """Summarise a conversation turn via LLM API call.
+        """Summarise a batch of paired conversation turns via LLM API call.
 
         Retries once on parse failure to handle transient API errors.
         """
+        if not source_turns:
+            return None
+        dialogue_batch = self._dialogue_batch_for_prompt(source_turns)
         prompt = SUMMARY_SYSTEM_PROMPT.format(
-            user_message=user_message,
-            assistant_response=assistant_response,
+            dialogue_batch=dialogue_batch,
         )
         
         for attempt in range(2):
@@ -1576,10 +1666,8 @@ class MemoryNodeManager:
 
     def _extract_retain_facts(
         self,
-        user_message: str,
-        assistant_response: str,
+        source_turns: List[Dict[str, Any]],
         turn_timestamp: Optional[Any] = None,
-        source_turns: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Extract HindSight-style narrative facts for retain.
 
@@ -1587,32 +1675,18 @@ class MemoryNodeManager:
         model fails or returns malformed JSON, we fall back to the older single
         summary so memory retention remains best-effort instead of all-or-none.
         """
+        if not source_turns:
+            return None
         if turn_timestamp is None:
             turn_timestamp_text = datetime.now().astimezone().isoformat()
         elif isinstance(turn_timestamp, datetime):
             turn_timestamp_text = turn_timestamp.astimezone().isoformat()
         else:
             turn_timestamp_text = str(turn_timestamp)
-        turns = source_turns or [{
-            "user_message": user_message,
-            "assistant_response": assistant_response,
-            "turn_timestamp": turn_timestamp_text,
-        }]
 
-        def _prompt_timestamp(turn: Dict[str, Any]) -> str:
-            value = turn.get("turn_timestamp")
-            if isinstance(value, datetime):
-                return value.isoformat()
-            return str(value or turn_timestamp_text)
-
-        dialogue_batch = "\n\n".join(
-            (
-                f"[Turn {index}]\n"
-                f"对话发生时间：{_prompt_timestamp(turn)}\n"
-                f"用户：{turn.get('user_message') or ''}\n"
-                f"助手：{turn.get('assistant_response') or ''}"
-            )
-            for index, turn in enumerate(turns, start=1)
+        dialogue_batch = self._dialogue_batch_for_prompt(
+            source_turns,
+            fallback_timestamp=turn_timestamp_text,
         )
         prompt = RETAIN_FACT_EXTRACTION_PROMPT.format(
             dialogue_batch=dialogue_batch,
@@ -1703,7 +1777,7 @@ class MemoryNodeManager:
         if not facts:
             if skipped_low_priority:
                 return {"facts": [], "causal_relations": []}
-            summary_data = self._summarize_turn(user_message, assistant_response)
+            summary_data = self._summarize_turn(source_turns)
             if not summary_data:
                 return None
             fallback = self._fallback_fact_from_summary(summary_data)
@@ -5175,10 +5249,8 @@ class MemoryNodeManager:
         try:
             # ── Step 1: Extract narrative facts (SYNC) ──
             retain_data = self._extract_retain_facts(
-                batch_user_message,
-                batch_assistant_response,
+                source_turns,
                 turn_timestamp=batch_timestamp,
-                source_turns=source_turns,
             )
             if not retain_data:
                 logger.debug("Skipping memory node — retain extraction returned no data")
