@@ -1209,6 +1209,13 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
+    try:
+        from agent.screen_memory.service import schedule_screen_memory_tick
+
+        schedule_screen_memory_tick()
+    except Exception as exc:
+        logger.debug("Failed to schedule screen memory tick: %s", exc)
+
     _LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows

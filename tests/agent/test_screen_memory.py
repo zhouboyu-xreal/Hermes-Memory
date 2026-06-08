@@ -1,0 +1,370 @@
+import sqlite3
+from datetime import datetime, timezone
+
+from agent.screen_memory.cleaner import ScreenMemoryCleaner
+from agent.screen_memory.config import load_screen_memory_config
+from agent.screen_memory import service
+
+
+def _cleaner(tmp_path):
+    config = load_screen_memory_config({
+        "screen_memory": {
+            "enabled": True,
+            "screenpipe_db": str(tmp_path / "screenpipe.db"),
+            "openchronicle_db": str(tmp_path / "openchronicle.db"),
+            "output_db": str(tmp_path / "screen-memory.db"),
+            "screen_memory_generation": {
+                "enabled": True,
+                "enable_LLM_fact_extraction": False,
+                "enable_observation_generation": True,
+                "enable_LLM_observation": False,
+                "fallback_observation_without_llm": True,
+            },
+        },
+        "embedding": {"enabled": False},
+    })
+    return ScreenMemoryCleaner(config)
+
+
+def _seed_workstream(cursor):
+    cursor.execute(
+        """
+        INSERT INTO views
+        (app_name, window_title, content_kind, start_timestamp, end_timestamp,
+         representative_text, topics_json, entities_json, artifacts_json,
+         evidence_ids_json, confidence, record_count)
+        VALUES ('Code', 'memory.py', 'coding', '2026-06-01 10:00:00',
+                '2026-06-01 10:30:00', 'memory clustering', '["memory"]',
+                '["MemoryNodeManager"]', '["memory.py"]', '[]', 0.9, 2)
+        """
+    )
+    view_id = cursor.lastrowid
+    cursor.execute(
+        """
+        INSERT INTO window_workstream
+        (title, summary, category, start_timestamp, end_timestamp, topics_json,
+         entities_json, artifacts_json, app_names_json, window_titles_json,
+         view_count, segment_count, confidence, created_at, updated_at)
+        VALUES ('Code - memory.py', 'Memory work', 'coding',
+                '2026-06-01 10:00:00', '2026-06-01 10:30:00', '["memory"]',
+                '["MemoryNodeManager"]', '["memory.py"]', '["Code"]',
+                '["memory.py"]', 1, 0, 0.9, '2026-06-01 10:30:00',
+                '2026-06-01 10:30:00')
+        """
+    )
+    workstream_id = cursor.lastrowid
+    cursor.execute(
+        """
+        INSERT INTO window_workstream_members
+        (window_workstream_id, view_id, relevance, reason, created_at)
+        VALUES (?, ?, 1.0, 'test', '2026-06-01 10:30:00')
+        """,
+        (workstream_id, view_id),
+    )
+    return workstream_id, view_id
+
+
+def _add_fact(cursor, view_id, fact_hash, text, timestamp):
+    cursor.execute(
+        """
+        INSERT INTO screen_facts
+        (view_id, fact_hash, fact_text, fact_type, fact_kind, work_type,
+         project_key, objective_key, topics_json, entities_json, artifacts_json,
+         evidence_text, evidence_record_ids_json, app_name, window_title,
+         start_timestamp, end_timestamp, confidence, created_at, updated_at)
+        VALUES (?, ?, ?, 'episodic', 'work_event', 'implementation',
+                'hermes-agent', 'screen-memory', '["screen memory"]',
+                '["ScreenMemoryCleaner"]', '["memory.py"]', ?, '[]', 'Code',
+                'memory.py', ?, ?, 0.9, ?, ?)
+        """,
+        (
+            view_id,
+            fact_hash,
+            text,
+            text,
+            timestamp,
+            timestamp,
+            timestamp,
+            timestamp,
+        ),
+    )
+
+
+def test_screen_memory_defaults_use_profile_output_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+
+    config = load_screen_memory_config({
+        "screen_memory": {
+            "enabled": True,
+            "screenpipe_db": str(tmp_path / "screenpipe.db"),
+            "openchronicle_db": str(tmp_path / "openchronicle.db"),
+        }
+    })
+
+    assert config["database"]["cleaned_db"] == str(
+        tmp_path / "profile" / "screen_memory" / "memory.db"
+    )
+    assert config["schedule"]["ingest_interval_minutes"] == 30
+    assert config["schedule"]["fact_clustering_interval_hours"] == 6
+    assert config["schedule"]["observation_interval_hours"] == 24
+
+
+def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
+    cleaner = _cleaner(tmp_path)
+    connection = cleaner.ensure_cleaned_db()
+    cursor = connection.cursor()
+    workstream_id, view_id = _seed_workstream(cursor)
+    _add_fact(
+        cursor,
+        view_id,
+        "fact-1",
+        "Implemented persistent screen fact clusters.",
+        "2026-06-01 10:05:00",
+    )
+    _add_fact(
+        cursor,
+        view_id,
+        "fact-2",
+        "Connected screen fact clusters to daily observations.",
+        "2026-06-01 10:15:00",
+    )
+    _add_fact(
+        cursor,
+        view_id,
+        "fact-3",
+        "Prepared screen fact clusters for observation generation.",
+        "2026-06-01 10:20:00",
+    )
+    _add_fact(
+        cursor,
+        view_id,
+        "fact-4",
+        "Checked screen fact clustering persistence.",
+        "2026-06-01 10:25:00",
+    )
+    connection.commit()
+
+    cluster_stats = cleaner.update_screen_fact_cluster_tables(connection)
+
+    assert cluster_stats["screen_facts_clustered"] == 0
+    assert cursor.execute(
+        "SELECT count(*) FROM screen_fact_cluster_members"
+    ).fetchone()[0] == 0
+
+    _add_fact(
+        cursor,
+        view_id,
+        "fact-5",
+        "Reached the screen fact clustering threshold.",
+        "2026-06-01 10:30:00",
+    )
+    connection.commit()
+
+    cluster_stats = cleaner.update_screen_fact_cluster_tables(connection)
+
+    assert cluster_stats["screen_facts_clustered"] == 5
+    cluster_row = cursor.execute(
+        """
+        SELECT id, observation_id, observed_fact_count
+        FROM screen_fact_clusters
+        WHERE window_workstream_id = ?
+        """,
+        (workstream_id,),
+    ).fetchone()
+    assert cluster_row[1] is None
+    assert cluster_row[2] == 0
+    assert cursor.execute(
+        "SELECT count(*) FROM screen_fact_cluster_members WHERE cluster_id = ?",
+        (cluster_row[0],),
+    ).fetchone()[0] == 5
+
+    observation_stats = cleaner.update_screen_observation_tables(connection, None)
+
+    assert observation_stats["screen_observations_generated"] == 1
+    cluster_row = cursor.execute(
+        """
+        SELECT id, observation_id, observed_fact_count
+        FROM screen_fact_clusters
+        WHERE id = ?
+        """,
+        (cluster_row[0],),
+    ).fetchone()
+    observation_id = cluster_row[1]
+    assert observation_id is not None
+    assert cluster_row[2] == 5
+
+    for index in range(6, 11):
+        _add_fact(
+            cursor,
+            view_id,
+            f"fact-{index}",
+            f"Verified screen memory clustering update {index}.",
+            f"2026-06-01 10:{index + 25:02d}:00",
+        )
+    connection.commit()
+    cleaner.update_screen_fact_cluster_tables(connection)
+    cleaner.update_screen_observation_tables(connection, None)
+
+    updated_cluster = cursor.execute(
+        """
+        SELECT observation_id, observed_fact_count
+        FROM screen_fact_clusters
+        WHERE id = ?
+        """,
+        (cluster_row[0],),
+    ).fetchone()
+    assert updated_cluster[0] == observation_id
+    assert updated_cluster[1] == 10
+    assert cursor.execute(
+        "SELECT count(*) FROM screen_observations"
+    ).fetchone()[0] == 1
+    assert cursor.execute(
+        "SELECT count(*) FROM screen_observation_facts WHERE observation_id = ?",
+        (observation_id,),
+    ).fetchone()[0] == 10
+    connection.close()
+
+
+def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
+    config = _cleaner(tmp_path).config
+    screenpipe_db = tmp_path / "screenpipe.db"
+    openchronicle_db = tmp_path / "openchronicle.db"
+    screenpipe_db.touch()
+    openchronicle_db.touch()
+    config["database"]["screenpipe_db"] = str(screenpipe_db)
+    config["database"]["openchronicle_db"] = str(openchronicle_db)
+
+    class _FakeCleaner:
+        def __init__(self, cleaner_config, llm_client=None):
+            self.config = cleaner_config
+            self.cleaned_db = cleaner_config["database"]["cleaned_db"]
+
+    monkeypatch.setattr(service, "_screen_memory_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(service, "load_screen_memory_config", lambda _cfg: config)
+    monkeypatch.setattr(service, "_inject_runtime_config", lambda *_args: None)
+    monkeypatch.setattr(service, "ScreenMemoryCleaner", _FakeCleaner)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"screen_memory": {"enabled": True}},
+    )
+
+    calls = []
+
+    def _ingest(_cleaner, state, now):
+        calls.append("ingest")
+        state["last_ingest_at"] = now.isoformat()
+        return {}
+
+    def _cluster(_cleaner, state, now):
+        calls.append("cluster")
+        state["last_fact_clustering_at"] = now.isoformat()
+        return {}
+
+    def _observe(_cleaner, state, now):
+        calls.append("observation")
+        state["last_observation_at"] = now.isoformat()
+        return {}
+
+    monkeypatch.setattr(service, "_run_ingest", _ingest)
+    monkeypatch.setattr(service, "_run_fact_clustering", _cluster)
+    monkeypatch.setattr(service, "_run_observations", _observe)
+
+    start = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    service.run_screen_memory_due_work(now=start)
+    assert calls == ["ingest", "cluster", "observation"]
+
+    calls.clear()
+    service.run_screen_memory_due_work(
+        now=datetime(2026, 6, 1, 1, tzinfo=timezone.utc)
+    )
+    assert calls == ["ingest"]
+
+    calls.clear()
+    service.run_screen_memory_due_work(
+        now=datetime(2026, 6, 1, 6, tzinfo=timezone.utc)
+    )
+    assert calls == ["ingest", "cluster"]
+
+    calls.clear()
+    service.run_screen_memory_due_work(
+        now=datetime(2026, 6, 2, tzinfo=timezone.utc)
+    )
+    assert calls == ["ingest", "cluster", "observation"]
+
+
+def test_incremental_clean_merges_screenpipe_and_openchronicle_into_workstream(tmp_path):
+    cleaner = _cleaner(tmp_path)
+    screenpipe_db = tmp_path / "screenpipe.db"
+    openchronicle_db = tmp_path / "openchronicle.db"
+    cleaner.screenpipe_db = str(screenpipe_db)
+    cleaner.openchronicle_db = str(openchronicle_db)
+
+    connection = sqlite3.connect(screenpipe_db)
+    connection.executescript(
+        """
+        CREATE TABLE frames (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL);
+        CREATE TABLE ocr_text (
+            id INTEGER PRIMARY KEY,
+            frame_id INTEGER NOT NULL,
+            app_name TEXT,
+            window_name TEXT,
+            focused INTEGER,
+            text TEXT
+        );
+        INSERT INTO frames VALUES (1, '2026-06-01T10:00:00Z');
+        INSERT INTO frames VALUES (2, '2026-06-01T10:00:03Z');
+        INSERT INTO ocr_text
+        VALUES (1, 1, 'Code', 'memory.py', 1,
+                'Implement ScreenMemoryCleaner records views and workstream pipeline');
+        INSERT INTO ocr_text
+        VALUES (2, 2, 'Code', 'memory.py', 1,
+                'Implement ScreenMemoryCleaner records views workstream and AXTree pipeline');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    connection = sqlite3.connect(openchronicle_db)
+    connection.executescript(
+        """
+        CREATE TABLE captures (
+            id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            app_name TEXT,
+            bundle_id TEXT,
+            window_title TEXT,
+            focused_role TEXT,
+            focused_value TEXT,
+            visible_text TEXT,
+            url TEXT
+        );
+        INSERT INTO captures
+        VALUES ('capture-1', '2026-06-01T10:00:02Z', 'Code',
+                'com.microsoft.VSCode', 'memory.py', 'AXTextArea',
+                'editor', 'ScreenMemoryCleaner AXTree structured content', '');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    stats = cleaner.clean(
+        start_time_str="2026-06-01T09:59:00Z",
+        end_time_str="2026-06-01T10:01:00Z",
+        incremental=True,
+        generate_screen_facts=False,
+        update_window_workstreams=True,
+    )
+
+    assert stats["cleaned_records"] == 2
+    assert stats["openchronicle_events"] == 1
+    assert stats["record_ax_event_links"] >= 1
+    output = sqlite3.connect(cleaner.cleaned_db)
+    assert output.execute("SELECT count(*) FROM views").fetchone()[0] == 1
+    assert output.execute("SELECT count(*) FROM window_workstream").fetchone()[0] == 1
+    assert output.execute(
+        "SELECT count(*) FROM window_workstream_members"
+    ).fetchone()[0] == 1
+    assert output.execute(
+        "SELECT count(*) FROM records WHERE ax_context_json IS NOT NULL"
+    ).fetchone()[0] >= 1
+    output.close()
