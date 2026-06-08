@@ -170,20 +170,30 @@ fact_type_preference 只能是：
 - episodic: 更需要具体经历、事件、时间线、上下文和证据
 - both: 两者都需要或无法判断
 
+needs_recall 判断标准：
+- true: 回答依赖用户或助手过去的经历、长期偏好、持续任务、历史状态、时间线或证据；或者长期记忆可能实质性改变回答内容
+- false: 当前输入已经包含完整信息，且问题只需要通用知识、当前输入中的材料、简单问候确认或与历史无关的临时操作
+- 仅依赖当前会话上下文不等同于需要长期记忆；不要因为长期记忆可能提供轻微帮助就返回 true
+
 要求：
-1. search_text 是用于 embedding 的检索表达，必须保留原始查询中的关键实体、事件、约束和意图；不要过度抽象。
-2. keywords 提取 2-8 个检索关键词，保留关键实体、产品、技术、动作、约束和主题词。
-3. entities 提取对召回有用的实体，遵守实体抽取规则；普通时间表达不要作为实体。
-4. layer_preference 是 interpretations/observations/facts 三层的偏好权重，数值在 0-1 之间，总和尽量接近 1。
-5. intent_confidence 是你对 recall_intent 判断的置信度，0-1。
-6. needs_evidence 表示回答是否需要展开 observation/interpretation 背后的事实证据。
-7. time_sensitivity 只能是 specific、recent、long_term、none。
-8. 仅返回 JSON，不要包含其他内容。
+1. needs_recall 表示是否需要查询长期记忆；recall_confidence 是该判断的置信度，0-1；recall_reason 用简短枚举式文本说明原因。
+2. 即使 needs_recall 为 false，也要返回完整 JSON，便于日志和降级处理。
+3. search_text 是用于 embedding 的检索表达，必须保留原始查询中的关键实体、事件、约束和意图；不要过度抽象。
+4. keywords 提取 2-8 个检索关键词，保留关键实体、产品、技术、动作、约束和主题词。
+5. entities 提取对召回有用的实体，遵守实体抽取规则；普通时间表达不要作为实体。
+6. layer_preference 是 interpretations/observations/facts 三层的偏好权重，数值在 0-1 之间，总和尽量接近 1。
+7. intent_confidence 是你对 recall_intent 判断的置信度，0-1。
+8. needs_evidence 表示回答是否需要展开 observation/interpretation 背后的事实证据。
+9. time_sensitivity 只能是 specific、recent、long_term、none。
+10. 仅返回 JSON，不要包含其他内容。
 
 """ + ENTITY_EXTRACTION_GUIDANCE + """
 
 输出格式：
 {{
+    "needs_recall": true,
+    "recall_confidence": 0.0,
+    "recall_reason": "historical_context_required",
     "search_text": "用于 embedding 的检索表达", 
     "keywords": ["关键词1", "关键词2"], 
     "entities": [{{"name": "实体名", "type": "CONCEPT"}}], 
@@ -1259,6 +1269,20 @@ class MemoryNodeManager:
         return sensitivity if sensitivity in {"specific", "recent", "long_term", "none"} else "none"
 
     @staticmethod
+    def _normalize_bool(value: Any, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "yes", "1"}:
+                return True
+            if normalized in {"false", "no", "0"}:
+                return False
+        return default
+
+    @staticmethod
     def _normalize_string_list(value: Any, *, limit: int = 8) -> List[str]:
         if isinstance(value, str):
             raw = value.split(",")
@@ -1304,6 +1328,11 @@ class MemoryNodeManager:
         if not keywords:
             keywords = self._fallback_query_keywords(query)
         return {
+            # Older analysis payloads did not contain a recall gate. Defaulting
+            # to True preserves their behavior and avoids accidental misses.
+            "needs_recall": self._normalize_bool(data.get("needs_recall"), True),
+            "recall_confidence": self._clip_unit_float(data.get("recall_confidence"), 0.0),
+            "recall_reason": str(data.get("recall_reason") or "").strip(),
             "search_text": search_text,
             "keywords": keywords[:8],
             "entities": self._normalize_fact_entities(data.get("entities", [])),
@@ -1348,6 +1377,36 @@ class MemoryNodeManager:
                 continue
             return None
         return None
+
+    @staticmethod
+    def _rule_based_recall_gate(query: str) -> Dict[str, str]:
+        """Handle only high-confidence recall decisions without an LLM call."""
+        text = str(query or "").strip()
+        normalized = re.sub(r"[\s，。！？、,.!?;；:：~～]+", "", text).lower()
+        if not normalized:
+            return {"decision": "skip", "reason": "empty_query"}
+
+        trivial_queries = {
+            "你好", "您好", "嗨", "哈喽", "hello", "hi", "hey",
+            "谢谢", "感谢", "多谢", "thankyou", "thanks",
+            "好的", "好", "可以", "明白了", "知道了", "收到", "没问题",
+            "ok", "okay", "gotit",
+            "再见", "拜拜", "bye", "goodbye",
+        }
+        if normalized in trivial_queries:
+            return {"decision": "skip", "reason": "trivial_social_query"}
+
+        explicit_history_terms = (
+            "你还记得", "还记得我", "之前我", "我之前", "我们之前",
+            "上次我", "我们上次", "以前我", "过去我", "曾经我",
+            "我说过", "我提到过", "历史记录", "根据你对我的了解",
+            "继续之前", "接着之前", "what did i", "do you remember",
+            "last time", "previously", "my history",
+        )
+        lowered = text.lower()
+        if any(term in lowered for term in explicit_history_terms):
+            return {"decision": "recall", "reason": "explicit_history_reference"}
+        return {"decision": "analyze", "reason": "semantic_judgment_required"}
 
     @staticmethod
     def _json_object_from_llm_text(text: str) -> Optional[Dict[str, Any]]:
@@ -5860,13 +5919,6 @@ class MemoryNodeManager:
         if not self._enabled or not query:
             return ""
 
-        if not self._ensure_embedding_client():
-            self._log_info("memory_recall", "skip", {
-                "reason": "embedding_client_unavailable",
-                "query": self._reflect_log_text(query, limit=300),
-            })
-            return ""
-
         started_at = time.monotonic()
         try:
             k = top_k or self._top_k
@@ -5894,12 +5946,50 @@ class MemoryNodeManager:
                 "effective_time_end": te,
             })
 
-            # Analyze the query once for embedding text, keywords, entities, and recall intent.
+            gate = self._rule_based_recall_gate(search_query)
+            self._log_info("memory_recall", "gate_decided", {
+                "decision": gate["decision"],
+                "reason": gate["reason"],
+            })
+            if gate["decision"] == "skip":
+                self._log_info("memory_recall", "skip", {
+                    "reason": gate["reason"],
+                    "query": self._reflect_log_text(search_query, limit=300),
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+                })
+                return ""
+
+            # Both explicit recall requests and ambiguous queries need the LLM
+            # analysis to produce retrieval-oriented search text and strategy.
             query_analysis = self._analyze_recall_query(search_query)
             if not query_analysis:
                 self._log_info("memory_recall", "skip", {
                     "reason": "query_analysis_empty",
+                    "gate_decision": gate["decision"],
+                    "gate_reason": gate["reason"],
                     "query": self._reflect_log_text(search_query, limit=300),
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+                })
+                return ""
+            analysis_source = "llm"
+
+            if (
+                gate["decision"] != "recall"
+                and not query_analysis.get("needs_recall", True)
+            ):
+                self._log_info("memory_recall", "skip", {
+                    "reason": query_analysis.get("recall_reason") or "llm_recall_not_needed",
+                    "decision_source": analysis_source,
+                    "recall_confidence": query_analysis.get("recall_confidence"),
+                    "query": self._reflect_log_text(search_query, limit=300),
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+                })
+                return ""
+
+            if not self._ensure_embedding_client():
+                self._log_info("memory_recall", "skip", {
+                    "reason": "embedding_client_unavailable",
+                    "query": self._reflect_log_text(query, limit=300),
                     "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
                 })
                 return ""
@@ -5935,6 +6025,10 @@ class MemoryNodeManager:
             }
             self._log_info("memory_recall", "query_analyzed", {
                 "search_text": self._reflect_log_text(query_analysis.get("search_text"), limit=300),
+                "analysis_source": analysis_source,
+                "needs_recall": query_analysis.get("needs_recall"),
+                "recall_confidence": query_analysis.get("recall_confidence"),
+                "recall_reason": query_analysis.get("recall_reason"),
                 "keywords": keywords,
                 "entities": self._recall_log_entities(entities),
                 "llm_recall_intent": query_analysis.get("recall_intent"),
