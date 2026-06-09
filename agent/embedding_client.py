@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -174,13 +175,17 @@ class _OpenAIBackend:
             base = "https://api.openai.com"
         self.url = f"{base}/v1/embeddings"
         self.model = config.get("model", "text-embedding-3-small")
-        self.api_key = config.get("api_key", "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")
+        self.api_key = str(config.get("api_key") or "").strip()
+        env_ref = re.fullmatch(r"\${([A-Za-z_][A-Za-z0-9_]*)}", self.api_key)
+        if env_ref:
+            self.api_key = os.environ.get(env_ref.group(1), "").strip()
         if not self.api_key:
             # Fall back to environment variables so secrets stay out of
             # config.yaml. Checks common embedding-provider env vars in order.
             self.api_key = (
-                os.environ.get("OPENAI_API_KEY")
+                os.environ.get("EMBEDDING_API_KEY")
                 or os.environ.get("OPENROUTER_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
                 or ""
             )
         self.timeout = config.get("timeout", 60)

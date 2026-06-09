@@ -58,6 +58,31 @@ class TestExpandEnvVars:
 
 
 class TestLoadConfigExpansion:
+    def test_load_config_expands_memory_embedding_api_key(
+        self, tmp_path, monkeypatch
+    ):
+        config_file = tmp_path / "config.yaml"
+        memory_file = tmp_path / "memory.yaml"
+        config_file.write_text("", encoding="utf-8")
+        memory_file.write_text(
+            "embedding:\n"
+            "  provider: openai\n"
+            "  api_key: ${EMBEDDING_API_KEY}\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("EMBEDDING_API_KEY", "embedding-test-key")
+        monkeypatch.setattr(
+            "hermes_cli.config.get_config_path", lambda: config_file
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.get_memory_config_path", lambda: memory_file
+        )
+
+        config = load_config()
+
+        assert config["embedding"]["api_key"] == "embedding-test-key"
+
     def test_load_config_expands_env_vars(self, tmp_path, monkeypatch):
         config_yaml = (
             "model:\n"
