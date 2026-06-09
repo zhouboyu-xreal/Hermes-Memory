@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run memory-node store fact extraction on a dialogue export.
+"""Run memory-node store fact extraction on dialogue test samples.
 
-This script is intentionally standalone: it flattens all user/assistant turns
-from a history_dialogue.json file, feeds them to MemoryNodeManager.store_turn(),
-and saves an isolated SessionDB under tmp/ by default. Fact extraction follows
-the batching interval configured in the project-level memory.yaml.
+Samples can come from a history_dialogue.json file or from
+PYTHON_TEST_SAMPLES below. Both sources are normalized into the same turn
+stream, fed to MemoryNodeManager.store_turn(), and saved in an isolated
+SessionDB under tmp/ by default. Fact extraction follows the batching interval
+configured in the project-level memory.yaml.
 """
 
 from __future__ import annotations
@@ -39,6 +40,63 @@ DEFAULT_LOG_PATH = REPO_ROOT / "tmp" / "memory_store_fact_test" / "memory_store_
 
 SAMPLE_ID_RE = re.compile(r"(?:^|_)sample(\d+)$")
 
+# Edit this list when a small, self-contained test run is more convenient than
+# maintaining a separate history_dialogue.json file. Its shape intentionally
+# matches the export format consumed by flatten_dialogue().
+try:
+    from scripts.test_data_sample import (
+        AGENT_FIFTH,
+        AGENT_FIRST,
+        AGENT_FORTH,
+        AGENT_SECOND,
+        AGENT_THIRD,
+        USER_FIFTH,
+        USER_FIRST,
+        USER_FORTH,
+        USER_SECOND,
+        USER_THIRD,
+    )
+except ModuleNotFoundError:
+    from test_data_sample import (
+        AGENT_FIFTH,
+        AGENT_FIRST,
+        AGENT_FORTH,
+        AGENT_SECOND,
+        AGENT_THIRD,
+        USER_FIFTH,
+        USER_FIRST,
+        USER_FORTH,
+        USER_SECOND,
+        USER_THIRD,
+    )
+
+PYTHON_TEST_SAMPLES: List[Dict[str, List[Dict[str, str]]]] = [
+    {
+        "python_sample1": [
+            {
+                "user": USER_FIRST,
+                "assistant": AGENT_FIRST,
+            },
+            {
+                "user": USER_SECOND,
+                "assistant": AGENT_SECOND,
+            },
+            {
+                "user": USER_THIRD,
+                "assistant": AGENT_THIRD,
+            },
+            {
+                "user": USER_FORTH,
+                "assistant": AGENT_FORTH,
+            },
+            {
+                "user": USER_FIFTH,
+                "assistant": AGENT_FIFTH,
+            },
+        ]
+    }
+]
+
 
 class StableEmbeddingClient:
     """Small deterministic embedding stand-in for store-path isolation."""
@@ -60,16 +118,36 @@ class StableEmbeddingClient:
 class StoreFactExtractionManager(MemoryNodeManager):
     """Use real retain extraction, but skip unrelated async graph work."""
 
-    def __init__(self, *args: Any, report_rows: List[Dict[str, Any]], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        report_rows: List[Dict[str, Any]],
+        llm_max_tokens: int,
+        llm_thinking: str,
+        llm_json_mode: bool,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._embedding_client = StableEmbeddingClient()
         self.report_rows = report_rows
+        self._test_llm_max_tokens = max(1, int(llm_max_tokens))
+        self._test_llm_thinking = str(llm_thinking)
+        self._test_llm_json_mode = bool(llm_json_mode)
+        self._test_llm_call_count = 0
 
     def _ensure_embedding_client(self) -> bool:
         self._embedding_client = StableEmbeddingClient()
         return True
 
     def _call_llm(self, prompt: str) -> str | None:
+        self._test_llm_call_count += 1
+        call_kind = (
+            "retain"
+            if "fact 提取模块" in prompt
+            else "summary"
+            if "对话摘要模块" in prompt
+            else "other"
+        )
         url = f"{self._llm_base_url.rstrip('/')}/chat/completions"
         headers = {"Content-Type": "application/json"}
         if self._llm_api_key:
@@ -78,15 +156,59 @@ class StoreFactExtractionManager(MemoryNodeManager):
             "model": self._llm_model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
-            "max_tokens": 2048,
+            "max_tokens": self._test_llm_max_tokens,
             "stream": False,
         }
+        if self._test_llm_thinking != "auto":
+            payload["thinking"] = {"type": self._test_llm_thinking}
+        if self._test_llm_json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        logging.info(
+            "LLM call #%s kind=%s model=%s prompt_chars=%s max_tokens=%s "
+            "thinking=%s json_mode=%s",
+            self._test_llm_call_count,
+            call_kind,
+            self._llm_model,
+            len(prompt),
+            self._test_llm_max_tokens,
+            self._test_llm_thinking,
+            self._test_llm_json_mode,
+        )
         try:
             response = requests.post(url, json=payload, headers=headers, timeout=self._llm_timeout)
             response.raise_for_status()
-            choices = response.json().get("choices", [])
+            response_data = response.json()
+            choices = response_data.get("choices", [])
             if choices:
-                return choices[0].get("message", {}).get("content", "")
+                choice = choices[0]
+                content = choice.get("message", {}).get("content", "") or ""
+                finish_reason = choice.get("finish_reason")
+                logging.info(
+                    "LLM result #%s kind=%s finish_reason=%s response_chars=%s usage=%s",
+                    self._test_llm_call_count,
+                    call_kind,
+                    finish_reason,
+                    len(content),
+                    response_data.get("usage"),
+                )
+                logging.info(
+                    "LLM raw response #%s kind=%s:\n%s",
+                    self._test_llm_call_count,
+                    call_kind,
+                    content,
+                )
+                if finish_reason == "length":
+                    logging.warning(
+                        "LLM result #%s was truncated; increase --llm-max-tokens",
+                        self._test_llm_call_count,
+                    )
+                return content
+            logging.error(
+                "LLM response #%s kind=%s contained no choices: %s",
+                self._test_llm_call_count,
+                call_kind,
+                response_data,
+            )
         except requests.exceptions.RequestException as exc:
             logging.error("LLM request failed for %s with model %s: %s", url, self._llm_model, exc)
         except (KeyError, ValueError, TypeError) as exc:
@@ -144,8 +266,8 @@ def sample_hour_offset(sample_id: str, fallback_offset: int) -> int:
     return fallback_offset
 
 
-def flatten_dialogue(path: Path) -> List[Tuple[str, int, str, str, int, bool]]:
-    data = json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
+def flatten_dialogue_data(data: Any) -> List[Tuple[str, int, str, str, int, bool]]:
+    """Normalize exported or in-file dialogue samples into store turns."""
     dialogue = data.get("dialogue") if isinstance(data, dict) else data
     if not isinstance(dialogue, list):
         raise ValueError("Expected JSON to contain a top-level dialogue list")
@@ -174,6 +296,20 @@ def flatten_dialogue(path: Path) -> List[Tuple[str, int, str, str, int, bool]]:
                 if user and assistant:
                     turns.append((sample_key, turn_index, user, assistant, hour_offset, is_last_turn))
     return turns
+
+
+def flatten_dialogue(path: Path) -> List[Tuple[str, int, str, str, int, bool]]:
+    data = json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
+    return flatten_dialogue_data(data)
+
+
+def load_test_turns(
+    source: str,
+    input_path: Path,
+) -> List[Tuple[str, int, str, str, int, bool]]:
+    if source == "python":
+        return flatten_dialogue_data(PYTHON_TEST_SAMPLES)
+    return flatten_dialogue(input_path)
 
 
 def iter_stored_nodes(db: SessionDB, start_id: int) -> Iterable[Dict[str, Any]]:
@@ -210,9 +346,18 @@ def load_hermes_config() -> Dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Exercise MemoryNodeManager.store_turn fact extraction against history_dialogue.json."
+        description="Exercise MemoryNodeManager.store_turn fact extraction against JSON or in-file Python samples."
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument(
+        "--sample-source",
+        choices=("json", "python"),
+        default="json",
+        help=(
+            "Read --input as JSON, or use PYTHON_TEST_SAMPLES defined in this "
+            "script. Defaults to json."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--db-name", default="memory_store_fact_test.db")
     parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
@@ -224,11 +369,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-api-key")
     parser.add_argument("--llm-timeout", type=int)
     parser.add_argument(
+        "--llm-max-tokens",
+        type=int,
+        default=8192,
+        help="Maximum output tokens for each extraction/summary LLM call. Defaults to 8192.",
+    )
+    parser.add_argument(
+        "--llm-thinking",
+        choices=("disabled", "enabled", "auto"),
+        default="disabled",
+        help=(
+            "Control provider thinking mode. Defaults to disabled because "
+            "structured extraction does not need a large reasoning budget; "
+            "auto omits the provider-specific parameter."
+        ),
+    )
+    parser.add_argument(
+        "--no-llm-json-mode",
+        action="store_false",
+        dest="llm_json_mode",
+        help="Do not request provider-enforced JSON output.",
+    )
+    parser.set_defaults(llm_json_mode=True)
+    parser.add_argument(
         "--fact-extraction-interval",
         type=int,
         help=(
             "Extract facts once per N completed turns. Defaults to "
             "memory.min_turns_before_store from memory.yaml."
+        ),
+    )
+    parser.add_argument(
+        "--fact-extraction-max-chars",
+        type=int,
+        help=(
+            "Extract facts early when pending dialogue exceeds this many "
+            "characters. Defaults to memory.max_chars_before_store."
         ),
     )
     parser.add_argument(
@@ -301,6 +477,14 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
             or 1
         ),
     )
+    args.fact_extraction_max_chars = max(
+        1,
+        int(
+            args.fact_extraction_max_chars
+            or memory_config.get("max_chars_before_store", 2000)
+            or 2000
+        ),
+    )
 
 def configure_logging(log_path: Path, log_level: str, manager_log_level: str) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -331,7 +515,7 @@ def main() -> int:
             "No OPENAI_API_KEY/HERMES_LLM_API_KEY found. Set one or pass --llm-base-url for a local compatible endpoint."
         )
 
-    turns = flatten_dialogue(args.input)
+    turns = load_test_turns(args.sample_source, args.input)
     if args.start:
         turns = turns[args.start :]
     if args.limit:
@@ -358,6 +542,7 @@ def main() -> int:
         else {}
     )
     memory_config["min_turns_before_store"] = args.fact_extraction_interval
+    memory_config["max_chars_before_store"] = args.fact_extraction_max_chars
     memory_config["llm_timeout"] = args.llm_timeout
     memory_config["enable_entity_extraction"] = False
     manager = StoreFactExtractionManager(
@@ -368,6 +553,9 @@ def main() -> int:
         llm_base_url=args.llm_base_url,
         llm_api_key=args.llm_api_key,
         report_rows=report_rows,
+        llm_max_tokens=args.llm_max_tokens,
+        llm_thinking=args.llm_thinking,
+        llm_json_mode=args.llm_json_mode,
     )
 
     stored_turns = 0
@@ -384,9 +572,18 @@ def main() -> int:
                 turn_timestamp = base_turn_timestamp + timedelta(hours=hour_offset, seconds=turn_index)
                 before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_nodes").fetchone()["max_id"]
                 pending_before = list(manager._pending_store_turns)
+                pending_with_current = pending_before + [{
+                    "user_message": user,
+                    "assistant_response": assistant,
+                }]
+                pending_character_count = manager._store_turns_character_count(
+                    pending_with_current,
+                )
                 extraction_due = (
                     len(pending_before) + 1
                     >= manager._min_turns_before_store
+                    or pending_character_count
+                    > manager._max_chars_before_store
                 )
                 ok = manager.store_turn(
                     user,
@@ -407,6 +604,8 @@ def main() -> int:
                     "turn_second_offset": turn_index,
                     "turn_timestamp": turn_timestamp.isoformat(),
                     "fact_extraction_interval": manager._min_turns_before_store,
+                    "fact_extraction_max_chars": manager._max_chars_before_store,
+                    "pending_character_count": pending_character_count,
                     "fact_extraction_due": extraction_due,
                     "source_turn_count": (
                         len(pending_before) + 1 if extraction_due else 0
@@ -459,17 +658,22 @@ def main() -> int:
         db.close()
 
     summary = {
-        "input": str(args.input),
+        "sample_source": args.sample_source,
+        "input": str(args.input) if args.sample_source == "json" else "PYTHON_TEST_SAMPLES",
         "db_path": str(db_path),
         "report_path": str(report_path),
         "turns_processed": len(turns),
         "turns_with_facts": stored_turns,
         "facts_stored": stored_facts,
         "fact_extraction_interval": manager._min_turns_before_store,
+        "fact_extraction_max_chars": manager._max_chars_before_store,
         "pending_turns": len(manager._pending_store_turns),
         "reflect_runs": reflect_runs,
         "llm_model": args.llm_model,
         "llm_base_url": args.llm_base_url,
+        "llm_max_tokens": args.llm_max_tokens,
+        "llm_thinking": args.llm_thinking,
+        "llm_json_mode": args.llm_json_mode,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

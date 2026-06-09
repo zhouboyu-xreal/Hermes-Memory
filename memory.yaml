@@ -5,6 +5,8 @@ memory:
   user_char_limit: 1375
   retrieval_top_k: 8
   min_turns_before_store: 5  # Extract facts once per N completed turns.
+  max_chars_before_store: 2000  # Extract early when pending dialogue exceeds this many characters.
+  store_queue_maxsize: 100
   recall_budget: mid
   enable_entity_extraction: true
   llm_timeout: 120

@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import queue
 import re
 import threading
 import time
@@ -1042,6 +1043,10 @@ class MemoryNodeManager:
             1,
             int(memory_cfg.get("min_turns_before_store", 1) or 1),
         )
+        self._max_chars_before_store = max(
+            1,
+            int(memory_cfg.get("max_chars_before_store", 2000) or 2000),
+        )
         self._pending_store_turns: List[Dict[str, Any]] = []
 
         # Default recall budget: "mid"
@@ -1056,6 +1061,18 @@ class MemoryNodeManager:
         self._turn_count = 0
         self._embedding_cfg = embedding_cfg
         self._memory_cfg = memory_cfg
+
+        self._store_queue_maxsize = max(
+            1,
+            int(memory_cfg.get("store_queue_maxsize", 100) or 100),
+        )
+        self._store_queue: queue.Queue[Dict[str, Any]] = queue.Queue(
+            maxsize=self._store_queue_maxsize,
+        )
+        self._store_worker_thread: Optional[threading.Thread] = None
+        self._store_worker_lock = threading.Lock()
+        self._store_shutdown_event = threading.Event()
+        self._llm_thread_context = threading.local()
 
         # Async background thread for non-critical work (relation graph + entity extraction)
         self._async_thread: Optional[threading.Thread] = None
@@ -1173,14 +1190,20 @@ class MemoryNodeManager:
         same authentication.  Otherwise falls back to ``_call_llm_api`` (raw
         ``requests.post`` to an OpenAI-compatible ``/v1/chat/completions``).
         """
-        if self._llm_client is not None:
-            if _llm_model_requires_responses_api(self._llm_model):
-                responses = getattr(self._llm_client, "responses", None)
+        thread_config = getattr(self._llm_thread_context, "config", None) or {}
+        llm_client = thread_config.get("llm_client", self._llm_client)
+        llm_model = str(thread_config.get("llm_model") or self._llm_model)
+        llm_base_url = str(thread_config.get("llm_base_url") or self._llm_base_url)
+        llm_api_key = str(thread_config.get("llm_api_key", self._llm_api_key) or "")
+
+        if llm_client is not None:
+            if _llm_model_requires_responses_api(llm_model):
+                responses = getattr(llm_client, "responses", None)
                 create = getattr(responses, "create", None)
                 if create is not None:
                     try:
                         resp = create(
-                            model=self._llm_model,
+                            model=llm_model,
                             input=prompt,
                             max_output_tokens=2048,
                             timeout=self._llm_timeout,
@@ -1192,14 +1215,14 @@ class MemoryNodeManager:
                         logger.debug("Shared Responses API LLM call failed: %s", e)
 
             base_kwargs = {
-                "model": self._llm_model,
+                "model": llm_model,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
                 "timeout": self._llm_timeout,
             }
             base_kwargs.update(
                 {"max_completion_tokens": 2048}
-                if _llm_prefers_max_completion_tokens(self._llm_base_url)
+                if _llm_prefers_max_completion_tokens(llm_base_url)
                 else {"max_tokens": 2048}
             )
             attempts = [base_kwargs]
@@ -1221,17 +1244,17 @@ class MemoryNodeManager:
                     continue
                 seen_payloads.add(marker)
                 try:
-                    resp = self._llm_client.chat.completions.create(**kwargs)
+                    resp = llm_client.chat.completions.create(**kwargs)
                     return getattr(resp.choices[0].message, "content", "") or ""
                 except Exception as e:
                     last_error = e
                     if _llm_unsupported_chat_api(e):
-                        responses = getattr(self._llm_client, "responses", None)
+                        responses = getattr(llm_client, "responses", None)
                         create = getattr(responses, "create", None)
                         if create is not None:
                             try:
                                 resp = create(
-                                    model=self._llm_model,
+                                    model=llm_model,
                                     input=prompt,
                                     max_output_tokens=2048,
                                     timeout=self._llm_timeout,
@@ -1253,9 +1276,9 @@ class MemoryNodeManager:
             return None
         return _call_llm_api(
             prompt,
-            model=self._llm_model,
-            base_url=self._llm_base_url,
-            api_key=self._llm_api_key,
+            model=llm_model,
+            base_url=llm_base_url,
+            api_key=llm_api_key,
             timeout=self._llm_timeout,
         )
 
@@ -5193,7 +5216,114 @@ class MemoryNodeManager:
             node_id, temporal_count, semantic_count, causal_count,
         )
 
+    def _store_worker_loop(self) -> None:
+        while not self._store_shutdown_event.is_set() or not self._store_queue.empty():
+            try:
+                task = self._store_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self._llm_thread_context.config = task["llm_config"]
+                self.store_turn(
+                    user_message=task["user_message"],
+                    assistant_response=task["assistant_response"],
+                    tags=task["tags"],
+                    turn_timestamp=task["turn_timestamp"],
+                )
+            except Exception as exc:
+                logger.info("Async memory store failed (non-fatal): %s", exc)
+            finally:
+                self._llm_thread_context.config = None
+                self._store_queue.task_done()
+
+    def store_turn_async(
+        self,
+        user_message: str,
+        assistant_response: str,
+        tags: Optional[List[str]] = None,
+        turn_timestamp: Optional[Any] = None,
+        *,
+        llm_client: Any = None,
+        llm_model: Optional[str] = None,
+        llm_base_url: Optional[str] = None,
+        llm_api_key: Optional[str] = None,
+    ) -> bool:
+        """Queue a completed turn for ordered background retention.
+
+        The return value only indicates whether the queue accepted the turn.
+        """
+        if not self._enabled or not user_message or not assistant_response:
+            return False
+
+        task = {
+            "user_message": str(user_message),
+            "assistant_response": str(assistant_response),
+            "tags": list(tags or []),
+            "turn_timestamp": turn_timestamp,
+            "llm_config": {
+                "llm_client": llm_client if llm_client is not None else self._llm_client,
+                "llm_model": str(llm_model or self._llm_model),
+                "llm_base_url": str(llm_base_url or self._llm_base_url),
+                "llm_api_key": (
+                    str(llm_api_key)
+                    if llm_api_key is not None
+                    else self._llm_api_key
+                ),
+            },
+        }
+        with self._store_worker_lock:
+            if self._store_shutdown_event.is_set():
+                return False
+            try:
+                self._store_queue.put_nowait(task)
+            except queue.Full:
+                logger.warning(
+                    "Memory store queue is full; dropping turn (maxsize=%d)",
+                    self._store_queue_maxsize,
+                )
+                return False
+            if not self._store_worker_thread or not self._store_worker_thread.is_alive():
+                self._store_worker_thread = threading.Thread(
+                    target=self._store_worker_loop,
+                    daemon=True,
+                    name="memory-node-store",
+                )
+                self._store_worker_thread.start()
+        return True
+
+    def flush_store_queue(self, timeout: Optional[float] = None) -> bool:
+        """Wait until all accepted store tasks finish."""
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while self._store_queue.unfinished_tasks:
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def shutdown_store_worker(
+        self,
+        *,
+        wait: bool = True,
+        timeout: Optional[float] = 5.0,
+    ) -> bool:
+        """Stop accepting store tasks and optionally drain the worker."""
+        with self._store_worker_lock:
+            self._store_shutdown_event.set()
+            worker = self._store_worker_thread
+        if not wait or worker is None:
+            return not self._store_queue.unfinished_tasks
+        worker.join(timeout=None if timeout is None else max(0.0, timeout))
+        return not worker.is_alive() and not self._store_queue.unfinished_tasks
+
     # ── Store turn as memory node ─────────────────────────────────────────
+
+    @staticmethod
+    def _store_turns_character_count(source_turns: List[Dict[str, Any]]) -> int:
+        return sum(
+            len(str(turn.get("user_message") or ""))
+            + len(str(turn.get("assistant_response") or ""))
+            for turn in source_turns
+        )
 
     def store_turn(
         self,
@@ -5223,7 +5353,16 @@ class MemoryNodeManager:
             "turn_timestamp": turn_timestamp,
             "tags": list(tags or []),
         })
-        if len(self._pending_store_turns) < self._min_turns_before_store:
+        pending_character_count = self._store_turns_character_count(
+            self._pending_store_turns,
+        )
+        turn_threshold_reached = (
+            len(self._pending_store_turns) >= self._min_turns_before_store
+        )
+        character_threshold_exceeded = (
+            pending_character_count >= self._max_chars_before_store
+        )
+        if not turn_threshold_reached and not character_threshold_exceeded:
             return False
 
         if not self._ensure_embedding_client():
@@ -5267,14 +5406,21 @@ class MemoryNodeManager:
                 keywords = self._normalize_keywords(fact.get("keywords", []))
                 raw_topics = self._normalize_keywords(fact.get("topic", keywords))
                 topics = self._topic_keys(raw_topics)
-                
+
+                if idx == 0:
+                    self._log_info(
+                        "memory_store",
+                        "extract_facts",
+                        {
+                            "user_message": batch_user_message,
+                            "assistant_response": batch_assistant_response,
+                            "source_turn_count": len(source_turns),
+                        },
+                    )
                 self._log_info(
                     "memory_store",
-                    "extract_facts", 
+                    "extract_facts",
                     {
-                        "user_message": batch_user_message,
-                        "assistant_response": batch_assistant_response,
-                        "source_turn_count": len(source_turns),
                         "summary": summary,
                         "keywords": keywords,
                         "topics": topics,

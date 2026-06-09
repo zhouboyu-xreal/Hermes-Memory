@@ -401,6 +401,8 @@ MEMORY_CONFIG_DEFAULTS = {
         "user_char_limit": 1375,
         "retrieval_top_k": 8,
         "min_turns_before_store": 1,
+        "max_chars_before_store": 2000,
+        "store_queue_maxsize": 100,
         "recall_budget": "mid",
         "enable_entity_extraction": True,
         "llm_timeout": 120,

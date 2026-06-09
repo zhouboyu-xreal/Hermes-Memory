@@ -4469,6 +4469,14 @@ class AIAgent:
                 self._memory_manager.shutdown_all()
             except Exception:
                 pass
+        if getattr(self, "_memory_node_manager", None):
+            try:
+                self._memory_node_manager.shutdown_store_worker(
+                    wait=True,
+                    timeout=5.0,
+                )
+            except Exception:
+                pass
         # Notify context engine of session end (flush DAG, close DBs, etc.)
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
@@ -4595,6 +4603,16 @@ class AIAgent:
         independently guarded so a failure in one does not prevent the rest.
         """
         task_id = getattr(self, "session_id", None) or ""
+
+        try:
+            memory_node_manager = getattr(self, "_memory_node_manager", None)
+            if memory_node_manager is not None:
+                memory_node_manager.shutdown_store_worker(
+                    wait=True,
+                    timeout=5.0,
+                )
+        except Exception:
+            pass
 
         # 1. Kill background processes for this task
         try:
@@ -13396,18 +13414,16 @@ class AIAgent:
         # with embedding + causal linking for future hybrid retrieval.
         if self._memory_node_manager and final_response and not interrupted:
             try:
-                self._memory_node_manager.configure_llm(
-                    llm_client=self.client,
-                    llm_model=self.model,
-                    llm_base_url=self.base_url,
-                    llm_api_key=self.api_key,
-                )
                 _store_msg = original_user_message if isinstance(original_user_message, str) else ""
                 _store_resp = final_response if isinstance(final_response, str) else ""
                 if _store_msg and _store_resp:
-                    self._memory_node_manager.store_turn(
+                    self._memory_node_manager.store_turn_async(
                         user_message=_store_msg,
                         assistant_response=_store_resp,
+                        llm_client=self.client,
+                        llm_model=self.model,
+                        llm_base_url=self.base_url,
+                        llm_api_key=self.api_key,
                     )
             except Exception:
                 pass

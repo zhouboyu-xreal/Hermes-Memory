@@ -2212,9 +2212,10 @@ class TestRunConversation:
         )
         memory_node_manager = MagicMock()
         memory_node_manager.recall.return_value = ""
-        memory_node_manager.store_turn.return_value = True
+        memory_node_manager.store_turn_async.return_value = True
         memory_node_manager.reflect.return_value = {"merged": 0}
         agent._memory_node_manager = memory_node_manager
+        agent._memory_node_reflect_interval = 5
 
         with (
             patch.object(agent, "_persist_session"),
@@ -2229,8 +2230,8 @@ class TestRunConversation:
             result = agent.run_conversation("hello 4")
 
         assert result["final_response"] == "Final answer"
-        assert memory_node_manager.store_turn.call_count == 5
-        memory_node_manager.reflect.assert_called_once_with(dry_run=False)
+        assert memory_node_manager.store_turn_async.call_count == 5
+        memory_node_manager.reflect.assert_called_once_with()
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)

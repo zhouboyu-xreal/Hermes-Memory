@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 import numpy as np
 import pytest
@@ -705,6 +706,41 @@ def test_store_turn_extracts_facts_every_configured_turn_batch(db):
     assert len(original_dialog["source_dialog"]["turns"]) == 3
 
 
+def test_store_turn_extracts_facts_when_pending_characters_exceed_limit(db):
+    retain_payload = {
+        "facts": [
+            {
+                "text": "用户提供了一段超过字符阈值的长文本。",
+                "keywords": ["长文本", "字符阈值"],
+                "topic": ["记忆提取"],
+                "fact_type": "episodic",
+                "fact_subject": "user",
+                "fact_kind": "action",
+                "priority": 70,
+                "entities": [],
+            }
+        ],
+        "causal_relations": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={
+            "min_turns_before_store": 5,
+            "max_chars_before_store": 2000,
+        },
+        llm_outputs=[json.dumps(retain_payload)],
+    )
+
+    assert mgr.store_turn("用" * 1000, "答" * 1000) is False
+    assert len(mgr._pending_store_turns) == 1
+    assert mgr.llm_prompts == []
+
+    assert mgr.store_turn("补", "充") is True
+    assert len(mgr.llm_prompts) == 1
+    assert mgr._pending_store_turns == []
+
+
 def test_store_turn_keeps_pending_batch_when_extraction_fails(db):
     mgr = _NoAsyncMemoryNodeManager(
         db,
@@ -716,6 +752,101 @@ def test_store_turn_keeps_pending_batch_when_extraction_fails(db):
     assert mgr.store_turn("第一轮", "回答一") is False
     assert mgr.store_turn("第二轮", "回答二") is False
     assert len(mgr._pending_store_turns) == 2
+
+
+def test_store_turn_async_queues_and_processes_turns_in_order(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+    )
+    calls = []
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def fake_store_turn(user_message, assistant_response, tags=None, turn_timestamp=None):
+        if not calls:
+            first_started.set()
+            release_first.wait(timeout=2.0)
+        calls.append((user_message, assistant_response, list(tags or []), turn_timestamp))
+        return True
+
+    mgr.store_turn = fake_store_turn
+
+    assert mgr.store_turn_async("第一轮", "回答一", tags=["one"]) is True
+    assert first_started.wait(timeout=1.0)
+    assert mgr.store_turn_async("第二轮", "回答二", tags=["two"]) is True
+    release_first.set()
+
+    assert mgr.flush_store_queue(timeout=2.0) is True
+    assert calls == [
+        ("第一轮", "回答一", ["one"], None),
+        ("第二轮", "回答二", ["two"], None),
+    ]
+    assert mgr.shutdown_store_worker(timeout=1.0) is True
+
+
+def test_store_turn_async_uses_enqueued_llm_config_snapshot(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+    )
+    seen_configs = []
+
+    def fake_store_turn(user_message, assistant_response, tags=None, turn_timestamp=None):
+        seen_configs.append(dict(mgr._llm_thread_context.config))
+        return True
+
+    client = object()
+    mgr.store_turn = fake_store_turn
+
+    assert mgr.store_turn_async(
+        "用户消息",
+        "助手回复",
+        llm_client=client,
+        llm_model="turn-model",
+        llm_base_url="https://turn.example/v1",
+        llm_api_key="turn-key",
+    ) is True
+    mgr.configure_llm(
+        llm_model="later-model",
+        llm_base_url="https://later.example/v1",
+        llm_api_key="later-key",
+    )
+
+    assert mgr.flush_store_queue(timeout=2.0) is True
+    assert seen_configs == [{
+        "llm_client": client,
+        "llm_model": "turn-model",
+        "llm_base_url": "https://turn.example/v1",
+        "llm_api_key": "turn-key",
+    }]
+    assert mgr.shutdown_store_worker(timeout=1.0) is True
+
+
+def test_store_turn_async_drops_when_bounded_queue_is_full(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"store_queue_maxsize": 1},
+    )
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def fake_store_turn(user_message, assistant_response, tags=None, turn_timestamp=None):
+        first_started.set()
+        release_first.wait(timeout=2.0)
+        return True
+
+    mgr.store_turn = fake_store_turn
+
+    assert mgr.store_turn_async("第一轮", "回答一") is True
+    assert first_started.wait(timeout=1.0)
+    assert mgr.store_turn_async("第二轮", "回答二") is True
+    assert mgr.store_turn_async("第三轮", "回答三") is False
+
+    release_first.set()
+    assert mgr.flush_store_queue(timeout=2.0) is True
+    assert mgr.shutdown_store_worker(timeout=1.0) is True
 
 
 def test_store_turn_filters_plain_time_expressions_from_fact_entities(db):
@@ -1277,6 +1408,7 @@ def test_memory_node_manager_separates_embedding_and_memory_config(db):
     memory_config = {
         "retrieval_top_k": 12,
         "min_turns_before_store": 3,
+        "max_chars_before_store": 2400,
         "recall_budget": "high",
         "enable_entity_extraction": False,
         "llm_timeout": 45,
@@ -1292,6 +1424,7 @@ def test_memory_node_manager_separates_embedding_and_memory_config(db):
     assert mgr._memory_cfg == memory_config
     assert mgr._top_k == 12
     assert mgr._min_turns_before_store == 3
+    assert mgr._max_chars_before_store == 2400
     assert mgr._recall_budget == "high"
     assert mgr._enable_entity_extraction is False
     assert mgr._llm_timeout == 45
