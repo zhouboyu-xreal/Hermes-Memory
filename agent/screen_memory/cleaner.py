@@ -1903,7 +1903,7 @@ class ScreenMemoryCleaner:
             builtins.print(*args, **kwargs)
             return
         sep = kwargs.get("sep", " ")
-        logger.debug("%s", sep.join(str(item) for item in args))
+        logger.info("%s", sep.join(str(item) for item in args))
 
     def classify_noise_reason(self, app, focused, cleaned_text):
         if app in self.ignored_apps:
@@ -8780,8 +8780,7 @@ class ScreenMemoryCleaner:
         self,
         start_time_str=None,
         end_time_str=None,
-        days=3,
-        incremental=False,
+        incremental=True,
         output_path=None,
         min_quality=None,
         segment_gap_minutes=None,
@@ -8794,6 +8793,11 @@ class ScreenMemoryCleaner:
         Clean and merge screen data from Screenpipe and OpenChronicle.
         
         Args:
+            start_time_str: Start of the ingest window. Missing or invalid
+                            values fall back to one ingest interval before
+                            end_time_str.
+            end_time_str: End of the ingest window. Missing or invalid values
+                          fall back to the current UTC time.
             incremental: If True, use ensure_cleaned_db() to preserve existing data.
                          If False, use init_cleaned_db() for a full reset.
             output_path: If provided (and not incremental), override self.cleaned_db
@@ -8804,16 +8808,41 @@ class ScreenMemoryCleaner:
         if output_path and not incremental:
             self.cleaned_db = os.path.expanduser(output_path)
 
-        # Parse start and end times
-        if start_time_str:
-            start_time = parse_user_time_to_utc(start_time_str)
-        else:
-            start_time = datetime.now(timezone.utc) - timedelta(days=days)
-            
-        if end_time_str:
-            end_time = parse_user_time_to_utc(end_time_str)
-        else:
+        # Parse the end first so a fallback start always produces one stable
+        # ingest window, including historical/manual runs.
+        try:
+            end_time = (
+                parse_user_time_to_utc(end_time_str)
+                if end_time_str
+                else datetime.now(timezone.utc)
+            )
+        except (TypeError, ValueError):
             end_time = datetime.now(timezone.utc)
+            self._print(
+                f"Invalid end_time_str {end_time_str!r}; using current UTC time."
+            )
+
+        schedule = self.config.get("schedule", {})
+        try:
+            ingest_interval_minutes = max(
+                1,
+                int(schedule.get("ingest_interval_minutes", 30)),
+            )
+        except (TypeError, ValueError):
+            ingest_interval_minutes = 30
+
+        try:
+            start_time = (
+                parse_user_time_to_utc(start_time_str)
+                if start_time_str
+                else end_time - timedelta(minutes=ingest_interval_minutes)
+            )
+        except (TypeError, ValueError):
+            start_time = end_time - timedelta(minutes=ingest_interval_minutes)
+            self._print(
+                f"Invalid start_time_str {start_time_str!r}; using the previous "
+                f"{ingest_interval_minutes} minutes."
+            )
             
         # Create or open output DB
         if incremental:

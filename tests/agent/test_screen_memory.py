@@ -1,7 +1,7 @@
 import sqlite3
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from agent.screen_memory.cleaner import ScreenMemoryCleaner
 from agent.screen_memory.config import load_screen_memory_config
@@ -256,6 +256,60 @@ def test_background_ingest_does_not_redirect_process_stdout(tmp_path):
         {},
         datetime(2026, 6, 1, tzinfo=timezone.utc),
     )
+
+
+def test_clean_invalid_start_uses_ingest_interval(tmp_path, monkeypatch):
+    cleaner = _cleaner(tmp_path)
+    cleaner.config["schedule"]["ingest_interval_minutes"] = 45
+    captured = {}
+
+    monkeypatch.setattr(
+        cleaner,
+        "ensure_cleaned_db",
+        lambda: sqlite3.connect(":memory:"),
+    )
+
+    def _capture_window(start_time, end_time):
+        captured["start"] = start_time
+        captured["end"] = end_time
+        raise RuntimeError("stop after window parsing")
+
+    monkeypatch.setattr(cleaner, "load_screenpipe_data", _capture_window)
+
+    assert cleaner.clean(
+        start_time_str="not-a-timestamp",
+        end_time_str="2026-06-01T10:00:00Z",
+        incremental=True,
+    ) is None
+    assert captured["end"] == datetime(
+        2026, 6, 1, 10, 0, tzinfo=timezone.utc
+    )
+    assert captured["end"] - captured["start"] == timedelta(minutes=45)
+
+
+def test_clean_missing_start_uses_ingest_interval(tmp_path, monkeypatch):
+    cleaner = _cleaner(tmp_path)
+    cleaner.config["schedule"]["ingest_interval_minutes"] = 20
+    captured = {}
+
+    monkeypatch.setattr(
+        cleaner,
+        "ensure_cleaned_db",
+        lambda: sqlite3.connect(":memory:"),
+    )
+
+    def _capture_window(start_time, end_time):
+        captured["start"] = start_time
+        captured["end"] = end_time
+        raise RuntimeError("stop after window parsing")
+
+    monkeypatch.setattr(cleaner, "load_screenpipe_data", _capture_window)
+
+    assert cleaner.clean(
+        end_time_str="2026-06-01T10:00:00Z",
+        incremental=True,
+    ) is None
+    assert captured["end"] - captured["start"] == timedelta(minutes=20)
 
 
 def test_quiet_cleaner_suppresses_console_output(tmp_path, capsys):
