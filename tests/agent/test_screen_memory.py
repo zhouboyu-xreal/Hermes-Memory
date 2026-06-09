@@ -106,8 +106,8 @@ def test_screen_memory_defaults_use_profile_output_path(tmp_path, monkeypatch):
     assert config["database"]["cleaned_db"] == str(
         tmp_path / "profile" / "screen_memory" / "memory.db"
     )
-    assert config["schedule"]["ingest_interval_minutes"] == 10
-    assert config["schedule"]["fact_clustering_interval_hours"] == 1
+    assert config["schedule"]["ingest_interval_minutes"] == 30
+    assert config["schedule"]["fact_clustering_interval_hours"] == 2
     assert config["schedule"]["observation_interval_hours"] == 24
 
 
@@ -256,6 +256,81 @@ def test_background_ingest_does_not_redirect_process_stdout(tmp_path):
         {},
         datetime(2026, 6, 1, tzinfo=timezone.utc),
     )
+
+
+def test_run_ingest_normalizes_window_and_state_to_utc():
+    captured = {}
+
+    class _FakeCleaner:
+        config = {"schedule": {"initial_lookback_minutes": 30}}
+
+        def clean(self, **kwargs):
+            captured.update(kwargs)
+            return {"cleaned_records": 1}
+
+    state = {}
+    service._run_ingest(
+        _FakeCleaner(),
+        state,
+        datetime(
+            2026,
+            6,
+            1,
+            18,
+            0,
+            tzinfo=timezone(timedelta(hours=8)),
+        ),
+    )
+
+    assert captured["start_time_str"] == "2026-06-01T09:30:00Z"
+    assert captured["end_time_str"] == "2026-06-01T10:00:00Z"
+    assert state["last_ingest_at"] == "2026-06-01T10:00:00Z"
+
+
+def test_screen_memory_state_times_are_normalized_to_utc():
+    expected = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+
+    assert service._parse_state_time("2026-06-01T10:00:00Z") == expected
+    assert service._parse_state_time("2026-06-01T10:00:00+00:00") == expected
+    assert service._parse_state_time("2026-06-01T18:00:00+08:00") == expected
+    assert service._parse_state_time("2026-06-01T10:00:00") == expected
+
+
+def test_screenpipe_window_compares_timestamp_values_across_offsets(tmp_path):
+    cleaner = _cleaner(tmp_path)
+    screenpipe_db = tmp_path / "screenpipe.db"
+    cleaner.screenpipe_db = str(screenpipe_db)
+    connection = sqlite3.connect(screenpipe_db)
+    connection.executescript(
+        """
+        CREATE TABLE frames (id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL);
+        CREATE TABLE ocr_text (
+            id INTEGER PRIMARY KEY,
+            frame_id INTEGER NOT NULL,
+            app_name TEXT,
+            window_name TEXT,
+            focused INTEGER,
+            text TEXT
+        );
+        INSERT INTO frames VALUES (1, '2026-06-01T09:59:59+00:00');
+        INSERT INTO frames VALUES (2, '2026-06-01T10:00:00Z');
+        INSERT INTO frames VALUES (3, '2026-06-01T18:00:30+08:00');
+        INSERT INTO frames VALUES (4, '2026-06-01T10:01:01.000000+00:00');
+        INSERT INTO ocr_text VALUES (1, 1, 'Code', 'before', 1, 'before');
+        INSERT INTO ocr_text VALUES (2, 2, 'Code', 'start', 1, 'start');
+        INSERT INTO ocr_text VALUES (3, 3, 'Code', 'offset', 1, 'offset');
+        INSERT INTO ocr_text VALUES (4, 4, 'Code', 'after', 1, 'after');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    rows = cleaner.load_screenpipe_data(
+        datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
+        datetime(2026, 6, 1, 10, 1, tzinfo=timezone.utc),
+    )
+
+    assert [row[5] for row in rows] == [2, 3]
 
 
 def test_clean_invalid_start_uses_ingest_interval(tmp_path, monkeypatch):
@@ -488,7 +563,7 @@ def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
     service.run_screen_memory_due_work(
         now=datetime(2026, 6, 1, 1, tzinfo=timezone.utc)
     )
-    assert calls == ["ingest", "cluster"]
+    assert calls == ["ingest"]
 
     calls.clear()
     service.run_screen_memory_due_work(
@@ -578,6 +653,14 @@ def test_incremental_clean_merges_screenpipe_and_openchronicle_into_workstream(t
     assert output.execute(
         "SELECT count(*) FROM records WHERE ax_context_json IS NOT NULL"
     ).fetchone()[0] >= 1
+    record_timestamp = output.execute(
+        "SELECT timestamp FROM records ORDER BY id LIMIT 1"
+    ).fetchone()[0]
+    event_timestamp = output.execute(
+        "SELECT timestamp FROM openchronicle_events ORDER BY id LIMIT 1"
+    ).fetchone()[0]
+    assert record_timestamp == "2026-06-01T18:00:00+08:00"
+    assert event_timestamp == "2026-06-01T18:00:02+08:00"
     output.close()
 
 

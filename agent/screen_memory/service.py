@@ -31,6 +31,16 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _format_utc_time(value: datetime) -> str:
+    return _as_utc(value).isoformat().replace("+00:00", "Z")
+
+
 def _parse_state_time(value: Any) -> Optional[datetime]:
     if not value:
         return None
@@ -78,7 +88,7 @@ def _save_state(state: Dict[str, Any]) -> None:
 
 def _is_due(last_run: Any, now: datetime, interval: timedelta) -> bool:
     previous = _parse_state_time(last_run)
-    return previous is None or now - previous >= interval
+    return previous is None or _as_utc(now) - previous >= interval
 
 
 def _configured_model(config: Dict[str, Any]) -> str:
@@ -144,6 +154,7 @@ def _run_ingest(
     state: Dict[str, Any],
     now: datetime,
 ) -> Optional[Dict[str, Any]]:
+    now = _as_utc(now)
     schedule = cleaner.config.get("schedule", {})
     previous = _parse_state_time(state.get("last_ingest_at"))
     if previous is None:
@@ -151,14 +162,14 @@ def _run_ingest(
             minutes=max(1, int(schedule.get("initial_lookback_minutes", 30)))
         )
     stats = cleaner.clean(
-        start_time_str=previous.isoformat(),
-        end_time_str=now.isoformat(),
+        start_time_str=_format_utc_time(previous),
+        end_time_str=_format_utc_time(now),
         incremental=True,
         generate_screen_facts=True,
         update_window_workstreams=True,
     )
     if stats is not None:
-        state["last_ingest_at"] = now.isoformat()
+        state["last_ingest_at"] = _format_utc_time(now)
         state["last_ingest_stats"] = stats
     return stats
 
@@ -168,12 +179,13 @@ def _run_fact_clustering(
     state: Dict[str, Any],
     now: datetime,
 ) -> Dict[str, Any]:
+    now = _as_utc(now)
     connection = cleaner.ensure_cleaned_db()
     try:
         stats = cleaner.update_screen_fact_cluster_tables(connection)
     finally:
         connection.close()
-    state["last_fact_clustering_at"] = now.isoformat()
+    state["last_fact_clustering_at"] = _format_utc_time(now)
     state["last_fact_clustering_stats"] = stats
     return stats
 
@@ -183,6 +195,7 @@ def _run_observations(
     state: Dict[str, Any],
     now: datetime,
 ) -> Dict[str, Any]:
+    now = _as_utc(now)
     connection = cleaner.ensure_cleaned_db()
     try:
         # A daily observation run first catches any facts left unclustered by
@@ -195,7 +208,7 @@ def _run_observations(
         "fact_clustering": cluster_stats,
         "observations": observation_stats,
     }
-    state["last_observation_at"] = now.isoformat()
+    state["last_observation_at"] = _format_utc_time(now)
     state["last_observation_stats"] = stats
     return stats
 
@@ -231,7 +244,7 @@ def run_screen_memory_due_work(
             return {"status": "busy"}
 
         state = _load_state()
-        current = (now or _utc_now()).astimezone(timezone.utc)
+        current = _as_utc(now or _utc_now())
         schedule = cleaner_config.get("schedule", {})
 
         ingest_due = force_phase == "ingest" or (

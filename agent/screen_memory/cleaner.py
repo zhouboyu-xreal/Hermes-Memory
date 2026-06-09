@@ -854,6 +854,7 @@ def datetime_to_epoch_second(dt):
 
 
 def parse_timestamp_to_utc(ts_str):
+    """Parse a source timestamp; naive source values are treated as UTC."""
     dt = datetime.fromisoformat((ts_str or "").replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -861,6 +862,7 @@ def parse_timestamp_to_utc(ts_str):
 
 
 def parse_user_time_to_utc(ts_str):
+    """Parse a user-entered time; naive values are interpreted as UTC+8."""
     dt = datetime.fromisoformat((ts_str or "").replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=DATABASE_TIMEZONE)
@@ -876,11 +878,19 @@ def to_db_timezone(dt):
 
 
 def format_db_timestamp(dt):
+    """Format timestamps for the cleaned database in UTC+8."""
     return to_db_timezone(dt).isoformat()
 
 
 def now_db_timestamp():
     return datetime.now(DATABASE_TIMEZONE).isoformat()
+
+
+def format_utc_timestamp(dt):
+    """Format a datetime as an explicit UTC ISO-8601 timestamp."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def normalize_app_key(value):
@@ -2604,18 +2614,19 @@ class ScreenMemoryCleaner:
         self._print(f"Connecting to Screenpipe database: {self.screenpipe_db}...")
         conn = sqlite3.connect(self.screenpipe_db)
         cursor = conn.cursor()
-        
-        start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S")
+
+        start_str = format_utc_timestamp(start_time)
         
         if end_time:
-            end_str = end_time.strftime("%Y-%m-%dT%H:%M:%S")
+            end_str = format_utc_timestamp(end_time)
             self._print(f"Fetching raw OCR between {start_str} and {end_str} UTC...")
             query = """
             SELECT f.timestamp, o.app_name, o.window_name, o.focused, o.text, f.id
             FROM frames f
             JOIN ocr_text o ON o.frame_id = f.id
-            WHERE f.timestamp >= ? AND f.timestamp <= ?
-            ORDER BY f.timestamp ASC
+            WHERE julianday(f.timestamp) >= julianday(?)
+              AND julianday(f.timestamp) <= julianday(?)
+            ORDER BY julianday(f.timestamp) ASC, f.id ASC
             """
             cursor.execute(query, (start_str, end_str))
         else:
@@ -2624,8 +2635,8 @@ class ScreenMemoryCleaner:
             SELECT f.timestamp, o.app_name, o.window_name, o.focused, o.text, f.id
             FROM frames f
             JOIN ocr_text o ON o.frame_id = f.id
-            WHERE f.timestamp >= ?
-            ORDER BY f.timestamp ASC
+            WHERE julianday(f.timestamp) >= julianday(?)
+            ORDER BY julianday(f.timestamp) ASC, f.id ASC
             """
             cursor.execute(query, (start_str,))
             
