@@ -73,6 +73,11 @@ KNOWN_MODEL_DIMS: Dict[str, int] = {
     "gte-large": 1024,
 }
 
+
+def _response_error_detail(response: requests.Response) -> str:
+    detail = (response.text or "").strip().replace("\n", " ")
+    return detail[:1000]
+
 # ── Config helpers ────────────────────────────────────────────────────────
 
 
@@ -180,18 +185,17 @@ class _OpenAIBackend:
         if env_ref:
             self.api_key = os.environ.get(env_ref.group(1), "").strip()
         if not self.api_key:
-            # Fall back to environment variables so secrets stay out of
-            # config.yaml. Checks common embedding-provider env vars in order.
-            self.api_key = (
-                os.environ.get("EMBEDDING_API_KEY")
-                or os.environ.get("OPENROUTER_API_KEY")
-                or os.environ.get("OPENAI_API_KEY")
-                or ""
-            )
+            self.api_key = os.environ.get("EMBEDDING_API_KEY", "").strip()
         self.timeout = config.get("timeout", 60)
 
     def embed(self, text: str) -> Optional[List[float]]:
         """Generate embedding for a single text string."""
+        if not self.api_key:
+            logger.error(
+                "Embedding request skipped: EMBEDDING_API_KEY is not set. "
+                "Export it before starting Hermes."
+            )
+            return None
         data = {
             "model": self.model,
             "input": text,
@@ -209,11 +213,23 @@ class _OpenAIBackend:
                 return items[0].get("embedding")
             return None
         except requests.exceptions.RequestException as e:
-            logger.warning("OpenAI-compatible embedding failed: %s", e)
+            response = getattr(e, "response", None)
+            detail = _response_error_detail(response) if response is not None else ""
+            logger.warning(
+                "OpenAI-compatible embedding failed: %s%s",
+                e,
+                f" response={detail}" if detail else "",
+            )
             return None
 
     def embed_batch(self, texts: List[str]) -> Optional[List[List[float]]]:
         """Generate embeddings for a batch of texts."""
+        if not self.api_key:
+            logger.error(
+                "Embedding request skipped: EMBEDDING_API_KEY is not set. "
+                "Export it before starting Hermes."
+            )
+            return None
         data = {
             "model": self.model,
             "input": texts,
@@ -230,7 +246,13 @@ class _OpenAIBackend:
             items = sorted(result.get("data", []), key=lambda x: x.get("index", 0))
             return [item["embedding"] for item in items]
         except requests.exceptions.RequestException as e:
-            logger.warning("OpenAI batch embedding failed, falling back to sequential: %s", e)
+            response = getattr(e, "response", None)
+            detail = _response_error_detail(response) if response is not None else ""
+            logger.warning(
+                "OpenAI batch embedding failed, falling back to sequential: %s%s",
+                e,
+                f" response={detail}" if detail else "",
+            )
             # Sequential fallback
             results: List[List[float]] = []
             for t in texts:

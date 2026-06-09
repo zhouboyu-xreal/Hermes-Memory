@@ -1,3 +1,7 @@
+import logging
+
+import requests
+
 from agent.embedding_client import _OpenAIBackend
 
 
@@ -9,7 +13,7 @@ def test_openai_backend_resolves_configured_environment_reference(monkeypatch):
     assert backend.api_key == "embedding-key"
 
 
-def test_openai_backend_prefers_embedding_environment_key(monkeypatch):
+def test_openai_backend_uses_embedding_environment_key(monkeypatch):
     monkeypatch.setenv("EMBEDDING_API_KEY", "embedding-key")
     monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
@@ -17,6 +21,16 @@ def test_openai_backend_prefers_embedding_environment_key(monkeypatch):
     backend = _OpenAIBackend({"api_key": ""})
 
     assert backend.api_key == "embedding-key"
+
+
+def test_openai_backend_does_not_fall_back_to_model_api_keys(monkeypatch):
+    monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+
+    backend = _OpenAIBackend({"api_key": ""})
+
+    assert backend.api_key == ""
 
 
 def test_openai_backend_does_not_send_unresolved_environment_reference(
@@ -32,3 +46,37 @@ def test_openai_backend_does_not_send_unresolved_environment_reference(
     )
 
     assert backend.api_key == ""
+
+
+def test_openai_backend_skips_request_without_embedding_key(
+    monkeypatch, caplog
+):
+    monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "agent.embedding_client.requests.post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("request should not be sent")
+        ),
+    )
+    backend = _OpenAIBackend({"api_key": ""})
+
+    assert backend.embed("test") is None
+    assert "EMBEDDING_API_KEY is not set" in caplog.text
+
+
+def test_openai_backend_logs_provider_error_response(monkeypatch, caplog):
+    response = requests.Response()
+    response.status_code = 401
+    response._content = b'{"error":{"message":"User not found.","code":401}}'
+    response.url = "https://embedding.example/v1/embeddings"
+
+    monkeypatch.setattr(
+        "agent.embedding_client.requests.post",
+        lambda *args, **kwargs: response,
+    )
+    backend = _OpenAIBackend({"api_key": "invalid-key"})
+
+    with caplog.at_level(logging.WARNING):
+        assert backend.embed("test") is None
+
+    assert "User not found." in caplog.text

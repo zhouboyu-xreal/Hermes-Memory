@@ -104,6 +104,20 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
     return merged
 
 
+def _load_embedding_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    raw = config.get("embedding", {})
+    if not isinstance(raw, dict):
+        return {"enabled": False, "api_key_env": "EMBEDDING_API_KEY"}
+
+    embedding = copy.deepcopy(raw)
+    if "enabled" not in embedding:
+        embedding["enabled"] = bool(
+            embedding.get("model") and embedding.get("base_url")
+        )
+    embedding.setdefault("api_key_env", "EMBEDDING_API_KEY")
+    return embedding
+
+
 def load_screen_memory_config(config: Dict[str, Any] | None = None) -> Dict[str, Any]:
     if config is None:
         from hermes_cli.config import load_config
@@ -144,5 +158,5 @@ def load_screen_memory_config(config: Dict[str, Any] | None = None) -> Dict[str,
         "task_workstream_generation": settings["task_workstream_generation"],
         "report_block_generation": settings["report_block_generation"],
         "screen_memory_generation": settings["screen_memory_generation"],
-        "embedding": copy.deepcopy(config.get("embedding", {})),
+        "embedding": _load_embedding_config(config),
     }

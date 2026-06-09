@@ -3443,8 +3443,16 @@ class ScreenMemoryCleaner:
     def call_embedding_model(self, texts, config):
         model = config.get("model")
         base_url = config.get("base_url")
-        api_key_env = config.get("api_key_env") or "OPENROUTER_API_KEY"
-        api_key = config.get("api_key") or os.environ.get(api_key_env)
+        api_key_env = config.get("api_key_env") or "EMBEDDING_API_KEY"
+        api_key = str(config.get("api_key") or "").strip()
+        env_ref = re.fullmatch(
+            r"\${([A-Za-z_][A-Za-z0-9_]*)}",
+            api_key,
+        )
+        if env_ref:
+            api_key = os.environ.get(env_ref.group(1), "").strip()
+        if not api_key:
+            api_key = os.environ.get(api_key_env, "").strip()
         timeout = config.get("timeout", config.get("embedding_timeout", 60))
         if not model:
             raise RuntimeError("Missing embedding.model in config")

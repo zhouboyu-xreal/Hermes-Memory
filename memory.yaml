@@ -15,9 +15,11 @@ memory:
   nudge_interval: 10
   flush_min_turns: 6
 embedding:
+  enabled: true
   provider: openai
-  model: text-embedding-3-small
+  model: openai/text-embedding-3-small
   base_url: https://openrouter.ai/api
   api_key: ${EMBEDDING_API_KEY}
+  api_key_env: EMBEDDING_API_KEY
   dimensions: 1536
   normalize: true

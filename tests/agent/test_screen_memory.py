@@ -111,6 +111,88 @@ def test_screen_memory_defaults_use_profile_output_path(tmp_path, monkeypatch):
     assert config["schedule"]["observation_interval_hours"] == 24
 
 
+def test_screen_memory_reads_embedding_config_from_hermes_config():
+    config = load_screen_memory_config({
+        "screen_memory": {"enabled": True},
+        "embedding": {
+            "provider": "openai",
+            "model": "text-embedding-3-small",
+            "base_url": "https://embedding.example/v1",
+            "api_key": "embedding-key",
+            "dimensions": 1536,
+            "normalize": True,
+            "batch_size": 16,
+        },
+    })
+
+    assert config["embedding"] == {
+        "enabled": True,
+        "provider": "openai",
+        "model": "text-embedding-3-small",
+        "base_url": "https://embedding.example/v1",
+        "api_key": "embedding-key",
+        "api_key_env": "EMBEDDING_API_KEY",
+        "dimensions": 1536,
+        "normalize": True,
+        "batch_size": 16,
+    }
+
+
+def test_screen_memory_preserves_explicitly_disabled_embedding():
+    config = load_screen_memory_config({
+        "screen_memory": {"enabled": True},
+        "embedding": {
+            "enabled": False,
+            "model": "text-embedding-3-small",
+            "base_url": "https://embedding.example/v1",
+        },
+    })
+
+    assert config["embedding"]["enabled"] is False
+
+
+def test_screen_memory_embedding_resolves_dedicated_env_key(
+    tmp_path, monkeypatch
+):
+    cleaner = _cleaner(tmp_path)
+    monkeypatch.setenv("EMBEDDING_API_KEY", "embedding-key")
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"data":[{"index":0,"embedding":[1.0,0.0]}]}'
+
+    captured = {}
+
+    def _urlopen(request, timeout):
+        captured["authorization"] = request.headers.get("Authorization")
+        captured["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setattr(
+        "agent.screen_memory.cleaner.urllib.request.urlopen",
+        _urlopen,
+    )
+
+    vectors = cleaner.call_embedding_model(
+        ["screen fact"],
+        {
+            "model": "embedding-model",
+            "base_url": "https://embedding.example/v1",
+            "api_key": "${EMBEDDING_API_KEY}",
+            "api_key_env": "EMBEDDING_API_KEY",
+        },
+    )
+
+    assert captured["authorization"] == "Bearer embedding-key"
+    assert vectors == [[1.0, 0.0]]
+
+
 def test_screen_memory_ticker_is_process_singleton(monkeypatch):
     service.stop_screen_memory_ticker()
     scheduled = threading.Event()
