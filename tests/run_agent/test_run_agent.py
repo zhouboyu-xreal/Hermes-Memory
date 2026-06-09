@@ -2190,7 +2190,7 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
-    def test_memory_node_reflect_runs_every_five_turns(self):
+    def test_memory_node_reflect_scheduling_is_delegated_each_turn(self):
         with (
             patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
             patch("run_agent.check_toolset_requirements", return_value={}),
@@ -2213,25 +2213,22 @@ class TestRunConversation:
         memory_node_manager = MagicMock()
         memory_node_manager.recall.return_value = ""
         memory_node_manager.store_turn_async.return_value = True
-        memory_node_manager.reflect.return_value = {"merged": 0}
+        memory_node_manager.reflect_if_due_async.return_value = False
         agent._memory_node_manager = memory_node_manager
-        agent._memory_node_reflect_interval = 5
 
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            for idx in range(4):
+            for idx in range(5):
                 result = agent.run_conversation(f"hello {idx}")
                 assert result["final_response"] == "Final answer"
-            assert memory_node_manager.reflect.call_count == 0
-
-            result = agent.run_conversation("hello 4")
 
         assert result["final_response"] == "Final answer"
         assert memory_node_manager.store_turn_async.call_count == 5
-        memory_node_manager.reflect.assert_called_once_with()
+        assert memory_node_manager.reflect_if_due_async.call_count == 5
+        memory_node_manager.reflect.assert_not_called()
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)

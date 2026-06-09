@@ -7,6 +7,7 @@ memory:
   min_turns_before_store: 5  # Extract facts once per N completed turns.
   max_chars_before_store: 2000  # Extract early when pending dialogue exceeds this many characters.
   store_queue_maxsize: 100
+  reflect_interval_seconds: 3600  # Check for new facts and reflect at most once per hour.
   recall_budget: mid
   enable_entity_extraction: true
   llm_timeout: 120

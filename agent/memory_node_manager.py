@@ -54,6 +54,7 @@ from agent.entity_extractor import ENTITY_EXTRACTION_GUIDANCE, is_attribute_enti
 from agent.temporal_entities import is_temporal_entity
 
 logger = logging.getLogger(__name__)
+MEMORY_REFLECT_META_KEY = "memory_node_last_successful_reflect_at"
 
 # ── Default LLM API endpoint ──────────────────────────────────────────────
 
@@ -1066,6 +1067,10 @@ class MemoryNodeManager:
             1,
             int(memory_cfg.get("store_queue_maxsize", 100) or 100),
         )
+        self._reflect_interval_seconds = max(
+            1.0,
+            float(memory_cfg.get("reflect_interval_seconds", 3600) or 3600),
+        )
         self._store_queue: queue.Queue[Dict[str, Any]] = queue.Queue(
             maxsize=self._store_queue_maxsize,
         )
@@ -1073,6 +1078,13 @@ class MemoryNodeManager:
         self._store_worker_lock = threading.Lock()
         self._store_shutdown_event = threading.Event()
         self._llm_thread_context = threading.local()
+        self._reflect_queued_or_running = False
+        try:
+            self._last_successful_reflect_at = float(
+                self._db.get_meta(MEMORY_REFLECT_META_KEY) or 0.0
+            )
+        except Exception:
+            self._last_successful_reflect_at = 0.0
 
         # Async background thread for non-critical work (relation graph + entity extraction)
         self._async_thread: Optional[threading.Thread] = None
@@ -5222,19 +5234,84 @@ class MemoryNodeManager:
                 task = self._store_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            task_kind = str(task.get("kind") or "store")
             try:
                 self._llm_thread_context.config = task["llm_config"]
-                self.store_turn(
-                    user_message=task["user_message"],
-                    assistant_response=task["assistant_response"],
-                    tags=task["tags"],
-                    turn_timestamp=task["turn_timestamp"],
-                )
+                if task_kind == "reflect":
+                    candidates = self._db.get_unobserved_nodes_for_observation(
+                        limit=1,
+                    )
+                    if not candidates:
+                        logger.debug(
+                            "Memory reflect due but skipped: no unobserved facts",
+                        )
+                        continue
+                    report = self.reflect(limit=int(task.get("limit") or 100))
+                    if not report.get("error"):
+                        completed_at = time.time()
+                        with self._store_worker_lock:
+                            self._last_successful_reflect_at = completed_at
+                        try:
+                            self._db.set_meta(
+                                MEMORY_REFLECT_META_KEY,
+                                str(completed_at),
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "Could not persist memory reflect timestamp: %s",
+                                exc,
+                            )
+                    logger.debug("MemoryNodeManager reflect report: %s", report)
+                else:
+                    self.store_turn(
+                        user_message=task["user_message"],
+                        assistant_response=task["assistant_response"],
+                        tags=task["tags"],
+                        turn_timestamp=task["turn_timestamp"],
+                    )
             except Exception as exc:
-                logger.info("Async memory store failed (non-fatal): %s", exc)
+                logger.info(
+                    "Async memory %s failed (non-fatal): %s",
+                    task_kind,
+                    exc,
+                )
             finally:
                 self._llm_thread_context.config = None
+                if task_kind == "reflect":
+                    with self._store_worker_lock:
+                        self._reflect_queued_or_running = False
                 self._store_queue.task_done()
+
+    def _llm_config_snapshot(
+        self,
+        *,
+        llm_client: Any = None,
+        llm_model: Optional[str] = None,
+        llm_base_url: Optional[str] = None,
+        llm_api_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "llm_client": (
+                llm_client if llm_client is not None else self._llm_client
+            ),
+            "llm_model": str(llm_model or self._llm_model),
+            "llm_base_url": str(llm_base_url or self._llm_base_url),
+            "llm_api_key": (
+                str(llm_api_key)
+                if llm_api_key is not None
+                else self._llm_api_key
+            ),
+        }
+
+    def _ensure_store_worker_locked(self) -> None:
+        if self._store_worker_thread and self._store_worker_thread.is_alive():
+            return
+        self._store_worker_thread = threading.Thread(
+            target=self._store_worker_loop,
+            daemon=True,
+            name="memory-node-store",
+        )
+        self._store_worker_thread.start()
 
     def store_turn_async(
         self,
@@ -5256,20 +5333,17 @@ class MemoryNodeManager:
             return False
 
         task = {
+            "kind": "store",
             "user_message": str(user_message),
             "assistant_response": str(assistant_response),
             "tags": list(tags or []),
             "turn_timestamp": turn_timestamp,
-            "llm_config": {
-                "llm_client": llm_client if llm_client is not None else self._llm_client,
-                "llm_model": str(llm_model or self._llm_model),
-                "llm_base_url": str(llm_base_url or self._llm_base_url),
-                "llm_api_key": (
-                    str(llm_api_key)
-                    if llm_api_key is not None
-                    else self._llm_api_key
-                ),
-            },
+            "llm_config": self._llm_config_snapshot(
+                llm_client=llm_client,
+                llm_model=llm_model,
+                llm_base_url=llm_base_url,
+                llm_api_key=llm_api_key,
+            ),
         }
         with self._store_worker_lock:
             if self._store_shutdown_event.is_set():
@@ -5282,17 +5356,69 @@ class MemoryNodeManager:
                     self._store_queue_maxsize,
                 )
                 return False
-            if not self._store_worker_thread or not self._store_worker_thread.is_alive():
-                self._store_worker_thread = threading.Thread(
-                    target=self._store_worker_loop,
-                    daemon=True,
-                    name="memory-node-store",
+            self._ensure_store_worker_locked()
+        return True
+
+    def reflect_if_due_async(
+        self,
+        *,
+        limit: int = 100,
+        llm_client: Any = None,
+        llm_model: Optional[str] = None,
+        llm_base_url: Optional[str] = None,
+        llm_api_key: Optional[str] = None,
+    ) -> bool:
+        """Queue reflection after earlier store tasks when its time window is due."""
+        if not self._enabled or not self._db:
+            return False
+
+        now = time.time()
+        with self._store_worker_lock:
+            if self._store_shutdown_event.is_set():
+                return False
+            if self._reflect_queued_or_running:
+                return False
+            try:
+                persisted_last_reflect = float(
+                    self._db.get_meta(MEMORY_REFLECT_META_KEY) or 0.0
                 )
-                self._store_worker_thread.start()
+                self._last_successful_reflect_at = max(
+                    self._last_successful_reflect_at,
+                    persisted_last_reflect,
+                )
+            except Exception:
+                pass
+            if (
+                now - self._last_successful_reflect_at
+                < self._reflect_interval_seconds
+            ):
+                return False
+
+            task = {
+                "kind": "reflect",
+                "limit": max(1, int(limit or 100)),
+                "llm_config": self._llm_config_snapshot(
+                    llm_client=llm_client,
+                    llm_model=llm_model,
+                    llm_base_url=llm_base_url,
+                    llm_api_key=llm_api_key,
+                ),
+            }
+            try:
+                self._store_queue.put_nowait(task)
+            except queue.Full:
+                logger.warning(
+                    "Memory store queue is full; reflection was not queued "
+                    "(maxsize=%d)",
+                    self._store_queue_maxsize,
+                )
+                return False
+            self._reflect_queued_or_running = True
+            self._ensure_store_worker_locked()
         return True
 
     def flush_store_queue(self, timeout: Optional[float] = None) -> bool:
-        """Wait until all accepted store tasks finish."""
+        """Wait until all accepted store and reflect tasks finish."""
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         while self._store_queue.unfinished_tasks:
             if deadline is not None and time.monotonic() >= deadline:
@@ -5691,8 +5817,8 @@ class MemoryNodeManager:
 
         It selects unprocessed facts, merges newly introduced entities, updates
         or creates observations, generates interpretations, and then applies
-        decay maintenance. The method is intentionally explicit and is not
-        called from ``run_agent.py`` yet.
+        decay maintenance. ``run_agent.py`` schedules this method through the
+        ordered background queue when the configured time interval is due.
         """
         if not self._db:
             return {

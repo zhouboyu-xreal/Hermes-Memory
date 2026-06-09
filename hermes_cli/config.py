@@ -403,6 +403,7 @@ MEMORY_CONFIG_DEFAULTS = {
         "min_turns_before_store": 1,
         "max_chars_before_store": 2000,
         "store_queue_maxsize": 100,
+        "reflect_interval_seconds": 3600,
         "recall_budget": "mid",
         "enable_entity_extraction": True,
         "llm_timeout": 120,

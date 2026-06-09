@@ -583,7 +583,7 @@ def main() -> int:
                     len(pending_before) + 1
                     >= manager._min_turns_before_store
                     or pending_character_count
-                    > manager._max_chars_before_store
+                    >= manager._max_chars_before_store
                 )
                 ok = manager.store_turn(
                     user,

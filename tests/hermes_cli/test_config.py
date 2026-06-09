@@ -80,6 +80,7 @@ class TestLoadConfigDefaults:
             assert config["memory"]["min_turns_before_store"] == 1
             assert config["memory"]["max_chars_before_store"] == 2000
             assert config["memory"]["store_queue_maxsize"] == 100
+            assert config["memory"]["reflect_interval_seconds"] == 3600
             assert get_memory_config_path() == tmp_path / "memory.yaml"
             assert get_memory_config_path().exists()
 

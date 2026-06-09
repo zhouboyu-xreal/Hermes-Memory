@@ -1,6 +1,7 @@
 import json
 import logging
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 import numpy as np
 import pytest
@@ -732,7 +733,7 @@ def test_store_turn_extracts_facts_when_pending_characters_exceed_limit(db):
         llm_outputs=[json.dumps(retain_payload)],
     )
 
-    assert mgr.store_turn("用" * 1000, "答" * 1000) is False
+    assert mgr.store_turn("用" * 1000, "答" * 998) is False
     assert len(mgr._pending_store_turns) == 1
     assert mgr.llm_prompts == []
 
@@ -847,6 +848,74 @@ def test_store_turn_async_drops_when_bounded_queue_is_full(db):
     release_first.set()
     assert mgr.flush_store_queue(timeout=2.0) is True
     assert mgr.shutdown_store_worker(timeout=1.0) is True
+
+
+def test_reflect_if_due_async_waits_for_interval(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"reflect_interval_seconds": 3600},
+    )
+    mgr._last_successful_reflect_at = time.time()
+
+    assert mgr.reflect_if_due_async() is False
+    assert mgr._store_queue.unfinished_tasks == 0
+
+
+def test_reflect_if_due_async_runs_after_queued_store(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"reflect_interval_seconds": 3600},
+    )
+    events = []
+    release_store = threading.Event()
+    store_started = threading.Event()
+
+    def fake_store_turn(*_args, **_kwargs):
+        events.append("store-start")
+        store_started.set()
+        release_store.wait(timeout=2.0)
+        events.append("store-finish")
+        return True
+
+    def fake_reflect(*_args, **_kwargs):
+        events.append("reflect")
+        return {"merged": 0}
+
+    mgr.store_turn = fake_store_turn
+    mgr.reflect = fake_reflect
+    db.get_unobserved_nodes_for_observation = lambda **_kwargs: [{"node_id": 1}]
+    mgr._last_successful_reflect_at = time.time() - 3601
+
+    assert mgr.store_turn_async("第一轮", "回答一") is True
+    assert store_started.wait(timeout=1.0)
+    assert mgr.reflect_if_due_async() is True
+    assert mgr.reflect_if_due_async() is False
+    release_store.set()
+    assert mgr.flush_store_queue(timeout=2.0) is True
+
+    assert events == ["store-start", "store-finish", "reflect"]
+    assert mgr._reflect_queued_or_running is False
+    assert float(db.get_meta("memory_node_last_successful_reflect_at")) > 0
+
+
+def test_reflect_if_due_async_skips_full_reflect_without_new_facts(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"reflect_interval_seconds": 1},
+    )
+    reflect_calls = []
+    mgr.reflect = lambda **kwargs: reflect_calls.append(kwargs) or {"merged": 0}
+    db.get_unobserved_nodes_for_observation = lambda **_kwargs: []
+    mgr._last_successful_reflect_at = time.time() - 2
+
+    assert mgr.reflect_if_due_async() is True
+    assert mgr.flush_store_queue(timeout=2.0) is True
+
+    assert reflect_calls == []
+    assert mgr._reflect_queued_or_running is False
 
 
 def test_store_turn_filters_plain_time_expressions_from_fact_entities(db):
@@ -1409,6 +1478,7 @@ def test_memory_node_manager_separates_embedding_and_memory_config(db):
         "retrieval_top_k": 12,
         "min_turns_before_store": 3,
         "max_chars_before_store": 2400,
+        "reflect_interval_seconds": 1800,
         "recall_budget": "high",
         "enable_entity_extraction": False,
         "llm_timeout": 45,
@@ -1425,6 +1495,7 @@ def test_memory_node_manager_separates_embedding_and_memory_config(db):
     assert mgr._top_k == 12
     assert mgr._min_turns_before_store == 3
     assert mgr._max_chars_before_store == 2400
+    assert mgr._reflect_interval_seconds == 1800
     assert mgr._recall_budget == "high"
     assert mgr._enable_entity_extraction is False
     assert mgr._llm_timeout == 45
