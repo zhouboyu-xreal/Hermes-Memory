@@ -9,12 +9,12 @@ from hermes_constants import get_hermes_home
 
 
 SCREEN_MEMORY_DEFAULTS: Dict[str, Any] = {
-    "enabled": False,
-    "screenpipe_db": "",
-    "openchronicle_db": "",
+    "enabled": True,
+    "screenpipe_db": "~/.screenpipe/db.sqlite",
+    "openchronicle_db": "~/.openchronicle/index.db",
     "output_db": "",
     "ingest_interval_minutes": 30,
-    "fact_clustering_interval_hours": 6,
+    "fact_clustering_interval_hours": 2,
     "observation_interval_hours": 24,
     "initial_lookback_minutes": 30,
     "openchronicle": {

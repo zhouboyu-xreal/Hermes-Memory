@@ -34,6 +34,7 @@ from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import numpy as np
+from hermes_cli.config import get_memory_config_path
 
 # Optional FAISS — gracefully degrades to keyword-only search when unavailable
 try:
@@ -51,10 +52,10 @@ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
 SCHEMA_VERSION = 13
 def _get_embedding_dim_from_config() -> int:
-    """Read embedding dimension from config.yaml, falling back to 1536."""
-    config_path = get_hermes_home() / "config.yaml"
+    """Read embedding dimension from memory.yaml, falling back to 1536."""
+    config_path = get_memory_config_path()
     try:
-        cfg = yaml.safe_load(config_path.read_text()) or {}
+        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         return int(cfg.get("embedding", {}).get("dimensions", 1536))
     except Exception:
         return 1536

@@ -159,6 +159,11 @@ def _log_exit(reason: str) -> None:
 
 def main():
     _install_sidecar_publisher()
+    try:
+        from agent.screen_memory.service import start_screen_memory_ticker
+        start_screen_memory_ticker()
+    except Exception:
+        pass
 
     # MCP tool discovery — inline is safe here: TUI entry is a plain
     # sync loop with no asyncio event loop to block.  Previously ran as

@@ -1,9 +1,11 @@
 """Screen activity cleaning pipeline adapted from the PME cleaner."""
 
+import builtins
 import os
 import sqlite3
 import hashlib
 import json
+import logging
 import math
 import re
 import struct
@@ -13,10 +15,13 @@ import urllib.request
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
+from pathlib import Path
+
 from agent.screen_memory.config import load_screen_memory_config
 
 DATABASE_TIMEZONE = timezone(timedelta(hours=8))
 MIN_NEW_FACTS_FOR_CLUSTERING = 5
+logger = logging.getLogger(__name__)
 
 NOISE_LINE_PATTERNS = [
     r"^\d{1,2}:\d{2}$",
@@ -1858,8 +1863,9 @@ def time_proximity_score(view_start, topic_start, topic_end, max_gap_days=30):
 
 
 class ScreenMemoryCleaner:
-    def __init__(self, config=None, llm_client=None):
+    def __init__(self, config=None, llm_client=None, *, quiet=False):
         self.config = config or load_screen_memory_config()
+        self.quiet = bool(quiet)
         self.llm_client = llm_client
         self.db_cfg = self.config.get("database", {})
         self.policy_cfg = self.config.get("cleaning_policy", {})
@@ -1881,11 +1887,23 @@ class ScreenMemoryCleaner:
         self.ax_trigger_interval = self.policy_cfg.get("ax_trigger_interval", 10)
         self.min_quality = self.policy_cfg.get("min_quality", 0.18)
         self.ignored_apps = set(self.policy_cfg.get("ignored_apps", []))
-        self.system_apps_keep_if_focused = set(self.policy_cfg.get("system_apps_keep_if_focused", []))
+        self.system_apps_keep_if_focused = set(
+            self.policy_cfg.get("system_apps_keep_if_focused", [])
+        )
         self.min_useful_chars = self.policy_cfg.get("min_useful_chars", 8)
         self.segment_gap_minutes = self.segment_cfg.get("gap_minutes", 8)
         self.max_segment_minutes = self.segment_cfg.get("max_minutes", 30)
-        self.focus_switch_split_minutes = self.segment_cfg.get("focus_switch_split_minutes", 5)
+        self.focus_switch_split_minutes = self.segment_cfg.get(
+            "focus_switch_split_minutes",
+            5,
+        )
+
+    def _print(self, *args, **kwargs):
+        if not self.quiet:
+            builtins.print(*args, **kwargs)
+            return
+        sep = kwargs.get("sep", " ")
+        logger.debug("%s", sep.join(str(item) for item in args))
 
     def classify_noise_reason(self, app, focused, cleaned_text):
         if app in self.ignored_apps:
@@ -2583,7 +2601,7 @@ class ScreenMemoryCleaner:
         return conn
 
     def load_screenpipe_data(self, start_time, end_time=None):
-        print(f"Connecting to Screenpipe database: {self.screenpipe_db}...")
+        self._print(f"Connecting to Screenpipe database: {self.screenpipe_db}...")
         conn = sqlite3.connect(self.screenpipe_db)
         cursor = conn.cursor()
         
@@ -2591,7 +2609,7 @@ class ScreenMemoryCleaner:
         
         if end_time:
             end_str = end_time.strftime("%Y-%m-%dT%H:%M:%S")
-            print(f"Fetching raw OCR between {start_str} and {end_str} UTC...")
+            self._print(f"Fetching raw OCR between {start_str} and {end_str} UTC...")
             query = """
             SELECT f.timestamp, o.app_name, o.window_name, o.focused, o.text, f.id
             FROM frames f
@@ -2601,7 +2619,7 @@ class ScreenMemoryCleaner:
             """
             cursor.execute(query, (start_str, end_str))
         else:
-            print(f"Fetching raw OCR since {start_str} UTC...")
+            self._print(f"Fetching raw OCR since {start_str} UTC...")
             query = """
             SELECT f.timestamp, o.app_name, o.window_name, o.focused, o.text, f.id
             FROM frames f
@@ -2613,18 +2631,22 @@ class ScreenMemoryCleaner:
             
         rows = cursor.fetchall()
         conn.close()
-        print(f"Fetched {len(rows)} raw OCR entries.")
+        self._print(f"Fetched {len(rows)} raw OCR entries.")
         return rows
 
     def load_openchronicle_events(self, start_time, end_time=None, include_discarded=False):
         if not self.openchronicle_db or not os.path.exists(self.openchronicle_db):
-            print(f"OpenChronicle database not found at {self.openchronicle_db}. Skipping AXTree dynamics.")
+            self._print(f"OpenChronicle database not found at {self.openchronicle_db}. Skipping AXTree dynamics.")
             if include_discarded:
                 return [], []
             return []
             
-        print(f"Connecting to OpenChronicle database: {self.openchronicle_db}...")
-        conn = sqlite3.connect(self.openchronicle_db)
+        self._print(f"Connecting to OpenChronicle database: {self.openchronicle_db}...")
+        database_uri = Path(self.openchronicle_db).expanduser().resolve().as_uri()
+        # OpenChronicle owns this database. immutable=1 prevents Hermes from
+        # creating journal sidecars or participating in its locking protocol;
+        # each ingest tick opens a new connection and therefore a new snapshot.
+        conn = sqlite3.connect(f"{database_uri}?immutable=1", uri=True)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
@@ -2658,9 +2680,9 @@ class ScreenMemoryCleaner:
             except Exception:
                 continue
                 
-        print(f"Loaded {len(oc_events)} OpenChronicle events.")
+        self._print(f"Loaded {len(oc_events)} OpenChronicle events.")
         if skipped_stats:
-            print(
+            self._print(
                 "Skipped OpenChronicle events: "
                 + ", ".join(f"{reason}={count}" for reason, count in sorted(skipped_stats.items()))
             )
@@ -2952,7 +2974,7 @@ class ScreenMemoryCleaner:
 
         sorted_seconds = sorted(timeline.keys())
         if not sorted_seconds:
-            print("No aligned records to clean.")
+            self._print("No aligned records to clean.")
             return [], {
                 "raw_records": len(sp_rows),
                 "cleaned_records": 0,
@@ -3157,7 +3179,7 @@ class ScreenMemoryCleaner:
         generate_screen_facts=True,
         update_window_workstreams=True,
     ):
-        print("Running scheduling simulation & deduplication...")
+        self._print("Running scheduling simulation & deduplication...")
         segment_gap_minutes = self.segment_gap_minutes if segment_gap_minutes is None else segment_gap_minutes
         max_segment_minutes = self.max_segment_minutes if max_segment_minutes is None else max_segment_minutes
         focus_switch_split_minutes = (
@@ -3538,7 +3560,7 @@ class ScreenMemoryCleaner:
                         status="error",
                         error=str(exc),
                     )
-                print(f"Screen fact embedding failed: {exc}")
+                self._print(f"Screen fact embedding failed: {exc}")
                 continue
             for (fact, embedding_text, embedding_hash), vector in zip(batch, vectors):
                 fact["embedding_vector"] = vector
@@ -3586,7 +3608,7 @@ class ScreenMemoryCleaner:
             import faiss
             import numpy as np
         except Exception as exc:
-            print(f"FAISS unavailable for screen fact similarity: {exc}")
+            self._print(f"FAISS unavailable for screen fact similarity: {exc}")
             return False
         matrix = np.asarray([fact["embedding_vector"] for fact in vector_facts], dtype="float32")
         if matrix.ndim != 2 or matrix.shape[0] < 2:
@@ -4041,7 +4063,7 @@ class ScreenMemoryCleaner:
             use_llm = llm_generation_count + llm_failed_count < llm_budget
             if not use_llm:
                 break
-            print(
+            self._print(
                 f"Summarizing fact with LLM "
                     f"({llm_generation_count + llm_failed_count + 1}/{llm_budget})..."
             )
@@ -4050,7 +4072,7 @@ class ScreenMemoryCleaner:
                 llm_generation_count += 1
             else:
                 llm_failed_count += 1
-                print(f"LLM screen fact extraction failed for view {view_entry.get('view_id')}: {error}")
+                self._print(f"LLM screen fact extraction failed for view {view_entry.get('view_id')}: {error}")
                 if fallback_enabled:
                     facts = self.fallback_screen_facts_for_view(view_entry)
             for fact in facts:
@@ -5015,7 +5037,7 @@ class ScreenMemoryCleaner:
                 fact_count = len(cluster.get("facts") or [])
                 use_llm = fact_count > 1 and llm_enabled and llm_generation_count + llm_failed_count < llm_budget
                 if use_llm:
-                    print(
+                    self._print(
                         f"Summarizing Screen_Observation with LLM "
                             f"({llm_generation_count + llm_failed_count + 1}/{llm_budget})..."
                     )
@@ -5028,7 +5050,7 @@ class ScreenMemoryCleaner:
                         llm_generation_count += 1
                     else:
                         llm_failed_count += 1
-                        print(
+                        self._print(
                             f"LLM screen observation generation failed for window_workstream "
                             f"{window_workstream_id}: {error}"
                         )
@@ -5038,7 +5060,7 @@ class ScreenMemoryCleaner:
                 else:
                     if fact_count > 1 and not fallback_enabled:
                         continue
-                    print("Summarizing Screen_Observation with fallback ")
+                    self._print("Summarizing Screen_Observation with fallback ")
                     observation = self.fallback_screen_observation_for_cluster(window_context, cluster)
                 entry = self.build_screen_observation_entry(
                     window_workstream_id,
@@ -5163,7 +5185,7 @@ class ScreenMemoryCleaner:
             view_infos = view_infos_by_segment.get(segment_key, [])
             use_llm = llm_enabled and llm_generation_count + llm_failed_count < llm_budget
             if use_llm:
-                print(
+                self._print(
                     f"Summarizing segment candidate {segment_key + 1} with LLM "
                         f"({llm_generation_count + llm_failed_count + 1}/{llm_budget})..."
                 )
@@ -5176,7 +5198,7 @@ class ScreenMemoryCleaner:
                 llm_generation_count += 1
             elif ok is False:
                 llm_failed_count += 1
-                print(f"LLM summary failed for segment candidate {segment_key + 1}: {error}")
+                self._print(f"LLM summary failed for segment candidate {segment_key + 1}: {error}")
             segment_entries.append({
                 "segment_key": segment_key,
                 "info": info,
@@ -8347,7 +8369,7 @@ class ScreenMemoryCleaner:
                 and llm_generation_count + llm_failed_count < llm_budget
             )
             if use_llm:
-                print(
+                self._print(
                     f"Generating report_block for window_workstream {window_workstream_id} "
                     f"{period['period_key']} with LLM "
                     f"({llm_generation_count + llm_failed_count + 1}/{llm_budget})..."
@@ -8360,7 +8382,7 @@ class ScreenMemoryCleaner:
                 llm_generation_count += 1
             elif ok is False:
                 llm_failed_count += 1
-                print(
+                self._print(
                     f"LLM report_block generation failed for window_workstream "
                     f"{window_workstream_id}: {error}"
                 )
@@ -8578,7 +8600,7 @@ class ScreenMemoryCleaner:
             task_entry = self.finalize_task_workstream(task)
             use_llm = llm_enabled and llm_generation_count + llm_failed_count < llm_budget
             if use_llm:
-                print(
+                self._print(
                     f"Summarizing task_workstream {task_entry['title']} with LLM "
                     f"({llm_generation_count + llm_failed_count + 1}/{llm_budget})..."
                 )
@@ -8588,7 +8610,7 @@ class ScreenMemoryCleaner:
                     llm_generation_count += 1
                 else:
                     llm_failed_count += 1
-                    print(f"LLM task_workstream summary failed for {task_entry['title']}: {error}")
+                    self._print(f"LLM task_workstream summary failed for {task_entry['title']}: {error}")
             task_entries.append(task_entry)
 
         touched_task_workstream_ids = []
@@ -8663,7 +8685,7 @@ class ScreenMemoryCleaner:
             workstream_entry = self.finalize_window_workstream(workstream)
             use_llm = llm_enabled and llm_generation_count + llm_failed_count < llm_budget
             if use_llm:
-                print(
+                self._print(
                     f"Summarizing window workstream {workstream_entry['title']} with LLM "
                     f"({llm_generation_count + llm_failed_count + 1}/{llm_budget})..."
                 )
@@ -8673,7 +8695,7 @@ class ScreenMemoryCleaner:
                     llm_generation_count += 1
                 else:
                     llm_failed_count += 1
-                    print(f"LLM workstream summary failed for {workstream_entry['title']}: {error}")
+                    self._print(f"LLM workstream summary failed for {workstream_entry['title']}: {error}")
             workstream_entries.append(workstream_entry)
 
         touched_window_workstream_ids = []
@@ -8729,11 +8751,11 @@ class ScreenMemoryCleaner:
         missing_bucket_count = max(0, sp_bucket_count - covered_bucket_count)
         coverage_ratio = covered_bucket_count / sp_bucket_count if sp_bucket_count else 0.0
         if not oc_events:
-            print(
+            self._print(
                 "OpenChronicle events are unavailable in this window. "
             )
         else:
-            print(
+            self._print(
                 "OpenChronicle coverage "
                 f"({bucket_minutes}-minute buckets): {covered_bucket_count}/{sp_bucket_count} "
                 f"Screenpipe buckets have AXTree captures. Keeping all {len(sp_rows)} OCR rows."
@@ -8794,7 +8816,7 @@ class ScreenMemoryCleaner:
         try:
             sp_rows = self.load_screenpipe_data(start_time, end_time)
         except Exception as e:
-            print(f"Error reading Screenpipe: {e}")
+            self._print(f"Error reading Screenpipe: {e}")
             output_conn.close()
             return None
             
@@ -8805,7 +8827,7 @@ class ScreenMemoryCleaner:
                 include_discarded=True,
             )
         except Exception as e:
-            print(f"Error reading OpenChronicle: {e}")
+            self._print(f"Error reading OpenChronicle: {e}")
             oc_events = []
             discarded_oc_events = []
 
@@ -8837,37 +8859,37 @@ class ScreenMemoryCleaner:
         
         stats.update(coverage_stats)
         
-        print("\n" + "="*50)
+        self._print("\n" + "="*50)
         mode_label = "INCREMENTAL" if incremental else "FULL RESET"
-        print(f"DATA PROCESSOR CLEANING STATS ({mode_label})")
-        print("="*50)
-        print(f"Output Path: {stats.get('output_path', 'N/A')}")
-        print(f"Raw Records: {stats.get('raw_records', 0)}")
-        print(f"Discarded Incomplete Records: {stats.get('discarded_incomplete_records', 0)}")
-        print(f"OpenChronicle Coverage Ratio: {stats.get('openchronicle_coverage_ratio', 0):.3f}")
-        print(f"Cleaned Records: {stats.get('cleaned_records', 0)}")
-        print(f"OpenChronicle Events: {stats.get('openchronicle_events', 0)}")
-        print(f"Record AX Event Links: {stats.get('record_ax_event_links', 0)}")
-        print(f"Record AX Context Updates: {stats.get('record_ax_context_updates', 0)}")
-        print(f"Discarded by OpenChronicle Events: {stats.get('discarded_openchronicle_event', 0)}")
-        print(f"Deduplicated (Skipped): {stats.get('deduplicated', 0)}")
-        print(f"Ignored Apps (Skipped): {stats.get('ignored_app', 0)}")
-        print(f"Unfocused System Apps (Skipped): {stats.get('unfocused_system_app', 0)}")
-        print(f"Low Information (Skipped): {stats.get('low_information', 0)}")
-        print(f"Low Quality (Skipped): {stats.get('low_quality', 0)}")
-        print(f"Total Segment Num: {stats.get('segments', 0)}")
-        print(f"Total View Num: {stats.get('views', 0)}")
-        print(f"Total Window Workstream Num: {stats.get('window_workstream', 0)}")
-        print(f"Total Task Workstream Num: {stats.get('task_workstream', 0)}")
-        print(f"Total Screen Fact Num: {stats.get('screen_facts', 0)}")
-        print(f"Total Screen Observation Num: {stats.get('screen_observations', 0)}")
-        print(f"LLM Segment Summaries: {stats.get('segment_llm_generation_count', 0)} ok, {stats.get('segment_llm_failed_count', 0)} failed")
-        print(f"LLM Window Workstream Summaries: {stats.get('window_workstream_llm_generation_count', 0)} ok, {stats.get('window_workstream_llm_failed_count', 0)} failed")
-        print(f"LLM Task Workstream Summaries: {stats.get('task_workstream_llm_generation_count', 0)} ok, {stats.get('task_workstream_llm_failed_count', 0)} failed")
-        print(f"LLM Screen Facts: {stats.get('screen_fact_llm_generation_count', 0)} ok, {stats.get('screen_fact_llm_failed_count', 0)} failed")
-        print(f"LLM Screen Observations: {stats.get('screen_observation_llm_generation_count', 0)} ok, {stats.get('screen_observation_llm_failed_count', 0)} failed")
-        print(f"Compression Ratio: {stats.get('raw_records', 0) / max(1, stats.get('cleaned_records', 0)):.2f}x")
-        print("="*50)
+        self._print(f"DATA PROCESSOR CLEANING STATS ({mode_label})")
+        self._print("="*50)
+        self._print(f"Output Path: {stats.get('output_path', 'N/A')}")
+        self._print(f"Raw Records: {stats.get('raw_records', 0)}")
+        self._print(f"Discarded Incomplete Records: {stats.get('discarded_incomplete_records', 0)}")
+        self._print(f"OpenChronicle Coverage Ratio: {stats.get('openchronicle_coverage_ratio', 0):.3f}")
+        self._print(f"Cleaned Records: {stats.get('cleaned_records', 0)}")
+        self._print(f"OpenChronicle Events: {stats.get('openchronicle_events', 0)}")
+        self._print(f"Record AX Event Links: {stats.get('record_ax_event_links', 0)}")
+        self._print(f"Record AX Context Updates: {stats.get('record_ax_context_updates', 0)}")
+        self._print(f"Discarded by OpenChronicle Events: {stats.get('discarded_openchronicle_event', 0)}")
+        self._print(f"Deduplicated (Skipped): {stats.get('deduplicated', 0)}")
+        self._print(f"Ignored Apps (Skipped): {stats.get('ignored_app', 0)}")
+        self._print(f"Unfocused System Apps (Skipped): {stats.get('unfocused_system_app', 0)}")
+        self._print(f"Low Information (Skipped): {stats.get('low_information', 0)}")
+        self._print(f"Low Quality (Skipped): {stats.get('low_quality', 0)}")
+        self._print(f"Total Segment Num: {stats.get('segments', 0)}")
+        self._print(f"Total View Num: {stats.get('views', 0)}")
+        self._print(f"Total Window Workstream Num: {stats.get('window_workstream', 0)}")
+        self._print(f"Total Task Workstream Num: {stats.get('task_workstream', 0)}")
+        self._print(f"Total Screen Fact Num: {stats.get('screen_facts', 0)}")
+        self._print(f"Total Screen Observation Num: {stats.get('screen_observations', 0)}")
+        self._print(f"LLM Segment Summaries: {stats.get('segment_llm_generation_count', 0)} ok, {stats.get('segment_llm_failed_count', 0)} failed")
+        self._print(f"LLM Window Workstream Summaries: {stats.get('window_workstream_llm_generation_count', 0)} ok, {stats.get('window_workstream_llm_failed_count', 0)} failed")
+        self._print(f"LLM Task Workstream Summaries: {stats.get('task_workstream_llm_generation_count', 0)} ok, {stats.get('task_workstream_llm_failed_count', 0)} failed")
+        self._print(f"LLM Screen Facts: {stats.get('screen_fact_llm_generation_count', 0)} ok, {stats.get('screen_fact_llm_failed_count', 0)} failed")
+        self._print(f"LLM Screen Observations: {stats.get('screen_observation_llm_generation_count', 0)} ok, {stats.get('screen_observation_llm_failed_count', 0)} failed")
+        self._print(f"Compression Ratio: {stats.get('raw_records', 0) / max(1, stats.get('cleaned_records', 0)):.2f}x")
+        self._print("="*50)
         return stats
 
     def incremental_clean(self, minutes=30):

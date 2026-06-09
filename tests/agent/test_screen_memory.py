@@ -1,4 +1,6 @@
 import sqlite3
+import sys
+import threading
 from datetime import datetime, timezone
 
 from agent.screen_memory.cleaner import ScreenMemoryCleaner
@@ -104,9 +106,82 @@ def test_screen_memory_defaults_use_profile_output_path(tmp_path, monkeypatch):
     assert config["database"]["cleaned_db"] == str(
         tmp_path / "profile" / "screen_memory" / "memory.db"
     )
-    assert config["schedule"]["ingest_interval_minutes"] == 30
-    assert config["schedule"]["fact_clustering_interval_hours"] == 6
+    assert config["schedule"]["ingest_interval_minutes"] == 10
+    assert config["schedule"]["fact_clustering_interval_hours"] == 1
     assert config["schedule"]["observation_interval_hours"] == 24
+
+
+def test_screen_memory_ticker_is_process_singleton(monkeypatch):
+    service.stop_screen_memory_ticker()
+    scheduled = threading.Event()
+    calls = []
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"screen_memory": {"enabled": True}},
+    )
+    monkeypatch.setattr(
+        service,
+        "load_screen_memory_config",
+        lambda _cfg: {"enabled": True},
+    )
+
+    def fake_schedule():
+        calls.append("tick")
+        scheduled.set()
+        return None
+
+    monkeypatch.setattr(service, "schedule_screen_memory_tick", fake_schedule)
+    try:
+        first = service.start_screen_memory_ticker(interval_seconds=60)
+        second = service.start_screen_memory_ticker(interval_seconds=60)
+
+        assert first is not None
+        assert first is second
+        assert scheduled.wait(timeout=1.0)
+        assert calls == ["tick"]
+    finally:
+        service.stop_screen_memory_ticker()
+
+
+def test_screen_memory_ticker_does_not_start_when_disabled(monkeypatch):
+    service.stop_screen_memory_ticker()
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"screen_memory": {"enabled": False}},
+    )
+    monkeypatch.setattr(
+        service,
+        "load_screen_memory_config",
+        lambda _cfg: {"enabled": False},
+    )
+
+    assert service.start_screen_memory_ticker(interval_seconds=1) is None
+
+
+def test_background_ingest_does_not_redirect_process_stdout(tmp_path):
+    expected_stdout = sys.stdout
+
+    class _FakeCleaner:
+        config = {"schedule": {"initial_lookback_minutes": 30}}
+
+        def clean(self, **_kwargs):
+            assert sys.stdout is expected_stdout
+            return {}
+
+    service._run_ingest(
+        _FakeCleaner(),
+        {},
+        datetime(2026, 6, 1, tzinfo=timezone.utc),
+    )
+
+
+def test_quiet_cleaner_suppresses_console_output(tmp_path, capsys):
+    cleaner = ScreenMemoryCleaner(_cleaner(tmp_path).config, quiet=True)
+
+    cleaner._print("hidden", "output")
+
+    assert capsys.readouterr().out == ""
 
 
 def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
@@ -235,7 +310,7 @@ def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
     config["database"]["openchronicle_db"] = str(openchronicle_db)
 
     class _FakeCleaner:
-        def __init__(self, cleaner_config, llm_client=None):
+        def __init__(self, cleaner_config, llm_client=None, quiet=False):
             self.config = cleaner_config
             self.cleaned_db = cleaner_config["database"]["cleaned_db"]
 
@@ -277,7 +352,7 @@ def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
     service.run_screen_memory_due_work(
         now=datetime(2026, 6, 1, 1, tzinfo=timezone.utc)
     )
-    assert calls == ["ingest"]
+    assert calls == ["ingest", "cluster"]
 
     calls.clear()
     service.run_screen_memory_due_work(
@@ -368,3 +443,52 @@ def test_incremental_clean_merges_screenpipe_and_openchronicle_into_workstream(t
         "SELECT count(*) FROM records WHERE ax_context_json IS NOT NULL"
     ).fetchone()[0] >= 1
     output.close()
+
+
+def test_openchronicle_read_uses_immutable_connection(
+    tmp_path,
+    monkeypatch,
+):
+    cleaner = _cleaner(tmp_path)
+    openchronicle_db = tmp_path / "openchronicle.db"
+    cleaner.openchronicle_db = str(openchronicle_db)
+    connection = sqlite3.connect(openchronicle_db)
+    connection.executescript(
+        """
+        CREATE TABLE captures (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            app_name TEXT,
+            bundle_id TEXT,
+            window_title TEXT,
+            focused_role TEXT,
+            focused_value TEXT,
+            visible_text TEXT,
+            url TEXT
+        );
+        INSERT INTO captures VALUES (
+            1, '2026-06-01T10:00:00Z', 'Code', 'com.microsoft.VSCode',
+            'memory.py', 'AXTextArea', 'screen memory', 'screen memory', ''
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    real_connect = sqlite3.connect
+    connection_uris = []
+
+    def guarded_connect(database, *args, **kwargs):
+        connection_uris.append(str(database))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", guarded_connect)
+    events = cleaner.load_openchronicle_events(
+        datetime(2026, 6, 1, 9, tzinfo=timezone.utc),
+        datetime(2026, 6, 1, 11, tzinfo=timezone.utc),
+    )
+
+    assert len(events) == 1
+    assert connection_uris == [
+        openchronicle_db.resolve().as_uri() + "?immutable=1"
+    ]

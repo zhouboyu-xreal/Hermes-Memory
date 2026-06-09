@@ -81,6 +81,9 @@ class TestLoadConfigDefaults:
             assert config["memory"]["max_chars_before_store"] == 2000
             assert config["memory"]["store_queue_maxsize"] == 100
             assert config["memory"]["reflect_interval_seconds"] == 3600
+            assert config["screen_memory"]["enabled"] is True
+            assert config["screen_memory"]["screenpipe_db"] == "~/.screenpipe/db.sqlite"
+            assert config["screen_memory"]["openchronicle_db"] == "~/.openchronicle/index.db"
             assert get_memory_config_path() == tmp_path / "memory.yaml"
             assert get_memory_config_path().exists()
 

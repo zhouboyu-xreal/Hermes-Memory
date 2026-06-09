@@ -1054,15 +1054,16 @@ DEFAULT_CONFIG = {
     },
 
     # Optional screen activity memory pipeline. When enabled, the gateway
-    # incrementally combines Screenpipe OCR and OpenChronicle AXTree captures.
+    # and interactive clients incrementally combine Screenpipe OCR and
+    # OpenChronicle AXTree captures.
     "screen_memory": {
-        "enabled": False,
-        "screenpipe_db": "",
-        "openchronicle_db": "",
+        "enabled": True,
+        "screenpipe_db": "~/.screenpipe/db.sqlite",
+        "openchronicle_db": "~/.openchronicle/index.db",
         # Empty uses <HERMES_HOME>/screen_memory/memory.db.
         "output_db": "",
-        "ingest_interval_minutes": 30,
-        "fact_clustering_interval_hours": 6,
+        "ingest_interval_minutes": 10,
+        "fact_clustering_interval_hours": 1,
         "observation_interval_hours": 24,
         "initial_lookback_minutes": 30,
     },

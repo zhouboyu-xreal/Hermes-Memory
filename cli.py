@@ -774,6 +774,11 @@ def _run_cleanup():
                 _active_agent_ref.shutdown_memory_provider()
     except Exception:
         pass
+    try:
+        from agent.screen_memory.service import stop_screen_memory_ticker
+        stop_screen_memory_ticker()
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -11351,6 +11356,11 @@ def main(
     
     # Register cleanup for single-query mode (interactive mode registers in run())
     atexit.register(_run_cleanup)
+    try:
+        from agent.screen_memory.service import start_screen_memory_ticker
+        start_screen_memory_ticker()
+    except Exception as exc:
+        logger.debug("Screen memory ticker startup skipped: %s", exc)
 
     # Also install signal handlers in single-query / `-q` mode.  Interactive
     # mode registers its own inside HermesCLI.run(), but `-q` runs

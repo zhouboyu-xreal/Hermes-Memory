@@ -1,8 +1,7 @@
 from __future__ import annotations
 
+import atexit
 import concurrent.futures
-import contextlib
-import io
 import json
 import logging
 import os
@@ -23,6 +22,9 @@ _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 )
 _FUTURE_LOCK = threading.Lock()
 _ACTIVE_FUTURE: Optional[concurrent.futures.Future] = None
+_TICKER_LOCK = threading.Lock()
+_TICKER_STOP_EVENT: Optional[threading.Event] = None
+_TICKER_THREAD: Optional[threading.Thread] = None
 
 
 def _utc_now() -> datetime:
@@ -148,17 +150,13 @@ def _run_ingest(
         previous = now - timedelta(
             minutes=max(1, int(schedule.get("initial_lookback_minutes", 30)))
         )
-    output = io.StringIO()
-    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-        stats = cleaner.clean(
-            start_time_str=previous.isoformat(),
-            end_time_str=now.isoformat(),
-            incremental=True,
-            generate_screen_facts=True,
-            update_window_workstreams=True,
-        )
-    if output.getvalue().strip():
-        logger.debug("Screen memory ingest output:\n%s", output.getvalue().strip())
+    stats = cleaner.clean(
+        start_time_str=previous.isoformat(),
+        end_time_str=now.isoformat(),
+        incremental=True,
+        generate_screen_facts=True,
+        update_window_workstreams=True,
+    )
     if stats is not None:
         state["last_ingest_at"] = now.isoformat()
         state["last_ingest_stats"] = stats
@@ -170,15 +168,11 @@ def _run_fact_clustering(
     state: Dict[str, Any],
     now: datetime,
 ) -> Dict[str, Any]:
-    output = io.StringIO()
-    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-        connection = cleaner.ensure_cleaned_db()
-        try:
-            stats = cleaner.update_screen_fact_cluster_tables(connection)
-        finally:
-            connection.close()
-    if output.getvalue().strip():
-        logger.debug("Screen memory fact clustering output:\n%s", output.getvalue().strip())
+    connection = cleaner.ensure_cleaned_db()
+    try:
+        stats = cleaner.update_screen_fact_cluster_tables(connection)
+    finally:
+        connection.close()
     state["last_fact_clustering_at"] = now.isoformat()
     state["last_fact_clustering_stats"] = stats
     return stats
@@ -189,18 +183,14 @@ def _run_observations(
     state: Dict[str, Any],
     now: datetime,
 ) -> Dict[str, Any]:
-    output = io.StringIO()
-    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-        connection = cleaner.ensure_cleaned_db()
-        try:
-            # A daily observation run first catches any facts left unclustered by
-            # a missed six-hour tick.
-            cluster_stats = cleaner.update_screen_fact_cluster_tables(connection)
-            observation_stats = cleaner.update_screen_observation_tables(connection, None)
-        finally:
-            connection.close()
-    if output.getvalue().strip():
-        logger.debug("Screen memory observation output:\n%s", output.getvalue().strip())
+    connection = cleaner.ensure_cleaned_db()
+    try:
+        # A daily observation run first catches any facts left unclustered by
+        # a missed clustering tick.
+        cluster_stats = cleaner.update_screen_fact_cluster_tables(connection)
+        observation_stats = cleaner.update_screen_observation_tables(connection, None)
+    finally:
+        connection.close()
     stats = {
         "fact_clustering": cluster_stats,
         "observations": observation_stats,
@@ -276,7 +266,11 @@ def run_screen_memory_due_work(
             }
 
         llm_client = _inject_runtime_config(cleaner_config, hermes_config)
-        cleaner = ScreenMemoryCleaner(cleaner_config, llm_client=llm_client)
+        cleaner = ScreenMemoryCleaner(
+            cleaner_config,
+            llm_client=llm_client,
+            quiet=True,
+        )
         phases: Dict[str, Any] = {}
         if ingest_due:
             phases["ingest"] = _run_ingest(cleaner, state, current)
@@ -317,13 +311,13 @@ def run_screen_memory_due_work(
 
 
 def schedule_screen_memory_tick() -> Optional[concurrent.futures.Future]:
-    """Start due screen-memory work without blocking the gateway cron tick."""
+    """Start due screen-memory work without blocking the caller."""
     global _ACTIVE_FUTURE
     try:
         from hermes_cli.config import load_config
 
         config = load_config() or {}
-        if not bool((config.get("screen_memory") or {}).get("enabled", False)):
+        if not load_screen_memory_config(config).get("enabled"):
             return None
     except Exception:
         return None
@@ -332,3 +326,69 @@ def schedule_screen_memory_tick() -> Optional[concurrent.futures.Future]:
             return _ACTIVE_FUTURE
         _ACTIVE_FUTURE = _EXECUTOR.submit(run_screen_memory_due_work)
         return _ACTIVE_FUTURE
+
+
+def _screen_memory_ticker_loop(
+    stop_event: threading.Event,
+    interval_seconds: float,
+) -> None:
+    logger.info(
+        "Screen memory ticker started (interval=%ss)",
+        int(interval_seconds),
+    )
+    while not stop_event.is_set():
+        try:
+            schedule_screen_memory_tick()
+        except Exception as exc:
+            logger.debug("Screen memory ticker error: %s", exc)
+        if stop_event.wait(interval_seconds):
+            break
+    logger.debug("Screen memory ticker stopped")
+
+
+def start_screen_memory_ticker(
+    *,
+    interval_seconds: float = 60.0,
+) -> Optional[threading.Thread]:
+    """Start one process-level ticker for interactive CLI/TUI runtimes."""
+    global _TICKER_STOP_EVENT, _TICKER_THREAD
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+        if not load_screen_memory_config(config).get("enabled"):
+            return None
+    except Exception as exc:
+        logger.debug("Screen memory ticker config check failed: %s", exc)
+        return None
+
+    clean_interval = max(1.0, float(interval_seconds or 60.0))
+    with _TICKER_LOCK:
+        if _TICKER_THREAD is not None and _TICKER_THREAD.is_alive():
+            return _TICKER_THREAD
+        _TICKER_STOP_EVENT = threading.Event()
+        _TICKER_THREAD = threading.Thread(
+            target=_screen_memory_ticker_loop,
+            args=(_TICKER_STOP_EVENT, clean_interval),
+            daemon=True,
+            name="screen-memory-ticker",
+        )
+        _TICKER_THREAD.start()
+        return _TICKER_THREAD
+
+
+def stop_screen_memory_ticker(*, timeout: float = 2.0) -> None:
+    """Stop the interactive process-level ticker if it is running."""
+    global _TICKER_STOP_EVENT, _TICKER_THREAD
+    with _TICKER_LOCK:
+        stop_event = _TICKER_STOP_EVENT
+        thread = _TICKER_THREAD
+        _TICKER_STOP_EVENT = None
+        _TICKER_THREAD = None
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=max(0.0, float(timeout or 0.0)))
+
+
+atexit.register(stop_screen_memory_ticker)

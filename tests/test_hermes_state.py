@@ -5,7 +5,47 @@ import numpy as np
 import pytest
 from pathlib import Path
 
+import hermes_state
 from hermes_state import SessionDB
+
+
+def test_embedding_dimension_is_loaded_from_memory_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "embedding:\n  dimensions: 111\n",
+        encoding="utf-8",
+    )
+    memory_path = tmp_path / "memory.yaml"
+    memory_path.write_text(
+        "embedding:\n  dimensions: 768\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        hermes_state,
+        "get_memory_config_path",
+        lambda: memory_path,
+    )
+    monkeypatch.setattr(hermes_state, "get_hermes_home", lambda: tmp_path)
+
+    assert hermes_state._get_embedding_dim_from_config() == 768
+
+
+def test_embedding_dimension_falls_back_when_memory_config_is_invalid(
+    tmp_path,
+    monkeypatch,
+):
+    memory_path = tmp_path / "memory.yaml"
+    memory_path.write_text(
+        "embedding:\n  dimensions: invalid\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        hermes_state,
+        "get_memory_config_path",
+        lambda: memory_path,
+    )
+
+    assert hermes_state._get_embedding_dim_from_config() == 1536
 
 
 @pytest.fixture()
