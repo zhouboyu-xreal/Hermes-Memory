@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pytest
 
+import hermes_state
 from agent.memory_node_manager import MemoryNodeManager
 from agent.memory_node_manager import (
     CAUSAL_RELATION_TYPE_TEXT,
@@ -176,7 +177,8 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
             {
                 "text": "Alice prefers Slack over email for urgent team communication.",
                 "keywords": ["Alice", "Slack", "email"],
-                "topic": ["urgent", "team", "communication"],
+                "primary_entity": {"name": "Alice", "type": "PERSON"},
+                "primary_topic": "urgent-team-communication",
                 "fact_type": "semantic",
                 "fact_subject": "user",
                 "fact_kind": "preference",
@@ -197,7 +199,8 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
             {
                 "text": "Hermes recommended configuring alerts to notify Alice in Slack.",
                 "keywords": ["Hermes", "alerts", "Slack"],
-                "topic": ["alert", "routing"],
+                "primary_entity": {"name": "Hermes", "type": "AGENT"},
+                "primary_topic": "alert-routing",
                 "fact_type": "episodic",
                 "fact_subject": "assistant",
                 "fact_kind": "recommendation",
@@ -226,7 +229,8 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert mgr.store_turn("Alice hates email for urgent alerts", "Use Slack alerts.") is True
 
     rows = db._conn.execute(
-        "SELECT id, summary, keywords, topic, tags, fact_type, fact_subject, fact_kind, entity_names, "
+        "SELECT id, summary, keywords, topic, primary_entity_id, primary_topic, "
+        "tags, fact_type, fact_subject, fact_kind, entity_names, "
         "task_event_like, task_event_subject, task_relevance "
         "FROM memory_nodes ORDER BY id"
     ).fetchall()
@@ -234,7 +238,9 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert rows[0]["summary"] == retain_payload["facts"][0]["text"]
     assert rows[1]["summary"] == retain_payload["facts"][1]["text"]
     assert "Alice Slack email" == rows[0]["keywords"]
-    assert "urgent team communication" == rows[0]["topic"]
+    assert "urgent-team-communication" == rows[0]["topic"]
+    assert rows[0]["primary_topic"] == "urgent-team-communication"
+    assert rows[0]["primary_entity_id"] is not None
     assert rows[0]["fact_type"] == "semantic"
     assert rows[0]["fact_subject"] == "user"
     assert rows[0]["fact_kind"] == "preference"
@@ -242,7 +248,7 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
     assert rows[1]["fact_subject"] == "assistant"
     assert rows[1]["fact_kind"] == "recommendation"
     assert json.loads(rows[0]["entity_names"]) == ["用户", "Alice", "Slack"]
-    assert json.loads(rows[1]["entity_names"]) == ["助手", "Alice", "Slack"]
+    assert json.loads(rows[1]["entity_names"]) == ["Hermes", "助手", "Alice", "Slack"]
     assert "fact_type:semantic" in json.loads(rows[0]["tags"])
     assert "fact_subject:user" in json.loads(rows[0]["tags"])
     assert "fact_type:episodic" in json.loads(rows[1]["tags"])
@@ -467,7 +473,7 @@ def test_store_turn_falls_back_to_summary_when_retain_json_is_bad(db):
     ).fetchone()
     assert row["summary"] == summary_payload["summary"]
     assert row["keywords"] == "PostgreSQL project"
-    assert row["topic"] == "postgresql project"
+    assert row["topic"] == "postgresql"
     assert row["fact_kind"] == "conversation_summary"
     assert "fact_kind:conversation_summary" in json.loads(row["tags"])
     assert "run_entity_extraction" not in mgr.async_calls[0]
@@ -479,7 +485,8 @@ def test_retain_and_relation_prompts_share_relation_type_contract():
     assert "Reason/HinderedBy" not in RETAIN_FACT_EXTRACTION_PROMPT
     assert "Reason/HinderedBy" not in RELATION_PROMPT_TEMPLATE
     assert '"keywords": ["关键词1", "关键词2"]' in RETAIN_FACT_EXTRACTION_PROMPT
-    assert '"topic": ["主题1", "主题2"]' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert '"primary_entity": {{"name": "主要主体实体", "type": "PERSON"}}' in RETAIN_FACT_EXTRACTION_PROMPT
+    assert '"primary_topic": "唯一核心主题"' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"fact_type": "semantic/episodic"' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"fact_subject": "user/assistant/world/project/system/other"' in RETAIN_FACT_EXTRACTION_PROMPT
     assert '"fact_kind": "preference/decision/request/recommendation/action/error/context/instruction/other"' in RETAIN_FACT_EXTRACTION_PROMPT
@@ -1026,6 +1033,25 @@ def _add_memory_node(
         task_event_subject=task_event_subject,
         task_relevance=task_relevance,
     )
+
+
+def test_memory_node_embeddings_reconstruct_requested_vectors(db, monkeypatch):
+    class _FakeFaissIndex:
+        ntotal = 2
+        d = 3
+
+        @staticmethod
+        def reconstruct(index):
+            return np.array([float(index), 1.0, 0.0], dtype=np.float32)
+
+    monkeypatch.setattr(hermes_state, "_HAS_FAISS", True)
+    db._memory_faiss_index = _FakeFaissIndex()
+    db._memory_faiss_id_map = [11, 22]
+
+    vectors = db.memory_node_embeddings([22, 99999])
+
+    assert set(vectors) == {22}
+    assert np.allclose(vectors[22], np.array([1.0, 1.0, 0.0], dtype=np.float32))
 
 
 def _add_task_interpretation(
@@ -2025,6 +2051,18 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         ).fetchall()
     }
     assert source_ids == {first_node, second_node, touched_node}
+    source_roles = {
+        row["node_id"]: row["role"]
+        for row in db._conn.execute(
+            "SELECT node_id, role FROM memory_observation_sources WHERE observation_id = ?",
+            (rows[0]["id"],),
+        ).fetchall()
+    }
+    assert source_roles == {
+        first_node: "initial",
+        second_node: "initial",
+        touched_node: "matched",
+    }
 
 
 def test_reflect_keeps_insight_and_task_observations_separate(db):
@@ -2645,9 +2683,16 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
     assert observation["summary"] == "Alice's urgent alert workflow is Slack-centered."
     sources = db._conn.execute("SELECT node_id FROM memory_observation_sources").fetchall()
     assert len(sources) == 3
+    source_roles = db._conn.execute(
+        "SELECT node_id, role FROM memory_observation_sources ORDER BY node_id"
+    ).fetchall()
+    assert {row["node_id"]: row["role"] for row in source_roles} == {
+        source["node_id"]: "initial"
+        for source in sources
+    }
 
 
-def test_unmatched_fact_clusters_match_generalized_topic_with_time_window(db):
+def test_unmatched_fact_clusters_keep_exact_topics_separate(db):
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
     facts = [
         {
@@ -2674,13 +2719,14 @@ def test_unmatched_fact_clusters_match_generalized_topic_with_time_window(db):
 
     clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
 
-    normalized = [
-        cluster for cluster in clusters
-        if cluster.get("topic_key") == "家庭" and cluster.get("topic_match") == "normalized"
-    ]
-    assert normalized
-    assert normalized[0]["raw_topic_keys"] == ["家庭", "家庭关系"]
-    assert normalized[0]["source_node_ids"] == [1, 2]
+    assert {
+        (cluster["topic_key"], tuple(cluster["source_node_ids"]))
+        for cluster in clusters
+    } == {
+        ("家庭", (1,)),
+        ("家庭关系", (2,)),
+    }
+    assert all(cluster["topic_match"] == "exact" for cluster in clusters)
 
 
 def test_unmatched_fact_clusters_do_not_match_different_specific_family_topics(db):
@@ -2749,7 +2795,7 @@ def test_unmatched_fact_clusters_require_time_window_for_generalized_topic_match
     ]
 
 
-def test_unmatched_fact_clusters_filter_suffix_facts_outside_time_window(db):
+def test_unmatched_fact_clusters_ignore_time_when_topics_are_exact(db):
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
     facts = [
         {
@@ -2786,15 +2832,16 @@ def test_unmatched_fact_clusters_filter_suffix_facts_outside_time_window(db):
 
     clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
 
-    normalized = [
-        cluster for cluster in clusters
-        if cluster.get("topic_key") == "健康" and cluster.get("topic_match") == "normalized"
-    ]
-    assert normalized
-    assert normalized[0]["source_node_ids"] == [1, 2]
+    assert {
+        (cluster["topic_key"], tuple(cluster["source_node_ids"]))
+        for cluster in clusters
+    } == {
+        ("健康", (1,)),
+        ("健康管理", (2, 3)),
+    }
 
 
-def test_unmatched_fact_clusters_match_suffix_fact_to_nearest_bare_fact(db):
+def test_unmatched_fact_clusters_do_not_generalize_topic_suffixes(db):
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
     facts = [
         {
@@ -2831,12 +2878,127 @@ def test_unmatched_fact_clusters_match_suffix_fact_to_nearest_bare_fact(db):
 
     clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
 
-    normalized = [
-        cluster for cluster in clusters
-        if cluster.get("topic_key") == "健康" and cluster.get("topic_match") == "normalized"
+    assert {
+        (cluster["topic_key"], tuple(cluster["source_node_ids"]))
+        for cluster in clusters
+    } == {
+        ("健康", (1, 2)),
+        ("健康管理", (3,)),
+    }
+
+
+def test_unmatched_fact_clusters_assign_each_fact_to_one_primary_cluster(db):
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    facts = [
+        {
+            "node_id": 1,
+            "time_key": "2026-05-01 10:00:00+00:00#00",
+            "summary": "用户讨论家庭关系以及孩子的教育安排。",
+            "keywords": ["用户", "家庭关系", "教育"],
+            "topics": ["家庭", "家庭关系"],
+            "linked_entities": [(7, "用户"), (8, "孩子")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+        {
+            "node_id": 2,
+            "time_key": "2026-05-01 10:20:00+00:00#00",
+            "summary": "用户补充了家庭关系的情况。",
+            "keywords": ["用户", "家庭关系"],
+            "topics": ["家庭关系"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+        {
+            "node_id": 3,
+            "time_key": "2026-05-01 10:30:00+00:00#00",
+            "summary": "用户继续讨论家庭。",
+            "keywords": ["用户", "家庭"],
+            "topics": ["家庭"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
     ]
-    assert normalized
-    assert normalized[0]["source_node_ids"] == [1, 2, 3]
+
+    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
+
+    assigned_node_ids = [
+        node_id
+        for cluster in clusters
+        for node_id in cluster["source_node_ids"]
+    ]
+    assert sorted(assigned_node_ids) == [1, 2, 3]
+    assert len(assigned_node_ids) == len(set(assigned_node_ids))
+    assert {
+        (cluster["entity_id"], cluster["topic_key"], tuple(cluster["source_node_ids"]))
+        for cluster in clusters
+    } == {
+        (7, "家庭", (1, 3)),
+        (7, "家庭关系", (2,)),
+    }
+
+
+def test_unmatched_fact_clusters_use_family_profile_without_duplicate_mixed_bucket(db):
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    facts = [
+        {
+            "node_id": 1,
+            "time_key": "2026-05-01 10:00:00+00:00#00",
+            "summary": "用户偏好使用邮件接收日报。",
+            "topics": ["日报通知"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "preference",
+        },
+        {
+            "node_id": 2,
+            "time_key": "2026-05-01 10:10:00+00:00#00",
+            "summary": "用户要求日报通知保持简洁。",
+            "topics": ["日报通知"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "instruction",
+        },
+    ]
+
+    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
+
+    assert len(clusters) == 1
+    assert clusters[0]["cluster_family"] == "preference"
+    assert clusters[0]["family_distribution"] == {"preference": 2}
+    assert clusters[0]["source_node_ids"] == [1, 2]
+    assert clusters[0]["can_create_observation"] is True
+
+
+def test_unmatched_fact_clusters_keep_singleton_for_matching_only(db):
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    facts = [
+        {
+            "node_id": 1,
+            "time_key": "2026-05-01 10:00:00+00:00#00",
+            "summary": "用户提到一个尚未重复出现的新主题。",
+            "topics": ["新主题"],
+            "linked_entities": [(7, "用户")],
+            "fact_type": "semantic",
+            "fact_subject": "user",
+            "fact_kind": "context",
+        },
+    ]
+
+    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
+
+    assert len(clusters) == 1
+    assert clusters[0]["source_node_ids"] == [1]
+    assert clusters[0]["is_singleton"] is True
+    assert clusters[0]["can_create_observation"] is False
+    assert clusters[0]["cluster_reason"] == "single_fact_deferred"
 
 
 def test_reflect_generates_interpretation_from_consolidated_observation(db):
@@ -3964,6 +4126,145 @@ def test_reflect_updates_existing_observation_by_entity_topic(db):
     assert metadata["source_fact_type_distribution"] == {"semantic": 2, "episodic": 0}
     assert metadata["dominant_fact_type"] == "semantic"
     assert metadata["evidence_mixture"] == "semantic_only"
+
+
+def test_reflect_clusters_facts_before_updating_existing_observation(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    old_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice initially routed urgent alerts through Slack.",
+        keywords=["alert-routing"],
+        fact_kind="action",
+    )
+    db.entity_link_node(old_node, alice)
+    observation_id = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="alert-routing",
+        topic_label="alert-routing",
+        observation_type="observation",
+        summary="Alice has an established alert routing workflow.",
+        keywords=["alert-routing", "Slack"],
+        source_node_ids=[old_node],
+        confidence=0.82,
+        metadata={"observation_kind": "event_cluster"},
+    )
+    new_nodes = []
+    for index, summary in enumerate(
+        [
+            "Alice refined the Slack escalation order for urgent alerts.",
+            "Alice added a fallback channel to the urgent alert routing workflow.",
+        ],
+    ):
+        node_id = _add_memory_node(
+            db,
+            time_key=MemoryNodeManager._memory_time_key(index),
+            summary=summary,
+            keywords=["alert-routing"],
+            fact_kind="action",
+        )
+        db.entity_link_node(node_id, alice)
+        new_nodes.append(node_id)
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "category": "observation",
+                "summary": "Alice progressively refined the urgent alert routing workflow.",
+                "keywords": ["alert-routing", "Slack", "fallback"],
+                "confidence": 0.9,
+                "metadata": {
+                    "observation_kind": "event_cluster",
+                    "evidence_shape": "progression",
+                },
+            }),
+        ],
+    )
+
+    report = mgr.reflect(limit=10)
+
+    observation_report = report["observation_reflect"]
+    assert observation_report["fact_cluster_observation_matches"] == 1
+    assert observation_report["fact_cluster_observation_node_count"] == 2
+    assert observation_report["fact_observation_matches"] == 1
+    assert observation_report["fact_observation_node_count"] == 2
+    assert observation_report["fact_clusters_consolidated"] == 0
+    assert db.memory_observation_source_ids(observation_id) == [old_node, *new_nodes]
+    source_roles = {
+        row["node_id"]: row["role"]
+        for row in db._conn.execute(
+            "SELECT node_id, role FROM memory_observation_sources WHERE observation_id = ?",
+            (observation_id,),
+        ).fetchall()
+    }
+    assert source_roles == {
+        old_node: "initial",
+        new_nodes[0]: "matched",
+        new_nodes[1]: "matched",
+    }
+    observation_prompts = [
+        prompt
+        for prompt in mgr.llm_prompts
+        if "observation consolidation 模块" in prompt
+    ]
+    assert len(observation_prompts) == 1
+    assert "Alice refined the Slack escalation order" in observation_prompts[0]
+    assert "Alice added a fallback channel" in observation_prompts[0]
+
+
+def test_fact_cluster_candidates_always_include_exact_entity_topic_observation(db, monkeypatch):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    old_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice has an alert routing workflow.",
+        keywords=["alert-routing"],
+    )
+    db.entity_link_node(old_node, alice)
+    observation_id = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="alert-routing",
+        topic_label="alert-routing",
+        observation_type="observation",
+        summary="Alice has an alert routing workflow.",
+        keywords=["alert-routing"],
+        source_node_ids=[old_node],
+    )
+    other_topic_observation_id = db.memory_upsert_observation(
+        entity_id=alice,
+        topic_key="health-management",
+        topic_label="health-management",
+        observation_type="observation",
+        summary="Alice has a health management routine.",
+        keywords=["health"],
+        source_node_ids=[old_node],
+    )
+    new_node = _add_memory_node(
+        db,
+        time_key=MemoryNodeManager._memory_time_key(0),
+        summary="Alice refined alert routing.",
+        keywords=["alert-routing"],
+    )
+    db.entity_link_node(new_node, alice)
+    monkeypatch.setattr(
+        db,
+        "search_memory_observations",
+        lambda *args, **kwargs: pytest.fail("exact cluster matching must not use broad search"),
+    )
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    candidates = mgr._candidate_observations_for_fact_cluster({
+        "entity_id": alice,
+        "entity_name": "Alice",
+        "topic_key": "alert-routing",
+        "source_node_ids": [new_node],
+        "source_nodes": [],
+    })
+
+    assert [candidate["id"] for candidate in candidates] == [observation_id]
+    assert other_topic_observation_id not in [candidate["id"] for candidate in candidates]
+    assert candidates[0]["entity_name"] == "Alice"
 
 
 def test_observation_metadata_tracks_fact_type_mixture():

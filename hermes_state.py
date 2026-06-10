@@ -191,6 +191,8 @@ CREATE TABLE IF NOT EXISTS memory_nodes (
     summary TEXT NOT NULL,
     keywords TEXT NOT NULL,
     topic TEXT NOT NULL,
+    primary_entity_id INTEGER REFERENCES entity_nodes(id),
+    primary_topic TEXT NOT NULL DEFAULT 'general',
     fact_type TEXT NOT NULL DEFAULT 'semantic',
     fact_subject TEXT NOT NULL DEFAULT 'other',
     fact_kind TEXT NOT NULL DEFAULT 'other',
@@ -338,7 +340,7 @@ CREATE TABLE IF NOT EXISTS memory_observations (
 CREATE TABLE IF NOT EXISTS memory_observation_sources (
     observation_id INTEGER NOT NULL REFERENCES memory_observations(id),
     node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
-    role TEXT NOT NULL DEFAULT 'supporting',
+    role TEXT NOT NULL DEFAULT 'initial',
     confidence REAL DEFAULT 1.0,
     PRIMARY KEY (observation_id, node_id)
 );
@@ -873,6 +875,8 @@ class SessionDB:
             "task_event_subject": "TEXT",
             "task_relevance": "TEXT",
             "entity_names": "TEXT NOT NULL DEFAULT '[]'",
+            "primary_entity_id": "INTEGER REFERENCES entity_nodes(id)",
+            "primary_topic": "TEXT NOT NULL DEFAULT 'general'",
             "decay_score": "REAL DEFAULT 1.0",
             "decay_updated_at": "TEXT",
             "decay_half_life_days": "REAL",
@@ -883,6 +887,19 @@ class SessionDB:
                 )
             except sqlite3.OperationalError:
                 pass
+        cursor.execute(
+            "UPDATE memory_nodes SET primary_topic = "
+            "CASE WHEN instr(trim(topic), ' ') > 0 "
+            "THEN substr(trim(topic), 1, instr(trim(topic), ' ') - 1) "
+            "ELSE COALESCE(NULLIF(trim(topic), ''), 'general') END "
+            "WHERE primary_topic IS NULL OR primary_topic = '' OR primary_topic = 'general'"
+        )
+        cursor.execute(
+            "UPDATE memory_nodes SET primary_entity_id = ("
+            "  SELECT MIN(mne.entity_id) FROM memory_node_entities mne "
+            "  WHERE mne.node_id = memory_nodes.id"
+            ") WHERE primary_entity_id IS NULL"
+        )
 
         # Backfill fact_type from legacy tags for existing retain facts.
         try:
@@ -2839,6 +2856,40 @@ class SessionDB:
                 break
         return results
 
+    def memory_node_embeddings(self, node_ids: List[int]) -> Dict[int, np.ndarray]:
+        """Reconstruct stored FAISS vectors for the requested memory nodes."""
+        if not _HAS_FAISS or self._memory_faiss_index is None or self._memory_faiss_index.ntotal == 0:
+            return {}
+        requested = {
+            int(node_id)
+            for node_id in node_ids
+            if node_id is not None
+        }
+        if not requested:
+            return {}
+        vectors: Dict[int, np.ndarray] = {}
+        max_pos = min(
+            int(self._memory_faiss_index.ntotal),
+            len(self._memory_faiss_id_map),
+        )
+        for idx in range(max_pos - 1, -1, -1):
+            node_id = int(self._memory_faiss_id_map[idx])
+            if node_id not in requested:
+                continue
+            try:
+                vector = self._memory_faiss_index.reconstruct(idx)
+            except TypeError:
+                vector = np.empty((self._memory_faiss_index.d,), dtype=np.float32)
+                self._memory_faiss_index.reconstruct(idx, vector)
+            except Exception:
+                continue
+            candidate = np.asarray(vector, dtype=np.float32).reshape(-1)
+            if candidate.size:
+                vectors[node_id] = candidate
+            if len(vectors) >= len(requested):
+                break
+        return vectors
+
     def memory_semantic_neighbors(
         self,
         query_embedding: np.ndarray,
@@ -3292,6 +3343,8 @@ class SessionDB:
         task_event_subject: str = "",
         task_relevance: str = "",
         entity_names: Optional[List[str]] = None,
+        primary_entity_id: Optional[int] = None,
+        primary_topic: Optional[str] = None,
     ) -> int:
         """Insert a new memory node (SQLite + FAISS). Returns the node ID.
 
@@ -3323,11 +3376,20 @@ class SessionDB:
             task_relevance_value = str(task_relevance or "").strip().lower()
             if task_relevance_value not in {"none", "weak", "medium", "strong"}:
                 task_relevance_value = ""
+            if primary_topic is None:
+                if isinstance(topic, list):
+                    primary_topic_value = str(topic[0] if topic else "").strip()
+                else:
+                    primary_topic_value = str(topic or "").strip().split(" ", 1)[0]
+            else:
+                primary_topic_value = str(primary_topic or "").strip()
+            primary_topic_value = primary_topic_value or "general"
             cursor = conn.execute(
                 """INSERT INTO memory_nodes
                    (time_key, summary, keywords, topic, tags, fact_type, fact_subject, fact_kind,
-                    task_event_like, task_event_subject, task_relevance, entity_names, original_dialog)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    task_event_like, task_event_subject, task_relevance, entity_names,
+                    primary_entity_id, primary_topic, original_dialog)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     time_key,
                     summary,
@@ -3341,6 +3403,8 @@ class SessionDB:
                     task_event_subject_value,
                     task_relevance_value,
                     entity_names_str,
+                    primary_entity_id,
+                    primary_topic_value,
                     original_dialog,
                 ),
             )
@@ -4139,6 +4203,10 @@ class SessionDB:
             )
             conn.execute("DELETE FROM memory_node_entities WHERE entity_id = ?", (duplicate_id,))
             conn.execute(
+                "UPDATE memory_nodes SET primary_entity_id = ? WHERE primary_entity_id = ?",
+                (canonical_id, duplicate_id),
+            )
+            conn.execute(
                 "UPDATE OR IGNORE entity_edges SET source_entity_id = ? WHERE source_entity_id = ?",
                 (canonical_id, duplicate_id),
             )
@@ -4799,7 +4867,8 @@ class SessionDB:
         day = str(date_key or datetime.now().astimezone().date().isoformat())[:10]
         rows = self._conn.execute(
             "WITH candidate_nodes AS ("
-            "  SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, mn.fact_type, mn.fact_subject, mn.fact_kind, "
+            "  SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, "
+            "  mn.primary_entity_id, mn.primary_topic, mn.fact_type, mn.fact_subject, mn.fact_kind, "
             "  mn.task_event_like, mn.task_event_subject, mn.task_relevance "
             "  FROM memory_nodes mn "
             "  WHERE substr(mn.time_key, 1, 10) = ? "
@@ -4810,12 +4879,15 @@ class SessionDB:
             "  ORDER BY mn.time_key ASC, mn.id ASC "
             "  LIMIT ?"
             ") "
-            "SELECT cn.id AS node_id, cn.time_key, cn.summary, cn.keywords, cn.topic, cn.fact_type, cn.fact_subject, cn.fact_kind, "
+            "SELECT cn.id AS node_id, cn.time_key, cn.summary, cn.keywords, cn.topic, "
+            "cn.primary_entity_id, cn.primary_topic, cn.fact_type, cn.fact_subject, cn.fact_kind, "
             "cn.task_event_like, cn.task_event_subject, cn.task_relevance, "
             "en.id AS entity_id, en.name AS entity_name "
             "FROM candidate_nodes cn "
-            "JOIN memory_node_entities mne ON mne.node_id = cn.id "
-            "JOIN entity_nodes en ON en.id = mne.entity_id "
+            "JOIN entity_nodes en ON en.id = COALESCE("
+            "  cn.primary_entity_id, "
+            "  (SELECT MIN(mne.entity_id) FROM memory_node_entities mne WHERE mne.node_id = cn.id)"
+            ") "
             "ORDER BY cn.time_key ASC, cn.id ASC, en.name ASC",
             (day, max(1, int(limit or 100))),
         ).fetchall()
@@ -4844,15 +4916,25 @@ class SessionDB:
                     ),
                     "task_event_subject": row["task_event_subject"] or "",
                     "task_relevance": row["task_relevance"] or "",
+                    "primary_entity_id": int(row["entity_id"]),
+                    "primary_entity_name": row["entity_name"],
+                    "primary_topic": str(row["primary_topic"] or "").strip()
+                    or next(
+                        (
+                            topic
+                            for topic in str(row["topic"] or "").split()
+                            if str(topic or "").strip()
+                        ),
+                        "general",
+                    ),
                     "topics": [
                         topic
                         for topic in str(row["topic"] or "").split()
                         if str(topic or "").strip()
                     ] or ["general"],
-                    "linked_entities": [],
+                    "linked_entities": [(int(row["entity_id"]), row["entity_name"])],
                 },
             )
-            item["linked_entities"].append((int(row["entity_id"]), row["entity_name"]))
 
         out = list(grouped.values())[:max(1, int(limit or 100))]
         return out
@@ -4938,8 +5020,12 @@ class SessionDB:
         embedding: Optional[np.ndarray] = None,
         embedding_text: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        source_role: str = "initial",
     ) -> int:
         """Create or update the active observation for an entity/topic/type."""
+        clean_source_role = str(source_role or "initial").strip().lower()
+        if clean_source_role not in {"initial", "matched"}:
+            clean_source_role = "initial"
         clean_source_ids = []
         seen = set()
         for node_id in source_node_ids:
@@ -5039,8 +5125,8 @@ class SessionDB:
             for node_id in clean_source_ids:
                 conn.execute(
                     "INSERT OR IGNORE INTO memory_observation_sources "
-                    "(observation_id, node_id, role, confidence) VALUES (?, ?, 'supporting', ?)",
-                    (observation_id, node_id, confidence_value),
+                    "(observation_id, node_id, role, confidence) VALUES (?, ?, ?, ?)",
+                    (observation_id, node_id, clean_source_role, confidence_value),
                 )
             return observation_id
 
@@ -5101,6 +5187,35 @@ class SessionDB:
             candidate_node_ids=candidate_node_ids,
         )
         return (observation["id"] if observation else None), len(pending)
+
+    def memory_observations_for_entity_topic(
+        self,
+        *,
+        entity_id: int,
+        topic_key: str,
+        query_embedding: Optional[np.ndarray] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return active observations for one exact entity/topic pair."""
+        rows = self._conn.execute(
+            "SELECT mo.*, en.name AS entity_name "
+            "FROM memory_observations mo "
+            "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
+            "WHERE mo.entity_id = ? AND mo.topic_key = ? AND mo.status = 'active' "
+            "ORDER BY mo.updated_at DESC, mo.id DESC",
+            (int(entity_id), str(topic_key)),
+        ).fetchall()
+        observations: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            embedding_similarity = self._embedding_similarity(
+                query_embedding,
+                item.get("embedding"),
+            )
+            if embedding_similarity is not None:
+                item["embedding_similarity"] = round(float(embedding_similarity), 4)
+            item.pop("embedding", None)
+            observations.append(item)
+        return observations
 
     def search_memory_observations(
         self,
@@ -5615,8 +5730,9 @@ class SessionDB:
         embedding: Optional[np.ndarray] = None,
         embedding_text: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        source_roles: Optional[Dict[int, str]] = None,
     ) -> None:
-        """Replace a duplicate observation group with one reflected observation."""
+        """Replace a duplicate observation group while preserving source roles."""
         clean_remove_ids = [
             int(obs_id)
             for obs_id in dict.fromkeys(remove_observation_ids)
@@ -5625,6 +5741,15 @@ class SessionDB:
         clean_source_ids = [int(node_id) for node_id in dict.fromkeys(source_node_ids)]
         if not clean_source_ids:
             raise ValueError("reflected observation requires at least one source node")
+        clean_source_roles: Dict[int, str] = {}
+        for node_id, role in (source_roles or {}).items():
+            try:
+                clean_node_id = int(node_id)
+            except (TypeError, ValueError):
+                continue
+            clean_role = str(role or "").strip().lower()
+            if clean_role in {"initial", "matched", "supporting"}:
+                clean_source_roles[clean_node_id] = clean_role
         placeholders = ",".join("?" for _ in clean_source_ids)
         time_rows = self._conn.execute(
             f"SELECT MIN(time_key) AS start_time, MAX(time_key) AS end_time FROM memory_nodes "
@@ -5641,6 +5766,23 @@ class SessionDB:
         source_time_end = time_rows["end_time"] if time_rows else None
 
         def _do(conn):
+            source_observation_ids = [keep_observation_id, *clean_remove_ids]
+            source_observation_placeholders = ",".join("?" for _ in source_observation_ids)
+            existing_source_rows = conn.execute(
+                "SELECT node_id, role FROM memory_observation_sources "
+                f"WHERE observation_id IN ({source_observation_placeholders})",
+                source_observation_ids,
+            ).fetchall()
+            role_priority = {"supporting": 0, "matched": 1, "initial": 2}
+            existing_source_roles: Dict[int, str] = {}
+            for row in existing_source_rows:
+                node_id = int(row["node_id"])
+                role = str(row["role"] or "supporting").strip().lower()
+                if role not in role_priority:
+                    role = "supporting"
+                previous = existing_source_roles.get(node_id)
+                if previous is None or role_priority[role] > role_priority[previous]:
+                    existing_source_roles[node_id] = role
             existing = conn.execute(
                 "SELECT embedding, embedding_text, embedding_updated_at "
                 "FROM memory_observations WHERE id = ?",
@@ -5695,10 +5837,14 @@ class SessionDB:
                 (keep_observation_id,),
             )
             for node_id in clean_source_ids:
+                role = clean_source_roles.get(
+                    node_id,
+                    existing_source_roles.get(node_id, "supporting"),
+                )
                 conn.execute(
                     "INSERT OR IGNORE INTO memory_observation_sources "
-                    "(observation_id, node_id, role, confidence) VALUES (?, ?, 'supporting', ?)",
-                    (keep_observation_id, node_id, confidence_value),
+                    "(observation_id, node_id, role, confidence) VALUES (?, ?, ?, ?)",
+                    (keep_observation_id, node_id, role, confidence_value),
                 )
 
         self._execute_write(_do)

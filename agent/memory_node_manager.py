@@ -43,6 +43,7 @@ import queue
 import re
 import threading
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -274,25 +275,34 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是长期记忆系统的 fact 提取模块
    - unknown: 无法确定时间
 12. entities 遵守下方统一实体提取规则；普通时间表达应写入 occurred_start/occurred_end，不进入 entities
 13. keywords 是用于检索这条 fact 的关键词，保留关键实体、产品、技术、动作和约束
-14. topic 是这条 fact 归属的主题词列表，用于后续 observation 分桶；不要把 entity name 本身当作唯一 topic
-15. fact_subject 只能是 user、assistant、world、project、system、other；表示这条记忆主要关于谁/什么主体
+14. primary_entity 是这条 fact 主要描述的唯一主体，用于后续 observation 分桶：
+   - 必须输出单个实体对象，并且该实体也必须出现在 entities 中
+   - 优先选择 fact 的行为、状态、偏好、决定或经历所归属的主体
+   - 仅被提及的对象、建议来源、地点、工具或上下文实体不能自动成为 primary_entity
+   - 多人互动事件选择该 fact 主要描述或影响的主体
+15. primary_topic 是这条 fact 唯一的核心主题，用于后续 observation 分桶：
+   - 必须输出一个具体、稳定的主题字符串，不要输出数组
+   - 不要把 entity name 本身当作 primary_topic
+   - 同批次语义相同的 facts 应尽量使用完全一致的 primary_topic 表述
+   - 不要在 primary_topic 中随意增删“关系、管理、状态、情况、问题”等后缀
+16. fact_subject 只能是 user、assistant、world、project、system、other；表示这条记忆主要关于谁/什么主体
    - 如果 fact_subject 是 user 或 assistant，可以把 "用户" 或 "助手" 作为 OTHER entity 输出，便于后续按对话主体聚合
-16. fact_kind 只能是 preference、decision、request、recommendation、action、error、context、instruction、other
+17. fact_kind 只能是 preference、decision、request、recommendation、action、error、context、instruction、other
    - instruction 只用于用户明确要求 AI 长期遵守的行为规则、格式偏好、语气偏好或工作方式
    - 临时任务要求、当前轮的一次性请求不要标为 instruction
-17. priority 是 0-100 的整数，表示长期记忆价值：
+18. priority 是 0-100 的整数，表示长期记忆价值：
    - 80-100: 长期偏好、硬约束、健康/安全/核心项目事实、明确长期指令、重要任务进展
    - 60-79: 可复用经验、一般任务事件、明确决策、失败原因
    - <60: 普通闲聊、一次性问答、无后续价值、重复弱信息；不要输出这条 fact
-18. task_event_like 描述这条 fact 是否是一个可能影响任务状态或步骤的事件；它不要求已经知道具体属于哪个任务
-19. task_event_subject 只能是 user、assistant、both、other；表示任务事件的主体或主要来源
-20. task_relevance 只能是 none、weak、medium、strong：
+19. task_event_like 描述这条 fact 是否是一个可能影响任务状态或步骤的事件；它不要求已经知道具体属于哪个任务
+20. task_event_subject 只能是 user、assistant、both、other；表示任务事件的主体或主要来源
+21. task_relevance 只能是 none、weak、medium、strong：
    - none: 与任务状态或步骤无关
    - weak: 像一个事件，但不足以说明它会影响任务状态或步骤
    - medium: 可能影响某个任务的状态或步骤
    - strong: 明确表示用户正在发起、推进、完成、阻塞、暂停、恢复或决策某个任务
-21. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
-22. 只返回 JSON，不要 markdown，不要额外解释
+22. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
+23. 只返回 JSON，不要 markdown，不要额外解释
 
 fact_kind 定义和判别边界：
 - preference：用户长期或反复表达的喜好、偏好、禁忌、习惯、倾向；不是一次性选择。
@@ -365,7 +375,8 @@ task_event_like 判断规则：
     {{
       "text": "完整叙事事实",
       "keywords": ["关键词1", "关键词2"],
-      "topic": ["主题1", "主题2"],
+      "primary_entity": {{"name": "主要主体实体", "type": "PERSON"}},
+      "primary_topic": "唯一核心主题",
       "fact_type": "semantic/episodic",
       "fact_subject": "user/assistant/world/project/system/other",
       "fact_kind": "preference/decision/request/recommendation/action/error/context/instruction/other",
@@ -1641,10 +1652,13 @@ class MemoryNodeManager:
         summary_data: Dict[str, Any],
     ) -> Dict[str, Any]:
         keywords = self._normalize_keywords(summary_data.get("keywords", []))
+        entities = self._normalize_fact_entities(summary_data.get("entities", []))
         return {
             "text": str(summary_data.get("summary", "")).strip(),
             "keywords": keywords,
-            "topic": keywords,
+            "primary_entity": entities[0] if entities else None,
+            "primary_topic": keywords[0] if keywords else "general",
+            "topic": [keywords[0] if keywords else "general"],
             "fact_type": "episodic",
             "fact_subject": "other",
             "fact_kind": "conversation_summary",
@@ -1657,7 +1671,7 @@ class MemoryNodeManager:
             "occurred_end": "",
             "time_confidence": "unknown",
             "where": "",
-            "entities": [],
+            "entities": entities,
         }
 
     @staticmethod
@@ -1755,14 +1769,39 @@ class MemoryNodeManager:
                     self._normalize_fact_entities(raw_fact.get("entities", [])),
                     fact_subject,
                 )
+                primary_entity_candidates = self._normalize_fact_entities(
+                    [raw_fact.get("primary_entity")]
+                )
+                if primary_entity_candidates:
+                    primary_entity = primary_entity_candidates[0]
+                else:
+                    subject_name = self._subject_entity_name(fact_subject)
+                    primary_entity = next(
+                        (
+                            entity
+                            for entity in entities
+                            if str(entity.get("name") or "").strip() == subject_name
+                        ),
+                        entities[0] if entities else None,
+                    )
+                if primary_entity and not any(
+                    str(entity.get("name") or "").strip()
+                    == str(primary_entity.get("name") or "").strip()
+                    for entity in entities
+                ):
+                    entities = [primary_entity, *entities]
                 keywords = self._normalize_keywords(raw_fact.get("keywords", []))
-                topic = self._normalize_keywords(raw_fact.get("topic", []))
+                legacy_topics = self._normalize_keywords(raw_fact.get("topic", []))
+                primary_topic = str(
+                    raw_fact.get("primary_topic")
+                    or (legacy_topics[0] if legacy_topics else "")
+                ).strip()
                 if not keywords:
-                    keywords = topic[:]
+                    keywords = [primary_topic] if primary_topic else []
                 if not keywords:
                     keywords = [e["name"] for e in entities[:5]]
-                if not topic:
-                    topic = keywords[:]
+                if not primary_topic:
+                    primary_topic = keywords[0] if keywords else "general"
                 task_event_like_raw = raw_fact.get("task_event_like")
                 task_event_like: Optional[bool]
                 if isinstance(task_event_like_raw, bool):
@@ -1793,7 +1832,9 @@ class MemoryNodeManager:
                 facts.append({
                     "text": text,
                     "keywords": keywords,
-                    "topic": topic,
+                    "primary_entity": primary_entity,
+                    "primary_topic": primary_topic,
+                    "topic": [primary_topic],
                     "fact_type": self._normalize_fact_type(raw_fact.get("fact_type", "semantic")),
                     "fact_subject": fact_subject,
                     "fact_kind": self._normalize_fact_kind(raw_fact.get("fact_kind", "other")),
@@ -1995,7 +2036,9 @@ class MemoryNodeManager:
                 "task_event_like": fact.get("task_event_like"),
                 "task_event_subject": fact.get("task_event_subject", ""),
                 "task_relevance": fact.get("task_relevance", ""),
-                "topic": fact.get("topic", fact.get("keywords", [])),
+                "primary_entity": fact.get("primary_entity"),
+                "primary_topic": fact.get("primary_topic", "general"),
+                "topic": fact.get("topic", [fact.get("primary_topic", "general")]),
                 "occurred_start": fact.get("occurred_start", ""),
                 "occurred_end": fact.get("occurred_end", ""),
                 "time_confidence": fact.get("time_confidence", "unknown"),
@@ -2152,6 +2195,9 @@ class MemoryNodeManager:
                 "fact_subject": fact.get("fact_subject"),
                 "fact_kind": fact.get("fact_kind"),
                 "summary": cls._reflect_log_text(fact.get("summary")),
+                "primary_entity_id": fact.get("primary_entity_id"),
+                "primary_entity_name": fact.get("primary_entity_name"),
+                "primary_topic": fact.get("primary_topic"),
                 "topics": fact.get("topics", []),
                 "keywords": fact.get("keywords", []),
                 "task_event_like": fact.get("task_event_like"),
@@ -4425,48 +4471,152 @@ class MemoryNodeManager:
         score += min(0.06, confidence * 0.06)
         return min(1.0, score), "+".join(reasons) or "weak"
 
-    def _candidate_observations_for_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _fact_cluster_query_embedding(self, cluster: Dict[str, Any]) -> Optional[np.ndarray]:
         if not self._db:
-            return []
-        query = " ".join(
-            str(part or "").strip()
-            for part in [
-                fact.get("summary"),
+            return None
+        source_node_ids = [
+            int(node_id)
+            for node_id in cluster.get("source_node_ids", [])
+            if node_id is not None
+        ]
+        embedding_loader = getattr(self._db, "memory_node_embeddings", None)
+        if not source_node_ids or not callable(embedding_loader):
+            return None
+        vectors = embedding_loader(source_node_ids)
+        cluster_vectors = [
+            np.asarray(vectors[node_id], dtype=np.float32).reshape(-1)
+            for node_id in source_node_ids
+            if node_id in vectors
+        ]
+        if not cluster_vectors:
+            return None
+        expected_shape = cluster_vectors[0].shape
+        cluster_vectors = [
+            vector
+            for vector in cluster_vectors
+            if vector.shape == expected_shape
+        ]
+        if not cluster_vectors:
+            return None
+        centroid = np.mean(np.stack(cluster_vectors), axis=0)
+        norm = float(np.linalg.norm(centroid))
+        if norm <= 0.0:
+            return None
+        return (centroid / norm).astype(np.float32)
+
+    @classmethod
+    def _fact_cluster_query_text(cls, cluster: Dict[str, Any]) -> str:
+        parts = [
+            str(cluster.get("entity_name") or ""),
+            str(cluster.get("topic_label") or cluster.get("topic_key") or ""),
+        ]
+        for fact in cluster.get("source_nodes", []):
+            parts.extend([
+                str(fact.get("summary") or ""),
                 " ".join(str(item) for item in fact.get("keywords", [])),
                 " ".join(str(item) for item in fact.get("topics", [])),
-            ]
-            if str(part or "").strip()
-        )
-        candidates: List[Dict[str, Any]] = []
-        seen: set[int] = set()
-        for entity_id, entity_name in self._fact_entity_pairs(fact):
-            try:
-                searched = self._db.search_memory_observations(
-                    query,
-                    entities=[entity_name] if entity_name else None,
-                    entity_ids=[entity_id],
-                    top_k=8,
-                )
-            except Exception:
-                searched = []
-            for item in searched:
-                try:
-                    observation_id = int(item["id"])
-                except (TypeError, ValueError, KeyError):
-                    continue
-                if observation_id in seen:
-                    continue
-                seen.add(observation_id)
-                candidates.append(item)
-        return candidates
+            ])
+        return " ".join(part.strip() for part in parts if part.strip())
 
-    def _match_fact_to_existing_observation(
+    def _candidate_observations_for_fact_cluster(
         self,
-        fact: Dict[str, Any],
+        cluster: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        if not self._db:
+            return []
+        try:
+            entity_id = int(cluster["entity_id"])
+        except (KeyError, TypeError, ValueError):
+            return []
+        try:
+            return self._db.memory_observations_for_entity_topic(
+                entity_id=entity_id,
+                topic_key=self._topic_key(cluster.get("topic_key") or "general"),
+                query_embedding=self._fact_cluster_query_embedding(cluster),
+            )
+        except Exception:
+            return []
+
+    def _fact_cluster_observation_match_score(
+        self,
+        *,
+        cluster: Dict[str, Any],
+        observation: Dict[str, Any],
+        supporting_nodes: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[float, str]:
+        source_nodes = list(cluster.get("source_nodes", []))
+        if not source_nodes:
+            return 0.0, "empty_cluster"
+        fact_scores = [
+            self._observation_match_score(
+                fact=fact,
+                observation=observation,
+                supporting_nodes=supporting_nodes,
+            )
+            for fact in source_nodes
+        ]
+        average_fact_score = sum(score for score, _reason in fact_scores) / len(fact_scores)
+        score = average_fact_score
+        reasons = [f"fact_mean:{average_fact_score:.3f}"]
+
+        cluster_topic = self._topic_key(cluster.get("topic_key") or cluster.get("topic_label") or "")
+        observation_topic = self._topic_key(
+            observation.get("topic_key") or observation.get("topic_label") or ""
+        )
+        if cluster_topic and observation_topic == cluster_topic:
+            score += 0.06
+            reasons.append("cluster_topic")
+        else:
+            return 0.0, "entity_topic_mismatch"
+
+        cluster_family = str(cluster.get("cluster_family") or "")
+        metadata = self._normalize_observation_metadata(
+            observation.get("metadata", {}),
+            supporting_nodes or [],
+        )
+        observation_family = self._observation_kind_family(metadata.get("observation_kind"))
+        if cluster_family in {"preference", "task"}:
+            if observation_family == cluster_family:
+                score += 0.04
+                reasons.append("cluster_family")
+            elif observation_family in {"preference", "task"}:
+                score -= 0.08
+                reasons.append("family_conflict")
+
+        try:
+            embedding_similarity = float(observation.get("embedding_similarity"))
+        except (TypeError, ValueError):
+            embedding_similarity = None
+        if embedding_similarity is not None:
+            if embedding_similarity >= 0.55:
+                score += min(0.08, (embedding_similarity - 0.55) * 0.18 + 0.035)
+                reasons.append(f"embedding:{embedding_similarity:.3f}")
+            elif embedding_similarity < 0.25:
+                score -= 0.04
+                reasons.append(f"embedding_weak:{embedding_similarity:.3f}")
+
+        if len(source_nodes) >= 2:
+            score += min(0.04, 0.015 * len(source_nodes))
+            reasons.append("multi_fact_support")
+        reason_summary = "+".join(
+            dict.fromkeys(
+                reason
+                for _score, fact_reason in fact_scores
+                for reason in fact_reason.split("+")
+                if reason
+            )
+        )
+        if reason_summary:
+            reasons.append(f"fact_signals:{reason_summary}")
+        return max(0.0, min(1.0, score)), "+".join(reasons)
+
+    def _match_fact_cluster_to_existing_observation(
+        self,
+        cluster: Dict[str, Any],
         *,
         auto_update_threshold: float = 0.72,
     ) -> Optional[Tuple[Dict[str, Any], float, str, List[Dict[str, Any]]]]:
-        candidates = self._candidate_observations_for_fact(fact)
+        candidates = self._candidate_observations_for_fact_cluster(cluster)
         if not candidates:
             return None
         supporting_facts_from_observation = self._db.get_observation_supporting_nodes(
@@ -4477,8 +4627,8 @@ class MemoryNodeManager:
         for candidate in candidates:
             observation_id = int(candidate["id"])
             supporting_nodes = supporting_facts_from_observation.get(observation_id, [])
-            score, reason = self._observation_match_score(
-                fact=fact,
+            score, reason = self._fact_cluster_observation_match_score(
+                cluster=cluster,
                 observation=candidate,
                 supporting_nodes=supporting_nodes,
             )
@@ -4488,9 +4638,12 @@ class MemoryNodeManager:
         if best_score < auto_update_threshold:
             self._log_info(
                 "memory_reflect",
-                "fact_observation_match_skipped", 
+                "fact_cluster_observation_match_skipped",
                 {
-                    "fact": self._reflect_fact_log_items([fact], limit=1),
+                    "entity_id": cluster.get("entity_id"),
+                    "topic_key": cluster.get("topic_key"),
+                    "cluster_family": cluster.get("cluster_family"),
+                    "source_node_ids": cluster.get("source_node_ids", []),
                     "best_observation_id": best.get("id"),
                     "best_score": round(best_score, 4),
                     "reason": reason,
@@ -4499,46 +4652,74 @@ class MemoryNodeManager:
             return None
         return best, best_score, reason, supporting_nodes
 
-    def _update_existing_observation_from_fact(
+    def _update_existing_observation_from_fact_cluster(
         self,
-        fact: Dict[str, Any],
+        cluster: Dict[str, Any],
         *,
+        consumed_node_ids: set[int],
         changed_observation_ids: Optional[List[int]] = None,
     ) -> Optional[int]:
         if not self._db:
             return None
-        match = self._match_fact_to_existing_observation(fact)
+        source_nodes = [
+            fact
+            for fact in cluster.get("source_nodes", [])
+            if (
+                self._node_id(fact) is not None
+                and self._node_id(fact) not in consumed_node_ids
+            )
+        ]
+        source_node_ids = [
+            int(node_id)
+            for node_id in dict.fromkeys(
+                self._node_id(fact)
+                for fact in source_nodes
+                if self._node_id(fact) is not None
+            )
+        ]
+        if not source_node_ids:
+            return None
+        cluster_for_match = {
+            **cluster,
+            "source_nodes": source_nodes,
+            "source_node_ids": source_node_ids,
+        }
+        match = self._match_fact_cluster_to_existing_observation(cluster_for_match)
         if not match:
             return None
         existing_observation, score, reason, supporting_nodes = match
         observation_id = int(existing_observation["id"])
-        fact_id = self._node_id(fact)
-        if fact_id is None:
-            return None
         existing_source_ids = self._db.memory_observation_source_ids(observation_id)
-        if fact_id in existing_source_ids:
+        pending_source_ids = [
+            node_id
+            for node_id in source_node_ids
+            if node_id not in existing_source_ids
+        ]
+        if not pending_source_ids:
+            consumed_node_ids.update(source_node_ids)
             return observation_id
 
-        source_nodes_for_prompt = [fact]
         generated = self._generate_observation(
             entity_name=existing_observation.get("entity_name", ""),
             topic_label=existing_observation.get("topic_label") or existing_observation.get("topic_key") or "",
-            source_nodes=source_nodes_for_prompt,
+            source_nodes=source_nodes,
             existing_observation=existing_observation,
         )
         if not generated:
             return None
         generated_metadata = self._normalize_observation_metadata(
             generated.get("metadata") or {},
-            supporting_nodes + [fact],
+            supporting_nodes + source_nodes,
         )
         metadata = {
-            "source": "memory_fact_observation_match",
-            "fact_match_score": round(float(score), 4),
-            "fact_match_reason": reason,
+            "source": "memory_fact_cluster_observation_match",
+            "fact_cluster_match_score": round(float(score), 4),
+            "fact_cluster_match_reason": reason,
+            "cluster_family": cluster.get("cluster_family"),
+            "cluster_score": round(float(cluster.get("cluster_score") or 0.0), 4),
             **generated_metadata,
         }
-        stored_source_ids = list(dict.fromkeys(existing_source_ids + [fact_id]))
+        stored_source_ids = list(dict.fromkeys(existing_source_ids + pending_source_ids))
         observation_keywords = generated["keywords"] or self._normalize_keywords(existing_observation.get("keywords", ""))
         embedding_text = self._observation_embedding_text(
             entity_name=existing_observation.get("entity_name", ""),
@@ -4559,17 +4740,25 @@ class MemoryNodeManager:
             embedding=self._embed_memory_layer_text(embedding_text),
             embedding_text=embedding_text,
             metadata=metadata,
+            source_roles={
+                node_id: "matched"
+                for node_id in pending_source_ids
+            },
         )
         if changed_observation_ids is not None:
             changed_observation_ids.append(observation_id)
+        consumed_node_ids.update(source_node_ids)
         self._log_info(
             "memory_reflect",
-            "fact_observation_matched", {
+            "fact_cluster_observation_matched", {
             "observation_id": observation_id,
-            "fact_node_id": fact_id,
+            "entity_id": cluster.get("entity_id"),
+            "topic_key": cluster.get("topic_key"),
+            "cluster_family": cluster.get("cluster_family"),
+            "source_node_ids": source_node_ids,
             "score": score,
             "reason": reason,
-            "supporting_facts": self._reflect_fact_log_items(supporting_nodes + [fact]),
+            "supporting_facts": self._reflect_fact_log_items(supporting_nodes + source_nodes),
             "updated_observation": {
                 **self._reflect_observation_log_item(generated),
                 "metadata": metadata,
@@ -4610,8 +4799,6 @@ class MemoryNodeManager:
         }
         task_kinds = {"request", "recommendation", "action", "decision", "error"}
         preference_kinds = {"preference", "instruction"}
-        if family == "mixed" and fact_kinds & preference_kinds and fact_kinds & task_kinds:
-            return 0.0, "mixed_preference_task_deferred"
         score = 0.45
         reasons = ["min_size"]
         if len(facts) >= 3:
@@ -4641,10 +4828,88 @@ class MemoryNodeManager:
         elif family == "mixed" and fact_kinds <= {"context", "other", "recommendation"}:
             score += 0.16
             reasons.append("mixed_context_event")
+        if fact_kinds & preference_kinds and fact_kinds & task_kinds:
+            score -= 0.06
+            reasons.append("mixed_preference_task")
         if "error" in fact_kinds:
             score += 0.04
             reasons.append("error_signal")
         return min(1.0, score), "+".join(reasons)
+
+    @classmethod
+    def _fact_cluster_family_profile(
+        cls,
+        facts: List[Dict[str, Any]],
+    ) -> Tuple[str, Dict[str, int], float]:
+        distribution = Counter(cls._fact_cluster_family(fact) for fact in facts)
+        if not distribution:
+            return "context", {}, 0.0
+        family_order = {"preference": 4, "task": 3, "event": 2, "context": 1}
+        dominant_family, dominant_count = max(
+            distribution.items(),
+            key=lambda item: (item[1], family_order.get(item[0], 0)),
+        )
+        coherence = dominant_count / max(1, sum(distribution.values()))
+        return dominant_family, dict(distribution), coherence
+
+    @classmethod
+    def _fact_cluster_semantic_cohesion(
+        cls,
+        facts: List[Dict[str, Any]],
+        *,
+        fact_embeddings: Dict[int, np.ndarray],
+        topic_match: str,
+    ) -> float:
+        if len(facts) < 2:
+            return 1.0
+        pair_scores: List[float] = []
+        for left_index, left in enumerate(facts):
+            left_id = cls._node_id(left)
+            left_terms = cls._match_terms(
+                left.get("summary"),
+                left.get("keywords", []),
+                left.get("topics", []),
+            )
+            for right in facts[left_index + 1:]:
+                right_id = cls._node_id(right)
+                vector_score: Optional[float] = None
+                left_vector = fact_embeddings.get(left_id) if left_id is not None else None
+                right_vector = fact_embeddings.get(right_id) if right_id is not None else None
+                if left_vector is not None and right_vector is not None and left_vector.shape == right_vector.shape:
+                    denominator = float(np.linalg.norm(left_vector) * np.linalg.norm(right_vector))
+                    if denominator > 0.0:
+                        cosine = float(np.dot(left_vector, right_vector) / denominator)
+                        vector_score = max(0.0, min(1.0, (cosine + 1.0) / 2.0))
+                if vector_score is not None:
+                    pair_scores.append(vector_score)
+                    continue
+                right_terms = cls._match_terms(
+                    right.get("summary"),
+                    right.get("keywords", []),
+                    right.get("topics", []),
+                )
+                lexical_score = cls._term_overlap_score(left_terms, right_terms)
+                structural_floor = 0.70 if topic_match == "normalized" else 0.65
+                pair_scores.append(max(structural_floor, lexical_score))
+        return sum(pair_scores) / max(1, len(pair_scores))
+
+    @classmethod
+    def _fact_cluster_temporal_cohesion(cls, facts: List[Dict[str, Any]]) -> float:
+        times = [
+            timestamp
+            for fact in facts
+            if (timestamp := cls._fact_time_seconds(fact)) is not None
+        ]
+        if len(times) < 2:
+            return 1.0
+        span_seconds = max(times) - min(times)
+        if span_seconds <= 2 * 60 * 60:
+            return 1.0
+        if span_seconds <= 24 * 60 * 60:
+            return 0.8
+        if span_seconds <= 7 * 24 * 60 * 60:
+            return 0.6
+        return 0.4
 
     _GENERALIZABLE_TOPIC_SUFFIXES = {
         "关系",   # 家庭 <-> 家庭关系；夫妻 <-> 夫妻关系
@@ -4705,136 +4970,104 @@ class MemoryNodeManager:
         excluded_node_ids: set[int],
         min_cluster_score: float = 0.66,
     ) -> List[Dict[str, Any]]:
-        buckets: Dict[Tuple[int, str, str, str], Dict[str, Any]] = {}
-        normalized_candidates: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+        buckets: Dict[Tuple[int, str], Dict[str, Any]] = {}
         for fact in facts:
             node_id = self._node_id(fact)
             if node_id is None or node_id in excluded_node_ids:
                 continue
-            family = self._fact_cluster_family(fact)
-            topics = fact.get("topics", []) or ["general"]
-            for entity_id, entity_name in self._fact_entity_pairs(fact):
-                for topic in topics:
-                    topic_key = self._topic_key(topic)
-                    for bucket_family in (family, "mixed"):
-                        key = (int(entity_id), topic_key, bucket_family, "raw")
-                        bucket = buckets.setdefault(
-                            key,
-                            {
-                                "entity_id": int(entity_id),
-                                "entity_name": entity_name,
-                                "topic_key": topic_key,
-                                "topic_label": topic_key,
-                                "topic_match": "raw",
-                                "raw_topic_keys": [topic_key],
-                                "cluster_family": bucket_family,
-                                "facts": [],
-                                "node_ids": set(),
-                            },
-                        )
-                        if node_id in bucket["node_ids"]:
-                            continue
-                        bucket["node_ids"].add(node_id)
-                        bucket["facts"].append(fact)
-
-                        normalized_head, suffix = self._split_generalizable_topic(topic_key)
-                        if suffix is not None or topic_key == normalized_head:
-                            normalized_key = (int(entity_id), normalized_head, bucket_family)
-                            candidate = normalized_candidates.setdefault(
-                                normalized_key,
-                                {
-                                    "entity_id": int(entity_id),
-                                    "entity_name": entity_name,
-                                    "topic_key": normalized_head,
-                                    "topic_label": normalized_head,
-                                    "topic_match": "normalized",
-                                    "cluster_family": bucket_family,
-                                    "bare_facts": [],
-                                    "bare_node_ids": set(),
-                                    "suffix_facts": {},
-                                    "suffix_node_ids": {},
-                                    "raw_topic_keys": [],
-                                },
-                            )
-                            if topic_key not in candidate["raw_topic_keys"]:
-                                candidate["raw_topic_keys"].append(topic_key)
-                            if suffix is None and topic_key == normalized_head:
-                                if node_id not in candidate["bare_node_ids"]:
-                                    candidate["bare_node_ids"].add(node_id)
-                                    candidate["bare_facts"].append(fact)
-                            elif suffix is not None:
-                                suffix_facts = candidate["suffix_facts"].setdefault(suffix, [])
-                                suffix_node_ids = candidate["suffix_node_ids"].setdefault(suffix, set())
-                                if node_id not in suffix_node_ids:
-                                    suffix_node_ids.add(node_id)
-                                    suffix_facts.append(fact)
-
-        for candidate in normalized_candidates.values():
-            bare_facts = candidate.get("bare_facts", [])
-            bare_node_ids = candidate.get("bare_node_ids", set())
-            if not bare_facts:
-                continue
-            for suffix, suffix_facts in candidate.get("suffix_facts", {}).items():
-                filtered_suffix_facts = [
-                    fact
-                    for fact in suffix_facts
-                    if self._facts_within_normalized_topic_window(list(bare_facts), fact)
-                ]
-                suffix_node_ids = {
-                    self._node_id(fact)
-                    for fact in filtered_suffix_facts
-                    if self._node_id(fact) is not None
-                }
-                combined_node_ids = set(bare_node_ids) | set(suffix_node_ids)
-                if len(combined_node_ids) < 2:
-                    continue
-                combined_facts = list(bare_facts) + filtered_suffix_facts
-                key = (
-                    int(candidate["entity_id"]),
-                    str(candidate["topic_key"]),
-                    str(candidate["cluster_family"]),
-                    f"normalized:{suffix}",
+            try:
+                entity_id = int(
+                    fact.get("primary_entity_id")
+                    or next(iter(self._fact_entity_pairs(fact)))[0]
                 )
-                buckets[key] = {
-                    "entity_id": candidate["entity_id"],
-                    "entity_name": candidate["entity_name"],
-                    "topic_key": candidate["topic_key"],
-                    "topic_label": candidate["topic_label"],
-                    "topic_match": candidate["topic_match"],
-                    "cluster_family": candidate["cluster_family"],
-                    "raw_topic_keys": [
-                        key
-                        for key in candidate.get("raw_topic_keys", [])
-                        if key == candidate["topic_key"] or key == f"{candidate['topic_key']}{suffix}"
-                    ],
-                    "facts": combined_facts,
-                    "node_ids": combined_node_ids,
-                }
+            except (StopIteration, TypeError, ValueError):
+                continue
+            entity_name = str(
+                fact.get("primary_entity_name")
+                or next(
+                    (
+                        name
+                        for candidate_id, name in self._fact_entity_pairs(fact)
+                        if int(candidate_id) == entity_id
+                    ),
+                    "",
+                )
+            )
+            topic_key = self._topic_key(
+                fact.get("primary_topic")
+                or next(iter(fact.get("topics", []) or []), "general")
+            )
+            key = (entity_id, topic_key)
+            bucket = buckets.setdefault(
+                key,
+                {
+                    "entity_id": entity_id,
+                    "entity_name": entity_name,
+                    "topic_key": topic_key,
+                    "topic_label": topic_key,
+                    "topic_match": "exact",
+                    "raw_topic_keys": [topic_key],
+                    "facts": [],
+                    "node_ids": set(),
+                },
+            )
+            if node_id not in bucket["node_ids"]:
+                bucket["node_ids"].add(node_id)
+                bucket["facts"].append(fact)
+
+        requested_node_ids = [
+            node_id
+            for bucket in buckets.values()
+            for node_id in bucket["node_ids"]
+        ]
+        embedding_loader = getattr(self._db, "memory_node_embeddings", None)
+        fact_embeddings = embedding_loader(requested_node_ids) if callable(embedding_loader) else {}
 
         clusters: List[Dict[str, Any]] = []
         for bucket in buckets.values():
             facts_for_cluster = sorted(
-                bucket["facts"],
+                bucket.get("facts", []),
                 key=lambda fact: (str(fact.get("time_key") or ""), self._node_id(fact) or 0),
             )
-            score, reason = self._fact_cluster_score(facts_for_cluster, str(bucket["cluster_family"]))
-            if score < min_cluster_score:
-                continue
+            family, family_distribution, family_coherence = self._fact_cluster_family_profile(
+                facts_for_cluster
+            )
+            semantic_cohesion = self._fact_cluster_semantic_cohesion(
+                facts_for_cluster,
+                fact_embeddings=fact_embeddings,
+                topic_match="exact",
+            )
+            temporal_cohesion = self._fact_cluster_temporal_cohesion(facts_for_cluster)
+            score, reason = self._fact_cluster_score(facts_for_cluster, family)
+            is_singleton = len(facts_for_cluster) == 1
             clusters.append({
-                **{key: value for key, value in bucket.items() if key not in {
-                    "facts", "node_ids", "bare_facts", "bare_node_ids", "suffix_facts", "suffix_node_ids",
-                }},
+                **{
+                    key: value
+                    for key, value in bucket.items()
+                    if key not in {"facts", "node_ids"}
+                },
+                "cluster_family": family,
+                "family_distribution": family_distribution,
+                "family_coherence": round(family_coherence, 4),
+                "semantic_cohesion": round(semantic_cohesion, 4),
+                "temporal_cohesion": round(temporal_cohesion, 4),
                 "source_nodes": facts_for_cluster,
-                "source_node_ids": [self._node_id(fact) for fact in facts_for_cluster if self._node_id(fact) is not None],
+                "source_node_ids": [
+                    self._node_id(fact)
+                    for fact in facts_for_cluster
+                    if self._node_id(fact) is not None
+                ],
                 "cluster_score": score,
                 "cluster_reason": reason,
+                "is_singleton": is_singleton,
+                "can_create_observation": not is_singleton and score >= min_cluster_score,
             })
 
         clusters.sort(
             key=lambda item: (
+                1 if item.get("can_create_observation") else 0,
                 float(item.get("cluster_score") or 0.0),
                 len(item.get("source_node_ids", [])),
-                1 if item.get("cluster_family") == "mixed" else 0,
                 str(item.get("topic_key") or ""),
             ),
             reverse=True,
@@ -4849,6 +5082,8 @@ class MemoryNodeManager:
         changed_observation_ids: Optional[List[int]] = None,
     ) -> Optional[int]:
         if not self._db:
+            return None
+        if not cluster.get("can_create_observation", True):
             return None
         source_nodes = [
             fact
@@ -4921,6 +5156,7 @@ class MemoryNodeManager:
             embedding=self._embed_memory_layer_text(embedding_text),
             embedding_text=embedding_text,
             metadata=observation_metadata,
+            source_role="initial",
         )
         if changed_observation_ids is not None:
             changed_observation_ids.append(int(observation_id))
@@ -4981,11 +5217,6 @@ class MemoryNodeManager:
         consolidated = 0
         entity_topic_updates = 0
         entity_topic_node_ids: set[int] = set()
-        fact_observation_matches = 0
-        fact_observation_node_ids: set[int] = set()
-        fact_clusters_considered = 0
-        fact_clusters_consolidated = 0
-        fact_cluster_node_ids: set[int] = set()
         changed_observation_ids: List[int] = []
         candidate_node_ids = [int(item["node_id"]) for item in unprocessed_fact_candidates]
 
@@ -5043,58 +5274,66 @@ class MemoryNodeManager:
                         exc,
                     )
 
-        for item in unprocessed_fact_candidates:
-            node_id = int(item["node_id"])
-            if node_id in merge_consumed_node_ids:
-                continue
-            try:
-                matched_observation_id = self._update_existing_observation_from_fact(
-                    item,
-                    changed_observation_ids=changed_observation_ids,
-                )
-            except Exception as exc:
-                logger.debug("Failed to match fact %d to existing observation: %s", node_id, exc)
-                matched_observation_id = None
-            if matched_observation_id is None:
-                continue
-            fact_observation_matches += 1
-            fact_observation_node_ids.add(node_id)
-            entity_topic_node_ids.add(node_id)
-
-        exlcuded_for_clusters = set(entity_topic_node_ids) | set(merge_consumed_node_ids)
+        consumed_node_ids = set(merge_consumed_node_ids)
         clusters = self._cluster_unmatched_facts(
             unprocessed_fact_candidates,
-            excluded_node_ids=exlcuded_for_clusters,
+            excluded_node_ids=consumed_node_ids,
         )
-        fact_clusters_considered = len(clusters)
         self._log_info(
             "memory_reflect",
             "fact_cluster_candidates", 
             {
-                "cluster_count": fact_clusters_considered,
+                "cluster_count": len(clusters),
                 "clusters": [
                     {
                         "entity_id": cluster.get("entity_id"),
                         "entity_name": cluster.get("entity_name"),
                         "topic_key": cluster.get("topic_key"),
                         "cluster_family": cluster.get("cluster_family"),
+                        "family_distribution": cluster.get("family_distribution", {}),
+                        "family_coherence": cluster.get("family_coherence"),
+                        "semantic_cohesion": cluster.get("semantic_cohesion"),
+                        "temporal_cohesion": cluster.get("temporal_cohesion"),
                         "cluster_score": cluster.get("cluster_score"),
                         "cluster_reason": cluster.get("cluster_reason"),
+                        "is_singleton": cluster.get("is_singleton"),
+                        "can_create_observation": cluster.get("can_create_observation"),
                         "source_node_ids": cluster.get("source_node_ids", []),
                     }
                     for cluster in clusters
                 ],
             })
         for cluster in clusters:
+            before_cluster_consumed_node_ids = set(consumed_node_ids)
             try:
-                observation_id = self._generate_observation_using_unmatched_fact_clusters(
+                matched_observation_id = self._update_existing_observation_from_fact_cluster(
                     cluster,
-                    consumed_node_ids=exlcuded_for_clusters,
+                    consumed_node_ids=consumed_node_ids,
                     changed_observation_ids=changed_observation_ids,
                 )
             except Exception as exc:
                 logger.debug(
-                    "Failed to consolidate unmatched fact cluster entity %s topic %s: %s",
+                    "Failed to match fact cluster entity %s topic %s to observation: %s",
+                    cluster.get("entity_id"),
+                    cluster.get("topic_key"),
+                    exc,
+                )
+                matched_observation_id = None
+            if matched_observation_id is not None:
+                consolidated += 1
+                current_consumed_node_ids = consumed_node_ids - before_cluster_consumed_node_ids
+                entity_topic_node_ids.update(current_consumed_node_ids)
+                continue
+
+            try:
+                observation_id = self._generate_observation_using_unmatched_fact_clusters(
+                    cluster,
+                    consumed_node_ids=consumed_node_ids,
+                    changed_observation_ids=changed_observation_ids,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Failed to generate observation from fact cluster entity %s topic %s: %s",
                     cluster.get("entity_id"),
                     cluster.get("topic_key"),
                     exc,
@@ -5102,28 +5341,16 @@ class MemoryNodeManager:
                 observation_id = None
             if observation_id is None:
                 continue
-            fact_clusters_consolidated += 1
+            consolidated += 1
 
-            current_consumed_source_nodes = [
-                fact
-                for fact in cluster.get("source_nodes", [])
-                if (self._node_id(fact) is not None and self._node_id(fact) not in exlcuded_for_clusters)
-            ]
-            current_consumed_node_ids = [self._node_id(fact) for fact in current_consumed_source_nodes if self._node_id(fact) is not None]
-            fact_cluster_node_ids.update(current_consumed_node_ids)
+            current_consumed_node_ids = consumed_node_ids - before_cluster_consumed_node_ids
             entity_topic_node_ids.update(current_consumed_node_ids)
-        consolidated += fact_observation_matches + fact_clusters_consolidated
-        
+                
         return {
             "candidate_count": len(unprocessed_fact_candidates),
             "consolidated": consolidated,
             "entity_topic_updates": entity_topic_updates,
             "entity_topic_node_count": len(entity_topic_node_ids),
-            "fact_observation_matches": fact_observation_matches,
-            "fact_observation_node_count": len(fact_observation_node_ids),
-            "fact_clusters_considered": fact_clusters_considered,
-            "fact_clusters_consolidated": fact_clusters_consolidated,
-            "fact_cluster_node_count": len(fact_cluster_node_ids),
             "observation_groups_merged": observation_groups_merged,
             "changed_observation_ids": list(dict.fromkeys(changed_observation_ids)),
             "touched_entity_ids": touched_entity_ids,
@@ -5534,8 +5761,25 @@ class MemoryNodeManager:
                 if not summary:
                     continue
                 keywords = self._normalize_keywords(fact.get("keywords", []))
-                raw_topics = self._normalize_keywords(fact.get("topic", keywords))
-                topics = self._topic_keys(raw_topics)
+                primary_topic = self._topic_key(
+                    fact.get("primary_topic")
+                    or next(iter(self._normalize_keywords(fact.get("topic", []))), "")
+                    or (keywords[0] if keywords else "general")
+                )
+                topics = [primary_topic]
+                primary_entity = fact.get("primary_entity")
+                primary_entity_id: Optional[int] = None
+                if isinstance(primary_entity, dict):
+                    primary_entity_name = str(primary_entity.get("name") or "").strip()
+                    primary_entity_type = (
+                        str(primary_entity.get("type") or "CONCEPT").strip().upper()
+                        or "CONCEPT"
+                    )
+                    if primary_entity_name:
+                        primary_entity_id = self._db.entity_add_entity(
+                            name=primary_entity_name,
+                            entity_type=primary_entity_type,
+                        )
 
                 if idx == 0:
                     self._log_info(
@@ -5554,6 +5798,9 @@ class MemoryNodeManager:
                         "summary": summary,
                         "keywords": keywords,
                         "topics": topics,
+                        "primary_entity": primary_entity,
+                        "primary_entity_id": primary_entity_id,
+                        "primary_topic": primary_topic,
                         "entity_names": [
                             str(entity.get("name", "")).strip()
                             for entity in fact.get("entities", [])
@@ -5596,6 +5843,8 @@ class MemoryNodeManager:
                     task_event_like=fact.get("task_event_like"),
                     task_event_subject=fact.get("task_event_subject", ""),
                     task_relevance=fact.get("task_relevance", ""),
+                    primary_entity_id=primary_entity_id,
+                    primary_topic=primary_topic,
                     entity_names=[
                         str(entity.get("name", "")).strip()
                         for entity in fact.get("entities", [])
@@ -5604,7 +5853,12 @@ class MemoryNodeManager:
                 )
 
                 fact_entities = fact.get("entities", [])
-                self._link_fact_entities(node_id, fact_entities)
+                linked_entities = self._link_fact_entities(node_id, fact_entities)
+                if primary_entity_id is not None and all(
+                    entity_id != primary_entity_id
+                    for entity_id, _entity_name in linked_entities
+                ):
+                    self._db.entity_link_node(node_id, primary_entity_id)
                 
                 stored_nodes.append((node_id, summary, embedding, keywords))
                 node_ids.append(node_id)
@@ -5802,6 +6056,10 @@ class MemoryNodeManager:
             embedding=self._embed_memory_layer_text(embedding_text),
             embedding_text=embedding_text,
             metadata=metadata,
+            source_roles={
+                int(node_id): "matched"
+                for node_id in group.get("pending_source_node_ids", [])
+            },
         )
         if changed_observation_ids is not None:
             changed_observation_ids.append(int(keep_observation["id"]))
