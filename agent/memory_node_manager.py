@@ -1994,7 +1994,7 @@ class MemoryNodeManager:
         return f"{base}{offset}#{fact_index:02d}"
 
     @staticmethod
-    def _original_dialog_payload(
+    def _build_original_dialog_payload(
         user_message: str,
         assistant_response: str,
         fact: Dict[str, Any],
@@ -4529,7 +4529,7 @@ class MemoryNodeManager:
         except (KeyError, TypeError, ValueError):
             return []
         try:
-            return self._db.memory_observations_for_entity_topic(
+            return self._db.get_observations_using_entity_topic(
                 entity_id=entity_id,
                 topic_key=self._topic_key(cluster.get("topic_key") or "general"),
                 query_embedding=self._fact_cluster_query_embedding(cluster),
@@ -4963,7 +4963,7 @@ class MemoryNodeManager:
         nearest_bare_time = min(bare_times, key=lambda time: abs(time - suffix_time))
         return abs(nearest_bare_time - suffix_time) <= cls._NORMALIZED_TOPIC_CLUSTER_WINDOW_SECONDS
 
-    def _cluster_unmatched_facts(
+    def _cluster_unprocessed_facts(
         self,
         facts: List[Dict[str, Any]],
         *,
@@ -5193,7 +5193,7 @@ class MemoryNodeManager:
         if not self._db:
             return {"candidate_count": 0, "consolidated": 0}
 
-        unprocessed_fact_candidates = self._db.get_unobserved_nodes_for_observation(
+        unprocessed_fact_candidates = self._db.get_unprocessed_facts_for_observation(
             date_key=date_key,
             limit=limit,
         )
@@ -5225,7 +5225,7 @@ class MemoryNodeManager:
             if changed_observation_ids is not None
             else []
         )
-        clusters = self._cluster_unmatched_facts(
+        clusters = self._cluster_unprocessed_facts(
             unprocessed_fact_candidates,
             excluded_node_ids=consumed_node_ids,
         )
@@ -5433,7 +5433,7 @@ class MemoryNodeManager:
             try:
                 self._llm_thread_context.config = task["llm_config"]
                 if task_kind == "reflect":
-                    candidates = self._db.get_unobserved_nodes_for_observation(
+                    candidates = self._db.get_unprocessed_facts_for_observation(
                         limit=1,
                     )
                     if not candidates:
@@ -5639,7 +5639,7 @@ class MemoryNodeManager:
     # ── Store turn as memory node ─────────────────────────────────────────
 
     @staticmethod
-    def _store_turns_character_count(source_turns: List[Dict[str, Any]]) -> int:
+    def _cal_store_turns_character_count(source_turns: List[Dict[str, Any]]) -> int:
         return sum(
             len(str(turn.get("user_message") or ""))
             + len(str(turn.get("assistant_response") or ""))
@@ -5674,7 +5674,7 @@ class MemoryNodeManager:
             "turn_timestamp": turn_timestamp,
             "tags": list(tags or []),
         })
-        pending_character_count = self._store_turns_character_count(
+        pending_character_count = self._cal_store_turns_character_count(
             self._pending_store_turns,
         )
         turn_threshold_reached = (
@@ -5793,7 +5793,7 @@ class MemoryNodeManager:
                     summary=summary,
                     keywords=keywords,
                     topic=topics,
-                    original_dialog=self._original_dialog_payload(
+                    original_dialog=self._build_original_dialog_payload(
                         user_message=batch_user_message,
                         assistant_response=batch_assistant_response,
                         fact=fact,
@@ -5905,7 +5905,7 @@ class MemoryNodeManager:
             if node.get("id") is not None
         ]
         group_source_ids = {int(node["id"]) for node in group_source_nodes}
-        topic_source_nodes = self._db.memory_observation_source_nodes(
+        topic_source_nodes = self._db.get_fact_nodes_using_entity_topic(
             entity_id=entity_id,
             topic_key=topic_key,
             limit=12,
@@ -6033,7 +6033,7 @@ class MemoryNodeManager:
         self,
         *,
         limit: int,
-        anchor_entity_ids: List[int],
+        date_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Merge duplicate entities and repair observations affected by the merge."""
         if not self._db:
@@ -6046,7 +6046,17 @@ class MemoryNodeManager:
                 "changed_observation_ids": [],
             }
 
-        entity_report = self._db.reflect_merging_entities(
+        unprocessed_fact_candidates = self._db.get_unprocessed_facts_for_observation(
+            date_key=date_key,
+            limit=limit,
+        )
+        anchor_entity_ids = list(dict.fromkeys(
+            int(entity_id)
+            for item in unprocessed_fact_candidates
+            for entity_id, _entity_name in item.get("linked_entities", [])
+        ))
+
+        entity_report = self._db.merge_similar_entities(
             limit=limit,
             anchor_entity_ids=anchor_entity_ids,
         )
@@ -6219,19 +6229,10 @@ class MemoryNodeManager:
                 "task_active_to_paused_days": task_active_to_paused_days,
                 "task_stale_days": task_stale_days,
             })
-        unprocessed_fact_candidates = self._db.get_unobserved_nodes_for_observation(
-            date_key=reflect_date_key,
-            limit=limit,
-        )
-        new_entity_ids = list(dict.fromkeys(
-            int(entity_id)
-            for item in unprocessed_fact_candidates
-            for entity_id, _entity_name in item.get("linked_entities", [])
-        ))
 
         entity_merging_report = self._reflect_merging_duplicated_entities(
             limit=limit,
-            anchor_entity_ids=new_entity_ids,
+            date_key=reflect_date_key,
         )
         changed_observation_ids = list(
             entity_merging_report.get("changed_observation_ids", [])

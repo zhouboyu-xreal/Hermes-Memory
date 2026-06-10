@@ -3888,7 +3888,7 @@ class SessionDB:
         ]
 
     @classmethod
-    def _entity_name_similarity(cls, left_name: str, right_name: str) -> Tuple[float, str, str]:
+    def _cal_entity_name_similarity(cls, left_name: str, right_name: str) -> Tuple[float, str, str]:
         left_norm = cls._entity_normalized_name(left_name)
         right_norm = cls._entity_normalized_name(right_name)
         if not left_norm or not right_norm:
@@ -3908,7 +3908,7 @@ class SessionDB:
         return 0.0, "name_mismatch", "high"
 
     @staticmethod
-    def _entity_type_compatible(left_type: str, right_type: str) -> Tuple[bool, float]:
+    def _cal_entity_type_compatible(left_type: str, right_type: str) -> Tuple[bool, float]:
         left = str(left_type or "CONCEPT").upper()
         right = str(right_type or "CONCEPT").upper()
         if left == right:
@@ -3925,7 +3925,7 @@ class SessionDB:
         return False, 0.0
 
     @classmethod
-    def _entity_cooccurrence_similarity(cls, left_raw: Any, right_raw: Any) -> float:
+    def _cal_entity_cooccurrence_similarity(cls, left_raw: Any, right_raw: Any) -> float:
         left = cls._entity_load_co_entities(left_raw)
         right = cls._entity_load_co_entities(right_raw)
         if not left or not right:
@@ -3938,7 +3938,7 @@ class SessionDB:
         return len(left_ids & right_ids) / len(union)
 
     @staticmethod
-    def _entity_merging_action(
+    def _judge_entity_merging_action(
         *,
         confidence: float,
         reason: str,
@@ -3951,20 +3951,20 @@ class SessionDB:
             return "merge"
         return "candidate"
 
-    def _reflection_entity_merging_candidate_for_pair(
+    def _judge_entity_merging_candidate_for_pair(
         self,
         left: sqlite3.Row,
         right: sqlite3.Row,
     ) -> Optional[Dict[str, Any]]:
-        type_compatible, type_score = self._entity_type_compatible(left["type"], right["type"])
+        type_compatible, type_score = self._cal_entity_type_compatible(left["type"], right["type"])
         if type_score <= 0.7:
             return None
-        name_score, reason, risk = self._entity_name_similarity(left["name"], right["name"])
+        name_score, reason, risk = self._cal_entity_name_similarity(left["name"], right["name"])
         if name_score <= 0:
             return None
-        co_score = self._entity_cooccurrence_similarity(left["co_entities"], right["co_entities"])
+        co_score = self._cal_entity_cooccurrence_similarity(left["co_entities"], right["co_entities"])
         confidence = max(0.0, min(1.0, (name_score * 0.72) + (type_score * 0.20) + (co_score * 0.08)))
-        action = self._entity_merging_action(
+        action = self._judge_entity_merging_action(
             confidence=confidence,
             reason=reason,
             risk=risk,
@@ -3988,7 +3988,7 @@ class SessionDB:
             "action": action,
         }
 
-    def _reflection_entity_merging_candidates(
+    def _find_entity_merging_candidates(
         self,
         limit: int = 100,
         anchor_entity_ids: Optional[List[int]] = None,
@@ -4033,7 +4033,7 @@ class SessionDB:
             pair_iter = _anchored_pairs()
 
         for left, right in pair_iter:
-            candidate = self._reflection_entity_merging_candidate_for_pair(left, right)
+            candidate = self._judge_entity_merging_candidate_for_pair(left, right)
             if candidate is not None:
                 candidates.append(candidate)
         candidates.sort(key=lambda item: (-item["confidence"], item["risk"], item["canonical_id"]))
@@ -4059,7 +4059,7 @@ class SessionDB:
             return left, right
         return (left, right) if int(left["id"]) <= int(right["id"]) else (right, left)
 
-    def reflect_merging_entities(
+    def merge_similar_entities(
         self,
         *,
         limit: int = 100,
@@ -4072,7 +4072,7 @@ class SessionDB:
         co-occurring entity profiles. Only low-risk normalized-name matches are
         merged automatically; other similar names are reported as candidates.
         """
-        candidates = self._reflection_entity_merging_candidates(
+        candidates = self._find_entity_merging_candidates(
             limit=limit,
             anchor_entity_ids=anchor_entity_ids,
         )
@@ -4080,7 +4080,7 @@ class SessionDB:
         for candidate in candidates:
             if candidate["action"] != "merge":
                 continue
-            self.entity_merge(
+            self.process_entity_merging(
                 canonical_id=candidate["canonical_id"],
                 duplicate_id=candidate["duplicate_id"],
                 reason=candidate["reason"],
@@ -4105,7 +4105,7 @@ class SessionDB:
             },
         }
 
-    def entity_merge(
+    def process_entity_merging(
         self,
         *,
         canonical_id: int,
@@ -4809,9 +4809,7 @@ class SessionDB:
                 out.append(item)
         return out
 
-    # ── Consolidated observations ───────────────────────────────────────
-
-    def memory_observation_source_nodes(
+    def get_fact_nodes_using_entity_topic(
         self,
         *,
         entity_id: int,
@@ -4857,7 +4855,7 @@ class SessionDB:
                 break
         return out
 
-    def get_unobserved_nodes_for_observation(
+    def get_unprocessed_facts_for_observation(
         self,
         *,
         date_key: Optional[str] = None,
@@ -5188,7 +5186,7 @@ class SessionDB:
         )
         return (observation["id"] if observation else None), len(pending)
 
-    def memory_observations_for_entity_topic(
+    def get_observations_using_entity_topic(
         self,
         *,
         entity_id: int,
