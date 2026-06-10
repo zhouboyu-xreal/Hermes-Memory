@@ -638,7 +638,9 @@ def main() -> int:
                         "Running reflect after sample %s",
                         sample_id,
                     )
-                    reflect_report = manager.reflect()
+                    reflect_report = manager.reflect(
+                        reflect_timestamp=turn_timestamp,
+                    )
                     reflect_runs += 1
                     reflect_row = {
                         "event": "reflect",

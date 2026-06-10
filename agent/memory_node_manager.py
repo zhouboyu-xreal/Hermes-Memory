@@ -4951,14 +4951,18 @@ class MemoryNodeManager:
         *,
         limit: int,
         entity_ids: List[int],
+        date_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Generate/update observations from today's facts not yet attached as sources."""
+        """Generate/update observations from the selected day's unobserved facts."""
         if not self._db:
             return {"candidate_count": 0, "consolidated": 0}
 
         merge_entity_ids = list(dict.fromkeys(int(entity_id) for entity_id in entity_ids))
 
-        unprocessed_fact_candidates = self._db.get_unobserved_nodes_for_observation(limit=limit)
+        unprocessed_fact_candidates = self._db.get_unobserved_nodes_for_observation(
+            date_key=date_key,
+            limit=limit,
+        )
         touched_entity_ids = list(dict.fromkeys(
             int(entity_id)
             for item in unprocessed_fact_candidates
@@ -5807,6 +5811,7 @@ class MemoryNodeManager:
         self,
         *,
         limit: int = 100,
+        reflect_timestamp: Optional[Any] = None,
         fact_half_life_days: Optional[float] = None,
         experience_half_life_days: Optional[float] = None,
         observation_decay_threshold: Optional[float] = None,
@@ -5819,6 +5824,8 @@ class MemoryNodeManager:
         or creates observations, generates interpretations, and then applies
         decay maintenance. ``run_agent.py`` schedules this method through the
         ordered background queue when the configured time interval is due.
+        ``reflect_timestamp`` selects the local calendar day to process and is
+        also used as the maintenance timestamp; it defaults to the current time.
         """
         if not self._db:
             return {
@@ -5828,18 +5835,48 @@ class MemoryNodeManager:
                 "observations_consolidated": 0,
                 "error": "memory database unavailable",
             }
+        if reflect_timestamp is None:
+            reflect_now = datetime.now().astimezone()
+        elif isinstance(reflect_timestamp, datetime):
+            reflect_now = (
+                reflect_timestamp.astimezone()
+                if reflect_timestamp.tzinfo is None
+                else reflect_timestamp
+            )
+        else:
+            try:
+                parsed_reflect_timestamp = datetime.fromisoformat(
+                    str(reflect_timestamp).replace("Z", "+00:00")
+                )
+                reflect_now = (
+                    parsed_reflect_timestamp.astimezone()
+                    if parsed_reflect_timestamp.tzinfo is None
+                    else parsed_reflect_timestamp
+                )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid memory reflect timestamp %r; using current time",
+                    reflect_timestamp,
+                )
+                reflect_now = datetime.now().astimezone()
+        reflect_date_key = reflect_now.date().isoformat()
         self._log_info(
             "memory_reflect",
             "start", 
             {
                 "limit": limit,
+                "reflect_timestamp": reflect_now.isoformat(),
+                "reflect_date_key": reflect_date_key,
                 "fact_half_life_days": fact_half_life_days,
                 "experience_half_life_days": experience_half_life_days,
                 "observation_decay_threshold": observation_decay_threshold,
                 "task_active_to_paused_days": task_active_to_paused_days,
                 "task_stale_days": task_stale_days,
             })
-        unprocessed_fact_candidates = self._db.get_unobserved_nodes_for_observation(limit=limit)
+        unprocessed_fact_candidates = self._db.get_unobserved_nodes_for_observation(
+            date_key=reflect_date_key,
+            limit=limit,
+        )
         new_entity_ids = list(dict.fromkeys(
             int(entity_id)
             for item in unprocessed_fact_candidates
@@ -5890,6 +5927,7 @@ class MemoryNodeManager:
         observation_report = self._reflect_generate_observations(
             limit=limit,
             entity_ids=list(dict.fromkeys(merged_entity_ids)),
+            date_key=reflect_date_key,
         )
 
         report = entity_merging_report
@@ -5903,7 +5941,6 @@ class MemoryNodeManager:
         report["interpretations_generated"] = self._generate_interpretations_using_observations(
             report["changed_observation_ids"]
         )
-        reflect_now = datetime.now().astimezone()
         node_decay_report = self._db.memory_reflect_node_decay(
             fact_half_life_days=fact_half_life_days,
             experience_half_life_days=experience_half_life_days,

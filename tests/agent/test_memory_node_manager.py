@@ -1864,6 +1864,25 @@ def test_memory_node_manager_reflect_delegates_to_db(db):
     assert report["merge_candidates"] == 1
 
 
+def test_memory_node_manager_reflect_uses_requested_timestamp_for_fact_day(db):
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    requested_at = datetime(2031, 4, 5, 23, 30, tzinfo=timezone(timedelta(hours=8)))
+    requested_date_keys = []
+    original_get_candidates = db.get_unobserved_nodes_for_observation
+
+    def capture_candidates(**kwargs):
+        requested_date_keys.append(kwargs.get("date_key"))
+        return original_get_candidates(**kwargs)
+
+    db.get_unobserved_nodes_for_observation = capture_candidates
+
+    report = mgr.reflect(limit=5, reflect_timestamp=requested_at)
+
+    assert requested_date_keys == ["2031-04-05", "2031-04-05"]
+    assert report["node_decay"]["evaluated_at"] == requested_at.isoformat()
+    assert report["observation_reflect"]["candidate_count"] == 0
+
+
 def test_memory_reflect_can_merge_normalized_entity_duplicates(db):
     node_id = _add_memory_node(
         db,
