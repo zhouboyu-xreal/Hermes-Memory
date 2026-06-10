@@ -4163,7 +4163,7 @@ class MemoryNodeManager:
             return True, "cluster_size_threshold"
         return False, "trigger_threshold_not_met"
 
-    def _generate_interpretations_using_observations(self, observation_ids: List[int]) -> int:
+    def _reflect_generate_interpretations_using_observations(self, observation_ids: List[int]) -> int:
         if not self._db:
             return 0
         clean_ids = list(dict.fromkeys(
@@ -5182,18 +5182,16 @@ class MemoryNodeManager:
         )
         return int(observation_id)
     
-    def _reflect_generate_observations(
+    def _reflect_generate_observations_using_facts(
         self,
         *,
         limit: int,
-        entity_ids: List[int],
         date_key: Optional[str] = None,
+        changed_observation_ids: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
         """Generate/update observations from the selected day's unobserved facts."""
         if not self._db:
             return {"candidate_count": 0, "consolidated": 0}
-
-        merge_entity_ids = list(dict.fromkeys(int(entity_id) for entity_id in entity_ids))
 
         unprocessed_fact_candidates = self._db.get_unobserved_nodes_for_observation(
             date_key=date_key,
@@ -5216,65 +5214,17 @@ class MemoryNodeManager:
         )
         consolidated = 0
         entity_topic_updates = 0
+        fact_cluster_observation_matches = 0
+        fact_cluster_observation_node_ids: set[int] = set()
+        fact_clusters_consolidated = 0
+        fact_cluster_node_ids: set[int] = set()
+        consumed_node_ids: set[int] = set()
         entity_topic_node_ids: set[int] = set()
-        changed_observation_ids: List[int] = []
-        candidate_node_ids = [int(item["node_id"]) for item in unprocessed_fact_candidates]
-
-        observation_groups_merged = 0
-        merge_consumed_node_ids: set[int] = set()
-        if merge_entity_ids:
-            groups = self._db.find_duplicated_observation_groups(entity_ids=merge_entity_ids)
-            augmented_groups = [
-                self._augment_observation_merge_group_with_pending_sources(group)
-                for group in groups
-            ]
-            self._log_info(
-                "memory_reflect",
-                "observation_merge_candidates", 
-                {
-                    "entity_ids": merge_entity_ids,
-                    "group_count": len(augmented_groups),
-                    "groups": [
-                        {
-                            "entity_id": group.get("entity_id"),
-                            "entity_name": group.get("entity_name"),
-                            "topic_key": group.get("topic_key"),
-                            "topic_label": group.get("topic_label"),
-                            "observation_type": group.get("observation_type"),
-                            "observation_ids": [
-                                observation.get("id")
-                                for observation in group.get("observations", [])
-                            ],
-                            "source_node_ids": [
-                                node.get("id")
-                                for node in group.get("source_nodes", [])
-                            ],
-                            "pending_source_node_ids": group.get("pending_source_node_ids", []),
-                        }
-                        for group in augmented_groups
-                    ],
-                })
-            for group in augmented_groups:
-                try:
-                    before_observed = set(self._db.find_observed_source_node_ids(candidate_node_ids))
-                    if self._merge_duplicated_observation_group(
-                        group,
-                        changed_observation_ids=changed_observation_ids,
-                    ):
-                        observation_groups_merged += 1
-                        after_observed = set(self._db.find_observed_source_node_ids(candidate_node_ids))
-                        newly_observed = after_observed - before_observed # to store nodes which are already consumed in observation merging step
-                        merge_consumed_node_ids.update(newly_observed)
-                        entity_topic_node_ids.update(newly_observed)
-                except Exception as exc:
-                    logger.debug(
-                        "Failed to merge observations for entity %s topic %s: %s",
-                        group.get("entity_id"),
-                        group.get("topic_key"),
-                        exc,
-                    )
-
-        consumed_node_ids = set(merge_consumed_node_ids)
+        changed_ids = (
+            changed_observation_ids
+            if changed_observation_ids is not None
+            else []
+        )
         clusters = self._cluster_unmatched_facts(
             unprocessed_fact_candidates,
             excluded_node_ids=consumed_node_ids,
@@ -5309,7 +5259,7 @@ class MemoryNodeManager:
                 matched_observation_id = self._update_existing_observation_from_fact_cluster(
                     cluster,
                     consumed_node_ids=consumed_node_ids,
-                    changed_observation_ids=changed_observation_ids,
+                    changed_observation_ids=changed_ids,
                 )
             except Exception as exc:
                 logger.debug(
@@ -5322,6 +5272,8 @@ class MemoryNodeManager:
             if matched_observation_id is not None:
                 consolidated += 1
                 current_consumed_node_ids = consumed_node_ids - before_cluster_consumed_node_ids
+                fact_cluster_observation_matches += 1
+                fact_cluster_observation_node_ids.update(current_consumed_node_ids)
                 entity_topic_node_ids.update(current_consumed_node_ids)
                 continue
 
@@ -5329,7 +5281,7 @@ class MemoryNodeManager:
                 observation_id = self._generate_observation_using_unmatched_fact_clusters(
                     cluster,
                     consumed_node_ids=consumed_node_ids,
-                    changed_observation_ids=changed_observation_ids,
+                    changed_observation_ids=changed_ids,
                 )
             except Exception as exc:
                 logger.debug(
@@ -5342,8 +5294,10 @@ class MemoryNodeManager:
             if observation_id is None:
                 continue
             consolidated += 1
+            fact_clusters_consolidated += 1
 
             current_consumed_node_ids = consumed_node_ids - before_cluster_consumed_node_ids
+            fact_cluster_node_ids.update(current_consumed_node_ids)
             entity_topic_node_ids.update(current_consumed_node_ids)
                 
         return {
@@ -5351,8 +5305,18 @@ class MemoryNodeManager:
             "consolidated": consolidated,
             "entity_topic_updates": entity_topic_updates,
             "entity_topic_node_count": len(entity_topic_node_ids),
-            "observation_groups_merged": observation_groups_merged,
-            "changed_observation_ids": list(dict.fromkeys(changed_observation_ids)),
+            "fact_cluster_observation_matches": fact_cluster_observation_matches,
+            "fact_cluster_observation_node_count": len(
+                fact_cluster_observation_node_ids
+            ),
+            "fact_observation_matches": fact_cluster_observation_matches,
+            "fact_observation_node_count": len(
+                fact_cluster_observation_node_ids
+            ),
+            "fact_clusters_considered": len(clusters),
+            "fact_clusters_consolidated": fact_clusters_consolidated,
+            "fact_cluster_node_count": len(fact_cluster_node_ids),
+            "changed_observation_ids": list(dict.fromkeys(changed_ids)),
             "touched_entity_ids": touched_entity_ids,
         }
 
@@ -6065,6 +6029,130 @@ class MemoryNodeManager:
             changed_observation_ids.append(int(keep_observation["id"]))
         return True
 
+    def _reflect_merging_duplicated_entities(
+        self,
+        *,
+        limit: int,
+        anchor_entity_ids: List[int],
+    ) -> Dict[str, Any]:
+        """Merge duplicate entities and repair observations affected by the merge."""
+        if not self._db:
+            return {
+                "candidates": [],
+                "merged": 0,
+                "candidate_count": 0,
+                "merge_candidates": 0,
+                "observation_groups_merged": 0,
+                "changed_observation_ids": [],
+            }
+
+        entity_report = self._db.reflect_merging_entities(
+            limit=limit,
+            anchor_entity_ids=anchor_entity_ids,
+        )
+        self._log_info(
+            "memory_reflect",
+            "entity_merge_candidates",
+            {
+                "anchor_entity_ids": anchor_entity_ids,
+                "candidate_count": entity_report.get("candidate_count", 0),
+                "merge_candidates": entity_report.get("merge_candidates", 0),
+                "merged": entity_report.get("merged", 0),
+                "candidates": entity_report.get("candidates", []),
+            },
+        )
+
+        merged_entity_ids: List[int] = []
+        for candidate in entity_report.get("candidates", []):
+            if candidate.get("action") != "merge":
+                continue
+            canonical_id = int(candidate["canonical_id"])
+            merged_entity_ids.append(canonical_id)
+            self._log_info(
+                "memory_reflect",
+                "entity_merge",
+                {
+                    "canonical_id": canonical_id,
+                    "canonical_name": candidate.get("canonical_name"),
+                    "duplicate_id": candidate.get("duplicate_id"),
+                    "duplicate_name": candidate.get("duplicate_name"),
+                    "confidence": candidate.get("confidence"),
+                    "reason": candidate.get("reason"),
+                    "risk": candidate.get("risk"),
+                    "name_score": candidate.get("name_score"),
+                    "type_score": candidate.get("type_score"),
+                    "co_entities_score": candidate.get("co_entities_score"),
+                },
+            )
+
+        merged_entity_ids = list(dict.fromkeys(merged_entity_ids))
+        groups = (
+            self._db.find_duplicated_observation_groups(
+                entity_ids=merged_entity_ids,
+            )
+            if merged_entity_ids
+            else []
+        )
+        augmented_groups = [
+            self._augment_observation_merge_group_with_pending_sources(group)
+            for group in groups
+        ]
+        self._log_info(
+            "memory_reflect",
+            "observation_merge_candidates",
+            {
+                "entity_ids": merged_entity_ids,
+                "group_count": len(augmented_groups),
+                "groups": [
+                    {
+                        "entity_id": group.get("entity_id"),
+                        "entity_name": group.get("entity_name"),
+                        "topic_key": group.get("topic_key"),
+                        "topic_label": group.get("topic_label"),
+                        "observation_type": group.get("observation_type"),
+                        "observation_ids": [
+                            observation.get("id")
+                            for observation in group.get("observations", [])
+                        ],
+                        "source_node_ids": [
+                            node.get("id")
+                            for node in group.get("source_nodes", [])
+                        ],
+                        "pending_source_node_ids": group.get(
+                            "pending_source_node_ids",
+                            [],
+                        ),
+                    }
+                    for group in augmented_groups
+                ],
+            },
+        )
+
+        observation_groups_merged = 0
+        changed_observation_ids: List[int] = []
+        for group in augmented_groups:
+            try:
+                if not self._merge_duplicated_observation_group(
+                    group,
+                    changed_observation_ids=changed_observation_ids,
+                ):
+                    continue
+                observation_groups_merged += 1
+            except Exception as exc:
+                logger.debug(
+                    "Failed to merge observations for entity %s topic %s: %s",
+                    group.get("entity_id"),
+                    group.get("topic_key"),
+                    exc,
+                )
+
+        return {
+            **entity_report,
+            "merged_entity_ids": merged_entity_ids,
+            "observation_groups_merged": observation_groups_merged,
+            "changed_observation_ids": list(dict.fromkeys(changed_observation_ids)),
+        }
+
     def reflect(
         self,
         *,
@@ -6141,62 +6229,27 @@ class MemoryNodeManager:
             for entity_id, _entity_name in item.get("linked_entities", [])
         ))
 
-        entity_merging_report = self._db.reflect_merging_entities(
+        entity_merging_report = self._reflect_merging_duplicated_entities(
             limit=limit,
             anchor_entity_ids=new_entity_ids,
         )
-        self._log_info(
-            "memory_reflect",
-            "entity_merge_candidates", 
-            {
-                "anchor_entity_ids": new_entity_ids,
-                "candidate_count": entity_merging_report.get("candidate_count", 0),
-                "merge_candidates": entity_merging_report.get("merge_candidates", 0),
-                "merged": entity_merging_report.get("merged", 0),
-                "candidates": entity_merging_report.get("candidates", []),
-            })
-        for candidate in entity_merging_report.get("candidates", []):
-            if candidate.get("action") != "merge":
-                continue
-            self._log_info(
-                "memory_reflect",
-                "entity_merge", 
-                {
-                    "canonical_id": candidate.get("canonical_id"),
-                    "canonical_name": candidate.get("canonical_name"),
-                    "duplicate_id": candidate.get("duplicate_id"),
-                    "duplicate_name": candidate.get("duplicate_name"),
-                    "confidence": candidate.get("confidence"),
-                    "reason": candidate.get("reason"),
-                    "risk": candidate.get("risk"),
-                    "name_score": candidate.get("name_score"),
-                    "type_score": candidate.get("type_score"),
-                    "co_entities_score": candidate.get("co_entities_score"),
-                })
-
-        merged_entity_ids: List[int] = []
-        if entity_merging_report.get("merged"):
-            merged_entity_ids = [
-                int(candidate["canonical_id"])
-                for candidate in entity_merging_report.get("candidates", [])
-                if candidate.get("action") == "merge"
-            ]
-        
-        observation_report = self._reflect_generate_observations(
-            limit=limit,
-            entity_ids=list(dict.fromkeys(merged_entity_ids)),
-            date_key=reflect_date_key,
+        changed_observation_ids = list(
+            entity_merging_report.get("changed_observation_ids", [])
         )
-
-        report = entity_merging_report
+        observation_report = self._reflect_generate_observations_using_facts(
+            limit=limit,
+            date_key=reflect_date_key,
+            changed_observation_ids=changed_observation_ids,
+        )
+        
+        report = dict(entity_merging_report)
         report["observation_reflect"] = observation_report
         report["observations_consolidated"] = observation_report.get("consolidated", 0)
-        report["observation_groups_merged"] = observation_report.get("observation_groups_merged", 0)
         report["changed_observation_ids"] = list(dict.fromkeys(
-            observation_report.get("changed_observation_ids", [])
+            changed_observation_ids
         ))
         report["interpretations_generated"] = 0
-        report["interpretations_generated"] = self._generate_interpretations_using_observations(
+        report["interpretations_generated"] = self._reflect_generate_interpretations_using_observations(
             report["changed_observation_ids"]
         )
         node_decay_report = self._db.memory_reflect_node_decay(
