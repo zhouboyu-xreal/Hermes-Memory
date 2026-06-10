@@ -2641,20 +2641,6 @@ class MemoryNodeManager:
         ]
         return any(pattern in text for pattern in action_patterns)
 
-    @staticmethod
-    def _fact_has_user_task_signal(fact: Dict[str, Any]) -> bool:
-        task_event_like_raw = fact.get("task_event_like")
-        task_event_subject = str(fact.get("task_event_subject") or "").strip().lower()
-        task_relevance = str(fact.get("task_relevance") or "").strip().lower()
-        has_structured_event = task_event_like_raw is not None and str(task_event_like_raw).strip() != ""
-        if has_structured_event:
-            if not MemoryNodeManager._is_task_event_like_fact(fact):
-                return False
-            if task_relevance not in {"medium", "strong"}:
-                return False
-            return task_event_subject in {"", "user", "both", "other"}
-        return MemoryNodeManager._is_task_event_like_fact(fact)
-
     def _fact_anchor_entity(self, facts: List[Dict[str, Any]]) -> Optional[Tuple[int, str]]:
         counts: Dict[int, Dict[str, Any]] = {}
         order = 0
