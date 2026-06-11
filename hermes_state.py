@@ -355,6 +355,52 @@ CREATE INDEX IF NOT EXISTS idx_memory_observation_sources_node
 ON memory_observation_sources(node_id);
 """
 
+MEMORY_SUB_CLAIMS_SQL = """
+CREATE TABLE IF NOT EXISTS memory_sub_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id INTEGER NOT NULL,
+    sub_claim_type TEXT NOT NULL,
+    claim_text TEXT NOT NULL,
+    evidence_mode TEXT NOT NULL DEFAULT 'aggregated',
+    confidence REAL DEFAULT 0.5,
+    status TEXT NOT NULL DEFAULT 'active',
+    embedding BLOB,
+    embedding_text TEXT NOT NULL DEFAULT '',
+    metadata TEXT DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_supported_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS memory_sub_claim_sources (
+    sub_claim_id INTEGER NOT NULL REFERENCES memory_sub_claims(id) ON DELETE CASCADE,
+    node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
+    relation TEXT NOT NULL DEFAULT 'support',
+    confidence REAL DEFAULT 1.0,
+    PRIMARY KEY (sub_claim_id, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_interpretation_sub_claims (
+    interpretation_id INTEGER NOT NULL REFERENCES memory_interpretations(id) ON DELETE CASCADE,
+    sub_claim_id INTEGER NOT NULL REFERENCES memory_sub_claims(id) ON DELETE CASCADE,
+    relation TEXT NOT NULL DEFAULT 'support',
+    confidence REAL DEFAULT 1.0,
+    PRIMARY KEY (interpretation_id, sub_claim_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_sub_claims_observation
+ON memory_sub_claims(observation_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_memory_sub_claims_type
+ON memory_sub_claims(sub_claim_type, status);
+
+CREATE INDEX IF NOT EXISTS idx_memory_sub_claim_sources_node
+ON memory_sub_claim_sources(node_id);
+
+CREATE INDEX IF NOT EXISTS idx_memory_interpretation_sub_claims_claim
+ON memory_interpretation_sub_claims(sub_claim_id);
+"""
+
 MEMORY_INTERPRETATIONS_SQL = """
 CREATE TABLE IF NOT EXISTS memory_interpretations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -825,6 +871,7 @@ class SessionDB:
         cursor.executescript(MEMORY_OBSERVATIONS_SQL)
         self._drop_legacy_memory_entity_columns(cursor)
         cursor.executescript(MEMORY_INTERPRETATIONS_SQL)
+        cursor.executescript(MEMORY_SUB_CLAIMS_SQL)
         for table_name in ("memory_observations", "memory_interpretations"):
             for col_name, col_type in {
                 "embedding": "BLOB",
@@ -4809,6 +4856,30 @@ class SessionDB:
                 out.append(item)
         return out
 
+    def get_interpretations_for_sub_claim(
+        self,
+        sub_claim_id: int,
+        *,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Return current interpretations explicitly linked to a sub-claim."""
+        try:
+            clean_id = int(sub_claim_id)
+        except (TypeError, ValueError):
+            return []
+        rows = self._conn.execute(
+            "SELECT mi.*, en.name AS entity_name "
+            "FROM memory_interpretation_sub_claims misc "
+            "JOIN memory_interpretations mi ON mi.id = misc.interpretation_id "
+            "LEFT JOIN entity_nodes en ON en.id = mi.entity_id "
+            "WHERE misc.sub_claim_id = ? "
+            "AND mi.status IN ('current', 'conflicted') "
+            "ORDER BY mi.updated_at DESC, mi.id DESC "
+            "LIMIT ?",
+            (clean_id, max(1, int(limit or 20))),
+        ).fetchall()
+        return [self._memory_interpretation_from_row(row) for row in rows]
+
     def get_fact_nodes_using_entity_topic(
         self,
         *,
@@ -5000,6 +5071,428 @@ class SessionDB:
             conn.execute(
                 "UPDATE memory_observations SET metadata = ? WHERE id = ?",
                 (metadata_str, int(observation_id)),
+            )
+
+        self._execute_write(_do)
+
+    def memory_replace_sub_claims_for_observation(
+        self,
+        observation_id: int,
+        sub_claims: List[Dict[str, Any]],
+    ) -> List[int]:
+        """Replace one observation's derived sub-claims and their fact evidence."""
+        clean_observation_id = int(observation_id)
+        now_text = datetime.now().astimezone().isoformat()
+
+        def _do(conn):
+            existing_rows = conn.execute(
+                "SELECT id FROM memory_sub_claims WHERE observation_id = ?",
+                (clean_observation_id,),
+            ).fetchall()
+            existing_ids = [
+                int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
+                for row in existing_rows
+            ]
+            if existing_ids:
+                placeholders = ",".join("?" for _ in existing_ids)
+                conn.execute(
+                    f"DELETE FROM memory_interpretation_sub_claims "
+                    f"WHERE sub_claim_id IN ({placeholders})",
+                    existing_ids,
+                )
+                conn.execute(
+                    f"DELETE FROM memory_sub_claim_sources "
+                    f"WHERE sub_claim_id IN ({placeholders})",
+                    existing_ids,
+                )
+            conn.execute(
+                "DELETE FROM memory_sub_claims WHERE observation_id = ?",
+                (clean_observation_id,),
+            )
+
+            inserted_ids: List[int] = []
+            for sub_claim in sub_claims:
+                claim_text = str(sub_claim.get("claim_text") or "").strip()
+                source_node_ids = self._json_int_list(
+                    sub_claim.get("source_node_ids", [])
+                )
+                if not claim_text or not source_node_ids:
+                    continue
+                sub_claim_type = str(
+                    sub_claim.get("sub_claim_type") or "context"
+                ).strip().lower()
+                evidence_mode = str(
+                    sub_claim.get("evidence_mode") or "aggregated"
+                ).strip().lower()
+                confidence = max(
+                    0.0,
+                    min(1.0, float(sub_claim.get("confidence", 0.5) or 0.5)),
+                )
+                metadata = sub_claim.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                embedding = self._embedding_to_blob(sub_claim.get("embedding"))
+                embedding_text = str(
+                    sub_claim.get("embedding_text") or claim_text
+                ).strip()
+                cursor = conn.execute(
+                    "INSERT INTO memory_sub_claims "
+                    "(observation_id, sub_claim_type, claim_text, evidence_mode, "
+                    "confidence, status, embedding, embedding_text, metadata, "
+                    "created_at, updated_at, last_supported_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+                    (
+                        clean_observation_id,
+                        sub_claim_type,
+                        claim_text,
+                        evidence_mode,
+                        confidence,
+                        embedding,
+                        embedding_text,
+                        json.dumps(metadata, ensure_ascii=False),
+                        now_text,
+                        now_text,
+                        now_text,
+                    ),
+                )
+                sub_claim_id = int(cursor.lastrowid)
+                inserted_ids.append(sub_claim_id)
+                for node_id in source_node_ids:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO memory_sub_claim_sources "
+                        "(sub_claim_id, node_id, relation, confidence) "
+                        "VALUES (?, ?, 'support', ?)",
+                        (sub_claim_id, node_id, confidence),
+                    )
+            return inserted_ids
+
+        return self._execute_write(_do)
+
+    def get_sub_claims_for_observations(
+        self,
+        observation_ids: List[int],
+    ) -> List[Dict[str, Any]]:
+        """Return active sub-claims with their supporting fact ids."""
+        clean_ids = self._json_int_list(observation_ids)
+        if not clean_ids:
+            return []
+        placeholders = ",".join("?" for _ in clean_ids)
+        rows = self._conn.execute(
+            "SELECT msc.*, mo.entity_id, mo.topic_key, mo.topic_label, "
+            "en.name AS entity_name "
+            "FROM memory_sub_claims msc "
+            "JOIN memory_observations mo ON mo.id = msc.observation_id "
+            "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
+            f"WHERE msc.observation_id IN ({placeholders}) "
+            "AND msc.status = 'active' "
+            "ORDER BY msc.observation_id, msc.id",
+            clean_ids,
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            source_rows = self._conn.execute(
+                "SELECT node_id FROM memory_sub_claim_sources "
+                "WHERE sub_claim_id = ? AND relation = 'support' "
+                "ORDER BY node_id",
+                (int(item["id"]),),
+            ).fetchall()
+            item["source_node_ids"] = [
+                int(source_row["node_id"]) for source_row in source_rows
+            ]
+            try:
+                item["metadata"] = json.loads(item.get("metadata") or "{}")
+            except (TypeError, ValueError):
+                item["metadata"] = {}
+            stored_embedding = item.get("embedding")
+            if stored_embedding is not None:
+                try:
+                    item["embedding"] = np.frombuffer(
+                        bytes(stored_embedding),
+                        dtype=np.float32,
+                    ).copy()
+                except (TypeError, ValueError):
+                    item["embedding"] = None
+            out.append(item)
+        return out
+
+    def get_deferred_sub_claims_for_interpretation(
+        self,
+        *,
+        entity_id: Optional[int],
+        exclude_sub_claim_ids: Optional[List[int]] = None,
+        limit: int = 32,
+    ) -> List[Dict[str, Any]]:
+        """Return active sub-claims whose interpretation workflow is deferred."""
+        excluded = set(self._json_int_list(exclude_sub_claim_ids or []))
+        params: List[Any] = []
+        entity_filter = ""
+        if entity_id is not None:
+            entity_filter = "AND mo.entity_id = ? "
+            params.append(int(entity_id))
+        rows = self._conn.execute(
+            "SELECT msc.*, mo.entity_id, mo.topic_key, mo.topic_label, "
+            "en.name AS entity_name "
+            "FROM memory_sub_claims msc "
+            "JOIN memory_observations mo ON mo.id = msc.observation_id "
+            "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
+            "WHERE msc.status = 'active' "
+            f"{entity_filter}"
+            "ORDER BY msc.updated_at DESC, msc.id DESC",
+            params,
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            sub_claim_id = int(item["id"])
+            if sub_claim_id in excluded:
+                continue
+            try:
+                item["metadata"] = json.loads(item.get("metadata") or "{}")
+            except (TypeError, ValueError):
+                item["metadata"] = {}
+            if item["metadata"].get("interpretation_status") != "deferred":
+                continue
+            source_rows = self._conn.execute(
+                "SELECT node_id FROM memory_sub_claim_sources "
+                "WHERE sub_claim_id = ? AND relation = 'support' "
+                "ORDER BY node_id",
+                (sub_claim_id,),
+            ).fetchall()
+            item["source_node_ids"] = [
+                int(source_row["node_id"]) for source_row in source_rows
+            ]
+            stored_embedding = item.get("embedding")
+            if stored_embedding is not None:
+                try:
+                    item["embedding"] = np.frombuffer(
+                        bytes(stored_embedding),
+                        dtype=np.float32,
+                    ).copy()
+                except (TypeError, ValueError):
+                    item["embedding"] = None
+            out.append(item)
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
+
+    def memory_create_sub_claim(
+        self,
+        observation_id: int,
+        sub_claim: Dict[str, Any],
+    ) -> Optional[int]:
+        """Create one persistent sub-claim and attach its fact evidence."""
+        claim_text = str(sub_claim.get("claim_text") or "").strip()
+        source_node_ids = self._json_int_list(
+            sub_claim.get("source_node_ids", [])
+        )
+        if not claim_text or not source_node_ids:
+            return None
+        now_text = datetime.now().astimezone().isoformat()
+        sub_claim_type = str(
+            sub_claim.get("sub_claim_type") or "context"
+        ).strip().lower()
+        evidence_mode = str(
+            sub_claim.get("evidence_mode") or "aggregated"
+        ).strip().lower()
+        confidence = max(
+            0.0,
+            min(1.0, float(sub_claim.get("confidence", 0.5) or 0.5)),
+        )
+        metadata = sub_claim.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        embedding = self._embedding_to_blob(sub_claim.get("embedding"))
+        embedding_text = str(
+            sub_claim.get("embedding_text") or claim_text
+        ).strip()
+
+        def _do(conn):
+            cursor = conn.execute(
+                "INSERT INTO memory_sub_claims "
+                "(observation_id, sub_claim_type, claim_text, evidence_mode, "
+                "confidence, status, embedding, embedding_text, metadata, "
+                "created_at, updated_at, last_supported_at) "
+                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+                (
+                    int(observation_id),
+                    sub_claim_type,
+                    claim_text,
+                    evidence_mode,
+                    confidence,
+                    embedding,
+                    embedding_text,
+                    json.dumps(metadata, ensure_ascii=False),
+                    now_text,
+                    now_text,
+                    now_text,
+                ),
+            )
+            sub_claim_id = int(cursor.lastrowid)
+            for node_id in source_node_ids:
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_sub_claim_sources "
+                    "(sub_claim_id, node_id, relation, confidence) "
+                    "VALUES (?, ?, 'support', ?)",
+                    (sub_claim_id, node_id, confidence),
+                )
+            return sub_claim_id
+
+        return self._execute_write(_do)
+
+    def memory_update_sub_claim(
+        self,
+        sub_claim_id: int,
+        *,
+        claim_text: str,
+        evidence_mode: str,
+        confidence: float,
+        source_node_ids: List[int],
+        embedding: Optional[np.ndarray],
+        embedding_text: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """Update a sub-claim in place while preserving its stable identity."""
+        clean_source_ids = self._json_int_list(source_node_ids)
+        now_text = datetime.now().astimezone().isoformat()
+        embedding_blob = self._embedding_to_blob(embedding)
+        confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT embedding FROM memory_sub_claims WHERE id = ?",
+                (int(sub_claim_id),),
+            ).fetchone()
+            next_embedding = (
+                embedding_blob
+                if embedding_blob is not None
+                else (existing["embedding"] if existing else None)
+            )
+            conn.execute(
+                "UPDATE memory_sub_claims SET claim_text = ?, evidence_mode = ?, "
+                "confidence = ?, embedding = ?, embedding_text = ?, metadata = ?, "
+                "updated_at = ?, last_supported_at = ? WHERE id = ?",
+                (
+                    str(claim_text or "").strip(),
+                    str(evidence_mode or "aggregated").strip().lower(),
+                    confidence_value,
+                    next_embedding,
+                    str(embedding_text or claim_text or "").strip(),
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    now_text,
+                    now_text,
+                    int(sub_claim_id),
+                ),
+            )
+            for node_id in clean_source_ids:
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_sub_claim_sources "
+                    "(sub_claim_id, node_id, relation, confidence) "
+                    "VALUES (?, ?, 'support', ?)",
+                    (int(sub_claim_id), node_id, confidence_value),
+                )
+
+        self._execute_write(_do)
+
+    def memory_update_observation_summary(
+        self,
+        observation_id: int,
+        *,
+        summary: str,
+        embedding: Optional[np.ndarray] = None,
+        embedding_text: Optional[str] = None,
+    ) -> None:
+        """Update the deterministic summary derived from active sub-claims."""
+        now_text = datetime.now().astimezone().isoformat()
+        embedding_blob = self._embedding_to_blob(embedding)
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT embedding, embedding_text, embedding_updated_at "
+                "FROM memory_observations WHERE id = ?",
+                (int(observation_id),),
+            ).fetchone()
+            if not existing:
+                return
+            next_embedding = (
+                embedding_blob
+                if embedding_blob is not None
+                else existing["embedding"]
+            )
+            next_embedding_text = (
+                str(embedding_text or "").strip()
+                if embedding_text is not None
+                else (existing["embedding_text"] or "")
+            )
+            next_embedding_updated_at = (
+                now_text
+                if embedding_blob is not None
+                else existing["embedding_updated_at"]
+            )
+            conn.execute(
+                "UPDATE memory_observations SET summary = ?, updated_at = ?, "
+                "embedding = ?, embedding_text = ?, embedding_updated_at = ? "
+                "WHERE id = ?",
+                (
+                    str(summary or "").strip(),
+                    now_text,
+                    next_embedding,
+                    next_embedding_text,
+                    next_embedding_updated_at,
+                    int(observation_id),
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def memory_update_sub_claim_metadata(
+        self,
+        sub_claim_id: int,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """Update sub-claim workflow metadata without changing its evidence."""
+        metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE memory_sub_claims SET metadata = ?, updated_at = ? "
+                "WHERE id = ?",
+                (
+                    metadata_str,
+                    datetime.now().astimezone().isoformat(),
+                    int(sub_claim_id),
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def memory_link_interpretation_sub_claim(
+        self,
+        interpretation_id: int,
+        sub_claim_id: int,
+        *,
+        relation: str = "support",
+        confidence: float = 1.0,
+    ) -> None:
+        """Persist which sub-claim supports or contradicts an interpretation."""
+        clean_relation = str(relation or "support").strip().lower()
+        if clean_relation not in {"support", "contradict", "refine"}:
+            clean_relation = "support"
+        confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
+
+        def _do(conn):
+            conn.execute(
+                "INSERT INTO memory_interpretation_sub_claims "
+                "(interpretation_id, sub_claim_id, relation, confidence) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(interpretation_id, sub_claim_id) DO UPDATE SET "
+                "relation = excluded.relation, confidence = excluded.confidence",
+                (
+                    int(interpretation_id),
+                    int(sub_claim_id),
+                    clean_relation,
+                    confidence_value,
+                ),
             )
 
         self._execute_write(_do)
@@ -5822,6 +6315,34 @@ class SessionDB:
             )
             if clean_remove_ids:
                 remove_placeholders = ",".join("?" for _ in clean_remove_ids)
+                sub_claim_rows = conn.execute(
+                    f"SELECT id FROM memory_sub_claims "
+                    f"WHERE observation_id IN ({remove_placeholders})",
+                    clean_remove_ids,
+                ).fetchall()
+                sub_claim_ids = [
+                    int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
+                    for row in sub_claim_rows
+                ]
+                if sub_claim_ids:
+                    sub_claim_placeholders = ",".join(
+                        "?" for _ in sub_claim_ids
+                    )
+                    conn.execute(
+                        f"DELETE FROM memory_interpretation_sub_claims "
+                        f"WHERE sub_claim_id IN ({sub_claim_placeholders})",
+                        sub_claim_ids,
+                    )
+                    conn.execute(
+                        f"DELETE FROM memory_sub_claim_sources "
+                        f"WHERE sub_claim_id IN ({sub_claim_placeholders})",
+                        sub_claim_ids,
+                    )
+                    conn.execute(
+                        f"DELETE FROM memory_sub_claims "
+                        f"WHERE id IN ({sub_claim_placeholders})",
+                        sub_claim_ids,
+                    )
                 conn.execute(
                     f"DELETE FROM memory_observation_sources WHERE observation_id IN ({remove_placeholders})",
                     clean_remove_ids,

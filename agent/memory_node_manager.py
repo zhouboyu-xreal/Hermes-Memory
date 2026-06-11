@@ -71,6 +71,69 @@ INTERPRETATION_MIN_CLUSTER_SIZE = 2
 INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT = 30
 INTERPRETATION_SINGLE_OBSERVATION_CONFIDENCE_CAP = 0.75
 
+SUB_CLAIM_EMBEDDING_SIMILARITY_THRESHOLD = 0.72
+SUB_CLAIM_MATCH_SIMILARITY_THRESHOLD = 0.78
+SUB_CLAIM_INTERPRETATION_TYPES = {
+    "task_state": {"task", "project_state", "constraint"},
+    "task_progress": {"task", "project_state"},
+    "decision": {"project_state", "strategy", "insight"},
+    "preference_signal": {"explicit_preference", "inferred_preference"},
+    "constraint": {"constraint", "explicit_instruction", "task_risk"},
+    "problem": {"task_risk", "project_state"},
+    "strategy": {"strategy", "insight"},
+    "behavior_pattern": {"behavior_pattern", "inferred_preference"},
+    "context": {"insight"},
+}
+
+SUB_CLAIM_CREATE_PROMPT = """你是长期记忆系统的 sub-claim 生成模块。sub-claim 是 observation 内由一组事实直接支持的、稳定且可独立演化的具体命题。
+
+约束：
+1. 只能使用输入 facts 中明确出现的信息，不得补充推断。
+2. claim_text 必须自包含，保留具体对象、动作、条件、结果和当前状态。
+3. sub_claim_type 必须保持为 requested_sub_claim_type。
+4. 不要生成 interpretation、行动建议或用户画像。
+5. 只返回一个合法 JSON object，不要使用 Markdown。
+
+输出格式：
+{{
+  "sub_claim_type": "{requested_sub_claim_type}",
+  "claim_text": "",
+  "confidence": 0.0
+}}
+
+observation:
+{observation_context}
+
+facts:
+{source_facts}
+"""
+
+SUB_CLAIM_UPDATE_PROMPT = """你是长期记忆系统的 sub-claim 增量更新模块。请用新增 facts 更新既有命题，同时保持命题身份和历史语义稳定。
+
+约束：
+1. 只能使用 existing_sub_claim 与 new_facts 中明确出现的信息。
+2. 保留仍被历史 facts 支持的内容；新增事实只能补充、细化、确认或更新状态。
+3. 除非新增事实明确推翻旧内容，否则不要重写成不同主题。
+4. sub_claim_type 必须保持不变。
+5. claim_text 必须自包含，保留具体对象、动作、条件、结果和当前状态。
+6. 不要生成 interpretation、行动建议或用户画像。
+7. 只返回一个合法 JSON object，不要使用 Markdown。
+
+输出格式：
+{{
+  "sub_claim_type": "{sub_claim_type}",
+  "claim_text": "",
+  "confidence": 0.0,
+  "change_summary": ""
+}}
+
+existing_sub_claim:
+{existing_sub_claim}
+
+new_facts:
+{new_facts}
+"""
+
 # ── Shared causal relation guidance ───────────────────────────────────────
 
 CAUSAL_RELATION_TYPES = ("Cause", "Want", "React", "Changed", "SameTopic", "None")
@@ -533,7 +596,7 @@ source facts:
 - evidence_shape 只能是 single_event、repeated_pattern、contrast、progression、correction、confirmation。
 - temporal_scope 只能是 momentary、recent、ongoing、historical、recurring。
 - candidate_interpretation_types 只能包含 insight、task、preference。
-- metadata 中只填写 observation_kind、evidence_shape、temporal_scope、candidate_interpretation_types、has_conflict、source_fact_type_distribution、dominant_fact_type、evidence_mixture、source_note。
+- metadata 中只填写 observation_kind、evidence_shape、temporal_scope、candidate_interpretation_types、has_conflict、source_fact_type_distribution、dominant_fact_type、evidence_mixture。
 
 只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
@@ -549,8 +612,7 @@ source facts:
     "has_conflict": false,
     "source_fact_type_distribution": {{"semantic": 0, "episodic": 0}},
     "dominant_fact_type": "semantic | episodic | mixed | unknown",
-    "evidence_mixture": "semantic_only | episodic_only | semantic_dominant | episodic_dominant | balanced_mixed | unknown",
-    "source_note": "可选，简短说明该 observation 的证据性质"
+    "evidence_mixture": "semantic_only | episodic_only | semantic_dominant | episodic_dominant | balanced_mixed | unknown"
   }}
 }}"""
 
@@ -626,21 +688,21 @@ topic: {topic_label}
     "has_conflict": false,
     "source_fact_type_distribution": {{"semantic": 0, "episodic": 0}},
     "dominant_fact_type": "semantic | episodic | mixed | unknown",
-    "evidence_mixture": "semantic_only | episodic_only | semantic_dominant | episodic_dominant | balanced_mixed | unknown",
-    "source_note": "可选，简短说明该 observation 的证据性质"
+    "evidence_mixture": "semantic_only | episodic_only | semantic_dominant | episodic_dominant | balanced_mixed | unknown"
   }}
 }}"""
 
 INTERPRETATION_GENERATION_PROMPT = """你是长期记忆 interpretation 生成模块。
 
-你需要基于一条已经 consolidation 完成的 observation，以及它的 supporting facts，判断是否值得生成或更新一条 Agent 对当前世界状态的解释。
+你需要基于 observation 内部的一条 sub-claim，以及它的 supporting facts，判断是否值得生成或更新一条 Agent 对当前世界状态的解释。兼容旧数据时，输入也可能直接是一条 observation。
 
 这里的 interpretation 不是用户原话，也不是原始事实；它是 Agent 基于记忆证据形成的 current best interpretation，用于后续召回时指导如何理解和行动。
 
-三层记忆架构：
+四层记忆架构：
 - fact：原始证据，表示对话中提取出的事实。
-- observation：历史归纳，表示发生过什么、出现过什么模式、经历过什么变化。
-- interpretation：当前解释，表示 Agent 现在如何理解这些 observation，以及后续应该如何行动。
+- observation：同一 entity/topic 下的事实容器。
+- sub-claim：observation 内部由一组相似 facts 直接支持的具体命题，是 interpretation 匹配和生成的主要语义单元。
+- interpretation：当前解释，表示 Agent 现在如何理解这些 sub-claims，以及后续应该如何行动。
 
 entity: {entity_name}
 topic: {topic_label}
@@ -674,6 +736,8 @@ supporting facts:
 - should_create=false 时，只输出 {{"should_create": false}}。
 - claim 是 Agent 当前解释，必须谨慎、可证据支持；不要写成用户原话。
 - interpretation_type 只能是 insight、task、explicit_preference、explicit_instruction、inferred_preference、behavior_pattern、project_state、task_risk、constraint、conflict_resolution、strategy、other。
+- observation_metadata 如果包含 sub_claim_type、evidence_mode 和 allowed_interpretation_types，必须遵守其类型门禁；interpretation_type 必须来自 allowed_interpretation_types。
+- fact_type 描述证据性质，sub_claim_type 描述证据直接支持的命题，interpretation_type 描述 Agent 的高层理解；禁止跳过 sub_claim_type 把 episodic 行为直接写成显式偏好。
 - insight 表示从 observation 提炼出的当前可用洞察；task 表示 Agent 当前认为用户正在推进的任务或目标。
 - 如果 interpretation_type=task，metadata 中填写 task_status、task_source、goal、evidence、steps；task_status 只能是 active、blocked、paused、stale，task_source 固定为 inferred_from_interpretation。
 - 如果 interpretation_type 不是 task，不要填写 task_status、goal、steps、next_action。
@@ -713,14 +777,15 @@ supporting facts:
 
 INTERPRETATION_UPDATE_PROMPT = """你是长期记忆 interpretation 更新模块。
 
-你需要根据新的 observation 和 supporting facts，更新一条已经存在的 interpretation。
+你需要根据新的 sub-claim 和 supporting facts，更新一条已经存在的 interpretation。兼容旧数据时，输入也可能直接是一条 observation。
 
 这里的 interpretation 是 Agent 当前对记忆证据的 current best interpretation。更新时要让它吸收新 observation 带来的进展、确认、修正、冲突或范围变化，而不是只追加证据。
 
-三层记忆架构：
+四层记忆架构：
 - fact：原始证据，表示对话中提取出的事实。
-- observation：历史归纳，表示发生过什么、出现过什么模式、经历过什么变化。
-- interpretation：当前解释，表示 Agent 现在如何理解这些 observation，以及后续应该如何行动。
+- observation：同一 entity/topic 下的事实容器。
+- sub-claim：observation 内部由一组相似 facts 直接支持的具体命题，是 interpretation 匹配和更新的主要语义单元。
+- interpretation：当前解释，表示 Agent 现在如何理解这些 sub-claims，以及后续应该如何行动。
 
 entity: {entity_name}
 topic: {topic_label}
@@ -755,6 +820,7 @@ supporting facts:
 - 如果 interpretation_type=task，metadata 中填写 task_status、task_source、goal、evidence、steps；task_status 只能是 active、blocked、paused、stale，task_source 固定为 inferred_from_interpretation。
 - 如果 interpretation_type 不是 task，不要填写 task_status、goal、steps、next_action。
 - 不要改变 interpretation_type，除非原类型明显错误；若必须改变，只能使用合法类型。
+- 新输入 metadata 如果包含 allowed_interpretation_types，更新后的 interpretation_type 必须位于该列表；不兼容时输出 {{"should_update": false}}。
 - 不要编造没有证据支持的新目标、偏好或风险。
 - evidence_node_ids 是直接支持更新后 interpretation 的底层 fact id，表示“为什么 Agent 现在仍然相信这个解释”；只能使用 supporting facts 中出现的 id。
 - evidence_observation_ids 是支持更新后 interpretation 的 observation id，表示“哪些中层归纳支撑这个解释”；通常应包含新的 observation id，只能使用输入 observation 的 id。
@@ -1142,35 +1208,6 @@ class MemoryNodeManager:
         except Exception as exc:
             logger.debug("Memory layer embedding failed: %s", exc)
             return None
-
-    @staticmethod
-    def _observation_embedding_text(
-        *,
-        entity_name: str = "",
-        topic_label: str = "",
-        observation_type: str = "",
-        summary: str = "",
-        keywords: Optional[List[str]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        metadata = metadata if isinstance(metadata, dict) else {}
-        metadata_parts = [
-            str(metadata.get(key) or "").strip()
-            for key in ("observation_kind", "evidence_shape", "temporal_scope", "dominant_fact_type")
-            if str(metadata.get(key) or "").strip()
-        ]
-        return "\n".join(
-            part
-            for part in [
-                f"entity: {entity_name}" if entity_name else "",
-                f"topic: {topic_label}" if topic_label else "",
-                f"type: {observation_type}" if observation_type else "",
-                f"summary: {summary}" if summary else "",
-                f"keywords: {', '.join(keywords or [])}" if keywords else "",
-                f"metadata: {', '.join(metadata_parts)}" if metadata_parts else "",
-            ]
-            if part
-        )
 
     @staticmethod
     def _interpretation_embedding_text(
@@ -2470,123 +2507,641 @@ class MemoryNodeManager:
         return "episodic", "episodic_dominant"
 
     @classmethod
-    def _normalize_observation_metadata(cls, metadata: Any, source_nodes: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-        metadata = cls._json_dict(metadata)
-        source_nodes = source_nodes or []
-        kind_aliases = {
-            "timeline": "event_cluster",
-            "event_pattern": "pattern",
-        }
-        allowed_kinds = {
-            "pattern", "event_cluster", "state_change", "outcome", "conflict", "context",
-            "preference_signal", "task_signal", "constraint", "goal_signal",
-            "emotion_signal", "relationship_signal",
-        }
-        observation_kind = str(metadata.get("observation_kind") or "context").strip().lower()
-        observation_kind = kind_aliases.get(observation_kind, observation_kind)
-        if observation_kind not in allowed_kinds:
-            observation_kind = cls._infer_observation_kind_from_facts(source_nodes)
-
-        allowed_shapes = {
-            "single_event", "repeated_pattern", "contrast", "progression",
-            "correction", "confirmation",
-        }
-        evidence_shape = str(metadata.get("evidence_shape") or "").strip().lower()
-        if evidence_shape not in allowed_shapes:
-            evidence_shape = cls._infer_evidence_shape_from_facts(source_nodes, observation_kind)
-
-        allowed_scopes = {"momentary", "recent", "ongoing", "historical", "recurring"}
-        temporal_scope = str(metadata.get("temporal_scope") or "").strip().lower()
-        if temporal_scope not in allowed_scopes:
-            temporal_scope = cls._infer_temporal_scope_from_facts(source_nodes, evidence_shape)
-
-        candidate_types = cls._metadata_candidate_types(metadata.get("candidate_interpretation_types"))
-        if not candidate_types:
-            candidate_types = cls._candidate_interpretation_types_for_observation_kind(observation_kind, source_nodes)
-
-        if source_nodes:
-            fact_type_distribution = cls._fact_type_distribution_from_facts(source_nodes)
-        else:
-            fact_type_distribution = cls._metadata_fact_type_distribution(
-                metadata.get("source_fact_type_distribution")
-            )
-        dominant_fact_type, evidence_mixture = cls._fact_type_evidence_summary(fact_type_distribution)
-        if dominant_fact_type == "unknown":
-            metadata_dominant = str(metadata.get("dominant_fact_type") or "").strip().lower()
-            if metadata_dominant in {"semantic", "episodic", "mixed"}:
-                dominant_fact_type = metadata_dominant
-            metadata_mixture = str(metadata.get("evidence_mixture") or "").strip().lower()
-            if metadata_mixture in {
-                "semantic_only", "episodic_only", "semantic_dominant",
-                "episodic_dominant", "balanced_mixed",
-            }:
-                evidence_mixture = metadata_mixture
-
-        return {
-            "observation_kind": observation_kind,
-            "evidence_shape": evidence_shape,
-            "temporal_scope": temporal_scope,
-            "candidate_interpretation_types": candidate_types,
-            "has_conflict": bool(metadata.get("has_conflict", observation_kind == "conflict")),
-            "source_fact_type_distribution": fact_type_distribution,
-            "dominant_fact_type": dominant_fact_type,
-            "evidence_mixture": evidence_mixture,
-            "source_note": str(metadata.get("source_note") or "").strip(),
-        }
-
-    @classmethod
-    def _infer_observation_kind_from_facts(cls, facts: List[Dict[str, Any]]) -> str:
-        fact_kinds = {str(fact.get("fact_kind") or "other").strip().lower() for fact in facts}
-        fact_subjects = {str(fact.get("fact_subject") or "").strip().lower() for fact in facts}
-        if fact_kinds & {"preference", "instruction"}:
-            return "preference_signal" if "preference" in fact_kinds else "constraint"
-        if fact_kinds & {"request", "action", "recommendation"} or any(cls._is_task_event_like_fact(fact) for fact in facts):
-            return "task_signal"
-        if fact_kinds & {"decision"}:
-            return "state_change"
-        if fact_kinds & {"error"}:
-            return "conflict"
-        if fact_subjects & {"user", "assistant"} and any(str(fact.get("fact_type") or "") == "episodic" for fact in facts):
-            return "event_cluster"
+    def _sub_claim_type_for_fact(cls, fact: Dict[str, Any]) -> str:
+        """Map fact evidence semantics to the claim it can directly support."""
+        fact_kind = str(fact.get("fact_kind") or "other").strip().lower()
+        fact_type = cls._normalize_fact_type(fact.get("fact_type", "semantic"))
+        if fact_kind == "instruction":
+            return "constraint"
+        if fact_kind == "preference":
+            return "preference_signal"
+        if fact_kind == "error":
+            return "problem"
+        if fact_kind == "decision":
+            return "decision"
+        if fact_kind == "recommendation":
+            return "strategy"
+        if fact_kind == "request":
+            return "task_state"
+        if fact_kind == "action":
+            if cls._is_task_event_like_fact(fact) or fact_type == "episodic":
+                return "task_progress"
+            return "behavior_pattern"
+        if cls._is_task_event_like_fact(fact):
+            return "task_state"
         return "context"
 
-    @classmethod
-    def _infer_evidence_shape_from_facts(cls, facts: List[Dict[str, Any]], observation_kind: str) -> str:
-        if len(facts) <= 1:
-            return "single_event"
-        fact_kinds = {str(fact.get("fact_kind") or "other").strip().lower() for fact in facts}
-        if observation_kind == "conflict" or "error" in fact_kinds:
-            return "contrast"
-        if "decision" in fact_kinds or any(cls._is_task_event_like_fact(fact) for fact in facts):
-            return "progression"
-        if observation_kind in {"pattern", "preference_signal", "constraint", "goal_signal"}:
-            return "repeated_pattern"
-        return "confirmation"
+    @staticmethod
+    def _sub_claim_observation_kind(sub_claim_type: str) -> str:
+        return {
+            "task_state": "task_signal",
+            "task_progress": "state_change",
+            "decision": "state_change",
+            "preference_signal": "preference_signal",
+            "constraint": "constraint",
+            "problem": "conflict",
+            "strategy": "context",
+            "behavior_pattern": "pattern",
+            "context": "context",
+        }.get(str(sub_claim_type or ""), "context")
 
     @staticmethod
-    def _infer_temporal_scope_from_facts(facts: List[Dict[str, Any]], evidence_shape: str) -> str:
-        fact_types = {str(fact.get("fact_type") or "semantic").strip().lower() for fact in facts}
-        if evidence_shape == "repeated_pattern":
-            return "recurring"
-        if fact_types == {"semantic"}:
-            return "ongoing"
-        if "episodic" in fact_types:
-            return "recent"
-        return "historical"
+    def _sub_claim_candidate_families(sub_claim_type: str) -> List[str]:
+        allowed = SUB_CLAIM_INTERPRETATION_TYPES.get(
+            str(sub_claim_type or "context"),
+            {"insight"},
+        )
+        families: List[str] = []
+        if allowed & {"task", "project_state", "task_risk"}:
+            families.append("task")
+        if allowed & {
+            "explicit_preference",
+            "explicit_instruction",
+            "inferred_preference",
+            "behavior_pattern",
+        }:
+            families.append("preference")
+        if allowed & {"insight", "strategy", "constraint", "conflict_resolution"}:
+            families.append("insight")
+        return families or ["insight"]
+
+    @staticmethod
+    def _sub_claim_allowed_interpretation_types(
+        sub_claim_type: str,
+        evidence_mode: str,
+    ) -> List[str]:
+        allowed = set(SUB_CLAIM_INTERPRETATION_TYPES.get(
+            str(sub_claim_type or "context"),
+            {"insight"},
+        ))
+        if sub_claim_type == "preference_signal":
+            if evidence_mode == "explicit":
+                allowed = {"explicit_preference"}
+            else:
+                allowed = {"inferred_preference"}
+        return sorted(allowed)
 
     @classmethod
-    def _candidate_interpretation_types_for_observation_kind(
+    def _sub_claim_evidence_mode(
         cls,
-        observation_kind: str,
-        facts: List[Dict[str, Any]],
-    ) -> List[str]:
-        fact_kinds = {str(fact.get("fact_kind") or "other").strip().lower() for fact in facts}
-        out: List[str] = ["insight"]
-        if observation_kind in {"task_signal", "state_change", "outcome"} or fact_kinds & {"request", "action", "decision", "recommendation"}:
-            out.append("task")
-        if observation_kind in {"preference_signal", "constraint", "pattern"} or fact_kinds & {"preference", "instruction"}:
-            out.append("preference")
-        return out
+        sub_claim_type: str,
+        source_nodes: List[Dict[str, Any]],
+    ) -> str:
+        kinds = {
+            str(node.get("fact_kind") or "other").strip().lower()
+            for node in source_nodes
+        }
+        fact_types = {
+            cls._normalize_fact_type(node.get("fact_type", "semantic"))
+            for node in source_nodes
+        }
+        if sub_claim_type == "constraint" and "instruction" in kinds:
+            return "explicit"
+        if (
+            sub_claim_type == "preference_signal"
+            and "preference" in kinds
+            and "semantic" in fact_types
+        ):
+            return "explicit"
+        if sub_claim_type == "behavior_pattern" or (
+            sub_claim_type == "preference_signal"
+            and len(source_nodes) >= 2
+            and fact_types == {"episodic"}
+        ):
+            return "behavioral"
+        if len(source_nodes) >= 2:
+            return "aggregated"
+        if fact_types == {"episodic"}:
+            return "episodic"
+        return "semantic"
+
+    def _cluster_observation_facts_into_sub_claims(
+        self,
+        source_nodes: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Build typed semantic fact clusters inside one observation."""
+        facts = [
+            dict(node)
+            for node in source_nodes
+            if self._node_id(node) is not None
+            and str(node.get("summary") or "").strip()
+        ]
+        if not facts:
+            return []
+        fact_ids = [int(self._node_id(fact)) for fact in facts]
+        embeddings = self._db.memory_node_embeddings(fact_ids)
+        clusters: List[Dict[str, Any]] = []
+        for fact in facts:
+            node_id = int(self._node_id(fact))
+            sub_claim_type = self._sub_claim_type_for_fact(fact)
+            fact_embedding = embeddings.get(node_id)
+            best_cluster = None
+            best_similarity = -1.0
+            for cluster in clusters:
+                if cluster["sub_claim_type"] != sub_claim_type:
+                    continue
+                similarity = self._embedding_similarity(
+                    fact_embedding,
+                    cluster.get("centroid"),
+                )
+                if similarity > best_similarity:
+                    best_cluster = cluster
+                    best_similarity = similarity
+            if (
+                best_cluster is None
+                or best_similarity < SUB_CLAIM_EMBEDDING_SIMILARITY_THRESHOLD
+            ):
+                vector = self._as_embedding_vector(fact_embedding)
+                clusters.append({
+                    "sub_claim_type": sub_claim_type,
+                    "source_nodes": [fact],
+                    "vectors": [vector] if vector is not None else [],
+                    "centroid": vector,
+                })
+                continue
+            best_cluster["source_nodes"].append(fact)
+            vector = self._as_embedding_vector(fact_embedding)
+            if vector is not None:
+                best_cluster["vectors"].append(vector)
+                centroid = np.mean(
+                    np.stack(best_cluster["vectors"]),
+                    axis=0,
+                )
+                best_cluster["centroid"] = self._as_embedding_vector(centroid)
+
+        sub_claims: List[Dict[str, Any]] = []
+        for cluster in clusters:
+            cluster_facts = cluster["source_nodes"]
+            centroid = cluster.get("centroid")
+            representative = max(
+                cluster_facts,
+                key=lambda fact: (
+                    self._embedding_similarity(
+                        embeddings.get(int(self._node_id(fact))),
+                        centroid,
+                    ),
+                    len(str(fact.get("summary") or "")),
+                ),
+            )
+            sub_claim_type = cluster["sub_claim_type"]
+            evidence_mode = self._sub_claim_evidence_mode(
+                sub_claim_type,
+                cluster_facts,
+            )
+            fact_type_distribution = self._fact_type_distribution_from_facts(
+                cluster_facts
+            )
+            fact_kind_distribution: Dict[str, int] = {}
+            for fact in cluster_facts:
+                fact_kind = str(
+                    fact.get("fact_kind") or "other"
+                ).strip().lower()
+                fact_kind_distribution[fact_kind] = (
+                    fact_kind_distribution.get(fact_kind, 0) + 1
+                )
+            pair_similarities = [
+                self._embedding_similarity(
+                    embeddings.get(int(self._node_id(left))),
+                    embeddings.get(int(self._node_id(right))),
+                )
+                for index, left in enumerate(cluster_facts)
+                for right in cluster_facts[index + 1:]
+            ]
+            semantic_cohesion = (
+                sum(pair_similarities) / len(pair_similarities)
+                if pair_similarities
+                else 1.0
+            )
+            confidence = min(
+                0.95,
+                0.55
+                + min(0.20, 0.06 * len(cluster_facts))
+                + max(0.0, semantic_cohesion) * 0.15,
+            )
+            allowed_interpretation_types = (
+                self._sub_claim_allowed_interpretation_types(
+                    sub_claim_type,
+                    evidence_mode,
+                )
+            )
+            claim_text = str(representative.get("summary") or "").strip()
+            sub_claims.append({
+                "sub_claim_type": sub_claim_type,
+                "claim_text": claim_text,
+                "evidence_mode": evidence_mode,
+                "confidence": confidence,
+                "source_node_ids": [
+                    int(self._node_id(fact)) for fact in cluster_facts
+                ],
+                "embedding": centroid,
+                "embedding_text": "\n".join([
+                    f"Sub-claim type: {sub_claim_type}",
+                    f"Claim: {claim_text}",
+                ]),
+                "metadata": {
+                    "source": "observation_fact_sub_clustering",
+                    "allowed_interpretation_types": allowed_interpretation_types,
+                    "candidate_interpretation_types": (
+                        self._sub_claim_candidate_families(sub_claim_type)
+                    ),
+                    "fact_type_distribution": fact_type_distribution,
+                    "fact_kind_distribution": fact_kind_distribution,
+                    "semantic_cohesion": round(semantic_cohesion, 4),
+                    "source_count": len(cluster_facts),
+                },
+            })
+        return sub_claims
+
+    @staticmethod
+    def _sub_claim_fact_payload(source_nodes: List[Dict[str, Any]]) -> str:
+        return json.dumps(
+            [
+                {
+                    "fact_id": node.get("id", node.get("node_id")),
+                    "fact_type": node.get("fact_type", "semantic"),
+                    "fact_kind": node.get("fact_kind", "other"),
+                    "fact_text": str(node.get("summary") or "").strip(),
+                    "timestamp": node.get("time_key"),
+                }
+                for node in source_nodes
+                if str(node.get("summary") or "").strip()
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    def _generate_sub_claim_using_llm(
+        self,
+        *,
+        observation: Dict[str, Any],
+        sub_claim_type: str,
+        source_nodes: List[Dict[str, Any]],
+        existing_sub_claim: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Create or incrementally revise one stable sub-claim."""
+        if not source_nodes:
+            return None
+        if existing_sub_claim:
+            prompt = SUB_CLAIM_UPDATE_PROMPT.format(
+                sub_claim_type=sub_claim_type,
+                existing_sub_claim=json.dumps(
+                    {
+                        "sub_claim_id": existing_sub_claim.get("id"),
+                        "sub_claim_type": sub_claim_type,
+                        "claim_text": existing_sub_claim.get("claim_text", ""),
+                        "confidence": existing_sub_claim.get("confidence", 0.5),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                new_facts=self._sub_claim_fact_payload(source_nodes),
+            )
+        else:
+            prompt = SUB_CLAIM_CREATE_PROMPT.format(
+                requested_sub_claim_type=sub_claim_type,
+                observation_context=json.dumps(
+                    {
+                        "observation_id": observation.get("id"),
+                        "entity": observation.get("entity_name", ""),
+                        "topic": observation.get("topic_label")
+                        or observation.get("topic_key", ""),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                source_facts=self._sub_claim_fact_payload(source_nodes),
+            )
+        data = self._json_object_from_llm_text(self._call_llm(prompt) or "")
+        if not data:
+            return None
+        returned_type = str(
+            data.get("sub_claim_type") or sub_claim_type
+        ).strip().lower()
+        claim_text = str(data.get("claim_text") or "").strip()
+        if returned_type != sub_claim_type or not claim_text:
+            return None
+        try:
+            confidence = float(data.get("confidence", 0.7) or 0.7)
+        except (TypeError, ValueError):
+            confidence = 0.7
+        return {
+            "claim_text": claim_text,
+            "confidence": max(0.0, min(1.0, confidence)),
+            "change_summary": str(data.get("change_summary") or "").strip(),
+        }
+
+    @staticmethod
+    def _fallback_sub_claim_text(
+        source_nodes: List[Dict[str, Any]],
+        *,
+        existing_text: str = "",
+    ) -> str:
+        summaries = list(dict.fromkeys(
+            str(node.get("summary") or "").strip()
+            for node in source_nodes
+            if str(node.get("summary") or "").strip()
+        ))
+        existing = str(existing_text or "").strip()
+        if existing:
+            additions = [summary for summary in summaries if summary not in existing]
+            return "；".join([existing, *additions[:2]])
+        return max(summaries, key=len) if summaries else ""
+
+    def _sub_claim_record_from_sources(
+        self,
+        *,
+        sub_claim_type: str,
+        claim_text: str,
+        source_nodes: List[Dict[str, Any]],
+        confidence: float,
+        previous_metadata: Optional[Dict[str, Any]] = None,
+        change_summary: str = "",
+    ) -> Dict[str, Any]:
+        evidence_mode = self._sub_claim_evidence_mode(
+            sub_claim_type,
+            source_nodes,
+        )
+        metadata = dict(previous_metadata or {})
+        metadata.update({
+            "source": "observation_fact_incremental_sub_claim",
+            "allowed_interpretation_types": (
+                self._sub_claim_allowed_interpretation_types(
+                    sub_claim_type,
+                    evidence_mode,
+                )
+            ),
+            "candidate_interpretation_types": (
+                self._sub_claim_candidate_families(sub_claim_type)
+            ),
+            "fact_type_distribution": (
+                self._fact_type_distribution_from_facts(source_nodes)
+            ),
+            "fact_kind_distribution": dict(Counter(
+                str(node.get("fact_kind") or "other").strip().lower()
+                for node in source_nodes
+            )),
+            "source_count": len(source_nodes),
+            "revision": int(metadata.get("revision") or 0) + 1,
+        })
+        if change_summary:
+            metadata["last_change_summary"] = change_summary
+        embedding_text = "\n".join([
+            f"Sub-claim type: {sub_claim_type}",
+            f"Claim: {claim_text}",
+        ])
+        return {
+            "sub_claim_type": sub_claim_type,
+            "claim_text": claim_text,
+            "evidence_mode": evidence_mode,
+            "confidence": confidence,
+            "source_node_ids": [
+                int(self._node_id(node))
+                for node in source_nodes
+                if self._node_id(node) is not None
+            ],
+            "embedding": self._embed_memory_layer_text(embedding_text),
+            "embedding_text": embedding_text,
+            "metadata": metadata,
+        }
+
+    def _refresh_observation_summary_from_sub_claims(
+        self,
+        observation: Dict[str, Any],
+        sub_claims: List[Dict[str, Any]],
+    ) -> None:
+        """Derive observation text without another LLM summarization call."""
+        type_order = {
+            "task_state": 0,
+            "task_progress": 1,
+            "decision": 2,
+            "constraint": 3,
+            "problem": 4,
+            "strategy": 5,
+            "preference_signal": 6,
+            "behavior_pattern": 7,
+            "context": 8,
+        }
+        ordered = sorted(
+            (
+                item for item in sub_claims
+                if str(item.get("claim_text") or "").strip()
+            ),
+            key=lambda item: (
+                type_order.get(str(item.get("sub_claim_type") or ""), 99),
+                str(item.get("updated_at") or ""),
+                int(item.get("id") or 0),
+            ),
+        )
+        summary = "\n".join(
+            str(item.get("claim_text") or "").strip()
+            for item in ordered
+        )
+        if not summary:
+            return
+        self._db.memory_update_observation_summary(
+            int(observation["id"]),
+            summary=summary,
+            embedding=self._embed_memory_layer_text(summary),
+            embedding_text=summary,
+        )
+
+    def _update_sub_claims_for_observations(
+        self,
+        observation_ids: List[int],
+    ) -> List[int]:
+        """Incrementally match new facts to stable sub-claims."""
+        if not self._db:
+            return []
+        clean_ids = list(dict.fromkeys(
+            int(observation_id)
+            for observation_id in observation_ids
+            if observation_id is not None
+        ))
+        observations = {
+            int(item["id"]): item
+            for item in self._db.get_observations_by_ids(clean_ids)
+        }
+        supporting_nodes = self._db.get_observation_supporting_nodes(
+            clean_ids,
+            per_observation=1000,
+        )
+        existing_by_observation: Dict[int, List[Dict[str, Any]]] = {}
+        for sub_claim in self._db.get_sub_claims_for_observations(clean_ids):
+            existing_by_observation.setdefault(
+                int(sub_claim["observation_id"]),
+                [],
+            ).append(sub_claim)
+
+        touched_sub_claim_ids: List[int] = []
+        for observation_id in clean_ids:
+            observation_touched_ids: List[int] = []
+            observation = observations.get(observation_id)
+            if not observation:
+                continue
+            all_facts = supporting_nodes.get(observation_id, [])
+            existing_sub_claims = existing_by_observation.get(
+                observation_id,
+                [],
+            )
+            assigned_fact_ids = {
+                int(node_id)
+                for sub_claim in existing_sub_claims
+                for node_id in sub_claim.get("source_node_ids", [])
+            }
+            new_facts = [
+                fact for fact in all_facts
+                if (
+                    self._node_id(fact) is not None
+                    and int(self._node_id(fact)) not in assigned_fact_ids
+                )
+            ]
+            fact_embeddings = self._db.memory_node_embeddings([
+                int(self._node_id(fact))
+                for fact in new_facts
+                if self._node_id(fact) is not None
+            ])
+            matched: Dict[int, List[Dict[str, Any]]] = {}
+            unmatched: List[Dict[str, Any]] = []
+            for fact in new_facts:
+                fact_id = int(self._node_id(fact))
+                fact_type = self._sub_claim_type_for_fact(fact)
+                candidates = [
+                    sub_claim
+                    for sub_claim in existing_sub_claims
+                    if sub_claim.get("sub_claim_type") == fact_type
+                ]
+                scored = [
+                    (
+                        self._embedding_similarity(
+                            fact_embeddings.get(fact_id),
+                            sub_claim.get("embedding"),
+                        ),
+                        sub_claim,
+                    )
+                    for sub_claim in candidates
+                ]
+                scored.sort(key=lambda item: item[0], reverse=True)
+                if (
+                    scored
+                    and scored[0][0] >= SUB_CLAIM_MATCH_SIMILARITY_THRESHOLD
+                ):
+                    matched.setdefault(int(scored[0][1]["id"]), []).append(fact)
+                else:
+                    unmatched.append(fact)
+
+            by_id = {
+                int(sub_claim["id"]): sub_claim
+                for sub_claim in existing_sub_claims
+            }
+            for sub_claim_id, added_facts in matched.items():
+                existing = by_id[sub_claim_id]
+                historical_facts = self._db.memory_nodes_by_ids(
+                    existing.get("source_node_ids", [])
+                )
+                combined_facts = historical_facts + added_facts
+                generated = self._generate_sub_claim_using_llm(
+                    observation=observation,
+                    sub_claim_type=str(existing["sub_claim_type"]),
+                    source_nodes=added_facts,
+                    existing_sub_claim=existing,
+                )
+                claim_text = (
+                    generated["claim_text"]
+                    if generated
+                    else self._fallback_sub_claim_text(
+                        added_facts,
+                        existing_text=str(existing.get("claim_text") or ""),
+                    )
+                )
+                record = self._sub_claim_record_from_sources(
+                    sub_claim_type=str(existing["sub_claim_type"]),
+                    claim_text=claim_text,
+                    source_nodes=combined_facts,
+                    confidence=(
+                        generated["confidence"]
+                        if generated
+                        else float(existing.get("confidence") or 0.5)
+                    ),
+                    previous_metadata=self._json_dict(
+                        existing.get("metadata", {})
+                    ),
+                    change_summary=(
+                        generated.get("change_summary", "")
+                        if generated
+                        else "deterministic fallback after LLM failure"
+                    ),
+                )
+                self._db.memory_update_sub_claim(
+                    sub_claim_id,
+                    claim_text=record["claim_text"],
+                    evidence_mode=record["evidence_mode"],
+                    confidence=record["confidence"],
+                    source_node_ids=record["source_node_ids"],
+                    embedding=record["embedding"],
+                    embedding_text=record["embedding_text"],
+                    metadata=record["metadata"],
+                )
+                touched_sub_claim_ids.append(sub_claim_id)
+                observation_touched_ids.append(sub_claim_id)
+
+            for candidate in self._cluster_observation_facts_into_sub_claims(
+                unmatched
+            ):
+                candidate_facts = self._db.memory_nodes_by_ids(
+                    candidate["source_node_ids"]
+                )
+                generated = self._generate_sub_claim_using_llm(
+                    observation=observation,
+                    sub_claim_type=str(candidate["sub_claim_type"]),
+                    source_nodes=candidate_facts,
+                )
+                claim_text = (
+                    generated["claim_text"]
+                    if generated
+                    else self._fallback_sub_claim_text(candidate_facts)
+                )
+                record = self._sub_claim_record_from_sources(
+                    sub_claim_type=str(candidate["sub_claim_type"]),
+                    claim_text=claim_text,
+                    source_nodes=candidate_facts,
+                    confidence=(
+                        generated["confidence"]
+                        if generated
+                        else float(candidate.get("confidence") or 0.5)
+                    ),
+                    change_summary=(
+                        generated.get("change_summary", "")
+                        if generated
+                        else "deterministic fallback after LLM failure"
+                    ),
+                )
+                sub_claim_id = self._db.memory_create_sub_claim(
+                    observation_id,
+                    record,
+                )
+                if sub_claim_id is not None:
+                    touched_sub_claim_ids.append(sub_claim_id)
+                    observation_touched_ids.append(sub_claim_id)
+
+            current_sub_claims = self._db.get_sub_claims_for_observations(
+                [observation_id]
+            )
+            self._refresh_observation_summary_from_sub_claims(
+                observation,
+                current_sub_claims,
+            )
+            self._log_info(
+                "memory_reflect",
+                "observation_sub_claims_incrementally_updated",
+                {
+                    "observation_id": observation_id,
+                    "new_fact_ids": [
+                        int(self._node_id(fact)) for fact in new_facts
+                    ],
+                    "touched_sub_claim_ids": observation_touched_ids,
+                },
+            )
+        return list(dict.fromkeys(touched_sub_claim_ids))
 
     @staticmethod
     def _is_task_event_like_fact(fact: Dict[str, Any]) -> bool:
@@ -2756,7 +3311,7 @@ class MemoryNodeManager:
         metadata = data.get("metadata", {})
         if not isinstance(metadata, dict):
             metadata = {}
-        metadata = self._normalize_observation_metadata(metadata, source_nodes)
+        metadata = self._json_dict(metadata)
         keywords = self._normalize_keywords(data.get("keywords", []))
         try:
             confidence = float(data.get("confidence", 0.7) or 0.7)
@@ -2768,6 +3323,45 @@ class MemoryNodeManager:
             "keywords": keywords,
             "confidence": max(0.0, min(1.0, confidence)),
             "metadata": metadata,
+        }
+
+    def _build_observation_container_from_facts(
+        self,
+        *,
+        source_nodes: List[Dict[str, Any]],
+        existing_observation: Optional[Dict[str, Any]] = None,
+        related_observations: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Build structural fields; sub-claims exclusively own the summary."""
+        summary = str(
+            (existing_observation or {}).get("summary") or ""
+        ).strip()
+
+        keywords: List[str] = []
+        for item in [existing_observation, *(related_observations or [])]:
+            if not item:
+                continue
+            keywords.extend(
+                self._normalize_keywords(
+                    str(item.get("keywords") or "").split()
+                )
+            )
+        for node in source_nodes:
+            keywords.extend(self._normalize_keywords(node.get("keywords", [])))
+        keywords = list(dict.fromkeys(keywords))
+        return {
+            "summary": summary,
+            "observation_type": "observation",
+            "keywords": keywords,
+            "confidence": max(
+                [float((existing_observation or {}).get("confidence") or 0.0)]
+                + [
+                    float(item.get("confidence") or 0.0)
+                    for item in related_observations or []
+                ]
+                + [0.7]
+            ),
+            "metadata": {},
         }
 
     @staticmethod
@@ -2849,6 +3443,29 @@ class MemoryNodeManager:
         ).strip().lower().replace("-", "_").replace(" ", "_")
         if interpretation_type not in allowed_types:
             interpretation_type = "behavior_pattern"
+        allowed_sub_claim_types = {
+            str(value).strip().lower()
+            for value in metadata.get("allowed_interpretation_types", [])
+            if str(value or "").strip()
+        }
+        if (
+            allowed_sub_claim_types
+            and interpretation_type not in allowed_sub_claim_types
+        ):
+            self._log_info(
+                "memory_reflect",
+                "interpretation_generation_rejected",
+                {
+                    "sub_claim_id": observation.get("_sub_claim_id"),
+                    "sub_claim_type": metadata.get("sub_claim_type"),
+                    "interpretation_type": interpretation_type,
+                    "reason": "sub_claim_type_gate",
+                    "allowed_interpretation_types": sorted(
+                        allowed_sub_claim_types
+                    ),
+                },
+            )
+            return None
         status = str(data.get("status") or "current").strip().lower()
         if status not in {"current", "conflicted"}:
             status = "current"
@@ -3015,6 +3632,19 @@ class MemoryNodeManager:
         ).strip().lower().replace("-", "_").replace(" ", "_")
         if interpretation_type not in allowed_types:
             interpretation_type = existing_type if existing_type in allowed_types else "insight"
+        allowed_sub_claim_types = {
+            str(value).strip().lower()
+            for value in observation_metadata.get(
+                "allowed_interpretation_types",
+                [],
+            )
+            if str(value or "").strip()
+        }
+        if (
+            allowed_sub_claim_types
+            and interpretation_type not in allowed_sub_claim_types
+        ):
+            return None
 
         claim = str(data.get("claim") or interpretation.get("claim") or "").strip()
         action_implication = str(
@@ -3122,7 +3752,7 @@ class MemoryNodeManager:
         source_nodes: List[Dict[str, Any]],
         interpretation_family: str,
     ) -> Tuple[bool, str]:
-        metadata = cls._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
+        metadata = cls._json_dict(observation.get("metadata", {}))
         observation_kind = str(metadata.get("observation_kind") or "context").strip().lower()
         evidence_shape = str(metadata.get("evidence_shape") or "single_event").strip().lower()
         temporal_scope = str(metadata.get("temporal_scope") or "recent").strip().lower()
@@ -3178,7 +3808,7 @@ class MemoryNodeManager:
         observation: Dict[str, Any],
         source_nodes: List[Dict[str, Any]],
     ) -> List[str]:
-        metadata = cls._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
+        metadata = cls._json_dict(observation.get("metadata", {}))
         families = cls._metadata_candidate_types(metadata.get("candidate_interpretation_types"))
         if not families:
             families = cls._candidate_interpretation_types_for_observation_kind(
@@ -3189,7 +3819,7 @@ class MemoryNodeManager:
 
     @classmethod
     def _observation_family(cls, observation: Dict[str, Any], source_nodes: List[Dict[str, Any]]) -> str:
-        metadata = cls._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
+        metadata = cls._json_dict(observation.get("metadata", {}))
         observation_kind = str(metadata.get("observation_kind") or "").strip().lower()
         candidate_families = cls._candidate_interpretation_families(observation, source_nodes)
         source_kinds = {
@@ -3407,12 +4037,43 @@ class MemoryNodeManager:
     ) -> Tuple[float, str]:
         metadata = self._json_dict(interpretation.get("metadata", {}))
         evidence_observation_ids = interpretation.get("evidence_observation_ids", [])
-        if int(observation_id) in evidence_observation_ids or metadata.get("observation_id") == int(observation_id):
+        sub_claim_id = observation.get("_sub_claim_id")
+        linked_sub_claim_ids = {
+            int(value)
+            for value in metadata.get("sub_claim_ids", [])
+            if str(value).isdigit()
+        }
+        if sub_claim_id is not None and int(sub_claim_id) in linked_sub_claim_ids:
+            return 1.0, "existing_sub_claim_evidence"
+        if (
+            sub_claim_id is None
+            and (
+                int(observation_id) in evidence_observation_ids
+                or metadata.get("observation_id") == int(observation_id)
+            )
+        ):
             return 1.0, "existing_observation_evidence"
 
         score = 0.0
         reasons: List[str] = []
-        observation_metadata = self._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
+        observation_metadata = self._json_dict(observation.get("metadata", {}))
+        raw_observation_metadata = self._json_dict(observation.get("metadata", {}))
+        allowed_interpretation_types = {
+            str(value).strip().lower()
+            for value in raw_observation_metadata.get(
+                "allowed_interpretation_types",
+                [],
+            )
+            if str(value or "").strip()
+        }
+        interpretation_type = str(
+            interpretation.get("interpretation_type") or ""
+        ).strip().lower()
+        if (
+            allowed_interpretation_types
+            and interpretation_type not in allowed_interpretation_types
+        ):
+            return 0.0, "sub_claim_type_gate"
         candidate_families = self._candidate_interpretation_families(observation, source_nodes)
         observation_family = self._observation_family(observation, source_nodes)
         interpretation_family = self._interpretation_family(interpretation.get("interpretation_type"))
@@ -3488,8 +4149,18 @@ class MemoryNodeManager:
         candidates: List[Dict[str, Any]] = []
         seen: set[int] = set()
 
+        sub_claim_id = observation.get("_sub_claim_id")
         try:
-            existing = self._db.get_interpretations_for_observation(int(observation_id), limit=10)
+            if sub_claim_id is not None:
+                existing = self._db.get_interpretations_for_sub_claim(
+                    int(sub_claim_id),
+                    limit=10,
+                )
+            else:
+                existing = self._db.get_interpretations_for_observation(
+                    int(observation_id),
+                    limit=10,
+                )
         except Exception:
             existing = []
         for item in existing:
@@ -3539,7 +4210,7 @@ class MemoryNodeManager:
         source_nodes: List[Dict[str, Any]],
     ) -> str:
         """Hash the observation fields that matter for interpretation decisions."""
-        normalized_metadata = cls._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
+        normalized_metadata = cls._json_dict(observation.get("metadata", {}))
         source_node_ids = []
         for node in source_nodes:
             node_id = node.get("id", node.get("node_id"))
@@ -3587,9 +4258,9 @@ class MemoryNodeManager:
             and str(metadata.get("interpretation_basis_hash") or "") == basis_hash
         )
 
-    def _update_observation_interpretation_state(
+    def _update_sub_claim_interpretation_state(
         self,
-        observation: Dict[str, Any],
+        sub_claim: Dict[str, Any],
         *,
         status: str,
         basis_hash: str,
@@ -3597,9 +4268,9 @@ class MemoryNodeManager:
         interpretation_id: Optional[int] = None,
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
-        if not self._db or not observation.get("id"):
+        if not self._db or not sub_claim.get("id"):
             return
-        metadata = self._json_dict(observation.get("metadata", {}))
+        metadata = self._json_dict(sub_claim.get("metadata", {}))
         status = status if status in {"pending", "deferred", "linked", "generated", "ignored"} else "pending"
         metadata.update({
             "interpretation_status": status,
@@ -3622,19 +4293,22 @@ class MemoryNodeManager:
         if extra:
             metadata.update(extra)
         try:
-            self._db.memory_update_observation_metadata(int(observation["id"]), metadata)
+            self._db.memory_update_sub_claim_metadata(
+                int(sub_claim["id"]),
+                metadata,
+            )
         except AttributeError:
             self._log_info(
                 "memory_reflect",
                 "interpretation_state_update_unsupported", 
                 {
-                    "observation_id": observation.get("id"),
+                    "sub_claim_id": sub_claim.get("id"),
                     "status": status,
                     "reason": reason,
                 }
             )
             return
-        observation["metadata"] = metadata
+        sub_claim["metadata"] = metadata
 
     @classmethod
     def _interpretation_generation_trigger_priority(
@@ -3643,7 +4317,7 @@ class MemoryNodeManager:
         source_nodes: List[Dict[str, Any]],
         family: str,
     ) -> Tuple[str, str]:
-        metadata = cls._normalize_observation_metadata(observation.get("metadata", {}), source_nodes)
+        metadata = cls._json_dict(observation.get("metadata", {}))
         observation_kind = str(metadata.get("observation_kind") or "context")
         evidence_shape = str(metadata.get("evidence_shape") or "single_event")
         temporal_scope = str(metadata.get("temporal_scope") or "recent")
@@ -3679,87 +4353,87 @@ class MemoryNodeManager:
             return "medium", "mixed_fact_type_evidence"
         return "low", "ordinary_insight"
 
-    def _get_similar_deferred_observation(
+    def _get_similar_deferred_sub_claims(
         self,
         item: Dict[str, Any],
-        supporting_facts_from_observation: Dict[int, List[Dict[str, Any]]],
-        seen_observation_ids: set[int],
+        seen_sub_claim_ids: set[int],
     ) -> List[Dict[str, Any]]:
         if not self._db:
             return []
-        observation = item["observation"]
-        query = " ".join(
-            str(part or "").strip()
-            for part in [
-                observation.get("summary"),
-                observation.get("keywords"),
-                observation.get("topic_label"),
-                observation.get("topic_key"),
-            ]
-            if str(part or "").strip()
-        )
+        semantic_sub_claim = item["sub_claim"]
         try:
-            candidates = self._db.search_memory_observations(
-                query,
-                entities=[observation.get("entity_name")] if observation.get("entity_name") else [],
-                entity_ids=[int(observation["entity_id"])] if observation.get("entity_id") is not None else None,
-                top_k=8,
+            candidates = self._db.get_deferred_sub_claims_for_interpretation(
+                entity_id=semantic_sub_claim.get("entity_id"),
+                exclude_sub_claim_ids=list(seen_sub_claim_ids),
+                limit=16,
             )
         except Exception:
             return []
 
         deferred_items: List[Dict[str, Any]] = []
-        missing_support_ids: List[int] = []
+        scored_candidates: List[Tuple[float, Dict[str, Any]]] = []
         for candidate in candidates:
             try:
                 candidate_id = int(candidate["id"])
             except (TypeError, ValueError, KeyError):
                 continue
-            if candidate_id in seen_observation_ids:
+            if candidate_id in seen_sub_claim_ids:
                 continue
-            metadata = self._json_dict(candidate.get("metadata", {}))
-            if self._interpretation_state(metadata) != "deferred":
-                continue
-            missing_support_ids.append(candidate_id)
-            candidate["metadata"] = metadata
-
-        if missing_support_ids:
-            try:
-                fetched_support = self._db.get_observation_supporting_nodes(
-                    missing_support_ids,
-                    per_observation=12,
-                )
-                supporting_facts_from_observation.update(fetched_support)
-            except Exception:
-                pass
-
-        for candidate in candidates:
-            try:
-                candidate_id = int(candidate["id"])
-            except (TypeError, ValueError, KeyError):
-                continue
-            if candidate_id in seen_observation_ids:
-                continue
-            metadata = self._json_dict(candidate.get("metadata", {}))
-            if self._interpretation_state(metadata) != "deferred":
-                continue
-            source_nodes = supporting_facts_from_observation.get(candidate_id, [])
-            family = self._observation_interpretation_cluster_family(candidate, source_nodes)
+            candidate_semantic_sub_claim = self._build_semantic_sub_claim(
+                candidate
+            )
+            source_nodes = self._db.memory_nodes_by_ids(
+                candidate.get("source_node_ids", [])
+            )
+            family = self._observation_interpretation_cluster_family(
+                candidate_semantic_sub_claim,
+                source_nodes,
+            )
             if family != item.get("family"):
                 continue
-            basis_hash = self._interpretation_basis_hash(candidate, source_nodes)
+            if str(candidate.get("sub_claim_type") or "") != str(
+                semantic_sub_claim.get("sub_claim_type") or ""
+            ):
+                continue
+            similarity = self._embedding_similarity(
+                semantic_sub_claim.get("embedding"),
+                candidate_semantic_sub_claim.get("embedding"),
+            )
+            if similarity < SUB_CLAIM_EMBEDDING_SIMILARITY_THRESHOLD:
+                continue
+            scored_candidates.append((similarity, {
+                "candidate": candidate,
+                "sub_claim": candidate_semantic_sub_claim,
+                "source_nodes": source_nodes,
+                "family": family,
+            }))
+
+        scored_candidates.sort(key=lambda entry: entry[0], reverse=True)
+        for similarity, entry in scored_candidates[:8]:
+            candidate = entry["candidate"]
+            candidate_id = int(candidate["id"])
+            semantic_candidate = entry["sub_claim"]
+            source_nodes = entry["source_nodes"]
+            metadata = self._json_dict(semantic_candidate.get("metadata", {}))
+            basis_hash = self._interpretation_basis_hash(
+                semantic_candidate,
+                source_nodes,
+            )
             if str(metadata.get("interpretation_basis_hash") or "") != basis_hash:
                 continue
-            seen_observation_ids.add(candidate_id)
+            seen_sub_claim_ids.add(candidate_id)
             deferred_items.append({
-                "observation": candidate,
-                "observation_id": candidate_id,
+                "sub_claim": semantic_candidate,
+                "sub_claim_id": candidate_id,
+                "observation_id": int(candidate["observation_id"]),
                 "source_nodes": source_nodes,
                 "source_node_ids": [int(node["id"]) for node in source_nodes if node.get("id") is not None],
                 "basis_hash": basis_hash,
-                "family": family,
+                "family": entry["family"],
                 "priority": "deferred",
-                "priority_reason": "previously_deferred",
+                "priority_reason": (
+                    f"previously_deferred_similarity_{similarity:.3f}"
+                ),
                 "is_deferred_context": True,
             })
         return deferred_items
@@ -3804,7 +4478,11 @@ class MemoryNodeManager:
                 }
             )
             return None
-        if not allow_content_update and reason != "existing_observation_evidence":
+        existing_evidence_reasons = {
+            "existing_observation_evidence",
+            "existing_sub_claim_evidence",
+        }
+        if not allow_content_update and reason not in existing_evidence_reasons:
             self._log_info(
                 "memory_reflect",
                 "interpretation_link_deferred", 
@@ -3828,7 +4506,7 @@ class MemoryNodeManager:
         metadata = self._json_dict(best.get("metadata", {}))
         updated_interpretation = None
         content_update_attempted = False
-        if allow_content_update and reason != "existing_observation_evidence":
+        if allow_content_update and reason not in existing_evidence_reasons:
             content_update_attempted = True
             updated_interpretation = self._update_existing_interpretation_from_observation(
                 interpretation=best,
@@ -3858,6 +4536,15 @@ class MemoryNodeManager:
             "linker_version": 1,
             "content_updated": bool(updated_interpretation),
         }
+        if observation.get("_sub_claim_id") is not None:
+            metadata["sub_claim_ids"] = list(dict.fromkeys([
+                *[
+                    int(value)
+                    for value in metadata.get("sub_claim_ids", [])
+                    if str(value).isdigit()
+                ],
+                int(observation["_sub_claim_id"]),
+            ]))
         claim = (updated_interpretation or {}).get("claim", best.get("claim", ""))
         target_text = (updated_interpretation or {}).get("target_text", best.get("target_text", ""))
         scope = (updated_interpretation or {}).get("scope", best.get("scope", "general"))
@@ -3908,6 +4595,12 @@ class MemoryNodeManager:
             embedding_text=embedding_text,
             metadata=metadata,
         )
+        if observation.get("_sub_claim_id") is not None:
+            self._db.memory_link_interpretation_sub_claim(
+                interpretation_id,
+                int(observation["_sub_claim_id"]),
+                confidence=float(best_score),
+            )
         self._log_info(
             "memory_reflect",
             "interpretation_linked", 
@@ -3955,18 +4648,30 @@ class MemoryNodeManager:
         self,
         items: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        buckets: Dict[Tuple[str, Any, str], Dict[str, Any]] = {}
+        buckets: Dict[Tuple[str, Any, str, str], Dict[str, Any]] = {}
         for item in items:
-            observation = item["observation"]
+            observation = item["sub_claim"]
             source_nodes = item.get("source_nodes", [])
             family = self._observation_interpretation_cluster_family(observation, source_nodes)
             topic_key = self._topic_key(observation.get("topic_key") or observation.get("topic_label") or "general")
             cluster_topic = "task-chain" if family == "task" else (topic_key or "general")
-            key = (family, observation.get("entity_id"), cluster_topic)
+            sub_claim_type = str(
+                self._json_dict(observation.get("metadata", {})).get(
+                    "sub_claim_type"
+                )
+                or "legacy_observation"
+            )
+            key = (
+                family,
+                observation.get("entity_id"),
+                cluster_topic,
+                sub_claim_type,
+            )
             bucket = buckets.setdefault(key, {
                 "family": family,
                 "entity_id": observation.get("entity_id"),
                 "topic_key": cluster_topic,
+                "sub_claim_type": sub_claim_type,
                 "items": [],
             })
             bucket["items"].append(item)
@@ -4008,11 +4713,16 @@ class MemoryNodeManager:
             for item in items
             if item.get("observation_id") is not None
         ]
+        sub_claim_ids = list(dict.fromkeys(
+            int(item["sub_claim"]["_sub_claim_id"])
+            for item in items
+            if item.get("sub_claim", {}).get("_sub_claim_id") is not None
+        ))
         if not observation_ids:
             return None
 
         if len(items) == 1:
-            observation = items[0]["observation"]
+            observation = items[0]["sub_claim"]
             should_generate, reason = self._should_generate_interpretation_for_observation(
                 observation,
                 all_source_nodes,
@@ -4039,14 +4749,13 @@ class MemoryNodeManager:
         else:
             summaries = []
             for index, item in enumerate(items, 1):
-                observation = item["observation"]
+                observation = item["sub_claim"]
                 summary = str(observation.get("summary") or "").strip()
                 if summary:
                     summaries.append(f"{index}. id={item['observation_id']} {summary}")
-            representative = dict(items[0]["observation"])
-            representative_metadata = self._normalize_observation_metadata(
-                representative.get("metadata", {}),
-                all_source_nodes,
+            representative = dict(items[0]["sub_claim"])
+            representative_metadata = self._json_dict(
+                representative.get("metadata", {})
             )
             representative["summary"] = "Clustered observations:\n" + "\n".join(summaries)
             representative["metadata"] = {
@@ -4074,6 +4783,7 @@ class MemoryNodeManager:
             "topic_label": representative.get("topic_label"),
             "observation_type": representative.get("observation_type", "observation"),
             "interpretation_cluster_family": family,
+            "sub_claim_ids": sub_claim_ids,
         }
         embedding_text = self._interpretation_embedding_text(
             entity_name=representative.get("entity_name") or "",
@@ -4106,6 +4816,12 @@ class MemoryNodeManager:
             embedding_text=embedding_text,
             metadata=metadata,
         )
+        for sub_claim_id in sub_claim_ids:
+            self._db.memory_link_interpretation_sub_claim(
+                interpretation_id,
+                sub_claim_id,
+                confidence=interpretation["confidence"],
+            )
         self._log_info(
             "memory_reflect",
             "interpretation_generated", 
@@ -4131,7 +4847,7 @@ class MemoryNodeManager:
         if len(items) == 1 and len(changed_items) == 1:
             item = changed_items[0]
             return cls._single_observation_generation_allowed(
-                observation=item["observation"],
+                observation=item["sub_claim"],
                 source_nodes=item.get("source_nodes", []),
                 interpretation_family=str(item.get("family") or cluster.get("family") or "insight"),
             )
@@ -4143,7 +4859,102 @@ class MemoryNodeManager:
             return True, "cluster_size_threshold"
         return False, "trigger_threshold_not_met"
 
-    def _reflect_generate_interpretations_using_observations(self, observation_ids: List[int]) -> int:
+    def _build_semantic_sub_claim(
+        self,
+        sub_claim: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build the semantic unit consumed by interpretation generation."""
+        sub_claim_type = str(
+            sub_claim.get("sub_claim_type") or "context"
+        ).strip().lower()
+        metadata = self._json_dict(sub_claim.get("metadata", {}))
+        source_count = max(
+            1,
+            int(metadata.get("source_count") or len(
+                sub_claim.get("source_node_ids", [])
+            ) or 1),
+        )
+        evidence_mode = str(
+            sub_claim.get("evidence_mode") or "aggregated"
+        ).strip().lower()
+        evidence_shape = (
+            "repeated_pattern"
+            if sub_claim_type in {"behavior_pattern", "preference_signal"}
+            and source_count >= 2
+            else (
+                "progression"
+                if sub_claim_type in {
+                    "task_state",
+                    "task_progress",
+                    "decision",
+                }
+                and source_count >= 2
+                else "single_event"
+            )
+        )
+        temporal_scope = (
+            "recurring"
+            if evidence_mode == "behavioral"
+            else ("ongoing" if evidence_mode in {"explicit", "semantic"} else "recent")
+        )
+        fact_type_distribution = metadata.get(
+            "fact_type_distribution",
+            {"semantic": 0, "episodic": 0},
+        )
+        dominant_fact_type, evidence_mixture = (
+            self._fact_type_evidence_summary(
+                self._metadata_fact_type_distribution(
+                    fact_type_distribution
+                )
+            )
+        )
+        allowed_interpretation_types = metadata.get(
+            "allowed_interpretation_types",
+            self._sub_claim_allowed_interpretation_types(
+                sub_claim_type,
+                evidence_mode,
+            ),
+        )
+        claim_text = str(sub_claim.get("claim_text") or "").strip()
+        return {
+            "id": int(sub_claim["id"]),
+            "_sub_claim_id": int(sub_claim["id"]),
+            "observation_id": int(sub_claim["observation_id"]),
+            "entity_id": sub_claim.get("entity_id"),
+            "entity_name": sub_claim.get("entity_name"),
+            "topic_key": sub_claim.get("topic_key"),
+            "topic_label": sub_claim.get("topic_label"),
+            "sub_claim_type": sub_claim_type,
+            "source_node_ids": [
+                int(node_id)
+                for node_id in sub_claim.get("source_node_ids", [])
+            ],
+            "summary": claim_text,
+            "keywords": claim_text,
+            "confidence": sub_claim.get("confidence", 0.5),
+            "embedding": sub_claim.get("embedding"),
+            "embedding_text": sub_claim.get("embedding_text") or claim_text,
+            "metadata": {
+                **metadata,
+                "sub_claim_id": int(sub_claim["id"]),
+                "sub_claim_type": sub_claim_type,
+                "evidence_mode": evidence_mode,
+                "observation_kind": self._sub_claim_observation_kind(
+                    sub_claim_type
+                ),
+                "evidence_shape": evidence_shape,
+                "temporal_scope": temporal_scope,
+                "candidate_interpretation_types": (
+                    self._sub_claim_candidate_families(sub_claim_type)
+                ),
+                "allowed_interpretation_types": allowed_interpretation_types,
+                "source_fact_type_distribution": fact_type_distribution,
+                "dominant_fact_type": dominant_fact_type,
+                "evidence_mixture": evidence_mixture,
+            },
+        }
+
+    def _reflect_generate_interpretations_using_sub_claims(self, observation_ids: List[int]) -> int:
         if not self._db:
             return 0
         clean_ids = list(dict.fromkeys(
@@ -4153,39 +4964,60 @@ class MemoryNodeManager:
         ))
         if not clean_ids:
             return 0
-        observations = self._db.get_observations_by_ids(clean_ids)
-        supporting_facts_from_observation = self._db.get_observation_supporting_nodes(
-            [int(observation["id"]) for observation in observations],
-            per_observation=12,
-        ) if observations else {}
+        sub_claims = self._db.get_sub_claims_for_observations(clean_ids)
         generated = 0
         candidate_items: List[Dict[str, Any]] = []
-        for observation in observations:
-            observation_id = int(observation["id"])
-            source_nodes = supporting_facts_from_observation.get(observation_id, [])
-            source_node_ids = [int(node["id"]) for node in source_nodes if node.get("id") is not None]
-            metadata = self._json_dict(observation.get("metadata", {}))
-            basis_hash = self._interpretation_basis_hash(observation, source_nodes)
-            if self._interpretation_state_is_final_for_basis(metadata, basis_hash):
+        semantic_sub_claims = [
+            self._build_semantic_sub_claim(sub_claim)
+            for sub_claim in sub_claims
+        ]
+        for semantic_sub_claim in semantic_sub_claims:
+            observation_id = int(semantic_sub_claim["observation_id"])
+            source_nodes = self._db.memory_nodes_by_ids(
+                semantic_sub_claim.get("source_node_ids", [])
+            )
+            source_node_ids = [
+                int(node["id"])
+                for node in source_nodes
+                if node.get("id") is not None
+            ]
+            metadata = self._json_dict(
+                semantic_sub_claim.get("metadata", {})
+            )
+            basis_hash = self._interpretation_basis_hash(
+                semantic_sub_claim,
+                source_nodes,
+            )
+            if self._interpretation_state_is_final_for_basis(
+                metadata,
+                basis_hash,
+            ):
                 self._log_info(
                     "memory_reflect",
-                    "interpretation_observation_skipped", 
+                    "interpretation_semantic_unit_skipped",
                     {
                         "observation_id": observation_id,
+                        "sub_claim_id": semantic_sub_claim["id"],
                         "status": self._interpretation_state(metadata),
                         "reason": "basis_already_processed",
-                    }
+                    },
                 )
                 continue
-            observation["metadata"] = metadata
-            family = self._observation_interpretation_cluster_family(observation, source_nodes)
-            priority, priority_reason = self._interpretation_generation_trigger_priority(
-                observation=observation,
-                source_nodes=source_nodes,
-                family=family,
+            semantic_sub_claim["metadata"] = metadata
+            family = self._observation_interpretation_cluster_family(
+                semantic_sub_claim,
+                source_nodes,
+            )
+            priority, priority_reason = (
+                self._interpretation_generation_trigger_priority(
+                    observation=semantic_sub_claim,
+                    source_nodes=source_nodes,
+                    family=family,
+                )
             )
             candidate_items.append({
-                "observation": observation,
+                "sub_claim": semantic_sub_claim,
+                "sub_claim_id": int(semantic_sub_claim["id"]),
                 "observation_id": observation_id,
                 "source_nodes": source_nodes,
                 "source_node_ids": source_node_ids,
@@ -4199,13 +5031,14 @@ class MemoryNodeManager:
         if not candidate_items:
             return 0
 
-        seen_observation_ids = {int(item["observation_id"]) for item in candidate_items}
+        seen_sub_claim_ids = {
+            int(item["sub_claim_id"]) for item in candidate_items
+        }
         cluster_context_items = list(candidate_items)
         for item in list(candidate_items):
-            deferred_items = self._get_similar_deferred_observation(
+            deferred_items = self._get_similar_deferred_sub_claims(
                 item,
-                supporting_facts_from_observation,
-                seen_observation_ids,
+                seen_sub_claim_ids,
             )
             cluster_context_items.extend(deferred_items)
 
@@ -4224,8 +5057,8 @@ class MemoryNodeManager:
             ]
             if not should_run:
                 for item in changed_items:
-                    self._update_observation_interpretation_state(
-                        item["observation"],
+                    self._update_sub_claim_interpretation_state(
+                        item["sub_claim"],
                         status="deferred",
                         basis_hash=item["basis_hash"],
                         reason=reason,
@@ -4241,7 +5074,7 @@ class MemoryNodeManager:
                 observation_id = int(item["observation_id"])
                 allow_content_update = llm_calls_used < INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT
                 link_result = self._link_observation_to_existing_interpretation(
-                    observation=item["observation"],
+                    observation=item["sub_claim"],
                     source_nodes=item["source_nodes"],
                     observation_id=observation_id,
                     source_node_ids=item["source_node_ids"],
@@ -4252,8 +5085,8 @@ class MemoryNodeManager:
                     linked_id = int(link_result["interpretation_id"])
                     if link_result.get("content_update_attempted"):
                         llm_calls_used += 1
-                    self._update_observation_interpretation_state(
-                        item["observation"],
+                    self._update_sub_claim_interpretation_state(
+                        item["sub_claim"],
                         status="linked",
                         basis_hash=item["basis_hash"],
                         reason=str(link_result.get("reason") or "linked_existing_interpretation"),
@@ -4272,8 +5105,8 @@ class MemoryNodeManager:
 
             if llm_calls_used >= INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT:
                 for item in unmatched_items:
-                    self._update_observation_interpretation_state(
-                        item["observation"],
+                    self._update_sub_claim_interpretation_state(
+                        item["sub_claim"],
                         status="deferred",
                         basis_hash=item["basis_hash"],
                         reason="llm_budget_exhausted",
@@ -4290,8 +5123,8 @@ class MemoryNodeManager:
             if interpretation_id is not None:
                 generated += 1
                 for item in generation_items:
-                    self._update_observation_interpretation_state(
-                        item["observation"],
+                    self._update_sub_claim_interpretation_state(
+                        item["sub_claim"],
                         status="generated",
                         basis_hash=item["basis_hash"],
                         reason="generated_from_observation_cluster",
@@ -4303,8 +5136,8 @@ class MemoryNodeManager:
                     )
             else:
                 for item in unmatched_items:
-                    self._update_observation_interpretation_state(
-                        item["observation"],
+                    self._update_sub_claim_interpretation_state(
+                        item["sub_claim"],
                         status="deferred",
                         basis_hash=item["basis_hash"],
                         reason="generation_not_created",
@@ -4314,189 +5147,6 @@ class MemoryNodeManager:
                         },
                     )
         return generated
-
-    @staticmethod
-    def _observation_kind_family(observation_kind: Any) -> str:
-        text = str(observation_kind or "").strip().lower()
-        if text in {"preference_signal", "constraint", "goal_signal", "pattern"}:
-            return "preference"
-        if text in {"task_signal", "state_change", "outcome", "event_cluster", "timeline"}:
-            return "task"
-        return "insight"
-
-    @classmethod
-    def _fact_observation_kind_targets(cls, fact: Dict[str, Any]) -> set[str]:
-        fact_kind = str(fact.get("fact_kind") or "other").strip().lower()
-        fact_type = str(fact.get("fact_type") or "semantic").strip().lower()
-        if fact_kind == "preference":
-            return {"preference_signal", "pattern"}
-        if fact_kind == "instruction":
-            return {"constraint", "preference_signal"}
-        if fact_kind == "request":
-            return {"task_signal", "goal_signal", "state_change"}
-        if fact_kind in {"action", "recommendation"}:
-            return {"task_signal", "event_cluster", "outcome"}
-        if fact_kind == "decision":
-            return {"state_change", "event_cluster", "task_signal"}
-        if fact_kind == "error":
-            return {"conflict", "outcome", "state_change"}
-        if fact_kind == "context":
-            return {"context", "pattern"}
-        if fact_type == "episodic":
-            return {"event_cluster", "state_change", "context"}
-        return {"context", "pattern"}
-
-    def _observation_match_score(
-        self,
-        *,
-        fact: Dict[str, Any],
-        observation: Dict[str, Any],
-        supporting_nodes: Optional[List[Dict[str, Any]]] = None,
-    ) -> Tuple[float, str]:
-        metadata = self._normalize_observation_metadata(observation.get("metadata", {}), supporting_nodes or [])
-        observation_kind = str(metadata.get("observation_kind") or "context")
-        candidate_types = set(self._metadata_candidate_types(metadata.get("candidate_interpretation_types")))
-        fact_targets = self._fact_observation_kind_targets(fact)
-
-        score = 0.0
-        reasons: List[str] = []
-
-        fact_entity_ids = {entity_id for entity_id, _name in self._fact_entity_pairs(fact)}
-        try:
-            observation_entity_id = int(observation.get("entity_id"))
-        except (TypeError, ValueError):
-            observation_entity_id = None
-        if observation_entity_id is not None and observation_entity_id in fact_entity_ids:
-            score += 0.24
-            reasons.append("entity")
-
-        fact_topics = {self._topic_key(topic) for topic in fact.get("topics", [])}
-        observation_topic = self._topic_key(observation.get("topic_key") or observation.get("topic_label") or "")
-        if observation_topic and observation_topic in fact_topics:
-            score += 0.20
-            reasons.append("topic")
-
-        if observation_kind in fact_targets:
-            score += 0.18
-            reasons.append("kind")
-        fact_family = ""
-        fact_kind = str(fact.get("fact_kind") or "").strip().lower()
-        if self._is_task_event_like_fact(fact):
-            fact_family = "task"
-        elif fact_kind in {"preference", "instruction"}:
-            fact_family = "preference"
-        if fact_family and self._observation_kind_family(observation_kind) == fact_family:
-            score += 0.08
-            reasons.append("kind_family")
-
-        fact_subject = str(fact.get("fact_subject") or "other").strip().lower()
-        source_subjects = {
-            str(node.get("fact_subject") or "other").strip().lower()
-            for node in supporting_nodes or []
-        }
-        if fact_subject != "other" and fact_subject in source_subjects:
-            score += 0.08
-            reasons.append("subject")
-
-        fact_type = str(fact.get("fact_type") or "semantic").strip().lower()
-        temporal_scope = str(metadata.get("temporal_scope") or "")
-        dominant_fact_type = str(metadata.get("dominant_fact_type") or "unknown").strip().lower()
-        evidence_mixture = str(metadata.get("evidence_mixture") or "unknown").strip().lower()
-        if fact_type == "semantic" and temporal_scope in {"ongoing", "recurring", "historical"}:
-            score += 0.06
-            reasons.append("semantic_scope")
-        elif fact_type == "episodic" and temporal_scope in {"momentary", "recent", "recurring"}:
-            score += 0.06
-            reasons.append("episodic_scope")
-        if fact_type == "semantic" and (
-            dominant_fact_type in {"semantic", "mixed"}
-            or evidence_mixture in {"semantic_only", "semantic_dominant", "balanced_mixed"}
-        ):
-            score += 0.04
-            reasons.append("semantic_evidence_shape")
-        elif fact_type == "episodic" and (
-            dominant_fact_type in {"episodic", "mixed"}
-            or evidence_mixture in {"episodic_only", "episodic_dominant", "balanced_mixed"}
-        ):
-            score += 0.04
-            reasons.append("episodic_evidence_shape")
-
-        if self._is_task_event_like_fact(fact) and "task" in candidate_types:
-            score += 0.08
-            reasons.append("task_affordance")
-        if str(fact.get("fact_kind") or "") in {"preference", "instruction"} and "preference" in candidate_types:
-            score += 0.08
-            reasons.append("preference_affordance")
-
-        fact_terms = self._match_terms(
-            fact.get("summary"),
-            fact.get("keywords", []),
-            fact.get("topics", []),
-        )
-        observation_terms = self._match_terms(
-            observation.get("summary"),
-            observation.get("keywords", ""),
-            observation.get("topic_label"),
-            observation.get("topic_key"),
-        )
-        overlap = self._term_overlap_score(fact_terms, observation_terms)
-        if overlap:
-            score += min(0.18, overlap * 0.18)
-            reasons.append("term_overlap")
-
-        try:
-            confidence = float(observation.get("confidence") or 0.0)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        score += min(0.06, confidence * 0.06)
-        return min(1.0, score), "+".join(reasons) or "weak"
-
-    def _fact_cluster_query_embedding(self, cluster: Dict[str, Any]) -> Optional[np.ndarray]:
-        if not self._db:
-            return None
-        source_node_ids = [
-            int(node_id)
-            for node_id in cluster.get("source_node_ids", [])
-            if node_id is not None
-        ]
-        embedding_loader = getattr(self._db, "memory_node_embeddings", None)
-        if not source_node_ids or not callable(embedding_loader):
-            return None
-        vectors = embedding_loader(source_node_ids)
-        cluster_vectors = [
-            np.asarray(vectors[node_id], dtype=np.float32).reshape(-1)
-            for node_id in source_node_ids
-            if node_id in vectors
-        ]
-        if not cluster_vectors:
-            return None
-        expected_shape = cluster_vectors[0].shape
-        cluster_vectors = [
-            vector
-            for vector in cluster_vectors
-            if vector.shape == expected_shape
-        ]
-        if not cluster_vectors:
-            return None
-        centroid = np.mean(np.stack(cluster_vectors), axis=0)
-        norm = float(np.linalg.norm(centroid))
-        if norm <= 0.0:
-            return None
-        return (centroid / norm).astype(np.float32)
-
-    @classmethod
-    def _fact_cluster_query_text(cls, cluster: Dict[str, Any]) -> str:
-        parts = [
-            str(cluster.get("entity_name") or ""),
-            str(cluster.get("topic_label") or cluster.get("topic_key") or ""),
-        ]
-        for fact in cluster.get("source_nodes", []):
-            parts.extend([
-                str(fact.get("summary") or ""),
-                " ".join(str(item) for item in fact.get("keywords", [])),
-                " ".join(str(item) for item in fact.get("topics", [])),
-            ])
-        return " ".join(part.strip() for part in parts if part.strip())
 
     def _candidate_observations_for_fact_cluster(
         self,
@@ -4512,125 +5162,25 @@ class MemoryNodeManager:
             return self._db.get_observations_using_entity_topic(
                 entity_id=entity_id,
                 topic_key=self._topic_key(cluster.get("topic_key") or "general"),
-                query_embedding=self._fact_cluster_query_embedding(cluster),
+                query_embedding=None,
             )
         except Exception:
             return []
 
-    def _fact_cluster_observation_match_score(
-        self,
-        *,
-        cluster: Dict[str, Any],
-        observation: Dict[str, Any],
-        supporting_nodes: Optional[List[Dict[str, Any]]] = None,
-    ) -> Tuple[float, str]:
-        source_nodes = list(cluster.get("source_nodes", []))
-        if not source_nodes:
-            return 0.0, "empty_cluster"
-        fact_scores = [
-            self._observation_match_score(
-                fact=fact,
-                observation=observation,
-                supporting_nodes=supporting_nodes,
-            )
-            for fact in source_nodes
-        ]
-        average_fact_score = sum(score for score, _reason in fact_scores) / len(fact_scores)
-        score = average_fact_score
-        reasons = [f"fact_mean:{average_fact_score:.3f}"]
-
-        cluster_topic = self._topic_key(cluster.get("topic_key") or cluster.get("topic_label") or "")
-        observation_topic = self._topic_key(
-            observation.get("topic_key") or observation.get("topic_label") or ""
-        )
-        if cluster_topic and observation_topic == cluster_topic:
-            score += 0.06
-            reasons.append("cluster_topic")
-        else:
-            return 0.0, "entity_topic_mismatch"
-
-        cluster_family = str(cluster.get("cluster_family") or "")
-        metadata = self._normalize_observation_metadata(
-            observation.get("metadata", {}),
-            supporting_nodes or [],
-        )
-        observation_family = self._observation_kind_family(metadata.get("observation_kind"))
-        if cluster_family in {"preference", "task"}:
-            if observation_family == cluster_family:
-                score += 0.04
-                reasons.append("cluster_family")
-            elif observation_family in {"preference", "task"}:
-                score -= 0.08
-                reasons.append("family_conflict")
-
-        try:
-            embedding_similarity = float(observation.get("embedding_similarity"))
-        except (TypeError, ValueError):
-            embedding_similarity = None
-        if embedding_similarity is not None:
-            if embedding_similarity >= 0.55:
-                score += min(0.08, (embedding_similarity - 0.55) * 0.18 + 0.035)
-                reasons.append(f"embedding:{embedding_similarity:.3f}")
-            elif embedding_similarity < 0.25:
-                score -= 0.04
-                reasons.append(f"embedding_weak:{embedding_similarity:.3f}")
-
-        if len(source_nodes) >= 2:
-            score += min(0.04, 0.015 * len(source_nodes))
-            reasons.append("multi_fact_support")
-        reason_summary = "+".join(
-            dict.fromkeys(
-                reason
-                for _score, fact_reason in fact_scores
-                for reason in fact_reason.split("+")
-                if reason
-            )
-        )
-        if reason_summary:
-            reasons.append(f"fact_signals:{reason_summary}")
-        return max(0.0, min(1.0, score)), "+".join(reasons)
-
     def _match_fact_cluster_to_existing_observation(
         self,
         cluster: Dict[str, Any],
-        *,
-        auto_update_threshold: float = 0.72,
     ) -> Optional[Tuple[Dict[str, Any], float, str, List[Dict[str, Any]]]]:
         candidates = self._candidate_observations_for_fact_cluster(cluster)
         if not candidates:
             return None
-        supporting_facts_from_observation = self._db.get_observation_supporting_nodes(
-            [int(item["id"]) for item in candidates],
+        observation = candidates[0]
+        observation_id = int(observation["id"])
+        supporting_nodes = self._db.get_observation_supporting_nodes(
+            [observation_id],
             per_observation=8,
-        )
-        scored: List[Tuple[float, str, Dict[str, Any], List[Dict[str, Any]]]] = []
-        for candidate in candidates:
-            observation_id = int(candidate["id"])
-            supporting_nodes = supporting_facts_from_observation.get(observation_id, [])
-            score, reason = self._fact_cluster_observation_match_score(
-                cluster=cluster,
-                observation=candidate,
-                supporting_nodes=supporting_nodes,
-            )
-            scored.append((score, reason, candidate, supporting_nodes))
-        scored.sort(key=lambda item: (item[0], item[2].get("last_supported_at") or ""), reverse=True)
-        best_score, reason, best, supporting_nodes = scored[0]
-        if best_score < auto_update_threshold:
-            self._log_info(
-                "memory_reflect",
-                "fact_cluster_observation_match_skipped",
-                {
-                    "entity_id": cluster.get("entity_id"),
-                    "topic_key": cluster.get("topic_key"),
-                    "cluster_family": cluster.get("cluster_family"),
-                    "source_node_ids": cluster.get("source_node_ids", []),
-                    "best_observation_id": best.get("id"),
-                    "best_score": round(best_score, 4),
-                    "reason": reason,
-                }
-            )
-            return None
-        return best, best_score, reason, supporting_nodes
+        ).get(observation_id, [])
+        return observation, 1.0, "exact_entity_topic", supporting_nodes
 
     def _update_existing_observation_from_fact_cluster(
         self,
@@ -4679,36 +5229,15 @@ class MemoryNodeManager:
             consumed_node_ids.update(source_node_ids)
             return observation_id
 
-        generated = self._generate_observation(
-            entity_name=existing_observation.get("entity_name", ""),
-            topic_label=existing_observation.get("topic_label") or existing_observation.get("topic_key") or "",
+        generated = self._build_observation_container_from_facts(
             source_nodes=source_nodes,
             existing_observation=existing_observation,
         )
         if not generated:
             return None
-        generated_metadata = self._normalize_observation_metadata(
-            generated.get("metadata") or {},
-            supporting_nodes + source_nodes,
-        )
-        metadata = {
-            "source": "memory_fact_cluster_observation_match",
-            "fact_cluster_match_score": round(float(score), 4),
-            "fact_cluster_match_reason": reason,
-            "cluster_family": cluster.get("cluster_family"),
-            "cluster_score": round(float(cluster.get("cluster_score") or 0.0), 4),
-            **generated_metadata,
-        }
+        metadata = {}
         stored_source_ids = list(dict.fromkeys(existing_source_ids + pending_source_ids))
         observation_keywords = generated["keywords"] or self._normalize_keywords(existing_observation.get("keywords", ""))
-        embedding_text = self._observation_embedding_text(
-            entity_name=existing_observation.get("entity_name", ""),
-            topic_label=existing_observation.get("topic_label") or existing_observation.get("topic_key") or "",
-            observation_type=generated["observation_type"],
-            summary=generated["summary"],
-            keywords=observation_keywords,
-            metadata=metadata,
-        )
         self._db.memory_replace_observation_group(
             keep_observation_id=observation_id,
             remove_observation_ids=[],
@@ -4717,8 +5246,8 @@ class MemoryNodeManager:
             keywords=observation_keywords,
             confidence=generated["confidence"],
             source_node_ids=stored_source_ids,
-            embedding=self._embed_memory_layer_text(embedding_text),
-            embedding_text=embedding_text,
+            embedding=None,
+            embedding_text=None,
             metadata=metadata,
             source_roles={
                 node_id: "matched"
@@ -4734,7 +5263,6 @@ class MemoryNodeManager:
             "observation_id": observation_id,
             "entity_id": cluster.get("entity_id"),
             "topic_key": cluster.get("topic_key"),
-            "cluster_family": cluster.get("cluster_family"),
             "source_node_ids": source_node_ids,
             "score": score,
             "reason": reason,
@@ -4746,209 +5274,11 @@ class MemoryNodeManager:
         })
         return observation_id
 
-    @classmethod
-    def _fact_cluster_family(cls, fact: Dict[str, Any]) -> str:
-        fact_kind = str(fact.get("fact_kind") or "other").strip().lower()
-        if fact_kind in {"preference", "instruction"}:
-            return "preference"
-        if fact_kind in {"request", "recommendation", "action", "decision", "error"}:
-            return "task"
-        if cls._is_task_event_like_fact(fact):
-            return "task"
-        if str(fact.get("fact_type") or "semantic").strip().lower() == "episodic":
-            return "event"
-        return "context"
-
-    @classmethod
-    def _fact_cluster_score(cls, facts: List[Dict[str, Any]], family: str) -> Tuple[float, str]:
-        if not facts:
-            return 0.0, "empty"
-        if len(facts) < 2:
-            return 0.0, "single_fact_deferred"
-        fact_types = {
-            str(fact.get("fact_type") or "semantic").strip().lower()
-            for fact in facts
-        }
-        fact_subjects = {
-            str(fact.get("fact_subject") or "other").strip().lower()
-            for fact in facts
-        }
-        fact_kinds = {
-            str(fact.get("fact_kind") or "other").strip().lower()
-            for fact in facts
-        }
-        task_kinds = {"request", "recommendation", "action", "decision", "error"}
-        preference_kinds = {"preference", "instruction"}
-        score = 0.45
-        reasons = ["min_size"]
-        if len(facts) >= 3:
-            score += 0.12
-            reasons.append("multi_fact")
-        if len(fact_types) == 1:
-            score += 0.08
-            reasons.append("fact_type")
-        elif family in {"task", "event"} and fact_types <= {"semantic", "episodic"}:
-            score += 0.05
-            reasons.append("semantic_episodic_chain")
-        if len(fact_subjects - {"other"}) <= 1:
-            score += 0.06
-            reasons.append("subject")
-        if family == "preference" and fact_kinds & {"preference", "instruction"}:
-            score += 0.14
-            reasons.append("preference_kind")
-        elif family == "task" and (fact_kinds & {"request", "action", "decision", "recommendation"}):
-            score += 0.14
-            reasons.append("task_kind")
-        elif family == "event" and "episodic" in fact_types:
-            score += 0.12
-            reasons.append("episodic_event")
-        elif family == "context" and fact_kinds <= {"context", "other"}:
-            score += 0.10
-            reasons.append("context_kind")
-        elif family == "mixed" and fact_kinds <= {"context", "other", "recommendation"}:
-            score += 0.16
-            reasons.append("mixed_context_event")
-        if fact_kinds & preference_kinds and fact_kinds & task_kinds:
-            score -= 0.06
-            reasons.append("mixed_preference_task")
-        if "error" in fact_kinds:
-            score += 0.04
-            reasons.append("error_signal")
-        return min(1.0, score), "+".join(reasons)
-
-    @classmethod
-    def _fact_cluster_family_profile(
-        cls,
-        facts: List[Dict[str, Any]],
-    ) -> Tuple[str, Dict[str, int], float]:
-        distribution = Counter(cls._fact_cluster_family(fact) for fact in facts)
-        if not distribution:
-            return "context", {}, 0.0
-        family_order = {"preference": 4, "task": 3, "event": 2, "context": 1}
-        dominant_family, dominant_count = max(
-            distribution.items(),
-            key=lambda item: (item[1], family_order.get(item[0], 0)),
-        )
-        coherence = dominant_count / max(1, sum(distribution.values()))
-        return dominant_family, dict(distribution), coherence
-
-    @classmethod
-    def _fact_cluster_semantic_cohesion(
-        cls,
-        facts: List[Dict[str, Any]],
-        *,
-        fact_embeddings: Dict[int, np.ndarray],
-        topic_match: str,
-    ) -> float:
-        if len(facts) < 2:
-            return 1.0
-        pair_scores: List[float] = []
-        for left_index, left in enumerate(facts):
-            left_id = cls._node_id(left)
-            left_terms = cls._match_terms(
-                left.get("summary"),
-                left.get("keywords", []),
-                left.get("topics", []),
-            )
-            for right in facts[left_index + 1:]:
-                right_id = cls._node_id(right)
-                vector_score: Optional[float] = None
-                left_vector = fact_embeddings.get(left_id) if left_id is not None else None
-                right_vector = fact_embeddings.get(right_id) if right_id is not None else None
-                if left_vector is not None and right_vector is not None and left_vector.shape == right_vector.shape:
-                    denominator = float(np.linalg.norm(left_vector) * np.linalg.norm(right_vector))
-                    if denominator > 0.0:
-                        cosine = float(np.dot(left_vector, right_vector) / denominator)
-                        vector_score = max(0.0, min(1.0, (cosine + 1.0) / 2.0))
-                if vector_score is not None:
-                    pair_scores.append(vector_score)
-                    continue
-                right_terms = cls._match_terms(
-                    right.get("summary"),
-                    right.get("keywords", []),
-                    right.get("topics", []),
-                )
-                lexical_score = cls._term_overlap_score(left_terms, right_terms)
-                structural_floor = 0.70 if topic_match == "normalized" else 0.65
-                pair_scores.append(max(structural_floor, lexical_score))
-        return sum(pair_scores) / max(1, len(pair_scores))
-
-    @classmethod
-    def _fact_cluster_temporal_cohesion(cls, facts: List[Dict[str, Any]]) -> float:
-        times = [
-            timestamp
-            for fact in facts
-            if (timestamp := cls._fact_time_seconds(fact)) is not None
-        ]
-        if len(times) < 2:
-            return 1.0
-        span_seconds = max(times) - min(times)
-        if span_seconds <= 2 * 60 * 60:
-            return 1.0
-        if span_seconds <= 24 * 60 * 60:
-            return 0.8
-        if span_seconds <= 7 * 24 * 60 * 60:
-            return 0.6
-        return 0.4
-
-    _GENERALIZABLE_TOPIC_SUFFIXES = {
-        "关系",   # 家庭 <-> 家庭关系；夫妻 <-> 夫妻关系
-        "管理",   # 健康 <-> 健康管理；时间 <-> 时间管理
-        "状态",   # 身体 <-> 身体状态；项目 <-> 项目状态
-        "情况",   # 家庭 <-> 家庭情况；工作 <-> 工作情况
-        "问题",   # 健康 <-> 健康问题；沟通 <-> 沟通问题
-    }
-    _NORMALIZED_TOPIC_CLUSTER_WINDOW_SECONDS = 2 * 60 * 60
-
-    @classmethod
-    def _split_generalizable_topic(cls, topic: Any) -> Tuple[str, Optional[str]]:
-        topic_key = cls._topic_key(topic)
-        for suffix in cls._GENERALIZABLE_TOPIC_SUFFIXES:
-            if topic_key.endswith(suffix) and len(topic_key) > len(suffix):
-                head = topic_key[: -len(suffix)].strip("-_ ")
-                if len(head) >= 2:
-                    return head, suffix
-        return topic_key, None
-
-    @staticmethod
-    def _fact_time_seconds(fact: Dict[str, Any]) -> Optional[float]:
-        raw = str(fact.get("time_key") or "").strip()
-        if not raw:
-            return None
-        raw = raw.split("#", 1)[0].replace(" ", "T", 1)
-        try:
-            parsed = datetime.fromisoformat(raw)
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.timestamp()
-
-    @classmethod
-    def _facts_within_normalized_topic_window(
-        cls,
-        bare_facts: List[Dict[str, Any]],
-        suffix_fact: Dict[str, Any],
-    ) -> bool:
-        suffix_time = cls._fact_time_seconds(suffix_fact)
-        if suffix_time is None:
-            return False
-        bare_times = [
-            time
-            for fact in bare_facts
-            if (time := cls._fact_time_seconds(fact)) is not None
-        ]
-        if not bare_times or len(bare_times) != len(bare_facts):
-            return False
-        nearest_bare_time = min(bare_times, key=lambda time: abs(time - suffix_time))
-        return abs(nearest_bare_time - suffix_time) <= cls._NORMALIZED_TOPIC_CLUSTER_WINDOW_SECONDS
-
     def _cluster_unprocessed_facts(
         self,
         facts: List[Dict[str, Any]],
         *,
         excluded_node_ids: set[int],
-        min_cluster_score: float = 0.66,
     ) -> List[Dict[str, Any]]:
         buckets: Dict[Tuple[int, str], Dict[str, Any]] = {}
         for fact in facts:
@@ -4985,8 +5315,6 @@ class MemoryNodeManager:
                     "entity_name": entity_name,
                     "topic_key": topic_key,
                     "topic_label": topic_key,
-                    "topic_match": "exact",
-                    "raw_topic_keys": [topic_key],
                     "facts": [],
                     "node_ids": set(),
                 },
@@ -4995,58 +5323,30 @@ class MemoryNodeManager:
                 bucket["node_ids"].add(node_id)
                 bucket["facts"].append(fact)
 
-        requested_node_ids = [
-            node_id
-            for bucket in buckets.values()
-            for node_id in bucket["node_ids"]
-        ]
-        embedding_loader = getattr(self._db, "memory_node_embeddings", None)
-        fact_embeddings = embedding_loader(requested_node_ids) if callable(embedding_loader) else {}
-
         clusters: List[Dict[str, Any]] = []
         for bucket in buckets.values():
             facts_for_cluster = sorted(
                 bucket.get("facts", []),
                 key=lambda fact: (str(fact.get("time_key") or ""), self._node_id(fact) or 0),
             )
-            family, family_distribution, family_coherence = self._fact_cluster_family_profile(
-                facts_for_cluster
-            )
-            semantic_cohesion = self._fact_cluster_semantic_cohesion(
-                facts_for_cluster,
-                fact_embeddings=fact_embeddings,
-                topic_match="exact",
-            )
-            temporal_cohesion = self._fact_cluster_temporal_cohesion(facts_for_cluster)
-            score, reason = self._fact_cluster_score(facts_for_cluster, family)
-            is_singleton = len(facts_for_cluster) == 1
             clusters.append({
                 **{
                     key: value
                     for key, value in bucket.items()
                     if key not in {"facts", "node_ids"}
                 },
-                "cluster_family": family,
-                "family_distribution": family_distribution,
-                "family_coherence": round(family_coherence, 4),
-                "semantic_cohesion": round(semantic_cohesion, 4),
-                "temporal_cohesion": round(temporal_cohesion, 4),
                 "source_nodes": facts_for_cluster,
                 "source_node_ids": [
                     self._node_id(fact)
                     for fact in facts_for_cluster
                     if self._node_id(fact) is not None
                 ],
-                "cluster_score": score,
-                "cluster_reason": reason,
-                "is_singleton": is_singleton,
-                "can_create_observation": not is_singleton and score >= min_cluster_score,
+                "can_create_observation": len(facts_for_cluster) >= 2,
             })
 
         clusters.sort(
             key=lambda item: (
                 1 if item.get("can_create_observation") else 0,
-                float(item.get("cluster_score") or 0.0),
                 len(item.get("source_node_ids", [])),
                 str(item.get("topic_key") or ""),
             ),
@@ -5078,34 +5378,14 @@ class MemoryNodeManager:
         entity_id = int(cluster["entity_id"])
         topic_key = str(cluster.get("topic_key") or "general")
         
-        observation = self._generate_observation(
-            entity_name=str(cluster.get("entity_name") or ""),
-            topic_label=topic_key,
+        observation = self._build_observation_container_from_facts(
             source_nodes=source_nodes,
             existing_observation=None,
         )
         if not observation:
             return None
-        generated_metadata = self._normalize_observation_metadata(
-            observation.get("metadata") or {},
-            source_nodes,
-        )
-        observation_metadata = {
-            "source": "memory_unmatched_fact_cluster",
-            "cluster_family": cluster.get("cluster_family"),
-            "cluster_score": round(float(cluster.get("cluster_score") or 0.0), 4),
-            "cluster_reason": cluster.get("cluster_reason"),
-            **generated_metadata,
-        }
+        observation_metadata = {}
         observation_keywords = observation["keywords"] or [topic_key]
-        embedding_text = self._observation_embedding_text(
-            entity_name=str(cluster.get("entity_name") or ""),
-            topic_label=str(cluster.get("topic_label") or topic_key),
-            observation_type=observation["observation_type"],
-            summary=observation["summary"],
-            keywords=observation_keywords,
-            metadata=observation_metadata,
-        )
         observation_id = self._db.memory_upsert_observation(
             entity_id=entity_id,
             topic_key=topic_key,
@@ -5115,8 +5395,8 @@ class MemoryNodeManager:
             keywords=observation_keywords,
             source_node_ids=source_node_ids,
             confidence=observation["confidence"],
-            embedding=self._embed_memory_layer_text(embedding_text),
-            embedding_text=embedding_text,
+            embedding=None,
+            embedding_text=None,
             metadata=observation_metadata,
             source_role="initial",
         )
@@ -5131,9 +5411,6 @@ class MemoryNodeManager:
                 "entity_id": entity_id,
                 "entity_name": cluster.get("entity_name"),
                 "topic_key": topic_key,
-                "cluster_family": cluster.get("cluster_family"),
-                "cluster_score": cluster.get("cluster_score"),
-                "cluster_reason": cluster.get("cluster_reason"),
                 "source_node_ids": source_node_ids,
                 "source_facts": self._reflect_fact_log_items(source_nodes),
                 "generated_observation": {
@@ -5193,7 +5470,7 @@ class MemoryNodeManager:
         )
         self._log_info(
             "memory_reflect",
-            "fact_cluster_candidates", 
+            "fact_cluster_candidates_for_observation",
             {
                 "cluster_count": len(clusters),
                 "clusters": [
@@ -5201,14 +5478,6 @@ class MemoryNodeManager:
                         "entity_id": cluster.get("entity_id"),
                         "entity_name": cluster.get("entity_name"),
                         "topic_key": cluster.get("topic_key"),
-                        "cluster_family": cluster.get("cluster_family"),
-                        "family_distribution": cluster.get("family_distribution", {}),
-                        "family_coherence": cluster.get("family_coherence"),
-                        "semantic_cohesion": cluster.get("semantic_cohesion"),
-                        "temporal_cohesion": cluster.get("temporal_cohesion"),
-                        "cluster_score": cluster.get("cluster_score"),
-                        "cluster_reason": cluster.get("cluster_reason"),
-                        "is_singleton": cluster.get("is_singleton"),
                         "can_create_observation": cluster.get("can_create_observation"),
                         "source_node_ids": cluster.get("source_node_ids", []),
                     }
@@ -5890,39 +6159,20 @@ class MemoryNodeManager:
         keep_observation = observations[0]
         related_observations = observations[1:]
         prompt_source_nodes = group.get("pending_source_nodes", [])
-        generated = self._generate_observation(
-            entity_name=group.get("entity_name", ""),
-            topic_label=group.get("topic_label", group.get("topic_key", "")),
+        generated = self._build_observation_container_from_facts(
             source_nodes=prompt_source_nodes,
             existing_observation=keep_observation,
             related_observations=related_observations,
-            target_type="observation",
         )
         if not generated:
             return False
         category = generated["observation_type"]
-        generated_metadata = self._normalize_observation_metadata(
-            generated.get("metadata") or {},
-            source_nodes,
-        )
-        metadata = {
-            "source": "memory_reflect_observation_merge",
-            **generated_metadata,
-        }
+        metadata = {}
         keywords = generated["keywords"]
         if not keywords:
             for item in observations:
                 keywords.extend(self._normalize_keywords(str(item.get("keywords", "")).split()))
             keywords = list(dict.fromkeys(keywords))
-        embedding_text = self._observation_embedding_text(
-            entity_name=group.get("entity_name", ""),
-            topic_label=group.get("topic_label", group.get("topic_key", "")),
-            observation_type=category,
-            summary=generated["summary"],
-            keywords=keywords,
-            metadata=metadata,
-        )
-
         remove_ids = [int(observation["id"]) for observation in observations[1:]]
         self._log_info(
             "memory_reflect",
@@ -5956,8 +6206,8 @@ class MemoryNodeManager:
             keywords=keywords,
             confidence=generated["confidence"],
             source_node_ids=source_ids,
-            embedding=self._embed_memory_layer_text(embedding_text),
-            embedding_text=embedding_text,
+            embedding=None,
+            embedding_text=None,
             metadata=metadata,
             source_roles={
                 int(node_id): "matched"
@@ -6176,6 +6426,7 @@ class MemoryNodeManager:
         changed_observation_ids = list(
             entity_merging_report.get("changed_observation_ids", [])
         )
+        # build fact-observation matching
         observation_report = self._reflect_generate_observations_using_facts(
             limit=limit,
             date_key=reflect_date_key,
@@ -6188,8 +6439,14 @@ class MemoryNodeManager:
         report["changed_observation_ids"] = list(dict.fromkeys(
             changed_observation_ids
         ))
+        # use fact-clustering to generation sub_claims in the same observation
+        report["sub_claim_ids"] = self._update_sub_claims_for_observations(
+            report["changed_observation_ids"]
+        )
+        report["sub_claims_updated"] = len(report["sub_claim_ids"])
+        report["sub_claims_generated"] = report["sub_claims_updated"]
         report["interpretations_generated"] = 0
-        report["interpretations_generated"] = self._reflect_generate_interpretations_using_observations(
+        report["interpretations_generated"] = self._reflect_generate_interpretations_using_sub_claims(
             report["changed_observation_ids"]
         )
         node_decay_report = self._db.memory_reflect_node_decay(
@@ -6222,6 +6479,7 @@ class MemoryNodeManager:
                 "task_updates": observation_report.get("task_updates", 0),
                 "entity_merged": report.get("merged", 0),
                 "observation_groups_merged": report.get("observation_groups_merged", 0),
+                "sub_claims_updated": report.get("sub_claims_updated", 0),
                 "interpretations_generated": report.get("interpretations_generated", 0),
                 "observations_inactivated": report.get("observations_inactivated", 0),
                 "tasks_paused": report.get("tasks_paused", 0),
