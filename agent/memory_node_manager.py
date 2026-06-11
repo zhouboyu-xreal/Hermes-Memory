@@ -3,19 +3,16 @@
 of conversation turns as structured memory nodes.
 
 Lifecycle (enhanced with HindSight-inspired features):
-  1. After each completed conversation turn (SYNC + ASYNC):
+  1. After each completed conversation turn (queued in the background):
      - Extract HindSight-style narrative facts via LLM API
      - Extract keywords
      - Generate embedding via EmbeddingClient
      - Store each fact as a memory node in SessionDB (SQLite + FAISS)
-     - Start background thread for relation graph + entity extraction
-
-  2. Background (ASYNC, non-blocking):
      - Build temporal + semantic relation graph edges to prior nodes
      - Extract entities and relations -> knowledge graph
      - Store in memory_node_relations + entity_nodes/edges
 
-  3. Before each new turn:
+  2. Before each new turn:
      - Embed the user's query
      - Search for relevant memory nodes (keyword + vector + entity graph + node relations)
      - Return formatted context for system prompt injection
@@ -1096,9 +1093,6 @@ class MemoryNodeManager:
             )
         except Exception:
             self._last_successful_reflect_at = 0.0
-
-        # Async background thread for non-critical work (relation graph + entity extraction)
-        self._async_thread: Optional[threading.Thread] = None
 
     def configure_llm(
         self,
@@ -5405,7 +5399,7 @@ class MemoryNodeManager:
             keywords=keywords,
         )
         logger.debug(
-            "Async: graph linked node %d temporal=%d semantic=%d causal=%d",
+            "Graph linked node %d temporal=%d semantic=%d causal=%d",
             node_id, temporal_count, semantic_count, causal_count,
         )
 
@@ -5641,10 +5635,11 @@ class MemoryNodeManager:
     ) -> bool:
         """Retain a turn as one or more narrative memory nodes.
 
-        The synchronous part follows the HindSight retain shape:
+        The work follows the HindSight retain shape:
         extract narrative facts → embed each fact → store nodes → link
-        entities and explicit intra-retain causal relations. Additional
-        cross-turn causal extraction still runs in the background.
+        entities and explicit intra-retain causal relations → build the
+        cross-turn relation graph. Callers that need non-blocking behavior
+        should use store_turn_async().
 
         Returns True if at least one fact was stored, False otherwise.
         """
@@ -5819,15 +5814,21 @@ class MemoryNodeManager:
             # ── Step 4: Link explicit relations between newly retained facts ──
             self._link_fact_relations(node_ids, retain_data.get("causal_relations", []))
 
-            # ── Step 5: Start async background relation graph work ──
+            # ── Step 5: Build cross-turn relation graph ──
             for node_id, summary, embedding, keywords in stored_nodes:
-                self._start_async_work(
-                    node_id=node_id,
-                    summary=summary,
-                    embedding=embedding,
-                    keywords=keywords,
-                    wait_previous=False,
-                )
+                try:
+                    self._build_relation_graph(
+                        node_id=node_id,
+                        summary=summary,
+                        embedding=embedding,
+                        keywords=keywords,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Relation graph construction failed for node %d: %s",
+                        node_id,
+                        exc,
+                    )
 
             logger.debug(
                 "Retained %d memory fact node(s) from %d turn(s)",
@@ -5839,36 +5840,6 @@ class MemoryNodeManager:
         except Exception as e:
             logger.info("Failed to store memory node (non-fatal): %s", e)
             return False
-
-    def _start_async_work(
-        self,
-        node_id: int,
-        summary: str,
-        embedding: np.ndarray,
-        keywords: Optional[List[str]] = None,
-        wait_previous: bool = True,
-    ) -> None:
-        """Start background thread for relation graph construction."""
-        def _run_async():
-            try:
-                # ── A. Relation graph construction ──
-                self._build_relation_graph(
-                    node_id=node_id,
-                    summary=summary,
-                    embedding=embedding,
-                    keywords=keywords or [],
-                )
-
-            except Exception as e:
-                logger.debug("Async background work failed for node %d: %s", node_id, e)
-
-        # Wait for previous async thread to finish, then start new one
-        if wait_previous and self._async_thread and self._async_thread.is_alive():
-            self._async_thread.join(timeout=5.0)
-        self._async_thread = threading.Thread(
-            target=_run_async, daemon=True, name="memory-node-async"
-        )
-        self._async_thread.start()
 
     def _augment_observation_merge_group_with_pending_sources(
         self,

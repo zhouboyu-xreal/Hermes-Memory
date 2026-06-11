@@ -152,7 +152,7 @@ class _NoAsyncMemoryNodeManager(MemoryNodeManager):
         self._embedding_client = _FakeEmbeddingClient()
         self._llm_outputs = list(llm_outputs or [])
         self.llm_prompts = []
-        self.async_calls = []
+        self.graph_calls = []
 
     def _call_llm(self, prompt):
         self.llm_prompts.append(prompt)
@@ -160,8 +160,9 @@ class _NoAsyncMemoryNodeManager(MemoryNodeManager):
             return self._llm_outputs.pop(0)
         return None
 
-    def _start_async_work(self, **kwargs):
-        self.async_calls.append(kwargs)
+    def _build_relation_graph(self, **kwargs):
+        self.graph_calls.append(kwargs)
+        return super()._build_relation_graph(**kwargs)
 
 
 @pytest.fixture()
@@ -293,16 +294,14 @@ def test_store_turn_retains_multiple_hindsight_facts(db):
 
     relation = db._conn.execute(
         "SELECT source_node_id, target_node_id, relation_type, confidence "
-        "FROM memory_node_relations"
+        "FROM memory_node_relations WHERE relation_type = 'Cause'"
     ).fetchone()
     assert relation["source_node_id"] == rows[0]["id"]
     assert relation["target_node_id"] == rows[1]["id"]
     assert relation["relation_type"] == "Cause"
     assert relation["confidence"] == pytest.approx(0.8)
-    assert len(mgr.async_calls) == 2
-    assert "run_entity_extraction" not in mgr.async_calls[0]
-    assert "run_entity_extraction" not in mgr.async_calls[1]
-    assert mgr.async_calls[0]["keywords"] == ["Alice", "Slack", "email"]
+    assert len(mgr.graph_calls) == 2
+    assert mgr.graph_calls[0]["keywords"] == ["Alice", "Slack", "email"]
 
 
 def test_memory_node_details_live_on_memory_nodes_table(db):
@@ -476,7 +475,7 @@ def test_store_turn_falls_back_to_summary_when_retain_json_is_bad(db):
     assert row["topic"] == "postgresql"
     assert row["fact_kind"] == "conversation_summary"
     assert "fact_kind:conversation_summary" in json.loads(row["tags"])
-    assert "run_entity_extraction" not in mgr.async_calls[0]
+    assert len(mgr.graph_calls) == 1
 
 
 def test_retain_and_relation_prompts_share_relation_type_contract():

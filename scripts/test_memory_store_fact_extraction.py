@@ -576,7 +576,7 @@ def main() -> int:
                     "user_message": user,
                     "assistant_response": assistant,
                 }]
-                pending_character_count = manager._store_turns_character_count(
+                pending_character_count = manager._cal_store_turns_character_count(
                     pending_with_current,
                 )
                 extraction_due = (
