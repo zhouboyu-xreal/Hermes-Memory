@@ -5077,25 +5077,7 @@ class MemoryNodeManager:
 
         entity_id = int(cluster["entity_id"])
         topic_key = str(cluster.get("topic_key") or "general")
-        existing_observation, _pending = self._db.memory_observation_pending_sources(
-            entity_id=entity_id,
-            topic_key=topic_key,
-            candidate_node_ids=source_node_ids,
-        )
-        if existing_observation is not None:
-            self._log_info(
-                "memory_reflect",
-                "fact_cluster_skipped_existing_observation", 
-                {
-                    "entity_id": entity_id,
-                    "topic_key": topic_key,
-                    "cluster_family": cluster.get("cluster_family"),
-                    "source_node_ids": source_node_ids,
-                    "existing_observation_id": existing_observation.get("id"),
-                }
-            )
-            return None
-
+        
         observation = self._generate_observation(
             entity_name=str(cluster.get("entity_name") or ""),
             topic_label=topic_key,
