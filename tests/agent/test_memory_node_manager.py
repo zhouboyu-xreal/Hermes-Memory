@@ -10,14 +10,7 @@ import hermes_state
 from agent.memory_node_manager import MemoryNodeManager
 from agent.memory_node_manager import (
     CAUSAL_RELATION_TYPE_TEXT,
-    INSIGHT_CONSOLIDATION_PROMPT,
-    OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE,
-    OBSERVATION_CONSOLIDATION_PROMPT,
-    OBSERVATION_METADATA_GUIDANCE,
     OBSERVATION_SUPPORT_SECTION_HEADER,
-    OBSERVATION_SOURCE_FACT_GUIDANCE,
-    OBSERVATION_TIME_GUIDANCE,
-    OBSERVATION_UPDATE_PROMPT,
     INTERPRETATION_GENERATION_PROMPT,
     INTERPRETATION_UPDATE_PROMPT,
     INTERPRETATION_SECTION_HEADER,
@@ -26,7 +19,6 @@ from agent.memory_node_manager import (
     RELATION_PROMPT_TEMPLATE,
     RETAIN_FACT_EXTRACTION_PROMPT,
     SUMMARY_SYSTEM_PROMPT,
-    TASK_CONSOLIDATION_PROMPT,
     WORLD_FACT_SECTION_HEADER,
 )
 from hermes_state import SessionDB
@@ -1068,11 +1060,11 @@ def _add_task_interpretation(
     topic_label = topic_label or topic_key
     observation_id = None
     if source_node_ids:
-        observation_id = db.memory_upsert_observation(
+        observation_id = db.memory_upsert_evidence_bundle(
             entity_id=entity_id,
             topic_key=topic_key,
             topic_label=topic_label,
-            observation_type="observation",
+            bundle_type="observation",
             summary=summary,
             keywords=keywords or [topic_label],
             source_node_ids=source_node_ids,
@@ -1698,10 +1690,10 @@ def test_resolve_recall_intent_prefers_confident_llm_but_keeps_evidence_override
     ) == "evidence"
 
 
-def test_search_memory_observations_uses_entities(db):
+def test_search_memory_evidence_bundles_uses_entities(db):
     columns = {
         row["name"]
-        for row in db._conn.execute("PRAGMA table_info(memory_observations)").fetchall()
+        for row in db._conn.execute("PRAGMA table_info(memory_evidence_bundles)").fetchall()
     }
     assert {"embedding", "embedding_text", "embedding_updated_at"}.issubset(columns)
     node_id = _add_memory_node(
@@ -1711,18 +1703,18 @@ def test_search_memory_observations_uses_entities(db):
         keywords=["Slack"],
     )
     alice = db.entity_add_entity("Alice", "PERSON")
-    db.memory_upsert_observation(
+    db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alerts",
         topic_label="alerts",
-        observation_type="insight",
+        bundle_type="insight",
         summary="The user prefers concise escalation notes.",
         keywords=["escalation"],
         source_node_ids=[node_id],
         confidence=0.8,
     )
 
-    results = db.search_memory_observations(
+    results = db.search_memory_evidence_bundles(
         ["unrelated"],
         entities=[{"name": "Alice", "type": "PERSON"}],
         top_k=3,
@@ -1731,7 +1723,7 @@ def test_search_memory_observations_uses_entities(db):
     assert [row["entity_name"] for row in results] == ["Alice"]
 
 
-def test_search_memory_observations_uses_embedding_similarity(db):
+def test_search_memory_evidence_bundles_uses_embedding_similarity(db):
     source_id = _add_memory_node(
         db,
         time_key="2026-05-01 10:00:00",
@@ -1739,11 +1731,11 @@ def test_search_memory_observations_uses_embedding_similarity(db):
         keywords=["architecture"],
     )
     hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
-    matching_id = db.memory_upsert_observation(
+    matching_id = db.memory_upsert_evidence_bundle(
         entity_id=hermes,
         topic_key="workflow",
         topic_label="workflow",
-        observation_type="preference",
+        bundle_type="preference",
         summary="The workflow favors design calibration before implementation.",
         keywords=["architecture"],
         source_node_ids=[source_id],
@@ -1751,11 +1743,11 @@ def test_search_memory_observations_uses_embedding_similarity(db):
         embedding=np.array([[1.0, 0.0]], dtype=np.float32),
         embedding_text="design calibration before implementation",
     )
-    db.memory_upsert_observation(
+    db.memory_upsert_evidence_bundle(
         entity_id=hermes,
         topic_key="calendar",
         topic_label="calendar",
-        observation_type="insight",
+        bundle_type="insight",
         summary="Calendar cleanup is unrelated.",
         keywords=["calendar"],
         source_node_ids=[source_id],
@@ -1764,7 +1756,7 @@ def test_search_memory_observations_uses_embedding_similarity(db):
         embedding_text="calendar cleanup",
     )
 
-    results = db.search_memory_observations(
+    results = db.search_memory_evidence_bundles(
         ["alignment"],
         top_k=5,
         query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
@@ -1774,7 +1766,7 @@ def test_search_memory_observations_uses_embedding_similarity(db):
     assert results[0]["embedding_similarity"] == pytest.approx(1.0)
 
 
-def test_search_memory_observations_rejects_weak_family_term_entity_mismatch(db):
+def test_search_memory_evidence_bundles_rejects_weak_family_term_entity_mismatch(db):
     node_id = _add_memory_node(
         db,
         time_key="2026-05-01 10:00:00",
@@ -1782,18 +1774,18 @@ def test_search_memory_observations_rejects_weak_family_term_entity_mismatch(db)
         keywords=["小明父亲", "退休", "自驾游"],
     )
     xiaoming_father = db.entity_add_entity("小明父亲", "PERSON")
-    db.memory_upsert_observation(
+    db.memory_upsert_evidence_bundle(
         entity_id=xiaoming_father,
         topic_key="家庭",
         topic_label="家庭",
-        observation_type="insight",
+        bundle_type="insight",
         summary="小明父亲退休后保留了对开车自驾游和苹果的偏好。",
         keywords=["退休", "自驾游", "苹果"],
         source_node_ids=[node_id],
         confidence=0.7,
     )
 
-    results = db.search_memory_observations(
+    results = db.search_memory_evidence_bundles(
         ["父亲", "中学", "校长"],
         entities=[{"name": "小张父亲", "type": "PERSON"}],
         top_k=3,
@@ -1885,7 +1877,7 @@ def test_memory_node_manager_reflect_delegates_to_db(db):
 
     report = mgr.reflect(limit=5)
 
-    assert report["observation_reflect"]["touched_entity_ids"] == [alice]
+    assert report["evidence_bundle_reflect"]["touched_entity_ids"] == [alice]
     assert report["merge_candidates"] == 1
 
 
@@ -1905,7 +1897,7 @@ def test_memory_node_manager_reflect_uses_requested_timestamp_for_fact_day(db):
 
     assert requested_date_keys == ["2031-04-05", "2031-04-05"]
     assert report["node_decay"]["evaluated_at"] == requested_at.isoformat()
-    assert report["observation_reflect"]["candidate_count"] == 0
+    assert report["evidence_bundle_reflect"]["candidate_count"] == 0
 
 
 def test_memory_reflect_can_merge_normalized_entity_duplicates(db):
@@ -1962,22 +1954,22 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
     db.entity_link_node(first_node, alice)
     db.entity_link_node(second_node, alice_spaced)
     db.entity_link_node(touched_node, alice_spaced)
-    first_observation = db.memory_upsert_observation(
+    first_observation = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alerts",
         topic_label="alerts",
-        observation_type="observation",
+        bundle_type="entity_topic",
         summary="Alice prefers Slack for urgent alerts.",
         keywords=["Slack", "alerts"],
         source_node_ids=[first_node],
         confidence=0.8,
         metadata={"observation_kind": "context"},
     )
-    second_observation = db.memory_upsert_observation(
+    second_observation = db.memory_upsert_evidence_bundle(
         entity_id=alice_spaced,
         topic_key="alerts",
         topic_label="alerts",
-        observation_type="observation",
+        bundle_type="entity_topic",
         summary="Alice routes incident notifications through Slack.",
         keywords=["Slack", "notifications"],
         source_node_ids=[second_node],
@@ -2009,7 +2001,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
     report = mgr.reflect(limit=10)
 
     assert report["merged"] == 1
-    assert report["observation_groups_merged"] == 1
+    assert report["evidence_bundle_groups_merged"] == 1
     merge_prompt = next(
         prompt
         for prompt in mgr.llm_prompts
@@ -2033,7 +2025,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
     assert observation_prompts == [merge_prompt]
     rows = db._conn.execute(
         "SELECT id, entity_id, topic_key, observation_type, summary, keywords "
-        "FROM memory_observations ORDER BY id"
+        "FROM memory_evidence_bundles ORDER BY id"
     ).fetchall()
     assert len(rows) == 1
     assert rows[0]["id"] in {first_observation, second_observation}
@@ -2045,7 +2037,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
     source_ids = {
         row["node_id"]
         for row in db._conn.execute(
-            "SELECT node_id FROM memory_observation_sources WHERE observation_id = ?",
+            "SELECT node_id FROM memory_evidence_bundle_sources WHERE observation_id = ?",
             (rows[0]["id"],),
         ).fetchall()
     }
@@ -2053,7 +2045,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
     source_roles = {
         row["node_id"]: row["role"]
         for row in db._conn.execute(
-            "SELECT node_id, role FROM memory_observation_sources WHERE observation_id = ?",
+            "SELECT node_id, role FROM memory_evidence_bundle_sources WHERE observation_id = ?",
             (rows[0]["id"],),
         ).fetchall()
     }
@@ -2082,20 +2074,20 @@ def test_reflect_keeps_insight_and_task_observations_separate(db):
         )
         db.entity_link_node(node_id, alice)
         node_ids.append(node_id)
-    insight_id = db.memory_upsert_observation(
+    insight_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alerts",
         topic_label="alerts",
-        observation_type="insight",
+        bundle_type="insight",
         summary="Alice prefers Slack for urgent alerts.",
         keywords=["Slack", "alerts"],
         source_node_ids=[node_ids[0]],
     )
-    task_id = db.memory_upsert_observation(
+    task_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alerts",
         topic_label="alerts",
-        observation_type="task",
+        bundle_type="task",
         summary="Alice is actively implementing Slack alert routing.",
         keywords=["Slack", "alerts", "routing"],
         source_node_ids=[node_ids[1]],
@@ -2105,11 +2097,11 @@ def test_reflect_keeps_insight_and_task_observations_separate(db):
         },
     )
 
-    groups = db.find_duplicated_observation_groups(entity_ids=[alice])
+    groups = db.find_duplicated_evidence_bundle_groups(entity_ids=[alice])
 
     assert groups == []
     rows = db._conn.execute(
-        "SELECT id, observation_type FROM memory_observations ORDER BY id"
+        "SELECT id, observation_type FROM memory_evidence_bundles ORDER BY id"
     ).fetchall()
     assert [(row["id"], row["observation_type"]) for row in rows] == [
         (insight_id, "insight"),
@@ -2133,20 +2125,20 @@ def test_reflect_observation_decay_uses_fact_type_half_lives(db):
         keywords=["Alice", "Slack"],
         fact_type="episodic",
     )
-    world_observation = db.memory_upsert_observation(
+    world_observation = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="world-alerts",
         topic_label="world alerts",
-        observation_type="insight",
+        bundle_type="insight",
         summary="Alice prefers Slack for urgent alerts.",
         keywords=["Slack", "alerts"],
         source_node_ids=[world_node],
     )
-    experience_observation = db.memory_upsert_observation(
+    experience_observation = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="experience-alerts",
         topic_label="experience alerts",
-        observation_type="insight",
+        bundle_type="insight",
         summary="Hermes has prior Slack alert routing experience for Alice.",
         keywords=["Slack", "alerts"],
         source_node_ids=[experience_node],
@@ -2157,7 +2149,7 @@ def test_reflect_observation_decay_uses_fact_type_half_lives(db):
         experience_half_life_days=30,
         now=datetime(2026, 4, 1, 0, 0, 0),
     )
-    report = db.memory_reflect_observation_decay(
+    report = db.memory_reflect_evidence_bundle_decay(
         threshold=0.3,
         now=datetime(2026, 4, 1, 0, 0, 0),
     )
@@ -2165,7 +2157,7 @@ def test_reflect_observation_decay_uses_fact_type_half_lives(db):
     rows = {
         row["id"]: row["status"]
         for row in db._conn.execute(
-            "SELECT id, status FROM memory_observations WHERE id IN (?, ?)",
+            "SELECT id, status FROM memory_evidence_bundles WHERE id IN (?, ?)",
             (world_observation, experience_observation),
         ).fetchall()
     }
@@ -2295,7 +2287,7 @@ def test_memory_node_manager_reflect_reports_task_inactivity(db):
     assert metadata["task_status"] == "paused"
 
 
-def test_search_memory_observations_ignores_inactive_observations(db):
+def test_search_memory_evidence_bundles_ignores_inactive_observations(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     active_node = _add_memory_node(
         db,
@@ -2309,30 +2301,30 @@ def test_search_memory_observations_ignores_inactive_observations(db):
         summary="Alice once preferred email alerts.",
         keywords=["Alice", "email"],
     )
-    active_observation = db.memory_upsert_observation(
+    active_observation = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="slack-alerts",
         topic_label="Slack alerts",
-        observation_type="insight",
+        bundle_type="insight",
         summary="Alice currently prefers Slack for urgent alerts.",
         keywords=["Slack", "alerts"],
         source_node_ids=[active_node],
     )
-    inactive_observation = db.memory_upsert_observation(
+    inactive_observation = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="email-alerts",
         topic_label="email alerts",
-        observation_type="insight",
+        bundle_type="insight",
         summary="Alice once preferred email alerts.",
         keywords=["email", "alerts"],
         source_node_ids=[stale_node],
     )
     db._conn.execute(
-        "UPDATE memory_observations SET status = 'inactive' WHERE id = ?",
+        "UPDATE memory_evidence_bundles SET status = 'inactive' WHERE id = ?",
         (inactive_observation,),
     )
 
-    results = db.search_memory_observations(["Alice", "alerts"], top_k=5)
+    results = db.search_memory_evidence_bundles(["Alice", "alerts"], top_k=5)
 
     assert [item["id"] for item in results] == [active_observation]
 
@@ -2346,11 +2338,11 @@ def test_memory_node_manager_reflect_inactivates_stale_observations(db):
         keywords=["Alice", "email"],
         fact_type="episodic",
     )
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="email-alerts",
         topic_label="email alerts",
-        observation_type="insight",
+        bundle_type="insight",
         summary="Alice used email alerts long ago.",
         keywords=["email", "alerts"],
         source_node_ids=[old_node],
@@ -2364,14 +2356,14 @@ def test_memory_node_manager_reflect_inactivates_stale_observations(db):
 
     row = db._conn.execute(
         "SELECT mo.status, mn.decay_score "
-        "FROM memory_observations mo "
-        "JOIN memory_observation_sources mos ON mos.observation_id = mo.id "
+        "FROM memory_evidence_bundles mo "
+        "JOIN memory_evidence_bundle_sources mos ON mos.observation_id = mo.id "
         "JOIN memory_nodes mn ON mn.id = mos.node_id "
         "WHERE mo.id = ?",
         (observation_id,),
     ).fetchone()
     assert report["node_decay"]["updated"] == 1
-    assert report["observations_inactivated"] == 1
+    assert report["evidence_bundles_inactivated"] == 1
     assert row["status"] == "inactive"
     assert row["decay_score"] < 0.9
 
@@ -2558,15 +2550,27 @@ def test_recall_expands_interpretation_to_evidence_observations(db, monkeypatch)
         fact_type="episodic",
     )
     db.entity_link_node(source_id, alice)
-    observation_id = db.memory_upsert_observation(
+    evidence_bundle_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="architecture-first",
         topic_label="Architecture-first workflow",
-        observation_type="preference",
-        summary="Alice's workflow favors design discussion before implementation.",
+        bundle_type="entity_topic",
+        summary="Architecture-first workflow evidence.",
         keywords=["architecture", "discussion"],
         source_node_ids=[source_id],
     )
+    observation_id = db.memory_create_observation(
+        evidence_bundle_id,
+        {
+            "observation_type": "preference_signal",
+            "summary": (
+                "Alice's workflow favors design discussion before implementation."
+            ),
+            "confidence": 0.8,
+            "source_node_ids": [source_id],
+        },
+    )
+    assert observation_id is not None
     db.memory_upsert_interpretation(
         claim="Alice currently prefers calibration before implementation.",
         entity_id=alice,
@@ -2662,16 +2666,16 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
         ],
     )
     assert mgr.store_turn("Alice urgent alerts", "Use Slack.") is True
-    assert db._conn.execute("SELECT COUNT(*) FROM memory_observations").fetchone()[0] == 0
+    assert db._conn.execute("SELECT COUNT(*) FROM memory_evidence_bundles").fetchone()[0] == 0
 
     report = mgr.reflect(limit=10)
-    assert report["observation_reflect"]["candidate_count"] == 3
-    assert report["observations_consolidated"] == 1
-    assert report["observation_reflect"]["fact_clusters_consolidated"] == 1
+    assert report["evidence_bundle_reflect"]["candidate_count"] == 3
+    assert report["evidence_bundles_consolidated"] == 1
+    assert report["evidence_bundle_reflect"]["fact_clusters_consolidated"] == 1
 
     observation = db._conn.execute(
         "SELECT mo.summary, mo.topic_key, mo.observation_type, mo.metadata, en.name AS entity_name "
-        "FROM memory_observations mo "
+        "FROM memory_evidence_bundles mo "
         "JOIN entity_nodes en ON en.id = mo.entity_id"
     ).fetchone()
     assert observation["entity_name"] == "Alice"
@@ -2679,10 +2683,10 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
     assert observation["observation_type"] == "observation"
     assert json.loads(observation["metadata"])["observation_kind"] == "context"
     assert observation["summary"] == "Alice's urgent alert workflow is Slack-centered."
-    sources = db._conn.execute("SELECT node_id FROM memory_observation_sources").fetchall()
+    sources = db._conn.execute("SELECT node_id FROM memory_evidence_bundle_sources").fetchall()
     assert len(sources) == 3
     source_roles = db._conn.execute(
-        "SELECT node_id, role FROM memory_observation_sources ORDER BY node_id"
+        "SELECT node_id, role FROM memory_evidence_bundle_sources ORDER BY node_id"
     ).fetchall()
     assert {row["node_id"]: row["role"] for row in source_roles} == {
         source["node_id"]: "initial"
@@ -2972,7 +2976,7 @@ def test_unmatched_fact_clusters_use_family_profile_without_duplicate_mixed_buck
     assert clusters[0]["cluster_family"] == "preference"
     assert clusters[0]["family_distribution"] == {"preference": 2}
     assert clusters[0]["source_node_ids"] == [1, 2]
-    assert clusters[0]["can_create_observation"] is True
+    assert clusters[0]["can_create_evidence_bundle"] is True
 
 
 def test_unmatched_fact_clusters_keep_singleton_for_matching_only(db):
@@ -2995,7 +2999,7 @@ def test_unmatched_fact_clusters_keep_singleton_for_matching_only(db):
     assert len(clusters) == 1
     assert clusters[0]["source_node_ids"] == [1]
     assert clusters[0]["is_singleton"] is True
-    assert clusters[0]["can_create_observation"] is False
+    assert clusters[0]["can_create_evidence_bundle"] is False
     assert clusters[0]["cluster_reason"] == "single_fact_deferred"
 
 
@@ -3045,9 +3049,9 @@ def test_cluster_unprocessed_facts_returns_only_structural_fields(db):
         "topic_label",
         "source_nodes",
         "source_node_ids",
-        "can_create_observation",
+        "can_create_evidence_bundle",
     }
-    assert clusters[0]["can_create_observation"] is True
+    assert clusters[0]["can_create_evidence_bundle"] is True
 
 
 def test_reflect_generates_interpretation_from_consolidated_observation(db):
@@ -3076,13 +3080,13 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
         embedding_config={},
         llm_outputs=[
             json.dumps({
-                "sub_claim_type": "strategy",
-                "claim_text": "Hermes recommended Slack alert routing for Alice.",
+                "observation_type": "strategy",
+                "summary": "Hermes recommended Slack alert routing for Alice.",
                 "confidence": 0.82,
             }),
             json.dumps({
-                "sub_claim_type": "preference_signal",
-                "claim_text": (
+                "observation_type": "preference_signal",
+                "summary": (
                     "Alice explicitly prefers Slack and dislikes email for "
                     "urgent alerts."
                 ),
@@ -3110,21 +3114,25 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
 
     report = mgr.reflect(limit=10)
 
-    assert report["observations_consolidated"] == 1
+    assert report["evidence_bundles_consolidated"] == 1
     interpretation = db._conn.execute(
         "SELECT claim, entity_id, target_text, scope, interpretation_type, confidence, "
         "action_implication, evidence_node_ids, evidence_observation_ids, metadata "
         "FROM memory_interpretations"
     ).fetchone()
-    observation_id = db._conn.execute("SELECT id FROM memory_observations").fetchone()["id"]
-    observation = db.get_observations_by_ids([observation_id])[0]
-    observation_metadata = json.loads(observation["metadata"])
-    assert observation["embedding_text"] == observation["summary"]
-    assert "[strategy]" not in observation["summary"]
-    assert "[preference_signal]" not in observation["summary"]
-    assert "Hermes recommended Slack alert routing" in observation["summary"]
-    assert "Alice explicitly prefers Slack" in observation["summary"]
-    assert set(observation_metadata) <= {"decay"}
+    evidence_bundle_id = db._conn.execute(
+        "SELECT id FROM memory_evidence_bundles"
+    ).fetchone()["id"]
+    evidence_bundle = db.get_evidence_bundles_by_ids(
+        [evidence_bundle_id]
+    )[0]
+    bundle_metadata = json.loads(evidence_bundle["metadata"])
+    assert evidence_bundle["embedding_text"] == evidence_bundle["summary"]
+    assert "[strategy]" not in evidence_bundle["summary"]
+    assert "[preference_signal]" not in evidence_bundle["summary"]
+    assert "Hermes recommended Slack alert routing" in evidence_bundle["summary"]
+    assert "Alice explicitly prefers Slack" in evidence_bundle["summary"]
+    assert set(bundle_metadata) <= {"decay"}
     assert interpretation["entity_id"] == alice
     assert interpretation["interpretation_type"] == "explicit_preference"
     assert interpretation["target_text"] == "urgent alert routing"
@@ -3133,20 +3141,29 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
     assert "优先使用 Slack" in interpretation["claim"]
     assert "优先建议 Slack" in interpretation["action_implication"]
     assert json.loads(interpretation["evidence_node_ids"]) == node_ids[:2]
-    assert json.loads(interpretation["evidence_observation_ids"]) == [observation_id]
+    evidence_observation_ids = json.loads(
+        interpretation["evidence_observation_ids"]
+    )
+    assert evidence_observation_ids == [
+        row["id"]
+        for row in db._conn.execute(
+            "SELECT id FROM memory_observations "
+            "WHERE observation_type = 'preference_signal'"
+        ).fetchall()
+    ]
     metadata = json.loads(interpretation["metadata"])
     assert metadata["source"] == "interpretation_generation"
     assert metadata["evidence_shape"] == "single_observation"
-    assert len(metadata["sub_claim_ids"]) == 1
-    linked_sub_claim = db._conn.execute(
-        "SELECT sub_claim_id FROM memory_interpretation_sub_claims "
+    assert len(metadata["observation_ids"]) == 1
+    linked_observation = db._conn.execute(
+        "SELECT observation_id FROM memory_interpretation_observations "
         "WHERE interpretation_id = 1"
     ).fetchone()
-    assert linked_sub_claim["sub_claim_id"] == metadata["sub_claim_ids"][0]
+    assert linked_observation["observation_id"] == metadata["observation_ids"][0]
     assert any("interpretation 生成模块" in prompt for prompt in mgr.llm_prompts)
 
 
-def test_incremental_sub_claim_update_preserves_identity_and_rebuilds_summary(db):
+def test_incremental_observation_update_preserves_identity_and_rebuilds_summary(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     first_node = _add_memory_node(
         db,
@@ -3158,11 +3175,11 @@ def test_incremental_sub_claim_update_preserves_identity_and_rebuilds_summary(db
         task_event_like=True,
     )
     db.entity_link_node(first_node, alice)
-    observation_id = db.memory_upsert_observation(
+    evidence_bundle_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",
         topic_label="alert routing",
-        observation_type="observation",
+        bundle_type="entity_topic",
         summary="Temporary container summary.",
         keywords=["alerts"],
         source_node_ids=[first_node],
@@ -3172,8 +3189,8 @@ def test_incremental_sub_claim_update_preserves_identity_and_rebuilds_summary(db
         embedding_config={},
         llm_outputs=[
             json.dumps({
-                "sub_claim_type": "task_progress",
-                "claim_text": "Alice implemented the alert routing fallback.",
+                "observation_type": "task_progress",
+                "summary": "Alice implemented the alert routing fallback.",
                 "confidence": 0.82,
             }),
         ],
@@ -3181,9 +3198,11 @@ def test_incremental_sub_claim_update_preserves_identity_and_rebuilds_summary(db
     embedding_client = _CapturingEmbeddingClient()
     mgr._embedding_client = embedding_client
 
-    first_ids = mgr._update_sub_claims_for_observations([observation_id])
+    first_ids = mgr._update_observations_for_evidence_bundles(
+        [evidence_bundle_id]
+    )
     assert len(first_ids) == 1
-    stable_sub_claim_id = first_ids[0]
+    stable_observation_id = first_ids[0]
     interpretation_id = db.memory_upsert_interpretation(
         claim="Alice is progressing the alert routing fallback.",
         entity_id=alice,
@@ -3191,11 +3210,11 @@ def test_incremental_sub_claim_update_preserves_identity_and_rebuilds_summary(db
         scope="alert-routing",
         interpretation_type="task",
         evidence_node_ids=[first_node],
-        evidence_observation_ids=[observation_id],
+        evidence_observation_ids=[stable_observation_id],
     )
-    db.memory_link_interpretation_sub_claim(
+    db.memory_link_interpretation_observation(
         interpretation_id,
-        stable_sub_claim_id,
+        stable_observation_id,
     )
 
     second_node = _add_memory_node(
@@ -3208,18 +3227,18 @@ def test_incremental_sub_claim_update_preserves_identity_and_rebuilds_summary(db
         task_event_like=True,
     )
     db.entity_link_node(second_node, alice)
-    db.memory_upsert_observation(
+    db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",
         topic_label="alert routing",
-        observation_type="observation",
-        summary="This value must be replaced from sub-claims.",
+        bundle_type="entity_topic",
+        summary="This value must be replaced from observations.",
         keywords=["alerts"],
         source_node_ids=[first_node, second_node],
     )
     mgr._llm_outputs.append(json.dumps({
-        "sub_claim_type": "task_progress",
-        "claim_text": (
+        "observation_type": "task_progress",
+        "summary": (
             "Alice implemented the alert routing fallback and verified its "
             "tests."
         ),
@@ -3227,30 +3246,36 @@ def test_incremental_sub_claim_update_preserves_identity_and_rebuilds_summary(db
         "change_summary": "Added verification result.",
     }))
 
-    second_ids = mgr._update_sub_claims_for_observations([observation_id])
+    second_ids = mgr._update_observations_for_evidence_bundles(
+        [evidence_bundle_id]
+    )
 
-    assert second_ids == [stable_sub_claim_id]
-    sub_claims = db.get_sub_claims_for_observations([observation_id])
-    assert len(sub_claims) == 1
-    assert sub_claims[0]["id"] == stable_sub_claim_id
-    assert sub_claims[0]["source_node_ids"] == [first_node, second_node]
-    assert sub_claims[0]["metadata"]["revision"] == 2
-    linked_sub_claim_id = db._conn.execute(
-        "SELECT sub_claim_id FROM memory_interpretation_sub_claims "
+    assert second_ids == [stable_observation_id]
+    observations = db.get_observations_for_evidence_bundles(
+        [evidence_bundle_id]
+    )
+    assert len(observations) == 1
+    assert observations[0]["id"] == stable_observation_id
+    assert observations[0]["source_node_ids"] == [first_node, second_node]
+    assert observations[0]["metadata"]["revision"] == 2
+    linked_observation_id = db._conn.execute(
+        "SELECT observation_id FROM memory_interpretation_observations "
         "WHERE interpretation_id = ?",
         (interpretation_id,),
-    ).fetchone()["sub_claim_id"]
-    assert linked_sub_claim_id == stable_sub_claim_id
-    observation = db.get_observations_by_ids([observation_id])[0]
-    assert observation["summary"] == (
+    ).fetchone()["observation_id"]
+    assert linked_observation_id == stable_observation_id
+    evidence_bundle = db.get_evidence_bundles_by_ids(
+        [evidence_bundle_id]
+    )[0]
+    assert evidence_bundle["summary"] == (
         "Alice implemented the alert routing fallback and verified its tests."
     )
-    assert observation["embedding_text"] == observation["summary"]
-    assert embedding_client.texts[-1] == observation["summary"]
-    assert json.loads(observation["metadata"]) == {}
+    assert evidence_bundle["embedding_text"] == evidence_bundle["summary"]
+    assert embedding_client.texts[-1] == evidence_bundle["summary"]
+    assert json.loads(evidence_bundle["metadata"]) == {}
 
 
-def test_interpretation_generation_skips_observation_without_sub_claims(db):
+def test_interpretation_generation_skips_observation_without_observations(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     node_id = _add_memory_node(
         db,
@@ -3259,11 +3284,11 @@ def test_interpretation_generation_skips_observation_without_sub_claims(db):
         keywords=["alert-routing"],
     )
     db.entity_link_node(node_id, alice)
-    observation_id = db.memory_upsert_observation(
+    evidence_bundle_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",
         topic_label="alert routing",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Alice discussed alert routing.",
         keywords=["alert-routing"],
         source_node_ids=[node_id],
@@ -3276,7 +3301,7 @@ def test_interpretation_generation_skips_observation_without_sub_claims(db):
     )
 
     generated = mgr._reflect_generate_interpretations_using_observations(
-        [observation_id]
+        [evidence_bundle_id]
     )
 
     assert generated == 0
@@ -3286,12 +3311,12 @@ def test_interpretation_generation_skips_observation_without_sub_claims(db):
     ).fetchone()[0] == 0
 
 
-def test_deferred_interpretation_context_is_loaded_from_sub_claims(db):
+def test_deferred_interpretation_context_is_loaded_from_observations(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
-    sub_claim_ids = []
+    evidence_bundle_ids = []
     observation_ids = []
-    for index, claim_text in enumerate(
+    for index, summary in enumerate(
         [
             "Alice is evaluating Slack alert routing.",
             "Alice is comparing Slack routing behavior.",
@@ -3301,31 +3326,31 @@ def test_deferred_interpretation_context_is_loaded_from_sub_claims(db):
         node_id = _add_memory_node(
             db,
             time_key=f"2026-05-0{index} 10:00:00",
-            summary=claim_text,
+            summary=summary,
             keywords=["Slack", "routing"],
             fact_kind="context",
         )
         db.entity_link_node(node_id, alice)
-        observation_id = db.memory_upsert_observation(
+        evidence_bundle_id = db.memory_upsert_evidence_bundle(
             entity_id=alice,
-            topic_key="slack-routing",
-            topic_label="Slack routing",
-            observation_type="observation",
+            topic_key=f"slack-routing-{index}",
+            topic_label=f"Slack routing {index}",
+            bundle_type="entity_topic",
             summary=f"parent observation text {index}",
             keywords=["parent-only-keyword"],
             source_node_ids=[node_id],
             metadata={"parent_only": True},
         )
-        sub_claim_id = db.memory_create_sub_claim(
-            observation_id,
+        observation_id = db.memory_create_observation(
+            evidence_bundle_id,
             {
-                "sub_claim_type": "context",
-                "claim_text": claim_text,
+                "observation_type": "context",
+                "summary": summary,
                 "evidence_mode": "semantic",
                 "confidence": 0.8,
                 "source_node_ids": [node_id],
                 "embedding": np.asarray([1.0, 0.01 * index], dtype=np.float32),
-                "embedding_text": claim_text,
+                "embedding_text": summary,
                 "metadata": {
                     "allowed_interpretation_types": ["insight"],
                     "candidate_interpretation_types": ["insight"],
@@ -3333,59 +3358,59 @@ def test_deferred_interpretation_context_is_loaded_from_sub_claims(db):
                 },
             },
         )
+        evidence_bundle_ids.append(evidence_bundle_id)
         observation_ids.append(observation_id)
-        sub_claim_ids.append(sub_claim_id)
 
-    first_sub_claim = db.get_sub_claims_for_observations(
-        [observation_ids[0]]
+    first_observation = db.get_observations_for_evidence_bundles(
+        [evidence_bundle_ids[0]]
     )[0]
-    first_semantic_sub_claim = mgr._build_semantic_sub_claim(first_sub_claim)
-    assert first_semantic_sub_claim["summary"] == first_sub_claim["claim_text"]
-    assert "parent observation text" not in first_semantic_sub_claim["summary"]
-    assert "parent_only" not in first_semantic_sub_claim["metadata"]
+    first_semantic_observation = mgr._build_semantic_observation(first_observation)
+    assert first_semantic_observation["summary"] == first_observation["summary"]
+    assert "parent observation text" not in first_semantic_observation["summary"]
+    assert "parent_only" not in first_semantic_observation["metadata"]
     first_sources = db.memory_nodes_by_ids(
-        first_sub_claim["source_node_ids"]
+        first_observation["source_node_ids"]
     )
     first_basis_hash = mgr._interpretation_basis_hash(
-        first_semantic_sub_claim,
+        first_semantic_observation,
         first_sources,
     )
-    db.memory_update_sub_claim_metadata(
-        sub_claim_ids[0],
+    db.memory_update_observation_metadata(
+        observation_ids[0],
         {
-            **first_sub_claim["metadata"],
+            **first_observation["metadata"],
             "interpretation_status": "deferred",
             "interpretation_basis_hash": first_basis_hash,
         },
     )
 
-    second_sub_claim = db.get_sub_claims_for_observations(
-        [observation_ids[1]]
+    second_observation = db.get_observations_for_evidence_bundles(
+        [evidence_bundle_ids[1]]
     )[0]
-    second_semantic_sub_claim = mgr._build_semantic_sub_claim(
-        second_sub_claim
+    second_semantic_observation = mgr._build_semantic_observation(
+        second_observation
     )
     second_sources = db.memory_nodes_by_ids(
-        second_sub_claim["source_node_ids"]
+        second_observation["source_node_ids"]
     )
     family = mgr._observation_interpretation_cluster_family(
-        second_semantic_sub_claim,
+        second_semantic_observation,
         second_sources,
     )
-    deferred_items = mgr._get_similar_deferred_sub_claims(
+    deferred_items = mgr._get_similar_deferred_observations(
         {
-            "sub_claim": second_semantic_sub_claim,
+            "observation": second_semantic_observation,
             "family": family,
         },
-        {sub_claim_ids[1]},
+        {observation_ids[1]},
     )
 
-    assert [item["sub_claim_id"] for item in deferred_items] == [
-        sub_claim_ids[0]
+    assert [item["observation_id"] for item in deferred_items] == [
+        observation_ids[0]
     ]
-    assert deferred_items[0]["observation_id"] == observation_ids[0]
-    assert deferred_items[0]["sub_claim"]["summary"] == (
-        first_sub_claim["claim_text"]
+    assert deferred_items[0]["evidence_bundle_id"] == evidence_bundle_ids[0]
+    assert deferred_items[0]["observation"]["summary"] == (
+        first_observation["summary"]
     )
 
 
@@ -3407,11 +3432,11 @@ def test_interpretation_linker_reuses_existing_observation_evidence_without_llm(
     )
     db.entity_link_node(first, alice)
     db.entity_link_node(second, alice)
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="slack-alerts",
         topic_label="Slack alerts",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Alice's urgent alert workflow is Slack-centered.",
         keywords=["Slack", "alerts"],
         source_node_ids=[first, second],
@@ -3458,11 +3483,11 @@ def test_interpretation_linker_matches_preference_by_entity_topic_without_llm(db
         fact_kind="preference",
     )
     db.entity_link_node(source, alice)
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="architecture-planning",
         topic_label="architecture planning",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Alice has repeatedly preferred architecture discussion before implementation.",
         keywords=["architecture", "planning"],
         source_node_ids=[source],
@@ -3540,11 +3565,11 @@ def test_interpretation_linker_respects_observation_candidate_type_gate(db):
         task_relevance="strong",
     )
     db.entity_link_node(source, hermes)
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=hermes,
         topic_key="memory-matching",
         topic_label="memory matching",
-        observation_type="observation",
+        bundle_type="observation",
         summary="用户正在推进 observation 与 interpretation 的匹配实现任务。",
         keywords=["memory", "matching"],
         source_node_ids=[source],
@@ -3568,10 +3593,10 @@ def test_interpretation_linker_respects_observation_candidate_type_gate(db):
         },
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
-    source_nodes = db.get_observation_supporting_nodes([observation_id])[observation_id]
+    source_nodes = db.get_evidence_bundle_supporting_nodes([observation_id])[observation_id]
 
     linked = mgr._link_observation_to_existing_interpretation(
-        observation=dict(db._conn.execute("SELECT * FROM memory_observations WHERE id = ?", (observation_id,)).fetchone()),
+        observation=dict(db._conn.execute("SELECT * FROM memory_evidence_bundles WHERE id = ?", (observation_id,)).fetchone()),
         source_nodes=source_nodes,
         observation_id=observation_id,
         source_node_ids=[source],
@@ -3611,11 +3636,11 @@ def test_interpretation_generation_clusters_unmatched_observations(db):
     )
     db.entity_link_node(first_source, hermes)
     db.entity_link_node(second_source, hermes)
-    first_observation = db.memory_upsert_observation(
+    first_observation = db.memory_upsert_evidence_bundle(
         entity_id=hermes,
         topic_key="memory-interpretation",
         topic_label="memory interpretation",
-        observation_type="observation",
+        bundle_type="observation",
         summary="用户要求设计 observation 与 interpretation 的匹配策略。",
         keywords=["memory", "interpretation"],
         source_node_ids=[first_source],
@@ -3626,11 +3651,11 @@ def test_interpretation_generation_clusters_unmatched_observations(db):
             "candidate_interpretation_types": ["task"],
         },
     )
-    second_observation = db.memory_upsert_observation(
+    second_observation = db.memory_upsert_evidence_bundle(
         entity_id=hermes,
         topic_key="memory-implementation",
         topic_label="memory implementation",
-        observation_type="observation",
+        bundle_type="observation",
         summary="助手开始实现 observation 与 interpretation 的 cheap matcher。",
         keywords=["memory", "interpretation"],
         source_node_ids=[second_source],
@@ -3700,11 +3725,11 @@ def test_interpretation_generation_defers_weak_single_observation(db):
         fact_kind="context",
     )
     db.entity_link_node(source, hermes)
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=hermes,
         topic_key="memory-indexing",
         topic_label="memory indexing",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Hermes memory recall discussion has indexing context.",
         keywords=["memory", "indexing"],
         source_node_ids=[source],
@@ -3723,7 +3748,7 @@ def test_interpretation_generation_defers_weak_single_observation(db):
     assert mgr.llm_prompts == []
     metadata = json.loads(
         db._conn.execute(
-            "SELECT metadata FROM memory_observations WHERE id = ?",
+            "SELECT metadata FROM memory_evidence_bundles WHERE id = ?",
             (observation_id,),
         ).fetchone()["metadata"]
     )
@@ -3742,11 +3767,11 @@ def test_interpretation_generation_defers_single_fact_insight_before_llm(db):
         fact_kind="context",
     )
     db.entity_link_node(source, hermes)
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=hermes,
         topic_key="memory-recall",
         topic_label="memory recall",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Hermes memory system changed one recall label.",
         keywords=["memory", "recall"],
         source_node_ids=[source],
@@ -3788,7 +3813,7 @@ def test_interpretation_generation_defers_single_fact_insight_before_llm(db):
     assert db._conn.execute("SELECT COUNT(*) AS count FROM memory_interpretations").fetchone()["count"] == 0
     metadata = json.loads(
         db._conn.execute(
-            "SELECT metadata FROM memory_observations WHERE id = ?",
+            "SELECT metadata FROM memory_evidence_bundles WHERE id = ?",
             (observation_id,),
         ).fetchone()["metadata"]
     )
@@ -3809,11 +3834,11 @@ def test_interpretation_generation_does_not_use_global_batch_threshold_for_weak_
         )
         db.entity_link_node(source, entity)
         observation_ids.append(
-            db.memory_upsert_observation(
+            db.memory_upsert_evidence_bundle(
                 entity_id=entity,
                 topic_key=f"ordinary-context-{index}",
                 topic_label=f"ordinary context {index}",
-                observation_type="observation",
+                bundle_type="observation",
                 summary=f"Hermes area {index} has ordinary context.",
                 keywords=[f"area-{index}", "ordinary"],
                 source_node_ids=[source],
@@ -3832,7 +3857,7 @@ def test_interpretation_generation_does_not_use_global_batch_threshold_for_weak_
     assert generated == 0
     assert mgr.llm_prompts == []
     rows = db._conn.execute(
-        "SELECT metadata FROM memory_observations WHERE id IN (?, ?, ?) ORDER BY id",
+        "SELECT metadata FROM memory_evidence_bundles WHERE id IN (?, ?, ?) ORDER BY id",
         tuple(observation_ids),
     ).fetchall()
     for row in rows:
@@ -3851,11 +3876,11 @@ def test_interpretation_generation_skips_final_observation_when_basis_unchanged(
         fact_kind="preference",
     )
     db.entity_link_node(source, alice)
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="architecture-notes",
         topic_label="architecture notes",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Alice prefers brief architecture notes before code changes.",
         keywords=["architecture", "brief"],
         source_node_ids=[source],
@@ -3886,7 +3911,7 @@ def test_interpretation_generation_skips_final_observation_when_basis_unchanged(
     assert second == 0
     assert mgr.llm_prompts == []
     row = db._conn.execute(
-        "SELECT metadata FROM memory_observations WHERE id = ?",
+        "SELECT metadata FROM memory_evidence_bundles WHERE id = ?",
         (observation_id,),
     ).fetchone()
     metadata = json.loads(row["metadata"])
@@ -3912,11 +3937,11 @@ def test_interpretation_generation_reuses_deferred_observation_in_new_cluster(db
     )
     db.entity_link_node(first_source, hermes)
     db.entity_link_node(second_source, hermes)
-    first_observation = db.memory_upsert_observation(
+    first_observation = db.memory_upsert_evidence_bundle(
         entity_id=hermes,
         topic_key="memory-indexing",
         topic_label="memory indexing",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Hermes memory recall discussion has indexing context.",
         keywords=["memory", "indexing"],
         source_node_ids=[first_source],
@@ -3930,11 +3955,11 @@ def test_interpretation_generation_reuses_deferred_observation_in_new_cluster(db
     first_mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
     assert first_mgr._generate_interpretations_using_observations([first_observation]) == 0
 
-    second_observation = db.memory_upsert_observation(
+    second_observation = db.memory_upsert_evidence_bundle(
         entity_id=hermes,
         topic_key="memory-indexing",
         topic_label="memory indexing followup",
-        observation_type="observation_followup",
+        bundle_type="observation_followup",
         summary="Hermes memory recall discussion connected indexing context to recall quality.",
         keywords=["memory", "indexing", "recall"],
         source_node_ids=[second_source],
@@ -3977,7 +4002,7 @@ def test_interpretation_generation_reuses_deferred_observation_in_new_cluster(db
     assert f"id={first_observation}" in prompt
     assert f"id={second_observation}" in prompt
     rows = db._conn.execute(
-        "SELECT id, metadata FROM memory_observations WHERE id IN (?, ?) ORDER BY id",
+        "SELECT id, metadata FROM memory_evidence_bundles WHERE id IN (?, ?) ORDER BY id",
         (first_observation, second_observation),
     ).fetchall()
     metadata_by_id = {row["id"]: json.loads(row["metadata"]) for row in rows}
@@ -4069,13 +4094,13 @@ def test_store_turn_can_consolidate_task_observation(db):
     )
 
     assert mgr.store_turn("继续改记忆系统", "我们来调整 observation 分类。") is True
-    assert db._conn.execute("SELECT COUNT(*) FROM memory_observations").fetchone()[0] == 0
+    assert db._conn.execute("SELECT COUNT(*) FROM memory_evidence_bundles").fetchone()[0] == 0
 
     report = mgr.reflect(limit=10)
-    assert report["observations_consolidated"] == 1
+    assert report["evidence_bundles_consolidated"] == 1
 
     observation = db._conn.execute(
-        "SELECT observation_type, summary, metadata FROM memory_observations"
+        "SELECT observation_type, summary, metadata FROM memory_evidence_bundles"
     ).fetchone()
     metadata = json.loads(observation["metadata"])
     assert observation["observation_type"] == "observation"
@@ -4147,14 +4172,14 @@ def test_reflect_updates_observation_by_entity_and_topic(db):
 
     report = mgr.reflect(limit=10)
 
-    assert report["observation_reflect"].get("task_matched", 0) == 0
-    assert report["observation_reflect"]["fact_observation_matches"] == 1
-    assert report["observation_reflect"]["fact_observation_node_count"] == 1
-    assert report["observation_reflect"]["entity_topic_updates"] == 0
-    assert report["observation_reflect"]["entity_topic_node_count"] == 1
-    assert db.memory_observation_source_ids(observation_id) == [source_node, new_node]
+    assert report["evidence_bundle_reflect"].get("task_matched", 0) == 0
+    assert report["evidence_bundle_reflect"]["fact_evidence_bundle_matches"] == 1
+    assert report["evidence_bundle_reflect"]["fact_evidence_bundle_node_count"] == 1
+    assert report["evidence_bundle_reflect"]["entity_topic_updates"] == 0
+    assert report["evidence_bundle_reflect"]["entity_topic_node_count"] == 1
+    assert db.memory_evidence_bundle_source_ids(observation_id) == [source_node, new_node]
     row = db._conn.execute(
-        "SELECT summary, metadata FROM memory_observations WHERE id = ?",
+        "SELECT summary, metadata FROM memory_evidence_bundles WHERE id = ?",
         (observation_id,),
     ).fetchone()
     assert "reflect 调度机制" in row["summary"]
@@ -4214,10 +4239,10 @@ def test_reflect_excludes_non_task_fact_kind_from_existing_task_match(db):
 
     report = mgr.reflect(limit=10)
 
-    assert report["observation_reflect"].get("task_matched", 0) == 0
-    assert report["observation_reflect"]["fact_observation_matches"] == 0
-    assert report["observation_reflect"]["fact_clusters_consolidated"] == 0
-    assert db.memory_observation_source_ids(observation_id) == [source_node]
+    assert report["evidence_bundle_reflect"].get("task_matched", 0) == 0
+    assert report["evidence_bundle_reflect"]["fact_evidence_bundle_matches"] == 0
+    assert report["evidence_bundle_reflect"]["fact_clusters_consolidated"] == 0
+    assert db.memory_evidence_bundle_source_ids(observation_id) == [source_node]
     assert mgr.llm_prompts == []
 
 
@@ -4268,9 +4293,9 @@ def test_reflect_no_longer_matches_observation_by_high_task_embedding_similarity
 
     report = mgr.reflect(limit=10)
 
-    assert report["observation_reflect"].get("task_matched", 0) == 0
-    assert report["observation_reflect"]["entity_topic_updates"] == 0
-    assert db.memory_observation_source_ids(observation_id) == [source_node]
+    assert report["evidence_bundle_reflect"].get("task_matched", 0) == 0
+    assert report["evidence_bundle_reflect"]["entity_topic_updates"] == 0
+    assert db.memory_evidence_bundle_source_ids(observation_id) == [source_node]
 
 
 def test_reflect_no_longer_matches_fact_to_single_recent_active_task(db):
@@ -4320,9 +4345,9 @@ def test_reflect_no_longer_matches_fact_to_single_recent_active_task(db):
 
     report = mgr.reflect(limit=10)
 
-    assert report["observation_reflect"].get("task_matched", 0) == 0
-    assert report["observation_reflect"]["entity_topic_updates"] == 0
-    assert db.memory_observation_source_ids(observation_id) == [source_node]
+    assert report["evidence_bundle_reflect"].get("task_matched", 0) == 0
+    assert report["evidence_bundle_reflect"]["entity_topic_updates"] == 0
+    assert db.memory_evidence_bundle_source_ids(observation_id) == [source_node]
 
 
 def test_reflect_leaves_unmatched_non_action_fact_for_regular_observation_flow(db):
@@ -4356,8 +4381,8 @@ def test_reflect_leaves_unmatched_non_action_fact_for_regular_observation_flow(d
 
     report = mgr.reflect(limit=10)
 
-    assert report["observation_reflect"].get("task_matched", 0) == 0
-    assert db.memory_observation_source_ids(observation_id) == [source_node]
+    assert report["evidence_bundle_reflect"].get("task_matched", 0) == 0
+    assert db.memory_evidence_bundle_source_ids(observation_id) == [source_node]
     assert mgr.llm_prompts == []
 
 
@@ -4372,11 +4397,11 @@ def test_reflect_updates_existing_observation_by_entity_topic(db):
         fact_kind="action",
     )
     db.entity_link_node(old_node, alice)
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",
         topic_label="alert-routing",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Alice has an alert routing history.",
         keywords=["alert-routing"],
         source_node_ids=[old_node],
@@ -4422,14 +4447,16 @@ def test_reflect_updates_existing_observation_by_entity_topic(db):
 
     report = mgr.reflect(limit=10)
 
-    assert report["observation_reflect"]["fact_observation_matches"] == 1
-    assert report["observation_reflect"]["fact_observation_node_count"] == 1
-    assert report["observation_reflect"]["entity_topic_updates"] == 0
-    assert report["observation_reflect"]["entity_topic_node_count"] == 1
-    assert db.memory_observation_source_ids(observation_id) == [old_node, new_matching_node]
-    assert unrelated_task_node not in db.find_observed_source_node_ids([unrelated_task_node])
+    assert report["evidence_bundle_reflect"]["fact_evidence_bundle_matches"] == 1
+    assert report["evidence_bundle_reflect"]["fact_evidence_bundle_node_count"] == 1
+    assert report["evidence_bundle_reflect"]["entity_topic_updates"] == 0
+    assert report["evidence_bundle_reflect"]["entity_topic_node_count"] == 1
+    assert db.memory_evidence_bundle_source_ids(observation_id) == [old_node, new_matching_node]
+    assert unrelated_task_node not in db.find_bundled_source_node_ids(
+        [unrelated_task_node]
+    )
     row = db._conn.execute(
-        "SELECT summary, metadata FROM memory_observations WHERE id = ?",
+        "SELECT summary, metadata FROM memory_evidence_bundles WHERE id = ?",
         (observation_id,),
     ).fetchone()
     assert row["summary"] == "Alice has continued refining alert routing over time."
@@ -4449,11 +4476,11 @@ def test_reflect_clusters_facts_before_updating_existing_observation(db):
         fact_kind="action",
     )
     db.entity_link_node(old_node, alice)
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",
         topic_label="alert-routing",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Alice has an established alert routing workflow.",
         keywords=["alert-routing", "Slack"],
         source_node_ids=[old_node],
@@ -4495,17 +4522,17 @@ def test_reflect_clusters_facts_before_updating_existing_observation(db):
 
     report = mgr.reflect(limit=10)
 
-    observation_report = report["observation_reflect"]
-    assert observation_report["fact_cluster_observation_matches"] == 1
-    assert observation_report["fact_cluster_observation_node_count"] == 2
-    assert observation_report["fact_observation_matches"] == 1
-    assert observation_report["fact_observation_node_count"] == 2
-    assert observation_report["fact_clusters_consolidated"] == 0
-    assert db.memory_observation_source_ids(observation_id) == [old_node, *new_nodes]
+    evidence_bundle_report = report["evidence_bundle_reflect"]
+    assert evidence_bundle_report["fact_cluster_evidence_bundle_matches"] == 1
+    assert evidence_bundle_report["fact_cluster_evidence_bundle_node_count"] == 2
+    assert evidence_bundle_report["fact_evidence_bundle_matches"] == 1
+    assert evidence_bundle_report["fact_evidence_bundle_node_count"] == 2
+    assert evidence_bundle_report["fact_clusters_consolidated"] == 0
+    assert db.memory_evidence_bundle_source_ids(observation_id) == [old_node, *new_nodes]
     source_roles = {
         row["node_id"]: row["role"]
         for row in db._conn.execute(
-            "SELECT node_id, role FROM memory_observation_sources WHERE observation_id = ?",
+            "SELECT node_id, role FROM memory_evidence_bundle_sources WHERE observation_id = ?",
             (observation_id,),
         ).fetchall()
     }
@@ -4521,7 +4548,7 @@ def test_reflect_clusters_facts_before_updating_existing_observation(db):
     ]
     assert observation_prompts == []
     row = db._conn.execute(
-        "SELECT metadata FROM memory_observations WHERE id = ?",
+        "SELECT metadata FROM memory_evidence_bundles WHERE id = ?",
         (observation_id,),
     ).fetchone()
     assert set(json.loads(row["metadata"])) <= {"decay"}
@@ -4536,20 +4563,20 @@ def test_fact_cluster_candidates_always_include_exact_entity_topic_observation(d
         keywords=["alert-routing"],
     )
     db.entity_link_node(old_node, alice)
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",
         topic_label="alert-routing",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Alice has an alert routing workflow.",
         keywords=["alert-routing"],
         source_node_ids=[old_node],
     )
-    other_topic_observation_id = db.memory_upsert_observation(
+    other_topic_observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="health-management",
         topic_label="health-management",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Alice has a health management routine.",
         keywords=["health"],
         source_node_ids=[old_node],
@@ -4563,12 +4590,12 @@ def test_fact_cluster_candidates_always_include_exact_entity_topic_observation(d
     db.entity_link_node(new_node, alice)
     monkeypatch.setattr(
         db,
-        "search_memory_observations",
+        "search_memory_evidence_bundles",
         lambda *args, **kwargs: pytest.fail("exact cluster matching must not use broad search"),
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
-    candidates = mgr._candidate_observations_for_fact_cluster({
+    candidates = mgr._candidate_evidence_bundles_for_fact_cluster({
         "entity_id": alice,
         "entity_name": "Alice",
         "topic_key": "alert-routing",
@@ -4581,7 +4608,7 @@ def test_fact_cluster_candidates_always_include_exact_entity_topic_observation(d
     assert candidates[0]["entity_name"] == "Alice"
 
 
-def test_observation_sub_claims_preserve_fact_to_interpretation_type_mapping(db):
+def test_observation_observations_preserve_fact_to_interpretation_type_mapping(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     task_node = _add_memory_node(
         db,
@@ -4610,22 +4637,22 @@ def test_observation_sub_claims_preserve_fact_to_interpretation_type_mapping(db)
     )
     for node_id in (task_node, preference_node, constraint_node):
         db.entity_link_node(node_id, alice)
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",
         topic_label="alert routing",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Alice has several alert routing requirements and activities.",
         keywords=["alerts"],
         source_node_ids=[task_node, preference_node, constraint_node],
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
-    sub_claim_ids = mgr._update_sub_claims_for_observations([observation_id])
+    observation_ids = mgr._update_observations_for_evidence_bundles([observation_id])
 
-    assert len(sub_claim_ids) == 3
-    sub_claims = db.get_sub_claims_for_observations([observation_id])
-    by_type = {item["sub_claim_type"]: item for item in sub_claims}
+    assert len(observation_ids) == 3
+    observations = db.get_observations_for_evidence_bundles([observation_id])
+    by_type = {item["observation_type"]: item for item in observations}
     assert set(by_type) == {"task_progress", "preference_signal", "constraint"}
     assert by_type["task_progress"]["source_node_ids"] == [task_node]
     assert by_type["preference_signal"]["evidence_mode"] == "explicit"
@@ -4641,7 +4668,7 @@ def test_observation_sub_claims_preserve_fact_to_interpretation_type_mapping(db)
     ) == {"constraint", "explicit_instruction", "task_risk"}
 
 
-def test_sub_claim_type_gate_rejects_incompatible_interpretation(db):
+def test_observation_type_gate_rejects_incompatible_interpretation(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     node_id = _add_memory_node(
         db,
@@ -4652,19 +4679,19 @@ def test_sub_claim_type_gate_rejects_incompatible_interpretation(db):
         fact_kind="preference",
     )
     db.entity_link_node(node_id, alice)
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",
         topic_label="alert routing",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Alice has an alert routing preference.",
         keywords=["alerts"],
         source_node_ids=[node_id],
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
-    mgr._update_sub_claims_for_observations([observation_id])
-    sub_claim = db.get_sub_claims_for_observations([observation_id])[0]
-    semantic_sub_claim = mgr._build_semantic_sub_claim(sub_claim)
+    mgr._update_observations_for_evidence_bundles([observation_id])
+    observation = db.get_observations_for_evidence_bundles([observation_id])[0]
+    semantic_observation = mgr._build_semantic_observation(observation)
     task_interpretation = {
         "id": 1,
         "entity_id": alice,
@@ -4678,17 +4705,17 @@ def test_sub_claim_type_gate_rejects_incompatible_interpretation(db):
     }
 
     score, reason = mgr._calculate_interpretation_candidate_score(
-        observation=semantic_sub_claim,
+        observation=semantic_observation,
         source_nodes=db.memory_nodes_by_ids([node_id]),
         interpretation=task_interpretation,
         observation_id=observation_id,
     )
 
     assert score == 0.0
-    assert reason == "sub_claim_type_gate"
+    assert reason == "observation_type_gate"
 
 
-def test_behavioral_preference_sub_claim_only_allows_inferred_preference(db):
+def test_behavioral_preference_observation_only_allows_inferred_preference(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     node_ids = []
     for index in range(2):
@@ -4702,23 +4729,23 @@ def test_behavioral_preference_sub_claim_only_allows_inferred_preference(db):
         )
         db.entity_link_node(node_id, alice)
         node_ids.append(node_id)
-    observation_id = db.memory_upsert_observation(
+    observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",
         topic_label="alert routing",
-        observation_type="observation",
+        bundle_type="observation",
         summary="Alice repeatedly selected Slack for urgent alerts.",
         keywords=["Slack", "alerts"],
         source_node_ids=node_ids,
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
-    mgr._update_sub_claims_for_observations([observation_id])
+    mgr._update_observations_for_evidence_bundles([observation_id])
 
-    sub_claim = db.get_sub_claims_for_observations([observation_id])[0]
-    assert sub_claim["sub_claim_type"] == "preference_signal"
-    assert sub_claim["evidence_mode"] == "behavioral"
-    assert sub_claim["metadata"]["allowed_interpretation_types"] == [
+    observation = db.get_observations_for_evidence_bundles([observation_id])[0]
+    assert observation["observation_type"] == "preference_signal"
+    assert observation["evidence_mode"] == "behavioral"
+    assert observation["metadata"]["allowed_interpretation_types"] == [
         "inferred_preference"
     ]
 
@@ -4783,15 +4810,6 @@ def test_task_metadata_normalizes_steps():
 
 
 def test_task_status_prompt_definitions_scope_stale_by_prompt_role():
-    assert INSIGHT_CONSOLIDATION_PROMPT == OBSERVATION_CONSOLIDATION_PROMPT
-    assert TASK_CONSOLIDATION_PROMPT == OBSERVATION_CONSOLIDATION_PROMPT
-    for prompt in (OBSERVATION_CONSOLIDATION_PROMPT, OBSERVATION_UPDATE_PROMPT):
-        assert '"category": "observation"' in prompt
-        assert "task_status、goal、steps、next_action、insight_type" in prompt
-        assert '"task_status": "active | blocked | paused | stale"' not in prompt
-        assert '"category": "task"' not in prompt
-        assert '"category": "insight"' not in prompt
-
     assert "interpretation_type 只能是 insight、task" in INTERPRETATION_GENERATION_PROMPT
     assert "task_status 只能是 active、blocked、paused、stale" in INTERPRETATION_GENERATION_PROMPT
     assert "task_source 固定为 inferred_from_interpretation" in INTERPRETATION_GENERATION_PROMPT
@@ -4799,50 +4817,9 @@ def test_task_status_prompt_definitions_scope_stale_by_prompt_role():
     assert "should_update" in INTERPRETATION_UPDATE_PROMPT
     assert "task_status 只能是 active、blocked、paused、stale" in INTERPRETATION_UPDATE_PROMPT
 
-
-def test_observation_prompts_explain_fact_type_and_kind_labels():
-    assert "semantic（语义记忆）" in OBSERVATION_SOURCE_FACT_GUIDANCE
-    assert "episodic（情景记忆）" in OBSERVATION_SOURCE_FACT_GUIDANCE
-    assert "fact_subject 表示记忆主体" in OBSERVATION_SOURCE_FACT_GUIDANCE
-    assert "fact_kind 类别说明" in OBSERVATION_SOURCE_FACT_GUIDANCE
-    assert "preference：用户长期或反复表达的偏好" in OBSERVATION_SOURCE_FACT_GUIDANCE
-    assert "instruction：用户要求 AI 以后长期遵守" in OBSERVATION_SOURCE_FACT_GUIDANCE
-    assert "fact_type 决定记忆性质" in OBSERVATION_SOURCE_FACT_GUIDANCE
-    assert "observation_kind 表示 observation 的信息性质" in OBSERVATION_METADATA_GUIDANCE
-    assert "evidence_shape 表示支撑 observation 的证据形态" in OBSERVATION_METADATA_GUIDANCE
-    assert "temporal_scope 表示 observation 的时间范围" in OBSERVATION_METADATA_GUIDANCE
-    assert "source_fact_type_distribution 表示 supporting facts" in OBSERVATION_METADATA_GUIDANCE
-    assert "dominant_fact_type 表示主要证据形态" in OBSERVATION_METADATA_GUIDANCE
-    assert "evidence_mixture 表示证据混合形态" in OBSERVATION_METADATA_GUIDANCE
-    assert "source facts 行中的 time 表示该事实的证据时间" in OBSERVATION_TIME_GUIDANCE
-    assert "source_time_start/source_time_end 表示已有 observation 的证据覆盖范围" in OBSERVATION_TIME_GUIDANCE
-    assert "created_at/updated_at 表示 observation 记录的存储生命周期" in OBSERVATION_TIME_GUIDANCE
-    assert "candidate_interpretation_types 是给 interpretation 生成/匹配阶段使用的粗粒度路由提示" in OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE
-    assert "最终 interpretation_type 仍由 interpretation prompt" in OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE
-    assert "explicit_preference、explicit_instruction、inferred_preference、behavior_pattern" in OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE
-    assert "task 表示 observation 可能支持 Agent 当前认为用户正在推进的任务或目标" in OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE
-
-    for prompt in (
-        INSIGHT_CONSOLIDATION_PROMPT,
-        TASK_CONSOLIDATION_PROMPT,
-        OBSERVATION_UPDATE_PROMPT,
-    ):
-        assert OBSERVATION_SOURCE_FACT_GUIDANCE in prompt
-        assert OBSERVATION_METADATA_GUIDANCE in prompt
-        assert OBSERVATION_TIME_GUIDANCE in prompt
-        assert OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE in prompt
-        assert "candidate_interpretation_types" in prompt
-        assert "evidence_shape" in prompt
-        assert "temporal_scope" in prompt
-        assert "source_fact_type_distribution" in prompt
-        assert "dominant_fact_type" in prompt
-        assert "evidence_mixture" in prompt
-        assert "preference_signal" in prompt
-
-
 def test_interpretation_generation_prompt_defines_interpretation_contract():
     assert "四层记忆架构" in INTERPRETATION_GENERATION_PROMPT
-    assert "sub-claim" in INTERPRETATION_GENERATION_PROMPT
+    assert "observation" in INTERPRETATION_GENERATION_PROMPT
     assert "allowed_interpretation_types" in INTERPRETATION_GENERATION_PROMPT
     assert "current best interpretation" in INTERPRETATION_GENERATION_PROMPT
     assert "不是用户原话" in INTERPRETATION_GENERATION_PROMPT
@@ -4933,15 +4910,25 @@ def test_recall_includes_observations_and_supporting_facts(db, monkeypatch):
         )
         db.entity_link_node(node_id, alice)
         source_ids.append(node_id)
-    db.memory_upsert_observation(
+    evidence_bundle_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="slack-alerts",
         topic_label="Slack alerts",
-        observation_type="insight",
-        summary="Alice's urgent alert workflow is Slack-centered.",
+        bundle_type="entity_topic",
+        summary="Slack alert workflow evidence.",
         keywords=["Slack", "alerts"],
         source_node_ids=source_ids,
     )
+    observation_id = db.memory_create_observation(
+        evidence_bundle_id,
+        {
+            "observation_type": "preference_signal",
+            "summary": "Alice's urgent alert workflow is Slack-centered.",
+            "confidence": 0.85,
+            "source_node_ids": source_ids,
+        },
+    )
+    assert observation_id is not None
     monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
     mgr = _NoAsyncMemoryNodeManager(
         db,

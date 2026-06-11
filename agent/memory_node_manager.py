@@ -71,9 +71,9 @@ INTERPRETATION_MIN_CLUSTER_SIZE = 2
 INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT = 30
 INTERPRETATION_SINGLE_OBSERVATION_CONFIDENCE_CAP = 0.75
 
-SUB_CLAIM_EMBEDDING_SIMILARITY_THRESHOLD = 0.72
-SUB_CLAIM_MATCH_SIMILARITY_THRESHOLD = 0.78
-SUB_CLAIM_INTERPRETATION_TYPES = {
+OBSERVATION_EMBEDDING_SIMILARITY_THRESHOLD = 0.72
+OBSERVATION_MATCH_SIMILARITY_THRESHOLD = 0.78
+OBSERVATION_INTERPRETATION_TYPES = {
     "task_state": {"task", "project_state", "constraint"},
     "task_progress": {"task", "project_state"},
     "decision": {"project_state", "strategy", "insight"},
@@ -85,50 +85,50 @@ SUB_CLAIM_INTERPRETATION_TYPES = {
     "context": {"insight"},
 }
 
-SUB_CLAIM_CREATE_PROMPT = """你是长期记忆系统的 sub-claim 生成模块。sub-claim 是 observation 内由一组事实直接支持的、稳定且可独立演化的具体命题。
+OBSERVATION_CREATE_PROMPT = """你是长期记忆系统的 observation 生成模块。observation 是 evidence_bundle 内由一组相似事实直接支持的、稳定且可独立演化的具体陈述。
 
 约束：
 1. 只能使用输入 facts 中明确出现的信息，不得补充推断。
-2. claim_text 必须自包含，保留具体对象、动作、条件、结果和当前状态。
-3. sub_claim_type 必须保持为 requested_sub_claim_type。
+2. summary 必须自包含，保留具体对象、动作、条件、结果和当前状态。
+3. observation_type 必须保持为 requested_observation_type。
 4. 不要生成 interpretation、行动建议或用户画像。
 5. 只返回一个合法 JSON object，不要使用 Markdown。
 
 输出格式：
 {{
-  "sub_claim_type": "{requested_sub_claim_type}",
-  "claim_text": "",
+  "observation_type": "{requested_observation_type}",
+  "summary": "",
   "confidence": 0.0
 }}
 
-observation:
-{observation_context}
+evidence_bundle:
+{evidence_bundle_context}
 
 facts:
 {source_facts}
 """
 
-SUB_CLAIM_UPDATE_PROMPT = """你是长期记忆系统的 sub-claim 增量更新模块。请用新增 facts 更新既有命题，同时保持命题身份和历史语义稳定。
+OBSERVATION_UPDATE_PROMPT = """你是长期记忆系统的 observation 增量更新模块。请用新增 facts 更新既有命题，同时保持命题身份和历史语义稳定。
 
 约束：
-1. 只能使用 existing_sub_claim 与 new_facts 中明确出现的信息。
+1. 只能使用 existing_observation 与 new_facts 中明确出现的信息。
 2. 保留仍被历史 facts 支持的内容；新增事实只能补充、细化、确认或更新状态。
 3. 除非新增事实明确推翻旧内容，否则不要重写成不同主题。
-4. sub_claim_type 必须保持不变。
-5. claim_text 必须自包含，保留具体对象、动作、条件、结果和当前状态。
+4. observation_type 必须保持不变。
+5. summary 必须自包含，保留具体对象、动作、条件、结果和当前状态。
 6. 不要生成 interpretation、行动建议或用户画像。
 7. 只返回一个合法 JSON object，不要使用 Markdown。
 
 输出格式：
 {{
-  "sub_claim_type": "{sub_claim_type}",
-  "claim_text": "",
+  "observation_type": "{observation_type}",
+  "summary": "",
   "confidence": 0.0,
   "change_summary": ""
 }}
 
-existing_sub_claim:
-{existing_sub_claim}
+existing_observation:
+{existing_observation}
 
 new_facts:
 {new_facts}
@@ -516,193 +516,17 @@ RELATION_PROMPT_TEMPLATE = """你是"AI眼镜记忆关系抽取模块"。
 【摘要B】：
 {summary2}"""
 
-# ── Observation consolidation prompt template ────────────────────────────
-
-OBSERVATION_SOURCE_FACT_GUIDANCE = """来源事实标注说明：
-- source facts 每行以 [fact_type/fact_subject/fact_kind] 开头，先理解标签，再综合正文。
-- semantic（语义记忆）：关于事实、概念、常识、稳定背景、长期偏好或长期规则；它描述长期可复用的"知道什么"。
-- episodic（情景记忆）：关于具体经历/事件，通常包含特定时间、地点、人物、行为、结果、情绪或状态变化；它描述"发生过什么/经历过什么"。
-- fact_subject 表示记忆主体：user、assistant、world、project、system、other；它独立于 fact_type。
-
-fact_kind 类别说明：
-- preference：用户长期或反复表达的偏好、禁忌、习惯、倾向。
-- decision：用户、项目或助手已经明确做出的决定、取舍或采用方案。
-- request：用户对 AI 或系统提出的当前任务请求。
-- recommendation：助手给出的具体建议、推荐方案或操作路径。
-- action：用户或助手已经执行、正在执行或计划执行的动作、实现、测试、排查、验证、修改。
-- error：失败、报错、阻塞、误判、踩坑、不可用方案或明确负面结果。
-- context：长期有用的背景事实、项目状态、关系、约束或环境信息。
-- instruction：用户要求 AI 以后长期遵守的行为规则、格式偏好、语气偏好或工作方式。
-- other：有一定保留价值但不属于以上类别的事实。
-
-使用这些标签时：
-- fact_type 决定记忆性质：semantic 偏稳定知识，episodic 偏具体事件。
-- fact_subject 决定主体来源：user/assistant/world/project/system/other。
-- fact_kind 只作为理解来源事实的线索；可以据此推断 observation metadata，但不要把 fact_kind 原样复制成 observation_kind。
-- 生成 observation 时只描述发生过什么、出现过什么模式、经历过什么变化。
-- insight、task、偏好、策略、风险和当前状态判断由 interpretation 层生成。"""
-
-OBSERVATION_METADATA_GUIDANCE = """observation metadata 字段含义：
-- observation_kind 表示 observation 的信息性质，也就是它在描述什么类型的历史归纳，例如模式、事件簇、状态变化、结果、冲突、偏好信号、任务信号、约束、目标信号、情绪信号或关系信号。
-- evidence_shape 表示支撑 observation 的证据形态，也就是它是由单个事件、多次重复、对比、逐步推进、修正还是确认形成的。
-- temporal_scope 表示 observation 的时间范围，也就是它是瞬时、近期、持续、历史还是反复发生的。
-- source_fact_type_distribution 表示 supporting facts 中 semantic/episodic 的数量分布，用来说明 observation 是由稳定知识、具体经历还是二者共同支持。
-- dominant_fact_type 表示主要证据形态：semantic 表示稳定知识占主导，episodic 表示具体经历占主导，mixed 表示二者相近，unknown 表示没有足够来源事实。
-- evidence_mixture 表示证据混合形态：semantic_only、episodic_only、semantic_dominant、episodic_dominant、balanced_mixed 或 unknown。它帮助 interpretation 判断一次经历、稳定事实、多次经历上升为模式等不同路径。"""
-
-OBSERVATION_TIME_GUIDANCE = """时间字段说明：
-- source facts 行中的 time 表示该事实的证据时间或记忆时间，用于判断事件先后、重复出现、近期性和历史性。
-- existing observation 的 source_time_start/source_time_end 表示已有 observation 的证据覆盖范围，优先用于判断 temporal_scope。
-- last_supported_at 表示已有 observation 最近一次被新证据支持。
-- created_at/updated_at 表示 observation 记录的存储生命周期，不要仅因为 updated_at 很新就判断现象本身是 recent。
-- 判断 temporal_scope 时优先依据 source facts 的 time 和 observation 的 source_time_start/source_time_end；单个具体事件通常是 momentary 或 recent，多时间点重复出现通常是 recurring，长期稳定背景/规则/偏好通常是 ongoing，明确属于过去阶段且未必当前有效的内容是 historical。"""
-
-OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE = """candidate_interpretation_types 字段含义：
-- candidate_interpretation_types 是给 interpretation 生成/匹配阶段使用的粗粒度路由提示，不是最终 interpretation_type；最终 interpretation_type 仍由 interpretation prompt 在 insight、task、explicit_preference、explicit_instruction、inferred_preference、behavior_pattern、project_state、task_risk、constraint、conflict_resolution、strategy、other 中选择。
-- insight 表示 observation 可能支持当前可用洞察、项目状态、风险、约束、冲突解决结论、策略或其他可复用解释；它关注 Agent 现在如何理解这些 observation。
-- task 表示 observation 可能支持 Agent 当前认为用户正在推进的任务或目标；只在 observation 指向请求、目标、进展、阻塞、结果或任务状态变化时加入。
-- preference 表示 observation 可能支持显式偏好、长期指令、推断偏好或行为模式；只在 observation 指向用户偏好、长期规则、工作方式、习惯、禁忌或反复行为倾向时加入。
-- 只加入有证据支持且对未来行为有明确指导价值的候选类型；普通事实摘要如果缺少未来行动含义，通常只保留 insight 或不生成 interpretation。"""
-
-OBSERVATION_CONSOLIDATION_PROMPT = """你是长期记忆 observation consolidation 模块。
-
-你需要把同一 entity/topic 下的 semantic facts 和 episodic memories，整合成一条长期可追溯的 observation。
-
-三层记忆架构：
-- fact：原始证据，表示对话中提取出的事实。
-- observation：历史归纳，表示发生过什么、出现过什么模式、经历过什么变化。
-- interpretation：当前解释，负责 insight、task、偏好、风险、策略和当前状态判断。
-
-entity: {entity_name}
-topic: {topic_label}
-
-source facts:
-{source_facts}
-
-""" + OBSERVATION_SOURCE_FACT_GUIDANCE + """
-
-""" + OBSERVATION_METADATA_GUIDANCE + """
-
-""" + OBSERVATION_TIME_GUIDANCE + """
-
-""" + OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE + """
-
-要求：
-- 只描述这些事实共同说明"发生过什么"。
-- 可以总结时间线、事件簇、状态变化、结果、冲突、成功/失败经验、约束信号或反复出现的现象。
-- 如果事实中出现前后变化或冲突，用"曾经/后来/当前事实显示/存在不一致"描述脉络，不要裁决最终应该相信什么。
-- 不要生成 task_status、goal、steps、next_action、insight_type；这些属于 interpretation 层。
-- observation_kind 只能是 pattern、event_cluster、state_change、outcome、conflict、context、preference_signal、task_signal、constraint、goal_signal、emotion_signal、relationship_signal。
-- evidence_shape 只能是 single_event、repeated_pattern、contrast、progression、correction、confirmation。
-- temporal_scope 只能是 momentary、recent、ongoing、historical、recurring。
-- candidate_interpretation_types 只能包含 insight、task、preference。
-- metadata 中只填写 observation_kind、evidence_shape、temporal_scope、candidate_interpretation_types、has_conflict、source_fact_type_distribution、dominant_fact_type、evidence_mixture。
-
-只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
-{{
-  "category": "observation",
-  "summary": "一句简洁、长期可追溯的 observation，描述发生过什么。",
-  "keywords": ["关键词1", "关键词2"],
-  "confidence": 0.0,
-  "metadata": {{
-    "observation_kind": "pattern | event_cluster | state_change | outcome | conflict | context | preference_signal | task_signal | constraint | goal_signal | emotion_signal | relationship_signal",
-    "evidence_shape": "single_event | repeated_pattern | contrast | progression | correction | confirmation",
-    "temporal_scope": "momentary | recent | ongoing | historical | recurring",
-    "candidate_interpretation_types": ["insight"],
-    "has_conflict": false,
-    "source_fact_type_distribution": {{"semantic": 0, "episodic": 0}},
-    "dominant_fact_type": "semantic | episodic | mixed | unknown",
-    "evidence_mixture": "semantic_only | episodic_only | semantic_dominant | episodic_dominant | balanced_mixed | unknown"
-  }}
-}}"""
-
-# Backward-compatible names for callers/tests that still import the old constants.
-INSIGHT_CONSOLIDATION_PROMPT = OBSERVATION_CONSOLIDATION_PROMPT
-TASK_CONSOLIDATION_PROMPT = OBSERVATION_CONSOLIDATION_PROMPT
-
-OBSERVATION_UPDATE_PROMPT = """你是长期记忆 observation consolidation 模块。
-
-你需要根据新的记忆事实，以及可能因 entity 合并带来的相关既有 observation，更新同一 entity/topic 下已有的 observation。
-
-三层记忆架构：
-- fact：原始证据。
-- observation：历史归纳，只描述发生过什么。
-- interpretation：当前解释，负责 insight、task、偏好、风险、策略和当前状态判断。
-
-entity: {entity_name}
-topic: {topic_label}
-
-已有 observation：
-当前类别：{existing_type}
-置信度：{existing_confidence}
-内容：{existing_summary}
-
-已有关键词：
-{existing_keywords}
-
-已有 metadata：
-{existing_metadata}
-
-已有 observation 时间信息：
-{existing_time_context}
-
-相关既有 observation（通常来自 entity 合并；没有则为 none）：
-{related_observations}
-
-新的来源事实：
-{source_facts}
-
-""" + OBSERVATION_SOURCE_FACT_GUIDANCE + """
-
-""" + OBSERVATION_METADATA_GUIDANCE + """
-
-""" + OBSERVATION_TIME_GUIDANCE + """
-
-""" + OBSERVATION_CANDIDATE_INTERPRETATION_GUIDANCE + """
-
-要求：
-- 输出更新后的 observation，category 固定为 "observation"。
-- 同一个 prompt 同时服务两类更新：entity 合并后的 observation 综合，以及新 facts 追加后的 observation 更新。
-- 只描述已有 observation、相关既有 observation 和新事实共同说明的历史脉络、事件变化、结果或冲突。
-- 如果新事实或相关 observation 覆盖、修正或反驳旧内容，不要静默删除关键历史；用简洁措辞保留重要变化过程。
-- 如果相关既有 observation 与已有 observation 只是同义重复，请合并为更高阶、更简洁的一条，不要简单拼接原文。
-- 不要生成 task_status、goal、steps、next_action、insight_type。
-- 不要裁决 "现在应该怎么做"；当前解释由 interpretation 层生成。
-- observation_kind 只能是 pattern、event_cluster、state_change、outcome、conflict、context、preference_signal、task_signal、constraint、goal_signal、emotion_signal、relationship_signal。
-- evidence_shape 只能是 single_event、repeated_pattern、contrast、progression、correction、confirmation。
-- temporal_scope 只能是 momentary、recent、ongoing、historical、recurring。
-- candidate_interpretation_types 只能包含 insight、task、preference。
-- metadata 中可填写 source_fact_type_distribution、dominant_fact_type、evidence_mixture；系统会根据实际 source facts 做最终校正。
-
-只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
-{{
-  "category": "observation",
-  "summary": "更新后的一句简洁 observation，描述发生过什么。",
-  "keywords": ["关键词1", "关键词2"],
-  "confidence": 0.0,
-  "metadata": {{
-    "observation_kind": "pattern | event_cluster | state_change | outcome | conflict | context | preference_signal | task_signal | constraint | goal_signal | emotion_signal | relationship_signal",
-    "evidence_shape": "single_event | repeated_pattern | contrast | progression | correction | confirmation",
-    "temporal_scope": "momentary | recent | ongoing | historical | recurring",
-    "candidate_interpretation_types": ["insight"],
-    "has_conflict": false,
-    "source_fact_type_distribution": {{"semantic": 0, "episodic": 0}},
-    "dominant_fact_type": "semantic | episodic | mixed | unknown",
-    "evidence_mixture": "semantic_only | episodic_only | semantic_dominant | episodic_dominant | balanced_mixed | unknown"
-  }}
-}}"""
-
 INTERPRETATION_GENERATION_PROMPT = """你是长期记忆 interpretation 生成模块。
 
-你需要基于 observation 内部的一条 sub-claim，以及它的 supporting facts，判断是否值得生成或更新一条 Agent 对当前世界状态的解释。兼容旧数据时，输入也可能直接是一条 observation。
+你需要基于一条 observation 及其 supporting facts，判断是否值得生成一条 Agent 对当前世界状态的解释。
 
 这里的 interpretation 不是用户原话，也不是原始事实；它是 Agent 基于记忆证据形成的 current best interpretation，用于后续召回时指导如何理解和行动。
 
 四层记忆架构：
 - fact：原始证据，表示对话中提取出的事实。
-- observation：同一 entity/topic 下的事实容器。
-- sub-claim：observation 内部由一组相似 facts 直接支持的具体命题，是 interpretation 匹配和生成的主要语义单元。
-- interpretation：当前解释，表示 Agent 现在如何理解这些 sub-claims，以及后续应该如何行动。
+- evidence_bundle：按相同 entity/topic 组织 facts 的容器，只负责限定证据范围。
+- observation：evidence_bundle 内由一组相似 facts 直接支持的具体命题，是 interpretation 匹配和生成的主要语义单元。
+- interpretation：当前解释，表示 Agent 现在如何理解这些 observations，以及后续应该如何行动。
 
 entity: {entity_name}
 topic: {topic_label}
@@ -736,8 +560,8 @@ supporting facts:
 - should_create=false 时，只输出 {{"should_create": false}}。
 - claim 是 Agent 当前解释，必须谨慎、可证据支持；不要写成用户原话。
 - interpretation_type 只能是 insight、task、explicit_preference、explicit_instruction、inferred_preference、behavior_pattern、project_state、task_risk、constraint、conflict_resolution、strategy、other。
-- observation_metadata 如果包含 sub_claim_type、evidence_mode 和 allowed_interpretation_types，必须遵守其类型门禁；interpretation_type 必须来自 allowed_interpretation_types。
-- fact_type 描述证据性质，sub_claim_type 描述证据直接支持的命题，interpretation_type 描述 Agent 的高层理解；禁止跳过 sub_claim_type 把 episodic 行为直接写成显式偏好。
+- observation_metadata 如果包含 observation_type、evidence_mode 和 allowed_interpretation_types，必须遵守其类型门禁；interpretation_type 必须来自 allowed_interpretation_types。
+- fact_type 描述证据性质，observation_type 描述证据直接支持的命题，interpretation_type 描述 Agent 的高层理解；禁止跳过 observation_type 把 episodic 行为直接写成显式偏好。
 - insight 表示从 observation 提炼出的当前可用洞察；task 表示 Agent 当前认为用户正在推进的任务或目标。
 - 如果 interpretation_type=task，metadata 中填写 task_status、task_source、goal、evidence、steps；task_status 只能是 active、blocked、paused、stale，task_source 固定为 inferred_from_interpretation。
 - 如果 interpretation_type 不是 task，不要填写 task_status、goal、steps、next_action。
@@ -777,15 +601,15 @@ supporting facts:
 
 INTERPRETATION_UPDATE_PROMPT = """你是长期记忆 interpretation 更新模块。
 
-你需要根据新的 sub-claim 和 supporting facts，更新一条已经存在的 interpretation。兼容旧数据时，输入也可能直接是一条 observation。
+你需要根据新的 observation 和 supporting facts，更新一条已经存在的 interpretation。
 
 这里的 interpretation 是 Agent 当前对记忆证据的 current best interpretation。更新时要让它吸收新 observation 带来的进展、确认、修正、冲突或范围变化，而不是只追加证据。
 
 四层记忆架构：
 - fact：原始证据，表示对话中提取出的事实。
-- observation：同一 entity/topic 下的事实容器。
-- sub-claim：observation 内部由一组相似 facts 直接支持的具体命题，是 interpretation 匹配和更新的主要语义单元。
-- interpretation：当前解释，表示 Agent 现在如何理解这些 sub-claims，以及后续应该如何行动。
+- evidence_bundle：按相同 entity/topic 组织 facts 的容器，只负责限定证据范围。
+- observation：evidence_bundle 内由一组相似 facts 直接支持的具体命题，是 interpretation 匹配和更新的主要语义单元。
+- interpretation：当前解释，表示 Agent 现在如何理解这些 observations，以及后续应该如何行动。
 
 entity: {entity_name}
 topic: {topic_label}
@@ -2263,6 +2087,33 @@ class MemoryNodeManager:
         }
 
     @classmethod
+    def _reflect_evidence_bundle_log_item(
+        cls,
+        evidence_bundle: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        metadata = evidence_bundle.get("metadata", {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata or "{}")
+            except (TypeError, ValueError):
+                metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return {
+            "id": evidence_bundle.get("id"),
+            "entity_id": evidence_bundle.get("entity_id"),
+            "entity_name": evidence_bundle.get("entity_name"),
+            "topic_key": evidence_bundle.get("topic_key"),
+            "topic_label": evidence_bundle.get("topic_label"),
+            "bundle_type": evidence_bundle.get("bundle_type"),
+            "summary": cls._reflect_log_text(evidence_bundle.get("summary")),
+            "keywords": evidence_bundle.get("keywords"),
+            "confidence": evidence_bundle.get("confidence"),
+            "status": evidence_bundle.get("status"),
+            "metadata": metadata,
+        }
+
+    @classmethod
     def _log_info(cls, scope: str, event: str, payload: Dict[str, Any]) -> None:
         record = {
             "scope": scope,
@@ -2507,7 +2358,7 @@ class MemoryNodeManager:
         return "episodic", "episodic_dominant"
 
     @classmethod
-    def _sub_claim_type_for_fact(cls, fact: Dict[str, Any]) -> str:
+    def _observation_type_for_fact(cls, fact: Dict[str, Any]) -> str:
         """Map fact evidence semantics to the claim it can directly support."""
         fact_kind = str(fact.get("fact_kind") or "other").strip().lower()
         fact_type = cls._normalize_fact_type(fact.get("fact_type", "semantic"))
@@ -2532,7 +2383,7 @@ class MemoryNodeManager:
         return "context"
 
     @staticmethod
-    def _sub_claim_observation_kind(sub_claim_type: str) -> str:
+    def _observation_kind(observation_type: str) -> str:
         return {
             "task_state": "task_signal",
             "task_progress": "state_change",
@@ -2543,12 +2394,12 @@ class MemoryNodeManager:
             "strategy": "context",
             "behavior_pattern": "pattern",
             "context": "context",
-        }.get(str(sub_claim_type or ""), "context")
+        }.get(str(observation_type or ""), "context")
 
     @staticmethod
-    def _sub_claim_candidate_families(sub_claim_type: str) -> List[str]:
-        allowed = SUB_CLAIM_INTERPRETATION_TYPES.get(
-            str(sub_claim_type or "context"),
+    def _observation_candidate_families(observation_type: str) -> List[str]:
+        allowed = OBSERVATION_INTERPRETATION_TYPES.get(
+            str(observation_type or "context"),
             {"insight"},
         )
         families: List[str] = []
@@ -2566,15 +2417,15 @@ class MemoryNodeManager:
         return families or ["insight"]
 
     @staticmethod
-    def _sub_claim_allowed_interpretation_types(
-        sub_claim_type: str,
+    def _observation_allowed_interpretation_types(
+        observation_type: str,
         evidence_mode: str,
     ) -> List[str]:
-        allowed = set(SUB_CLAIM_INTERPRETATION_TYPES.get(
-            str(sub_claim_type or "context"),
+        allowed = set(OBSERVATION_INTERPRETATION_TYPES.get(
+            str(observation_type or "context"),
             {"insight"},
         ))
-        if sub_claim_type == "preference_signal":
+        if observation_type == "preference_signal":
             if evidence_mode == "explicit":
                 allowed = {"explicit_preference"}
             else:
@@ -2582,9 +2433,9 @@ class MemoryNodeManager:
         return sorted(allowed)
 
     @classmethod
-    def _sub_claim_evidence_mode(
+    def _observation_evidence_mode(
         cls,
-        sub_claim_type: str,
+        observation_type: str,
         source_nodes: List[Dict[str, Any]],
     ) -> str:
         kinds = {
@@ -2595,16 +2446,16 @@ class MemoryNodeManager:
             cls._normalize_fact_type(node.get("fact_type", "semantic"))
             for node in source_nodes
         }
-        if sub_claim_type == "constraint" and "instruction" in kinds:
+        if observation_type == "constraint" and "instruction" in kinds:
             return "explicit"
         if (
-            sub_claim_type == "preference_signal"
+            observation_type == "preference_signal"
             and "preference" in kinds
             and "semantic" in fact_types
         ):
             return "explicit"
-        if sub_claim_type == "behavior_pattern" or (
-            sub_claim_type == "preference_signal"
+        if observation_type == "behavior_pattern" or (
+            observation_type == "preference_signal"
             and len(source_nodes) >= 2
             and fact_types == {"episodic"}
         ):
@@ -2615,11 +2466,11 @@ class MemoryNodeManager:
             return "episodic"
         return "semantic"
 
-    def _cluster_observation_facts_into_sub_claims(
+    def _cluster_evidence_bundle_facts_into_observations(
         self,
         source_nodes: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Build typed semantic fact clusters inside one observation."""
+        """Build typed semantic fact clusters inside one evidence bundle."""
         facts = [
             dict(node)
             for node in source_nodes
@@ -2633,12 +2484,12 @@ class MemoryNodeManager:
         clusters: List[Dict[str, Any]] = []
         for fact in facts:
             node_id = int(self._node_id(fact))
-            sub_claim_type = self._sub_claim_type_for_fact(fact)
+            observation_type = self._observation_type_for_fact(fact)
             fact_embedding = embeddings.get(node_id)
             best_cluster = None
             best_similarity = -1.0
             for cluster in clusters:
-                if cluster["sub_claim_type"] != sub_claim_type:
+                if cluster["observation_type"] != observation_type:
                     continue
                 similarity = self._embedding_similarity(
                     fact_embedding,
@@ -2649,11 +2500,11 @@ class MemoryNodeManager:
                     best_similarity = similarity
             if (
                 best_cluster is None
-                or best_similarity < SUB_CLAIM_EMBEDDING_SIMILARITY_THRESHOLD
+                or best_similarity < OBSERVATION_EMBEDDING_SIMILARITY_THRESHOLD
             ):
                 vector = self._as_embedding_vector(fact_embedding)
                 clusters.append({
-                    "sub_claim_type": sub_claim_type,
+                    "observation_type": observation_type,
                     "source_nodes": [fact],
                     "vectors": [vector] if vector is not None else [],
                     "centroid": vector,
@@ -2669,7 +2520,7 @@ class MemoryNodeManager:
                 )
                 best_cluster["centroid"] = self._as_embedding_vector(centroid)
 
-        sub_claims: List[Dict[str, Any]] = []
+        observations: List[Dict[str, Any]] = []
         for cluster in clusters:
             cluster_facts = cluster["source_nodes"]
             centroid = cluster.get("centroid")
@@ -2683,9 +2534,9 @@ class MemoryNodeManager:
                     len(str(fact.get("summary") or "")),
                 ),
             )
-            sub_claim_type = cluster["sub_claim_type"]
-            evidence_mode = self._sub_claim_evidence_mode(
-                sub_claim_type,
+            observation_type = cluster["observation_type"]
+            evidence_mode = self._observation_evidence_mode(
+                observation_type,
                 cluster_facts,
             )
             fact_type_distribution = self._fact_type_distribution_from_facts(
@@ -2719,15 +2570,15 @@ class MemoryNodeManager:
                 + max(0.0, semantic_cohesion) * 0.15,
             )
             allowed_interpretation_types = (
-                self._sub_claim_allowed_interpretation_types(
-                    sub_claim_type,
+                self._observation_allowed_interpretation_types(
+                    observation_type,
                     evidence_mode,
                 )
             )
-            claim_text = str(representative.get("summary") or "").strip()
-            sub_claims.append({
-                "sub_claim_type": sub_claim_type,
-                "claim_text": claim_text,
+            summary = str(representative.get("summary") or "").strip()
+            observations.append({
+                "observation_type": observation_type,
+                "summary": summary,
                 "evidence_mode": evidence_mode,
                 "confidence": confidence,
                 "source_node_ids": [
@@ -2735,14 +2586,14 @@ class MemoryNodeManager:
                 ],
                 "embedding": centroid,
                 "embedding_text": "\n".join([
-                    f"Sub-claim type: {sub_claim_type}",
-                    f"Claim: {claim_text}",
+                    f"Observation type: {observation_type}",
+                    f"Claim: {summary}",
                 ]),
                 "metadata": {
-                    "source": "observation_fact_sub_clustering",
+                    "source": "evidence_bundle_fact_clustering",
                     "allowed_interpretation_types": allowed_interpretation_types,
                     "candidate_interpretation_types": (
-                        self._sub_claim_candidate_families(sub_claim_type)
+                        self._observation_candidate_families(observation_type)
                     ),
                     "fact_type_distribution": fact_type_distribution,
                     "fact_kind_distribution": fact_kind_distribution,
@@ -2750,10 +2601,10 @@ class MemoryNodeManager:
                     "source_count": len(cluster_facts),
                 },
             })
-        return sub_claims
+        return observations
 
     @staticmethod
-    def _sub_claim_fact_payload(source_nodes: List[Dict[str, Any]]) -> str:
+    def _observation_fact_payload(source_nodes: List[Dict[str, Any]]) -> str:
         return json.dumps(
             [
                 {
@@ -2770,68 +2621,68 @@ class MemoryNodeManager:
             indent=2,
         )
 
-    def _generate_sub_claim_using_llm(
+    def _generate_observation_using_llm(
         self,
         *,
-        observation: Dict[str, Any],
-        sub_claim_type: str,
+        evidence_bundle: Dict[str, Any],
+        observation_type: str,
         source_nodes: List[Dict[str, Any]],
-        existing_sub_claim: Optional[Dict[str, Any]] = None,
+        existing_observation: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Create or incrementally revise one stable sub-claim."""
+        """Create or incrementally revise one stable observation."""
         if not source_nodes:
             return None
-        if existing_sub_claim:
-            prompt = SUB_CLAIM_UPDATE_PROMPT.format(
-                sub_claim_type=sub_claim_type,
-                existing_sub_claim=json.dumps(
+        if existing_observation:
+            prompt = OBSERVATION_UPDATE_PROMPT.format(
+                observation_type=observation_type,
+                existing_observation=json.dumps(
                     {
-                        "sub_claim_id": existing_sub_claim.get("id"),
-                        "sub_claim_type": sub_claim_type,
-                        "claim_text": existing_sub_claim.get("claim_text", ""),
-                        "confidence": existing_sub_claim.get("confidence", 0.5),
+                        "observation_id": existing_observation.get("id"),
+                        "observation_type": observation_type,
+                        "summary": existing_observation.get("summary", ""),
+                        "confidence": existing_observation.get("confidence", 0.5),
                     },
                     ensure_ascii=False,
                     indent=2,
                 ),
-                new_facts=self._sub_claim_fact_payload(source_nodes),
+                new_facts=self._observation_fact_payload(source_nodes),
             )
         else:
-            prompt = SUB_CLAIM_CREATE_PROMPT.format(
-                requested_sub_claim_type=sub_claim_type,
-                observation_context=json.dumps(
+            prompt = OBSERVATION_CREATE_PROMPT.format(
+                requested_observation_type=observation_type,
+                evidence_bundle_context=json.dumps(
                     {
-                        "observation_id": observation.get("id"),
-                        "entity": observation.get("entity_name", ""),
-                        "topic": observation.get("topic_label")
-                        or observation.get("topic_key", ""),
+                        "evidence_bundle_id": evidence_bundle.get("id"),
+                        "entity": evidence_bundle.get("entity_name", ""),
+                        "topic": evidence_bundle.get("topic_label")
+                        or evidence_bundle.get("topic_key", ""),
                     },
                     ensure_ascii=False,
                     indent=2,
                 ),
-                source_facts=self._sub_claim_fact_payload(source_nodes),
+                source_facts=self._observation_fact_payload(source_nodes),
             )
         data = self._json_object_from_llm_text(self._call_llm(prompt) or "")
         if not data:
             return None
         returned_type = str(
-            data.get("sub_claim_type") or sub_claim_type
+            data.get("observation_type") or observation_type
         ).strip().lower()
-        claim_text = str(data.get("claim_text") or "").strip()
-        if returned_type != sub_claim_type or not claim_text:
+        summary = str(data.get("summary") or "").strip()
+        if returned_type != observation_type or not summary:
             return None
         try:
             confidence = float(data.get("confidence", 0.7) or 0.7)
         except (TypeError, ValueError):
             confidence = 0.7
         return {
-            "claim_text": claim_text,
+            "summary": summary,
             "confidence": max(0.0, min(1.0, confidence)),
             "change_summary": str(data.get("change_summary") or "").strip(),
         }
 
     @staticmethod
-    def _fallback_sub_claim_text(
+    def _fallback_observation_text(
         source_nodes: List[Dict[str, Any]],
         *,
         existing_text: str = "",
@@ -2847,31 +2698,31 @@ class MemoryNodeManager:
             return "；".join([existing, *additions[:2]])
         return max(summaries, key=len) if summaries else ""
 
-    def _sub_claim_record_from_sources(
+    def _observation_record_from_sources(
         self,
         *,
-        sub_claim_type: str,
-        claim_text: str,
+        observation_type: str,
+        summary: str,
         source_nodes: List[Dict[str, Any]],
         confidence: float,
         previous_metadata: Optional[Dict[str, Any]] = None,
         change_summary: str = "",
     ) -> Dict[str, Any]:
-        evidence_mode = self._sub_claim_evidence_mode(
-            sub_claim_type,
+        evidence_mode = self._observation_evidence_mode(
+            observation_type,
             source_nodes,
         )
         metadata = dict(previous_metadata or {})
         metadata.update({
-            "source": "observation_fact_incremental_sub_claim",
+            "source": "evidence_bundle_fact_incremental_observation",
             "allowed_interpretation_types": (
-                self._sub_claim_allowed_interpretation_types(
-                    sub_claim_type,
+                self._observation_allowed_interpretation_types(
+                    observation_type,
                     evidence_mode,
                 )
             ),
             "candidate_interpretation_types": (
-                self._sub_claim_candidate_families(sub_claim_type)
+                self._observation_candidate_families(observation_type)
             ),
             "fact_type_distribution": (
                 self._fact_type_distribution_from_facts(source_nodes)
@@ -2886,12 +2737,12 @@ class MemoryNodeManager:
         if change_summary:
             metadata["last_change_summary"] = change_summary
         embedding_text = "\n".join([
-            f"Sub-claim type: {sub_claim_type}",
-            f"Claim: {claim_text}",
+            f"Observation type: {observation_type}",
+            f"Claim: {summary}",
         ])
         return {
-            "sub_claim_type": sub_claim_type,
-            "claim_text": claim_text,
+            "observation_type": observation_type,
+            "summary": summary,
             "evidence_mode": evidence_mode,
             "confidence": confidence,
             "source_node_ids": [
@@ -2904,12 +2755,12 @@ class MemoryNodeManager:
             "metadata": metadata,
         }
 
-    def _refresh_observation_summary_from_sub_claims(
+    def _refresh_evidence_bundle_summary_from_observations(
         self,
-        observation: Dict[str, Any],
-        sub_claims: List[Dict[str, Any]],
+        evidence_bundle: Dict[str, Any],
+        observations: List[Dict[str, Any]],
     ) -> None:
-        """Derive observation text without another LLM summarization call."""
+        """Derive evidence bundle text without another LLM call."""
         type_order = {
             "task_state": 0,
             "task_progress": 1,
@@ -2923,70 +2774,70 @@ class MemoryNodeManager:
         }
         ordered = sorted(
             (
-                item for item in sub_claims
-                if str(item.get("claim_text") or "").strip()
+                item for item in observations
+                if str(item.get("summary") or "").strip()
             ),
             key=lambda item: (
-                type_order.get(str(item.get("sub_claim_type") or ""), 99),
+                type_order.get(str(item.get("observation_type") or ""), 99),
                 str(item.get("updated_at") or ""),
                 int(item.get("id") or 0),
             ),
         )
         summary = "\n".join(
-            str(item.get("claim_text") or "").strip()
+            str(item.get("summary") or "").strip()
             for item in ordered
         )
         if not summary:
             return
-        self._db.memory_update_observation_summary(
-            int(observation["id"]),
+        self._db.memory_update_evidence_bundle_summary(
+            int(evidence_bundle["id"]),
             summary=summary,
             embedding=self._embed_memory_layer_text(summary),
             embedding_text=summary,
         )
 
-    def _update_sub_claims_for_observations(
+    def _update_observations_for_evidence_bundles(
         self,
-        observation_ids: List[int],
+        evidence_bundle_ids: List[int],
     ) -> List[int]:
-        """Incrementally match new facts to stable sub-claims."""
+        """Incrementally match new facts to stable observations."""
         if not self._db:
             return []
         clean_ids = list(dict.fromkeys(
-            int(observation_id)
-            for observation_id in observation_ids
-            if observation_id is not None
+            int(evidence_bundle_id)
+            for evidence_bundle_id in evidence_bundle_ids
+            if evidence_bundle_id is not None
         ))
-        observations = {
+        evidence_bundles = {
             int(item["id"]): item
-            for item in self._db.get_observations_by_ids(clean_ids)
+            for item in self._db.get_evidence_bundles_by_ids(clean_ids)
         }
-        supporting_nodes = self._db.get_observation_supporting_nodes(
+        supporting_nodes = self._db.get_evidence_bundle_supporting_nodes(
             clean_ids,
-            per_observation=1000,
+            per_evidence_bundle=1000,
         )
-        existing_by_observation: Dict[int, List[Dict[str, Any]]] = {}
-        for sub_claim in self._db.get_sub_claims_for_observations(clean_ids):
-            existing_by_observation.setdefault(
-                int(sub_claim["observation_id"]),
+        existing_by_bundle: Dict[int, List[Dict[str, Any]]] = {}
+        for observation in self._db.get_observations_for_evidence_bundles(clean_ids):
+            existing_by_bundle.setdefault(
+                int(observation["evidence_bundle_id"]),
                 [],
-            ).append(sub_claim)
+            ).append(observation)
 
-        touched_sub_claim_ids: List[int] = []
-        for observation_id in clean_ids:
-            observation_touched_ids: List[int] = []
-            observation = observations.get(observation_id)
-            if not observation:
+        touched_observation_ids: List[int] = []
+        for evidence_bundle_id in clean_ids:
+            bundle_observation_ids: List[int] = []
+            evidence_bundle = evidence_bundles.get(evidence_bundle_id)
+            if not evidence_bundle:
                 continue
-            all_facts = supporting_nodes.get(observation_id, [])
-            existing_sub_claims = existing_by_observation.get(
-                observation_id,
+            all_facts = supporting_nodes.get(evidence_bundle_id, [])
+            existing_observations = existing_by_bundle.get(
+                evidence_bundle_id,
                 [],
             )
             assigned_fact_ids = {
                 int(node_id)
-                for sub_claim in existing_sub_claims
-                for node_id in sub_claim.get("source_node_ids", [])
+                for observation in existing_observations
+                for node_id in observation.get("source_node_ids", [])
             }
             new_facts = [
                 fact for fact in all_facts
@@ -3004,58 +2855,58 @@ class MemoryNodeManager:
             unmatched: List[Dict[str, Any]] = []
             for fact in new_facts:
                 fact_id = int(self._node_id(fact))
-                fact_type = self._sub_claim_type_for_fact(fact)
+                fact_type = self._observation_type_for_fact(fact)
                 candidates = [
-                    sub_claim
-                    for sub_claim in existing_sub_claims
-                    if sub_claim.get("sub_claim_type") == fact_type
+                    observation
+                    for observation in existing_observations
+                    if observation.get("observation_type") == fact_type
                 ]
                 scored = [
                     (
                         self._embedding_similarity(
                             fact_embeddings.get(fact_id),
-                            sub_claim.get("embedding"),
+                            observation.get("embedding"),
                         ),
-                        sub_claim,
+                        observation,
                     )
-                    for sub_claim in candidates
+                    for observation in candidates
                 ]
                 scored.sort(key=lambda item: item[0], reverse=True)
                 if (
                     scored
-                    and scored[0][0] >= SUB_CLAIM_MATCH_SIMILARITY_THRESHOLD
+                    and scored[0][0] >= OBSERVATION_MATCH_SIMILARITY_THRESHOLD
                 ):
                     matched.setdefault(int(scored[0][1]["id"]), []).append(fact)
                 else:
                     unmatched.append(fact)
 
             by_id = {
-                int(sub_claim["id"]): sub_claim
-                for sub_claim in existing_sub_claims
+                int(observation["id"]): observation
+                for observation in existing_observations
             }
-            for sub_claim_id, added_facts in matched.items():
-                existing = by_id[sub_claim_id]
+            for observation_id, added_facts in matched.items():
+                existing = by_id[observation_id]
                 historical_facts = self._db.memory_nodes_by_ids(
                     existing.get("source_node_ids", [])
                 )
                 combined_facts = historical_facts + added_facts
-                generated = self._generate_sub_claim_using_llm(
-                    observation=observation,
-                    sub_claim_type=str(existing["sub_claim_type"]),
+                generated = self._generate_observation_using_llm(
+                    evidence_bundle=evidence_bundle,
+                    observation_type=str(existing["observation_type"]),
                     source_nodes=added_facts,
-                    existing_sub_claim=existing,
+                    existing_observation=existing,
                 )
-                claim_text = (
-                    generated["claim_text"]
+                summary = (
+                    generated["summary"]
                     if generated
-                    else self._fallback_sub_claim_text(
+                    else self._fallback_observation_text(
                         added_facts,
-                        existing_text=str(existing.get("claim_text") or ""),
+                        existing_text=str(existing.get("summary") or ""),
                     )
                 )
-                record = self._sub_claim_record_from_sources(
-                    sub_claim_type=str(existing["sub_claim_type"]),
-                    claim_text=claim_text,
+                record = self._observation_record_from_sources(
+                    observation_type=str(existing["observation_type"]),
+                    summary=summary,
                     source_nodes=combined_facts,
                     confidence=(
                         generated["confidence"]
@@ -3071,9 +2922,9 @@ class MemoryNodeManager:
                         else "deterministic fallback after LLM failure"
                     ),
                 )
-                self._db.memory_update_sub_claim(
-                    sub_claim_id,
-                    claim_text=record["claim_text"],
+                self._db.memory_update_observation(
+                    observation_id,
+                    summary=record["summary"],
                     evidence_mode=record["evidence_mode"],
                     confidence=record["confidence"],
                     source_node_ids=record["source_node_ids"],
@@ -3081,28 +2932,28 @@ class MemoryNodeManager:
                     embedding_text=record["embedding_text"],
                     metadata=record["metadata"],
                 )
-                touched_sub_claim_ids.append(sub_claim_id)
-                observation_touched_ids.append(sub_claim_id)
+                touched_observation_ids.append(observation_id)
+                bundle_observation_ids.append(observation_id)
 
-            for candidate in self._cluster_observation_facts_into_sub_claims(
+            for candidate in self._cluster_evidence_bundle_facts_into_observations(
                 unmatched
             ):
                 candidate_facts = self._db.memory_nodes_by_ids(
                     candidate["source_node_ids"]
                 )
-                generated = self._generate_sub_claim_using_llm(
-                    observation=observation,
-                    sub_claim_type=str(candidate["sub_claim_type"]),
+                generated = self._generate_observation_using_llm(
+                    evidence_bundle=evidence_bundle,
+                    observation_type=str(candidate["observation_type"]),
                     source_nodes=candidate_facts,
                 )
-                claim_text = (
-                    generated["claim_text"]
+                summary = (
+                    generated["summary"]
                     if generated
-                    else self._fallback_sub_claim_text(candidate_facts)
+                    else self._fallback_observation_text(candidate_facts)
                 )
-                record = self._sub_claim_record_from_sources(
-                    sub_claim_type=str(candidate["sub_claim_type"]),
-                    claim_text=claim_text,
+                record = self._observation_record_from_sources(
+                    observation_type=str(candidate["observation_type"]),
+                    summary=summary,
                     source_nodes=candidate_facts,
                     confidence=(
                         generated["confidence"]
@@ -3115,33 +2966,33 @@ class MemoryNodeManager:
                         else "deterministic fallback after LLM failure"
                     ),
                 )
-                sub_claim_id = self._db.memory_create_sub_claim(
-                    observation_id,
+                observation_id = self._db.memory_create_observation(
+                    evidence_bundle_id,
                     record,
                 )
-                if sub_claim_id is not None:
-                    touched_sub_claim_ids.append(sub_claim_id)
-                    observation_touched_ids.append(sub_claim_id)
+                if observation_id is not None:
+                    touched_observation_ids.append(observation_id)
+                    bundle_observation_ids.append(observation_id)
 
-            current_sub_claims = self._db.get_sub_claims_for_observations(
-                [observation_id]
+            current_observations = self._db.get_observations_for_evidence_bundles(
+                [evidence_bundle_id]
             )
-            self._refresh_observation_summary_from_sub_claims(
-                observation,
-                current_sub_claims,
+            self._refresh_evidence_bundle_summary_from_observations(
+                evidence_bundle,
+                current_observations,
             )
             self._log_info(
                 "memory_reflect",
-                "observation_sub_claims_incrementally_updated",
+                "evidence_bundle_observations_incrementally_updated",
                 {
-                    "observation_id": observation_id,
+                    "evidence_bundle_id": evidence_bundle_id,
                     "new_fact_ids": [
                         int(self._node_id(fact)) for fact in new_facts
                     ],
-                    "touched_sub_claim_ids": observation_touched_ids,
+                    "touched_observation_ids": bundle_observation_ids,
                 },
             )
-        return list(dict.fromkeys(touched_sub_claim_ids))
+        return list(dict.fromkeys(touched_observation_ids))
 
     @staticmethod
     def _is_task_event_like_fact(fact: Dict[str, Any]) -> bool:
@@ -3206,139 +3057,23 @@ class MemoryNodeManager:
         winner = sorted(counts.values(), key=lambda item: (-item["count"], item["order"]))[0]
         return int(winner["entity_id"]), str(winner["entity_name"] or "")
         
-    @staticmethod
-    def _observation_time_value(value: Any) -> str:
-        text = str(value or "").strip()
-        return text[:64] if text else "unknown"
-
-    @classmethod
-    def _format_observation_source_fact(cls, index: int, node: Dict[str, Any]) -> Optional[str]:
-        fact_type = str(node.get("fact_type") or "semantic")
-        fact_subject = str(node.get("fact_subject") or "other")
-        fact_kind = str(node.get("fact_kind") or "other")
-        summary = str(node.get("summary") or "").strip()
-        if not summary:
-            return None
-        time_key = cls._observation_time_value(node.get("time_key"))
-        return f"{index}. [time={time_key}; {fact_type}/{fact_subject}/{fact_kind}] {summary}"
-
-    @classmethod
-    def _observation_time_context(cls, observation: Dict[str, Any]) -> str:
-        fields = (
-            "source_time_start",
-            "source_time_end",
-            "last_supported_at",
-            "created_at",
-            "updated_at",
-        )
-        return "\n".join(
-            f"- {field}: {cls._observation_time_value(observation.get(field))}"
-            for field in fields
-        )
-
-    @classmethod
-    def _observation_time_inline(cls, observation: Dict[str, Any]) -> str:
-        start = cls._observation_time_value(observation.get("source_time_start"))
-        end = cls._observation_time_value(observation.get("source_time_end"))
-        last_supported = cls._observation_time_value(observation.get("last_supported_at"))
-        updated = cls._observation_time_value(observation.get("updated_at"))
-        return f"source_time={start}..{end}; last_supported_at={last_supported}; updated_at={updated}"
-
-    def _generate_observation(
-        self,
-        *,
-        entity_name: str,
-        topic_label: str,
-        source_nodes: List[Dict[str, Any]],
-        existing_observation: Optional[Dict[str, Any]] = None,
-        related_observations: Optional[List[Dict[str, Any]]] = None,
-        target_type: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Generate a consolidated observation from source facts via LLM."""
-        fact_lines = []
-        for index, node in enumerate(source_nodes[:8], 1):
-            line = self._format_observation_source_fact(index, node)
-            if line:
-                fact_lines.append(line)
-        if not fact_lines and not existing_observation:
-            return None
-
-        if existing_observation:
-            existing_metadata = existing_observation.get("metadata", {})
-            if isinstance(existing_metadata, str):
-                try:
-                    existing_metadata = json.loads(existing_metadata or "{}")
-                except (TypeError, ValueError):
-                    existing_metadata = {}
-            related_lines = []
-            for index, observation in enumerate(related_observations or [], 1):
-                summary = str(observation.get("summary") or "").strip()
-                if not summary:
-                    continue
-                time_context = self._observation_time_inline(observation)
-                related_lines.append(
-                    f"{index}. [{observation.get('observation_type', 'observation')}; "
-                    f"confidence={observation.get('confidence', 0.0)}; {time_context}] {summary}"
-                )
-            prompt = OBSERVATION_UPDATE_PROMPT.format(
-                entity_name=entity_name,
-                topic_label=topic_label,
-                existing_summary=existing_observation.get("summary", ""),
-                existing_type=existing_observation.get("observation_type", "insight"),
-                existing_keywords=existing_observation.get("keywords", ""),
-                existing_confidence=existing_observation.get("confidence", 0.7),
-                existing_metadata=json.dumps(existing_metadata or {}, ensure_ascii=False, sort_keys=True),
-                existing_time_context=self._observation_time_context(existing_observation),
-                related_observations="\n".join(related_lines) or "(none)",
-                source_facts="\n".join(fact_lines) or "(none)",
-            )
-        else:
-            prompt = OBSERVATION_CONSOLIDATION_PROMPT.format(
-                entity_name=entity_name,
-                topic_label=topic_label,
-                source_facts="\n".join(fact_lines),
-            )
-        result = self._call_llm(prompt)
-        data = self._json_object_from_llm_text(result or "")
-        if not data:
-            logger.debug("Observation consolidation returned invalid JSON")
-            return None
-
-        summary = str(data.get("summary", "")).strip()
-        if not summary:
-            return None
-        category = "observation"
-        metadata = data.get("metadata", {})
-        if not isinstance(metadata, dict):
-            metadata = {}
-        metadata = self._json_dict(metadata)
-        keywords = self._normalize_keywords(data.get("keywords", []))
-        try:
-            confidence = float(data.get("confidence", 0.7) or 0.7)
-        except (TypeError, ValueError):
-            confidence = 0.7
-        return {
-            "summary": summary,
-            "observation_type": category,
-            "keywords": keywords,
-            "confidence": max(0.0, min(1.0, confidence)),
-            "metadata": metadata,
-        }
-
-    def _build_observation_container_from_facts(
+    def _build_evidence_bundle_from_facts(
         self,
         *,
         source_nodes: List[Dict[str, Any]],
-        existing_observation: Optional[Dict[str, Any]] = None,
-        related_observations: Optional[List[Dict[str, Any]]] = None,
+        existing_evidence_bundle: Optional[Dict[str, Any]] = None,
+        related_evidence_bundles: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Build structural fields; sub-claims exclusively own the summary."""
+        """Build structural fields; observations exclusively own the summary."""
         summary = str(
-            (existing_observation or {}).get("summary") or ""
+            (existing_evidence_bundle or {}).get("summary") or ""
         ).strip()
 
         keywords: List[str] = []
-        for item in [existing_observation, *(related_observations or [])]:
+        for item in [
+            existing_evidence_bundle,
+            *(related_evidence_bundles or []),
+        ]:
             if not item:
                 continue
             keywords.extend(
@@ -3351,13 +3086,13 @@ class MemoryNodeManager:
         keywords = list(dict.fromkeys(keywords))
         return {
             "summary": summary,
-            "observation_type": "observation",
+            "bundle_type": "entity_topic",
             "keywords": keywords,
             "confidence": max(
-                [float((existing_observation or {}).get("confidence") or 0.0)]
+                [float((existing_evidence_bundle or {}).get("confidence") or 0.0)]
                 + [
                     float(item.get("confidence") or 0.0)
-                    for item in related_observations or []
+                    for item in related_evidence_bundles or []
                 ]
                 + [0.7]
             ),
@@ -3443,25 +3178,25 @@ class MemoryNodeManager:
         ).strip().lower().replace("-", "_").replace(" ", "_")
         if interpretation_type not in allowed_types:
             interpretation_type = "behavior_pattern"
-        allowed_sub_claim_types = {
+        allowed_observation_types = {
             str(value).strip().lower()
             for value in metadata.get("allowed_interpretation_types", [])
             if str(value or "").strip()
         }
         if (
-            allowed_sub_claim_types
-            and interpretation_type not in allowed_sub_claim_types
+            allowed_observation_types
+            and interpretation_type not in allowed_observation_types
         ):
             self._log_info(
                 "memory_reflect",
                 "interpretation_generation_rejected",
                 {
-                    "sub_claim_id": observation.get("_sub_claim_id"),
-                    "sub_claim_type": metadata.get("sub_claim_type"),
+                    "observation_id": observation.get("id"),
+                    "observation_type": metadata.get("observation_type"),
                     "interpretation_type": interpretation_type,
-                    "reason": "sub_claim_type_gate",
+                    "reason": "observation_type_gate",
                     "allowed_interpretation_types": sorted(
-                        allowed_sub_claim_types
+                        allowed_observation_types
                     ),
                 },
             )
@@ -3632,7 +3367,7 @@ class MemoryNodeManager:
         ).strip().lower().replace("-", "_").replace(" ", "_")
         if interpretation_type not in allowed_types:
             interpretation_type = existing_type if existing_type in allowed_types else "insight"
-        allowed_sub_claim_types = {
+        allowed_observation_types = {
             str(value).strip().lower()
             for value in observation_metadata.get(
                 "allowed_interpretation_types",
@@ -3641,8 +3376,8 @@ class MemoryNodeManager:
             if str(value or "").strip()
         }
         if (
-            allowed_sub_claim_types
-            and interpretation_type not in allowed_sub_claim_types
+            allowed_observation_types
+            and interpretation_type not in allowed_observation_types
         ):
             return None
 
@@ -4037,20 +3772,16 @@ class MemoryNodeManager:
     ) -> Tuple[float, str]:
         metadata = self._json_dict(interpretation.get("metadata", {}))
         evidence_observation_ids = interpretation.get("evidence_observation_ids", [])
-        sub_claim_id = observation.get("_sub_claim_id")
-        linked_sub_claim_ids = {
+        linked_observation_ids = {
             int(value)
-            for value in metadata.get("sub_claim_ids", [])
+            for value in metadata.get("observation_ids", [])
             if str(value).isdigit()
         }
-        if sub_claim_id is not None and int(sub_claim_id) in linked_sub_claim_ids:
-            return 1.0, "existing_sub_claim_evidence"
+        if int(observation_id) in linked_observation_ids:
+            return 1.0, "existing_observation_evidence"
         if (
-            sub_claim_id is None
-            and (
-                int(observation_id) in evidence_observation_ids
-                or metadata.get("observation_id") == int(observation_id)
-            )
+            int(observation_id) in evidence_observation_ids
+            or metadata.get("observation_id") == int(observation_id)
         ):
             return 1.0, "existing_observation_evidence"
 
@@ -4073,7 +3804,7 @@ class MemoryNodeManager:
             allowed_interpretation_types
             and interpretation_type not in allowed_interpretation_types
         ):
-            return 0.0, "sub_claim_type_gate"
+            return 0.0, "observation_type_gate"
         candidate_families = self._candidate_interpretation_families(observation, source_nodes)
         observation_family = self._observation_family(observation, source_nodes)
         interpretation_family = self._interpretation_family(interpretation.get("interpretation_type"))
@@ -4149,18 +3880,11 @@ class MemoryNodeManager:
         candidates: List[Dict[str, Any]] = []
         seen: set[int] = set()
 
-        sub_claim_id = observation.get("_sub_claim_id")
         try:
-            if sub_claim_id is not None:
-                existing = self._db.get_interpretations_for_sub_claim(
-                    int(sub_claim_id),
-                    limit=10,
-                )
-            else:
-                existing = self._db.get_interpretations_for_observation(
-                    int(observation_id),
-                    limit=10,
-                )
+            existing = self._db.get_interpretations_for_observation(
+                int(observation_id),
+                limit=10,
+            )
         except Exception:
             existing = []
         for item in existing:
@@ -4258,9 +3982,9 @@ class MemoryNodeManager:
             and str(metadata.get("interpretation_basis_hash") or "") == basis_hash
         )
 
-    def _update_sub_claim_interpretation_state(
+    def _update_observation_interpretation_state(
         self,
-        sub_claim: Dict[str, Any],
+        observation: Dict[str, Any],
         *,
         status: str,
         basis_hash: str,
@@ -4268,9 +3992,9 @@ class MemoryNodeManager:
         interpretation_id: Optional[int] = None,
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
-        if not self._db or not sub_claim.get("id"):
+        if not self._db or not observation.get("id"):
             return
-        metadata = self._json_dict(sub_claim.get("metadata", {}))
+        metadata = self._json_dict(observation.get("metadata", {}))
         status = status if status in {"pending", "deferred", "linked", "generated", "ignored"} else "pending"
         metadata.update({
             "interpretation_status": status,
@@ -4293,8 +4017,8 @@ class MemoryNodeManager:
         if extra:
             metadata.update(extra)
         try:
-            self._db.memory_update_sub_claim_metadata(
-                int(sub_claim["id"]),
+            self._db.memory_update_observation_metadata(
+                int(observation["id"]),
                 metadata,
             )
         except AttributeError:
@@ -4302,13 +4026,13 @@ class MemoryNodeManager:
                 "memory_reflect",
                 "interpretation_state_update_unsupported", 
                 {
-                    "sub_claim_id": sub_claim.get("id"),
+                    "observation_id": observation.get("id"),
                     "status": status,
                     "reason": reason,
                 }
             )
             return
-        sub_claim["metadata"] = metadata
+        observation["metadata"] = metadata
 
     @classmethod
     def _interpretation_generation_trigger_priority(
@@ -4353,18 +4077,18 @@ class MemoryNodeManager:
             return "medium", "mixed_fact_type_evidence"
         return "low", "ordinary_insight"
 
-    def _get_similar_deferred_sub_claims(
+    def _get_similar_deferred_observations(
         self,
         item: Dict[str, Any],
-        seen_sub_claim_ids: set[int],
+        seen_observation_ids: set[int],
     ) -> List[Dict[str, Any]]:
         if not self._db:
             return []
-        semantic_sub_claim = item["sub_claim"]
+        semantic_observation = item["observation"]
         try:
-            candidates = self._db.get_deferred_sub_claims_for_interpretation(
-                entity_id=semantic_sub_claim.get("entity_id"),
-                exclude_sub_claim_ids=list(seen_sub_claim_ids),
+            candidates = self._db.get_deferred_observations_for_interpretation(
+                entity_id=semantic_observation.get("entity_id"),
+                exclude_observation_ids=list(seen_observation_ids),
                 limit=16,
             )
         except Exception:
@@ -4377,33 +4101,33 @@ class MemoryNodeManager:
                 candidate_id = int(candidate["id"])
             except (TypeError, ValueError, KeyError):
                 continue
-            if candidate_id in seen_sub_claim_ids:
+            if candidate_id in seen_observation_ids:
                 continue
-            candidate_semantic_sub_claim = self._build_semantic_sub_claim(
+            candidate_semantic_observation = self._build_semantic_observation(
                 candidate
             )
             source_nodes = self._db.memory_nodes_by_ids(
                 candidate.get("source_node_ids", [])
             )
             family = self._observation_interpretation_cluster_family(
-                candidate_semantic_sub_claim,
+                candidate_semantic_observation,
                 source_nodes,
             )
             if family != item.get("family"):
                 continue
-            if str(candidate.get("sub_claim_type") or "") != str(
-                semantic_sub_claim.get("sub_claim_type") or ""
+            if str(candidate.get("observation_type") or "") != str(
+                semantic_observation.get("observation_type") or ""
             ):
                 continue
             similarity = self._embedding_similarity(
-                semantic_sub_claim.get("embedding"),
-                candidate_semantic_sub_claim.get("embedding"),
+                semantic_observation.get("embedding"),
+                candidate_semantic_observation.get("embedding"),
             )
-            if similarity < SUB_CLAIM_EMBEDDING_SIMILARITY_THRESHOLD:
+            if similarity < OBSERVATION_EMBEDDING_SIMILARITY_THRESHOLD:
                 continue
             scored_candidates.append((similarity, {
                 "candidate": candidate,
-                "sub_claim": candidate_semantic_sub_claim,
+                "observation": candidate_semantic_observation,
                 "source_nodes": source_nodes,
                 "family": family,
             }))
@@ -4412,7 +4136,7 @@ class MemoryNodeManager:
         for similarity, entry in scored_candidates[:8]:
             candidate = entry["candidate"]
             candidate_id = int(candidate["id"])
-            semantic_candidate = entry["sub_claim"]
+            semantic_candidate = entry["observation"]
             source_nodes = entry["source_nodes"]
             metadata = self._json_dict(semantic_candidate.get("metadata", {}))
             basis_hash = self._interpretation_basis_hash(
@@ -4421,11 +4145,11 @@ class MemoryNodeManager:
             )
             if str(metadata.get("interpretation_basis_hash") or "") != basis_hash:
                 continue
-            seen_sub_claim_ids.add(candidate_id)
+            seen_observation_ids.add(candidate_id)
             deferred_items.append({
-                "sub_claim": semantic_candidate,
-                "sub_claim_id": candidate_id,
-                "observation_id": int(candidate["observation_id"]),
+                "observation": semantic_candidate,
+                "observation_id": candidate_id,
+                "evidence_bundle_id": int(candidate["evidence_bundle_id"]),
                 "source_nodes": source_nodes,
                 "source_node_ids": [int(node["id"]) for node in source_nodes if node.get("id") is not None],
                 "basis_hash": basis_hash,
@@ -4480,7 +4204,6 @@ class MemoryNodeManager:
             return None
         existing_evidence_reasons = {
             "existing_observation_evidence",
-            "existing_sub_claim_evidence",
         }
         if not allow_content_update and reason not in existing_evidence_reasons:
             self._log_info(
@@ -4536,15 +4259,14 @@ class MemoryNodeManager:
             "linker_version": 1,
             "content_updated": bool(updated_interpretation),
         }
-        if observation.get("_sub_claim_id") is not None:
-            metadata["sub_claim_ids"] = list(dict.fromkeys([
-                *[
-                    int(value)
-                    for value in metadata.get("sub_claim_ids", [])
-                    if str(value).isdigit()
-                ],
-                int(observation["_sub_claim_id"]),
-            ]))
+        metadata["observation_ids"] = list(dict.fromkeys([
+            *[
+                int(value)
+                for value in metadata.get("observation_ids", [])
+                if str(value).isdigit()
+            ],
+            int(observation_id),
+        ]))
         claim = (updated_interpretation or {}).get("claim", best.get("claim", ""))
         target_text = (updated_interpretation or {}).get("target_text", best.get("target_text", ""))
         scope = (updated_interpretation or {}).get("scope", best.get("scope", "general"))
@@ -4595,12 +4317,11 @@ class MemoryNodeManager:
             embedding_text=embedding_text,
             metadata=metadata,
         )
-        if observation.get("_sub_claim_id") is not None:
-            self._db.memory_link_interpretation_sub_claim(
-                interpretation_id,
-                int(observation["_sub_claim_id"]),
-                confidence=float(best_score),
-            )
+        self._db.memory_link_interpretation_observation(
+            interpretation_id,
+            int(observation_id),
+            confidence=float(best_score),
+        )
         self._log_info(
             "memory_reflect",
             "interpretation_linked", 
@@ -4650,14 +4371,14 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         buckets: Dict[Tuple[str, Any, str, str], Dict[str, Any]] = {}
         for item in items:
-            observation = item["sub_claim"]
+            observation = item["observation"]
             source_nodes = item.get("source_nodes", [])
             family = self._observation_interpretation_cluster_family(observation, source_nodes)
             topic_key = self._topic_key(observation.get("topic_key") or observation.get("topic_label") or "general")
             cluster_topic = "task-chain" if family == "task" else (topic_key or "general")
-            sub_claim_type = str(
+            observation_type = str(
                 self._json_dict(observation.get("metadata", {})).get(
-                    "sub_claim_type"
+                    "observation_type"
                 )
                 or "legacy_observation"
             )
@@ -4665,13 +4386,13 @@ class MemoryNodeManager:
                 family,
                 observation.get("entity_id"),
                 cluster_topic,
-                sub_claim_type,
+                observation_type,
             )
             bucket = buckets.setdefault(key, {
                 "family": family,
                 "entity_id": observation.get("entity_id"),
                 "topic_key": cluster_topic,
-                "sub_claim_type": sub_claim_type,
+                "observation_type": observation_type,
                 "items": [],
             })
             bucket["items"].append(item)
@@ -4713,16 +4434,12 @@ class MemoryNodeManager:
             for item in items
             if item.get("observation_id") is not None
         ]
-        sub_claim_ids = list(dict.fromkeys(
-            int(item["sub_claim"]["_sub_claim_id"])
-            for item in items
-            if item.get("sub_claim", {}).get("_sub_claim_id") is not None
-        ))
+        observation_ids = list(dict.fromkeys(observation_ids))
         if not observation_ids:
             return None
 
         if len(items) == 1:
-            observation = items[0]["sub_claim"]
+            observation = items[0]["observation"]
             should_generate, reason = self._should_generate_interpretation_for_observation(
                 observation,
                 all_source_nodes,
@@ -4749,11 +4466,11 @@ class MemoryNodeManager:
         else:
             summaries = []
             for index, item in enumerate(items, 1):
-                observation = item["sub_claim"]
+                observation = item["observation"]
                 summary = str(observation.get("summary") or "").strip()
                 if summary:
                     summaries.append(f"{index}. id={item['observation_id']} {summary}")
-            representative = dict(items[0]["sub_claim"])
+            representative = dict(items[0]["observation"])
             representative_metadata = self._json_dict(
                 representative.get("metadata", {})
             )
@@ -4783,7 +4500,6 @@ class MemoryNodeManager:
             "topic_label": representative.get("topic_label"),
             "observation_type": representative.get("observation_type", "observation"),
             "interpretation_cluster_family": family,
-            "sub_claim_ids": sub_claim_ids,
         }
         embedding_text = self._interpretation_embedding_text(
             entity_name=representative.get("entity_name") or "",
@@ -4816,10 +4532,10 @@ class MemoryNodeManager:
             embedding_text=embedding_text,
             metadata=metadata,
         )
-        for sub_claim_id in sub_claim_ids:
-            self._db.memory_link_interpretation_sub_claim(
+        for observation_id in observation_ids:
+            self._db.memory_link_interpretation_observation(
                 interpretation_id,
-                sub_claim_id,
+                observation_id,
                 confidence=interpretation["confidence"],
             )
         self._log_info(
@@ -4847,7 +4563,7 @@ class MemoryNodeManager:
         if len(items) == 1 and len(changed_items) == 1:
             item = changed_items[0]
             return cls._single_observation_generation_allowed(
-                observation=item["sub_claim"],
+                observation=item["observation"],
                 source_nodes=item.get("source_nodes", []),
                 interpretation_family=str(item.get("family") or cluster.get("family") or "insight"),
             )
@@ -4859,31 +4575,31 @@ class MemoryNodeManager:
             return True, "cluster_size_threshold"
         return False, "trigger_threshold_not_met"
 
-    def _build_semantic_sub_claim(
+    def _build_semantic_observation(
         self,
-        sub_claim: Dict[str, Any],
+        observation: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Build the semantic unit consumed by interpretation generation."""
-        sub_claim_type = str(
-            sub_claim.get("sub_claim_type") or "context"
+        observation_type = str(
+            observation.get("observation_type") or "context"
         ).strip().lower()
-        metadata = self._json_dict(sub_claim.get("metadata", {}))
+        metadata = self._json_dict(observation.get("metadata", {}))
         source_count = max(
             1,
             int(metadata.get("source_count") or len(
-                sub_claim.get("source_node_ids", [])
+                observation.get("source_node_ids", [])
             ) or 1),
         )
         evidence_mode = str(
-            sub_claim.get("evidence_mode") or "aggregated"
+            observation.get("evidence_mode") or "aggregated"
         ).strip().lower()
         evidence_shape = (
             "repeated_pattern"
-            if sub_claim_type in {"behavior_pattern", "preference_signal"}
+            if observation_type in {"behavior_pattern", "preference_signal"}
             and source_count >= 2
             else (
                 "progression"
-                if sub_claim_type in {
+                if observation_type in {
                     "task_state",
                     "task_progress",
                     "decision",
@@ -4910,42 +4626,41 @@ class MemoryNodeManager:
         )
         allowed_interpretation_types = metadata.get(
             "allowed_interpretation_types",
-            self._sub_claim_allowed_interpretation_types(
-                sub_claim_type,
+            self._observation_allowed_interpretation_types(
+                observation_type,
                 evidence_mode,
             ),
         )
-        claim_text = str(sub_claim.get("claim_text") or "").strip()
+        summary = str(observation.get("summary") or "").strip()
         return {
-            "id": int(sub_claim["id"]),
-            "_sub_claim_id": int(sub_claim["id"]),
-            "observation_id": int(sub_claim["observation_id"]),
-            "entity_id": sub_claim.get("entity_id"),
-            "entity_name": sub_claim.get("entity_name"),
-            "topic_key": sub_claim.get("topic_key"),
-            "topic_label": sub_claim.get("topic_label"),
-            "sub_claim_type": sub_claim_type,
+            "id": int(observation["id"]),
+            "evidence_bundle_id": int(observation["evidence_bundle_id"]),
+            "entity_id": observation.get("entity_id"),
+            "entity_name": observation.get("entity_name"),
+            "topic_key": observation.get("topic_key"),
+            "topic_label": observation.get("topic_label"),
+            "observation_type": observation_type,
             "source_node_ids": [
                 int(node_id)
-                for node_id in sub_claim.get("source_node_ids", [])
+                for node_id in observation.get("source_node_ids", [])
             ],
-            "summary": claim_text,
-            "keywords": claim_text,
-            "confidence": sub_claim.get("confidence", 0.5),
-            "embedding": sub_claim.get("embedding"),
-            "embedding_text": sub_claim.get("embedding_text") or claim_text,
+            "summary": summary,
+            "keywords": summary,
+            "confidence": observation.get("confidence", 0.5),
+            "embedding": observation.get("embedding"),
+            "embedding_text": observation.get("embedding_text") or summary,
             "metadata": {
                 **metadata,
-                "sub_claim_id": int(sub_claim["id"]),
-                "sub_claim_type": sub_claim_type,
+                "observation_id": int(observation["id"]),
+                "observation_type": observation_type,
                 "evidence_mode": evidence_mode,
-                "observation_kind": self._sub_claim_observation_kind(
-                    sub_claim_type
+                "observation_kind": self._observation_kind(
+                    observation_type
                 ),
                 "evidence_shape": evidence_shape,
                 "temporal_scope": temporal_scope,
                 "candidate_interpretation_types": (
-                    self._sub_claim_candidate_families(sub_claim_type)
+                    self._observation_candidate_families(observation_type)
                 ),
                 "allowed_interpretation_types": allowed_interpretation_types,
                 "source_fact_type_distribution": fact_type_distribution,
@@ -4954,27 +4669,30 @@ class MemoryNodeManager:
             },
         }
 
-    def _reflect_generate_interpretations_using_sub_claims(self, observation_ids: List[int]) -> int:
+    def _reflect_generate_interpretations_using_observations(
+        self,
+        evidence_bundle_ids: List[int],
+    ) -> int:
         if not self._db:
             return 0
         clean_ids = list(dict.fromkeys(
-            int(observation_id)
-            for observation_id in observation_ids
-            if observation_id is not None
+            int(evidence_bundle_id)
+            for evidence_bundle_id in evidence_bundle_ids
+            if evidence_bundle_id is not None
         ))
         if not clean_ids:
             return 0
-        sub_claims = self._db.get_sub_claims_for_observations(clean_ids)
+        observations = self._db.get_observations_for_evidence_bundles(clean_ids)
         generated = 0
         candidate_items: List[Dict[str, Any]] = []
-        semantic_sub_claims = [
-            self._build_semantic_sub_claim(sub_claim)
-            for sub_claim in sub_claims
+        semantic_observations = [
+            self._build_semantic_observation(observation)
+            for observation in observations
         ]
-        for semantic_sub_claim in semantic_sub_claims:
-            observation_id = int(semantic_sub_claim["observation_id"])
+        for semantic_observation in semantic_observations:
+            observation_id = int(semantic_observation["id"])
             source_nodes = self._db.memory_nodes_by_ids(
-                semantic_sub_claim.get("source_node_ids", [])
+                semantic_observation.get("source_node_ids", [])
             )
             source_node_ids = [
                 int(node["id"])
@@ -4982,10 +4700,10 @@ class MemoryNodeManager:
                 if node.get("id") is not None
             ]
             metadata = self._json_dict(
-                semantic_sub_claim.get("metadata", {})
+                semantic_observation.get("metadata", {})
             )
             basis_hash = self._interpretation_basis_hash(
-                semantic_sub_claim,
+                semantic_observation,
                 source_nodes,
             )
             if self._interpretation_state_is_final_for_basis(
@@ -4997,28 +4715,26 @@ class MemoryNodeManager:
                     "interpretation_semantic_unit_skipped",
                     {
                         "observation_id": observation_id,
-                        "sub_claim_id": semantic_sub_claim["id"],
                         "status": self._interpretation_state(metadata),
                         "reason": "basis_already_processed",
                     },
                 )
                 continue
-            semantic_sub_claim["metadata"] = metadata
+            semantic_observation["metadata"] = metadata
             family = self._observation_interpretation_cluster_family(
-                semantic_sub_claim,
+                semantic_observation,
                 source_nodes,
             )
             priority, priority_reason = (
                 self._interpretation_generation_trigger_priority(
-                    observation=semantic_sub_claim,
+                    observation=semantic_observation,
                     source_nodes=source_nodes,
                     family=family,
                 )
             )
             candidate_items.append({
-                "sub_claim": semantic_sub_claim,
-                "sub_claim_id": int(semantic_sub_claim["id"]),
-                "observation_id": observation_id,
+                "observation": semantic_observation,
+                "observation_id": int(semantic_observation["id"]),
                 "source_nodes": source_nodes,
                 "source_node_ids": source_node_ids,
                 "basis_hash": basis_hash,
@@ -5031,14 +4747,14 @@ class MemoryNodeManager:
         if not candidate_items:
             return 0
 
-        seen_sub_claim_ids = {
-            int(item["sub_claim_id"]) for item in candidate_items
+        seen_observation_ids = {
+            int(item["observation_id"]) for item in candidate_items
         }
         cluster_context_items = list(candidate_items)
         for item in list(candidate_items):
-            deferred_items = self._get_similar_deferred_sub_claims(
+            deferred_items = self._get_similar_deferred_observations(
                 item,
-                seen_sub_claim_ids,
+                seen_observation_ids,
             )
             cluster_context_items.extend(deferred_items)
 
@@ -5057,8 +4773,8 @@ class MemoryNodeManager:
             ]
             if not should_run:
                 for item in changed_items:
-                    self._update_sub_claim_interpretation_state(
-                        item["sub_claim"],
+                    self._update_observation_interpretation_state(
+                        item["observation"],
                         status="deferred",
                         basis_hash=item["basis_hash"],
                         reason=reason,
@@ -5074,7 +4790,7 @@ class MemoryNodeManager:
                 observation_id = int(item["observation_id"])
                 allow_content_update = llm_calls_used < INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT
                 link_result = self._link_observation_to_existing_interpretation(
-                    observation=item["sub_claim"],
+                    observation=item["observation"],
                     source_nodes=item["source_nodes"],
                     observation_id=observation_id,
                     source_node_ids=item["source_node_ids"],
@@ -5085,8 +4801,8 @@ class MemoryNodeManager:
                     linked_id = int(link_result["interpretation_id"])
                     if link_result.get("content_update_attempted"):
                         llm_calls_used += 1
-                    self._update_sub_claim_interpretation_state(
-                        item["sub_claim"],
+                    self._update_observation_interpretation_state(
+                        item["observation"],
                         status="linked",
                         basis_hash=item["basis_hash"],
                         reason=str(link_result.get("reason") or "linked_existing_interpretation"),
@@ -5105,8 +4821,8 @@ class MemoryNodeManager:
 
             if llm_calls_used >= INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT:
                 for item in unmatched_items:
-                    self._update_sub_claim_interpretation_state(
-                        item["sub_claim"],
+                    self._update_observation_interpretation_state(
+                        item["observation"],
                         status="deferred",
                         basis_hash=item["basis_hash"],
                         reason="llm_budget_exhausted",
@@ -5123,8 +4839,8 @@ class MemoryNodeManager:
             if interpretation_id is not None:
                 generated += 1
                 for item in generation_items:
-                    self._update_sub_claim_interpretation_state(
-                        item["sub_claim"],
+                    self._update_observation_interpretation_state(
+                        item["observation"],
                         status="generated",
                         basis_hash=item["basis_hash"],
                         reason="generated_from_observation_cluster",
@@ -5136,8 +4852,8 @@ class MemoryNodeManager:
                     )
             else:
                 for item in unmatched_items:
-                    self._update_sub_claim_interpretation_state(
-                        item["sub_claim"],
+                    self._update_observation_interpretation_state(
+                        item["observation"],
                         status="deferred",
                         basis_hash=item["basis_hash"],
                         reason="generation_not_created",
@@ -5148,7 +4864,7 @@ class MemoryNodeManager:
                     )
         return generated
 
-    def _candidate_observations_for_fact_cluster(
+    def _candidate_evidence_bundles_for_fact_cluster(
         self,
         cluster: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
@@ -5159,7 +4875,7 @@ class MemoryNodeManager:
         except (KeyError, TypeError, ValueError):
             return []
         try:
-            return self._db.get_observations_using_entity_topic(
+            return self._db.get_evidence_bundles_using_entity_topic(
                 entity_id=entity_id,
                 topic_key=self._topic_key(cluster.get("topic_key") or "general"),
                 query_embedding=None,
@@ -5167,27 +4883,27 @@ class MemoryNodeManager:
         except Exception:
             return []
 
-    def _match_fact_cluster_to_existing_observation(
+    def _match_fact_cluster_to_existing_evidence_bundle(
         self,
         cluster: Dict[str, Any],
     ) -> Optional[Tuple[Dict[str, Any], float, str, List[Dict[str, Any]]]]:
-        candidates = self._candidate_observations_for_fact_cluster(cluster)
+        candidates = self._candidate_evidence_bundles_for_fact_cluster(cluster)
         if not candidates:
             return None
-        observation = candidates[0]
-        observation_id = int(observation["id"])
-        supporting_nodes = self._db.get_observation_supporting_nodes(
-            [observation_id],
-            per_observation=8,
-        ).get(observation_id, [])
-        return observation, 1.0, "exact_entity_topic", supporting_nodes
+        evidence_bundle = candidates[0]
+        evidence_bundle_id = int(evidence_bundle["id"])
+        supporting_nodes = self._db.get_evidence_bundle_supporting_nodes(
+            [evidence_bundle_id],
+            per_evidence_bundle=8,
+        ).get(evidence_bundle_id, [])
+        return evidence_bundle, 1.0, "exact_entity_topic", supporting_nodes
 
-    def _update_existing_observation_from_fact_cluster(
+    def _update_existing_evidence_bundle_from_fact_cluster(
         self,
         cluster: Dict[str, Any],
         *,
         consumed_node_ids: set[int],
-        changed_observation_ids: Optional[List[int]] = None,
+        changed_evidence_bundle_ids: Optional[List[int]] = None,
     ) -> Optional[int]:
         if not self._db:
             return None
@@ -5214,12 +4930,14 @@ class MemoryNodeManager:
             "source_nodes": source_nodes,
             "source_node_ids": source_node_ids,
         }
-        match = self._match_fact_cluster_to_existing_observation(cluster_for_match)
+        match = self._match_fact_cluster_to_existing_evidence_bundle(cluster_for_match)
         if not match:
             return None
-        existing_observation, score, reason, supporting_nodes = match
-        observation_id = int(existing_observation["id"])
-        existing_source_ids = self._db.memory_observation_source_ids(observation_id)
+        existing_bundle, score, reason, supporting_nodes = match
+        evidence_bundle_id = int(existing_bundle["id"])
+        existing_source_ids = self._db.memory_evidence_bundle_source_ids(
+            evidence_bundle_id
+        )
         pending_source_ids = [
             node_id
             for node_id in source_node_ids
@@ -5227,23 +4945,25 @@ class MemoryNodeManager:
         ]
         if not pending_source_ids:
             consumed_node_ids.update(source_node_ids)
-            return observation_id
+            return evidence_bundle_id
 
-        generated = self._build_observation_container_from_facts(
+        generated = self._build_evidence_bundle_from_facts(
             source_nodes=source_nodes,
-            existing_observation=existing_observation,
+            existing_evidence_bundle=existing_bundle,
         )
         if not generated:
             return None
         metadata = {}
         stored_source_ids = list(dict.fromkeys(existing_source_ids + pending_source_ids))
-        observation_keywords = generated["keywords"] or self._normalize_keywords(existing_observation.get("keywords", ""))
-        self._db.memory_replace_observation_group(
-            keep_observation_id=observation_id,
-            remove_observation_ids=[],
-            observation_type=generated["observation_type"],
+        bundle_keywords = generated["keywords"] or self._normalize_keywords(
+            existing_bundle.get("keywords", "")
+        )
+        self._db.memory_replace_evidence_bundle_group(
+            keep_evidence_bundle_id=evidence_bundle_id,
+            remove_evidence_bundle_ids=[],
+            bundle_type=generated["bundle_type"],
             summary=generated["summary"],
-            keywords=observation_keywords,
+            keywords=bundle_keywords,
             confidence=generated["confidence"],
             source_node_ids=stored_source_ids,
             embedding=None,
@@ -5254,25 +4974,25 @@ class MemoryNodeManager:
                 for node_id in pending_source_ids
             },
         )
-        if changed_observation_ids is not None:
-            changed_observation_ids.append(observation_id)
+        if changed_evidence_bundle_ids is not None:
+            changed_evidence_bundle_ids.append(evidence_bundle_id)
         consumed_node_ids.update(source_node_ids)
         self._log_info(
             "memory_reflect",
-            "fact_cluster_observation_matched", {
-            "observation_id": observation_id,
+            "fact_cluster_evidence_bundle_matched", {
+            "evidence_bundle_id": evidence_bundle_id,
             "entity_id": cluster.get("entity_id"),
             "topic_key": cluster.get("topic_key"),
             "source_node_ids": source_node_ids,
             "score": score,
             "reason": reason,
             "supporting_facts": self._reflect_fact_log_items(supporting_nodes + source_nodes),
-            "updated_observation": {
-                **self._reflect_observation_log_item(generated),
+            "updated_evidence_bundle": {
+                **self._reflect_evidence_bundle_log_item(generated),
                 "metadata": metadata,
             },
         })
-        return observation_id
+        return evidence_bundle_id
 
     def _cluster_unprocessed_facts(
         self,
@@ -5341,12 +5061,12 @@ class MemoryNodeManager:
                     for fact in facts_for_cluster
                     if self._node_id(fact) is not None
                 ],
-                "can_create_observation": len(facts_for_cluster) >= 2,
+                "can_create_evidence_bundle": len(facts_for_cluster) >= 2,
             })
 
         clusters.sort(
             key=lambda item: (
-                1 if item.get("can_create_observation") else 0,
+                1 if item.get("can_create_evidence_bundle") else 0,
                 len(item.get("source_node_ids", [])),
                 str(item.get("topic_key") or ""),
             ),
@@ -5354,16 +5074,16 @@ class MemoryNodeManager:
         )
         return clusters
 
-    def _generate_observation_using_unmatched_fact_clusters(
+    def _generate_evidence_bundle_using_unmatched_fact_clusters(
         self,
         cluster: Dict[str, Any],
         *,
         consumed_node_ids: set[int],
-        changed_observation_ids: Optional[List[int]] = None,
+        changed_evidence_bundle_ids: Optional[List[int]] = None,
     ) -> Optional[int]:
         if not self._db:
             return None
-        if not cluster.get("can_create_observation", True):
+        if not cluster.get("can_create_evidence_bundle", True):
             return None
         source_nodes = [
             fact
@@ -5378,61 +5098,61 @@ class MemoryNodeManager:
         entity_id = int(cluster["entity_id"])
         topic_key = str(cluster.get("topic_key") or "general")
         
-        observation = self._build_observation_container_from_facts(
+        evidence_bundle = self._build_evidence_bundle_from_facts(
             source_nodes=source_nodes,
-            existing_observation=None,
+            existing_evidence_bundle=None,
         )
-        if not observation:
+        if not evidence_bundle:
             return None
-        observation_metadata = {}
-        observation_keywords = observation["keywords"] or [topic_key]
-        observation_id = self._db.memory_upsert_observation(
+        bundle_metadata = {}
+        bundle_keywords = evidence_bundle["keywords"] or [topic_key]
+        evidence_bundle_id = self._db.memory_upsert_evidence_bundle(
             entity_id=entity_id,
             topic_key=topic_key,
             topic_label=str(cluster.get("topic_label") or topic_key),
-            observation_type=observation["observation_type"],
-            summary=observation["summary"],
-            keywords=observation_keywords,
+            bundle_type=evidence_bundle["bundle_type"],
+            summary=evidence_bundle["summary"],
+            keywords=bundle_keywords,
             source_node_ids=source_node_ids,
-            confidence=observation["confidence"],
+            confidence=evidence_bundle["confidence"],
             embedding=None,
             embedding_text=None,
-            metadata=observation_metadata,
+            metadata=bundle_metadata,
             source_role="initial",
         )
-        if changed_observation_ids is not None:
-            changed_observation_ids.append(int(observation_id))
+        if changed_evidence_bundle_ids is not None:
+            changed_evidence_bundle_ids.append(int(evidence_bundle_id))
         consumed_node_ids.update(source_node_ids)
         self._log_info(
             "memory_reflect",
-            "fact_cluster_observation_generated", 
+            "fact_cluster_evidence_bundle_generated",
             {
-                "observation_id": observation_id,
+                "evidence_bundle_id": evidence_bundle_id,
                 "entity_id": entity_id,
                 "entity_name": cluster.get("entity_name"),
                 "topic_key": topic_key,
                 "source_node_ids": source_node_ids,
                 "source_facts": self._reflect_fact_log_items(source_nodes),
-                "generated_observation": {
-                    **self._reflect_observation_log_item(observation),
-                    "metadata": observation_metadata,
+                "generated_evidence_bundle": {
+                    **self._reflect_evidence_bundle_log_item(evidence_bundle),
+                    "metadata": bundle_metadata,
                 },
             }
         )
-        return int(observation_id)
+        return int(evidence_bundle_id)
     
-    def _reflect_generate_observations_using_facts(
+    def _reflect_generate_evidence_bundles_using_facts(
         self,
         *,
         limit: int,
         date_key: Optional[str] = None,
-        changed_observation_ids: Optional[List[int]] = None,
+        changed_evidence_bundle_ids: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
-        """Generate/update observations from the selected day's unobserved facts."""
+        """Generate or update evidence bundles from unprocessed facts."""
         if not self._db:
             return {"candidate_count": 0, "consolidated": 0}
 
-        unprocessed_fact_candidates = self._db.get_unprocessed_facts_for_observation(
+        unprocessed_fact_candidates = self._db.get_unprocessed_facts_for_evidence_bundle(
             date_key=date_key,
             limit=limit,
         )
@@ -5443,7 +5163,7 @@ class MemoryNodeManager:
         ))
         self._log_info(
             "memory_reflect",
-            "fact_candidates_for_observation", 
+            "fact_candidates_for_evidence_bundle",
             {
                 "limit": limit,
                 "candidate_count": len(unprocessed_fact_candidates),
@@ -5453,15 +5173,15 @@ class MemoryNodeManager:
         )
         consolidated = 0
         entity_topic_updates = 0
-        fact_cluster_observation_matches = 0
-        fact_cluster_observation_node_ids: set[int] = set()
+        fact_cluster_evidence_bundle_matches = 0
+        fact_cluster_evidence_bundle_node_ids: set[int] = set()
         fact_clusters_consolidated = 0
         fact_cluster_node_ids: set[int] = set()
         consumed_node_ids: set[int] = set()
         entity_topic_node_ids: set[int] = set()
         changed_ids = (
-            changed_observation_ids
-            if changed_observation_ids is not None
+            changed_evidence_bundle_ids
+            if changed_evidence_bundle_ids is not None
             else []
         )
         clusters = self._cluster_unprocessed_facts(
@@ -5470,7 +5190,7 @@ class MemoryNodeManager:
         )
         self._log_info(
             "memory_reflect",
-            "fact_cluster_candidates_for_observation",
+            "fact_cluster_candidates_for_evidence_bundle",
             {
                 "cluster_count": len(clusters),
                 "clusters": [
@@ -5478,7 +5198,7 @@ class MemoryNodeManager:
                         "entity_id": cluster.get("entity_id"),
                         "entity_name": cluster.get("entity_name"),
                         "topic_key": cluster.get("topic_key"),
-                        "can_create_observation": cluster.get("can_create_observation"),
+                        "can_create_evidence_bundle": cluster.get("can_create_evidence_bundle"),
                         "source_node_ids": cluster.get("source_node_ids", []),
                     }
                     for cluster in clusters
@@ -5487,42 +5207,42 @@ class MemoryNodeManager:
         for cluster in clusters:
             before_cluster_consumed_node_ids = set(consumed_node_ids)
             try:
-                matched_observation_id = self._update_existing_observation_from_fact_cluster(
+                matched_bundle_id = self._update_existing_evidence_bundle_from_fact_cluster(
                     cluster,
                     consumed_node_ids=consumed_node_ids,
-                    changed_observation_ids=changed_ids,
+                    changed_evidence_bundle_ids=changed_ids,
                 )
             except Exception as exc:
                 logger.debug(
-                    "Failed to match fact cluster entity %s topic %s to observation: %s",
+                    "Failed to match fact cluster entity %s topic %s to evidence bundle: %s",
                     cluster.get("entity_id"),
                     cluster.get("topic_key"),
                     exc,
                 )
-                matched_observation_id = None
-            if matched_observation_id is not None:
+                matched_bundle_id = None
+            if matched_bundle_id is not None:
                 consolidated += 1
                 current_consumed_node_ids = consumed_node_ids - before_cluster_consumed_node_ids
-                fact_cluster_observation_matches += 1
-                fact_cluster_observation_node_ids.update(current_consumed_node_ids)
+                fact_cluster_evidence_bundle_matches += 1
+                fact_cluster_evidence_bundle_node_ids.update(current_consumed_node_ids)
                 entity_topic_node_ids.update(current_consumed_node_ids)
                 continue
 
             try:
-                observation_id = self._generate_observation_using_unmatched_fact_clusters(
+                evidence_bundle_id = self._generate_evidence_bundle_using_unmatched_fact_clusters(
                     cluster,
                     consumed_node_ids=consumed_node_ids,
-                    changed_observation_ids=changed_ids,
+                    changed_evidence_bundle_ids=changed_ids,
                 )
             except Exception as exc:
                 logger.debug(
-                    "Failed to generate observation from fact cluster entity %s topic %s: %s",
+                    "Failed to generate evidence bundle from fact cluster entity %s topic %s: %s",
                     cluster.get("entity_id"),
                     cluster.get("topic_key"),
                     exc,
                 )
-                observation_id = None
-            if observation_id is None:
+                evidence_bundle_id = None
+            if evidence_bundle_id is None:
                 continue
             consolidated += 1
             fact_clusters_consolidated += 1
@@ -5536,18 +5256,18 @@ class MemoryNodeManager:
             "consolidated": consolidated,
             "entity_topic_updates": entity_topic_updates,
             "entity_topic_node_count": len(entity_topic_node_ids),
-            "fact_cluster_observation_matches": fact_cluster_observation_matches,
-            "fact_cluster_observation_node_count": len(
-                fact_cluster_observation_node_ids
+            "fact_cluster_evidence_bundle_matches": fact_cluster_evidence_bundle_matches,
+            "fact_cluster_evidence_bundle_node_count": len(
+                fact_cluster_evidence_bundle_node_ids
             ),
-            "fact_observation_matches": fact_cluster_observation_matches,
-            "fact_observation_node_count": len(
-                fact_cluster_observation_node_ids
+            "fact_evidence_bundle_matches": fact_cluster_evidence_bundle_matches,
+            "fact_evidence_bundle_node_count": len(
+                fact_cluster_evidence_bundle_node_ids
             ),
             "fact_clusters_considered": len(clusters),
             "fact_clusters_consolidated": fact_clusters_consolidated,
             "fact_cluster_node_count": len(fact_cluster_node_ids),
-            "changed_observation_ids": list(dict.fromkeys(changed_ids)),
+            "changed_evidence_bundle_ids": list(dict.fromkeys(changed_ids)),
             "touched_entity_ids": touched_entity_ids,
         }
 
@@ -5664,7 +5384,7 @@ class MemoryNodeManager:
             try:
                 self._llm_thread_context.config = task["llm_config"]
                 if task_kind == "reflect":
-                    candidates = self._db.get_unprocessed_facts_for_observation(
+                    candidates = self._db.get_unprocessed_facts_for_evidence_bundle(
                         limit=1,
                     )
                     if not candidates:
@@ -6092,7 +5812,7 @@ class MemoryNodeManager:
             logger.info("Failed to store memory node (non-fatal): %s", e)
             return False
 
-    def _augment_observation_merge_group_with_pending_sources(
+    def _augment_evidence_bundle_merge_group_with_pending_sources(
         self,
         group: Dict[str, Any],
     ) -> Dict[str, Any]:
@@ -6143,65 +5863,68 @@ class MemoryNodeManager:
         ]
         return augmented
 
-    def _merge_duplicated_observation_group(
+    def _merge_duplicated_evidence_bundle_group(
         self,
         group: Dict[str, Any],
         *,
-        changed_observation_ids: Optional[List[int]] = None,
+        changed_evidence_bundle_ids: Optional[List[int]] = None,
     ) -> bool:
-        observations = group.get("observations") or []
+        evidence_bundles = group.get("evidence_bundles") or []
         source_nodes = group.get("source_nodes") or []
-        if len(observations) < 2:
+        if len(evidence_bundles) < 2:
             return False
         source_ids = [int(node["id"]) for node in source_nodes]
         if not source_ids:
             return False
-        keep_observation = observations[0]
-        related_observations = observations[1:]
+        keep_bundle = evidence_bundles[0]
+        related_bundles = evidence_bundles[1:]
         prompt_source_nodes = group.get("pending_source_nodes", [])
-        generated = self._build_observation_container_from_facts(
+        generated = self._build_evidence_bundle_from_facts(
             source_nodes=prompt_source_nodes,
-            existing_observation=keep_observation,
-            related_observations=related_observations,
+            existing_evidence_bundle=keep_bundle,
+            related_evidence_bundles=related_bundles,
         )
         if not generated:
             return False
-        category = generated["observation_type"]
+        bundle_type = generated["bundle_type"]
         metadata = {}
         keywords = generated["keywords"]
         if not keywords:
-            for item in observations:
+            for item in evidence_bundles:
                 keywords.extend(self._normalize_keywords(str(item.get("keywords", "")).split()))
             keywords = list(dict.fromkeys(keywords))
-        remove_ids = [int(observation["id"]) for observation in observations[1:]]
+        remove_ids = [
+            int(evidence_bundle["id"])
+            for evidence_bundle in evidence_bundles[1:]
+        ]
         self._log_info(
             "memory_reflect",
-            "observation_merge", 
+            "evidence_bundle_merge",
             {
                 "entity_id": group.get("entity_id"),
                 "entity_name": group.get("entity_name", ""),
                 "topic_key": group.get("topic_key"),
                 "topic_label": group.get("topic_label", group.get("topic_key", "")),
-                "observation_type": category,
-                "keep_observation_id": int(keep_observation["id"]),
-                "remove_observation_ids": remove_ids,
-                "input_observations": [
-                    self._reflect_observation_log_item(observation)
-                    for observation in observations
+                "bundle_type": bundle_type,
+                "keep_evidence_bundle_id": int(keep_bundle["id"]),
+                "remove_evidence_bundle_ids": remove_ids,
+                "input_evidence_bundles": [
+                    self._reflect_evidence_bundle_log_item(evidence_bundle)
+                    for evidence_bundle in evidence_bundles
                 ],
                 "supporting_facts": self._reflect_fact_log_items(source_nodes),
-                "merged_observation": {
+                "merged_evidence_bundle": {
                     "summary": self._reflect_log_text(generated["summary"]),
-                    "observation_type": category,
+                    "bundle_type": bundle_type,
                     "keywords": keywords,
                     "confidence": generated["confidence"],
                     "metadata": metadata,
                 },
             })
-        self._db.memory_replace_observation_group(
-            keep_observation_id=int(keep_observation["id"]),
-            remove_observation_ids=remove_ids,
-            observation_type=category,
+        self._db.memory_replace_evidence_bundle_group(
+            keep_evidence_bundle_id=int(keep_bundle["id"]),
+            remove_evidence_bundle_ids=remove_ids,
+            bundle_type=bundle_type,
             summary=generated["summary"],
             keywords=keywords,
             confidence=generated["confidence"],
@@ -6214,8 +5937,8 @@ class MemoryNodeManager:
                 for node_id in group.get("pending_source_node_ids", [])
             },
         )
-        if changed_observation_ids is not None:
-            changed_observation_ids.append(int(keep_observation["id"]))
+        if changed_evidence_bundle_ids is not None:
+            changed_evidence_bundle_ids.append(int(keep_bundle["id"]))
         return True
 
     def _reflect_merging_duplicated_entities(
@@ -6231,11 +5954,11 @@ class MemoryNodeManager:
                 "merged": 0,
                 "candidate_count": 0,
                 "merge_candidates": 0,
-                "observation_groups_merged": 0,
-                "changed_observation_ids": [],
+                "evidence_bundle_groups_merged": 0,
+                "changed_evidence_bundle_ids": [],
             }
 
-        unprocessed_fact_candidates = self._db.get_unprocessed_facts_for_observation(
+        unprocessed_fact_candidates = self._db.get_unprocessed_facts_for_evidence_bundle(
             date_key=date_key,
             limit=limit,
         )
@@ -6286,19 +6009,19 @@ class MemoryNodeManager:
 
         merged_entity_ids = list(dict.fromkeys(merged_entity_ids))
         groups = (
-            self._db.find_duplicated_observation_groups(
+            self._db.find_duplicated_evidence_bundle_groups(
                 entity_ids=merged_entity_ids,
             )
             if merged_entity_ids
             else []
         )
         augmented_groups = [
-            self._augment_observation_merge_group_with_pending_sources(group)
+            self._augment_evidence_bundle_merge_group_with_pending_sources(group)
             for group in groups
         ]
         self._log_info(
             "memory_reflect",
-            "observation_merge_candidates",
+            "evidence_bundle_merge_candidates",
             {
                 "entity_ids": merged_entity_ids,
                 "group_count": len(augmented_groups),
@@ -6308,10 +6031,10 @@ class MemoryNodeManager:
                         "entity_name": group.get("entity_name"),
                         "topic_key": group.get("topic_key"),
                         "topic_label": group.get("topic_label"),
-                        "observation_type": group.get("observation_type"),
-                        "observation_ids": [
-                            observation.get("id")
-                            for observation in group.get("observations", [])
+                        "bundle_type": group.get("bundle_type"),
+                        "evidence_bundle_ids": [
+                            evidence_bundle.get("id")
+                            for evidence_bundle in group.get("evidence_bundles", [])
                         ],
                         "source_node_ids": [
                             node.get("id")
@@ -6327,16 +6050,16 @@ class MemoryNodeManager:
             },
         )
 
-        observation_groups_merged = 0
-        changed_observation_ids: List[int] = []
+        evidence_bundle_groups_merged = 0
+        changed_evidence_bundle_ids: List[int] = []
         for group in augmented_groups:
             try:
-                if not self._merge_duplicated_observation_group(
+                if not self._merge_duplicated_evidence_bundle_group(
                     group,
-                    changed_observation_ids=changed_observation_ids,
+                    changed_evidence_bundle_ids=changed_evidence_bundle_ids,
                 ):
                     continue
-                observation_groups_merged += 1
+                evidence_bundle_groups_merged += 1
             except Exception as exc:
                 logger.debug(
                     "Failed to merge observations for entity %s topic %s: %s",
@@ -6348,8 +6071,8 @@ class MemoryNodeManager:
         return {
             **entity_report,
             "merged_entity_ids": merged_entity_ids,
-            "observation_groups_merged": observation_groups_merged,
-            "changed_observation_ids": list(dict.fromkeys(changed_observation_ids)),
+            "evidence_bundle_groups_merged": evidence_bundle_groups_merged,
+            "changed_evidence_bundle_ids": list(dict.fromkeys(changed_evidence_bundle_ids)),
         }
 
     def reflect(
@@ -6377,7 +6100,7 @@ class MemoryNodeManager:
                 "candidates": [],
                 "merged": 0,
                 "candidate_count": 0,
-                "observations_consolidated": 0,
+                "evidence_bundles_consolidated": 0,
                 "error": "memory database unavailable",
             }
         if reflect_timestamp is None:
@@ -6423,38 +6146,38 @@ class MemoryNodeManager:
             limit=limit,
             date_key=reflect_date_key,
         )
-        changed_observation_ids = list(
-            entity_merging_report.get("changed_observation_ids", [])
+        changed_evidence_bundle_ids = list(
+            entity_merging_report.get("changed_evidence_bundle_ids", [])
         )
-        # build fact-observation matching
-        observation_report = self._reflect_generate_observations_using_facts(
+        # build fact-evidence_bundle matching
+        evidence_bundle_report = self._reflect_generate_evidence_bundles_using_facts(
             limit=limit,
             date_key=reflect_date_key,
-            changed_observation_ids=changed_observation_ids,
+            changed_evidence_bundle_ids=changed_evidence_bundle_ids,
         )
         
         report = dict(entity_merging_report)
-        report["observation_reflect"] = observation_report
-        report["observations_consolidated"] = observation_report.get("consolidated", 0)
-        report["changed_observation_ids"] = list(dict.fromkeys(
-            changed_observation_ids
+        report["evidence_bundle_reflect"] = evidence_bundle_report
+        report["evidence_bundles_consolidated"] = evidence_bundle_report.get("consolidated", 0)
+        report["changed_evidence_bundle_ids"] = list(dict.fromkeys(
+            changed_evidence_bundle_ids
         ))
-        # use fact-clustering to generation sub_claims in the same observation
-        report["sub_claim_ids"] = self._update_sub_claims_for_observations(
-            report["changed_observation_ids"]
+        # Cluster facts inside each evidence bundle into semantic observations.
+        report["observation_ids"] = self._update_observations_for_evidence_bundles(
+            report["changed_evidence_bundle_ids"]
         )
-        report["sub_claims_updated"] = len(report["sub_claim_ids"])
-        report["sub_claims_generated"] = report["sub_claims_updated"]
+        report["observations_updated"] = len(report["observation_ids"])
+        report["observations_generated"] = report["observations_updated"]
         report["interpretations_generated"] = 0
-        report["interpretations_generated"] = self._reflect_generate_interpretations_using_sub_claims(
-            report["changed_observation_ids"]
+        report["interpretations_generated"] = self._reflect_generate_interpretations_using_observations(
+            report["changed_evidence_bundle_ids"]
         )
         node_decay_report = self._db.memory_reflect_node_decay(
             fact_half_life_days=fact_half_life_days,
             experience_half_life_days=experience_half_life_days,
             now=reflect_now,
         )
-        decay_report = self._db.memory_reflect_observation_decay(
+        decay_report = self._db.memory_reflect_evidence_bundle_decay(
             threshold=observation_decay_threshold,
             now=reflect_now,
         )
@@ -6464,24 +6187,27 @@ class MemoryNodeManager:
             now=reflect_now,
         )
         report["node_decay"] = node_decay_report
-        report["observation_decay"] = decay_report
+        report["evidence_bundle_decay"] = decay_report
         report["task_inactivity"] = task_inactivity_report
-        report["observations_inactivated"] = decay_report.get("inactivated", 0)
-        report["observations_would_inactivate"] = decay_report.get("would_inactivate", 0)
+        report["evidence_bundles_inactivated"] = decay_report.get("inactivated", 0)
+        report["evidence_bundles_would_inactivate"] = decay_report.get("would_inactivate", 0)
         report["tasks_paused"] = task_inactivity_report.get("paused", 0)
         report["tasks_stale"] = task_inactivity_report.get("stale", 0)
         self._log_info(
             "memory_reflect",
             "finish", 
             {
-                "observations_consolidated": report.get("observations_consolidated", 0),
-                "task_matched": observation_report.get("task_matched", 0),
-                "task_updates": observation_report.get("task_updates", 0),
+                "evidence_bundles_consolidated": report.get("evidence_bundles_consolidated", 0),
+                "task_matched": evidence_bundle_report.get("task_matched", 0),
+                "task_updates": evidence_bundle_report.get("task_updates", 0),
                 "entity_merged": report.get("merged", 0),
-                "observation_groups_merged": report.get("observation_groups_merged", 0),
-                "sub_claims_updated": report.get("sub_claims_updated", 0),
+                "evidence_bundle_groups_merged": report.get("evidence_bundle_groups_merged", 0),
+                "observations_updated": report.get("observations_updated", 0),
                 "interpretations_generated": report.get("interpretations_generated", 0),
-                "observations_inactivated": report.get("observations_inactivated", 0),
+                "evidence_bundles_inactivated": report.get(
+                    "evidence_bundles_inactivated",
+                    0,
+                ),
                 "tasks_paused": report.get("tasks_paused", 0),
                 "tasks_stale": report.get("tasks_stale", 0),
             })

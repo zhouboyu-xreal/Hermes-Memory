@@ -315,13 +315,13 @@ CREATE TRIGGER IF NOT EXISTS entity_nodes_au AFTER UPDATE ON entity_nodes BEGIN
 END;
 """
 
-MEMORY_OBSERVATIONS_SQL = """
-CREATE TABLE IF NOT EXISTS memory_observations (
+MEMORY_EVIDENCE_BUNDLES_SQL = """
+CREATE TABLE IF NOT EXISTS memory_evidence_bundles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_id INTEGER NOT NULL REFERENCES entity_nodes(id),
     topic_key TEXT NOT NULL,
     topic_label TEXT NOT NULL,
-    observation_type TEXT NOT NULL DEFAULT 'context',
+    bundle_type TEXT NOT NULL DEFAULT 'entity_topic',
     summary TEXT NOT NULL,
     keywords TEXT NOT NULL,
     confidence REAL DEFAULT 1.0,
@@ -337,30 +337,30 @@ CREATE TABLE IF NOT EXISTS memory_observations (
     metadata TEXT DEFAULT '{}'
 );
 
-CREATE TABLE IF NOT EXISTS memory_observation_sources (
-    observation_id INTEGER NOT NULL REFERENCES memory_observations(id),
+CREATE TABLE IF NOT EXISTS memory_evidence_bundle_sources (
+    evidence_bundle_id INTEGER NOT NULL REFERENCES memory_evidence_bundles(id),
     node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
     role TEXT NOT NULL DEFAULT 'initial',
     confidence REAL DEFAULT 1.0,
-    PRIMARY KEY (observation_id, node_id)
+    PRIMARY KEY (evidence_bundle_id, node_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_memory_observations_entity_topic
-ON memory_observations(entity_id, topic_key, status);
+CREATE INDEX IF NOT EXISTS idx_memory_evidence_bundles_entity_topic
+ON memory_evidence_bundles(entity_id, topic_key, status);
 
-CREATE INDEX IF NOT EXISTS idx_memory_observations_status
-ON memory_observations(status);
+CREATE INDEX IF NOT EXISTS idx_memory_evidence_bundles_status
+ON memory_evidence_bundles(status);
 
-CREATE INDEX IF NOT EXISTS idx_memory_observation_sources_node
-ON memory_observation_sources(node_id);
+CREATE INDEX IF NOT EXISTS idx_memory_evidence_bundle_sources_node
+ON memory_evidence_bundle_sources(node_id);
 """
 
-MEMORY_SUB_CLAIMS_SQL = """
-CREATE TABLE IF NOT EXISTS memory_sub_claims (
+MEMORY_OBSERVATIONS_SQL = """
+CREATE TABLE IF NOT EXISTS memory_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    observation_id INTEGER NOT NULL,
-    sub_claim_type TEXT NOT NULL,
-    claim_text TEXT NOT NULL,
+    evidence_bundle_id INTEGER NOT NULL REFERENCES memory_evidence_bundles(id) ON DELETE CASCADE,
+    observation_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
     evidence_mode TEXT NOT NULL DEFAULT 'aggregated',
     confidence REAL DEFAULT 0.5,
     status TEXT NOT NULL DEFAULT 'active',
@@ -372,33 +372,33 @@ CREATE TABLE IF NOT EXISTS memory_sub_claims (
     last_supported_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS memory_sub_claim_sources (
-    sub_claim_id INTEGER NOT NULL REFERENCES memory_sub_claims(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS memory_observation_sources (
+    observation_id INTEGER NOT NULL REFERENCES memory_observations(id) ON DELETE CASCADE,
     node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
     relation TEXT NOT NULL DEFAULT 'support',
     confidence REAL DEFAULT 1.0,
-    PRIMARY KEY (sub_claim_id, node_id)
+    PRIMARY KEY (observation_id, node_id)
 );
 
-CREATE TABLE IF NOT EXISTS memory_interpretation_sub_claims (
+CREATE TABLE IF NOT EXISTS memory_interpretation_observations (
     interpretation_id INTEGER NOT NULL REFERENCES memory_interpretations(id) ON DELETE CASCADE,
-    sub_claim_id INTEGER NOT NULL REFERENCES memory_sub_claims(id) ON DELETE CASCADE,
+    observation_id INTEGER NOT NULL REFERENCES memory_observations(id) ON DELETE CASCADE,
     relation TEXT NOT NULL DEFAULT 'support',
     confidence REAL DEFAULT 1.0,
-    PRIMARY KEY (interpretation_id, sub_claim_id)
+    PRIMARY KEY (interpretation_id, observation_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_memory_sub_claims_observation
-ON memory_sub_claims(observation_id, status);
+CREATE INDEX IF NOT EXISTS idx_memory_observations_bundle
+ON memory_observations(evidence_bundle_id, status);
 
-CREATE INDEX IF NOT EXISTS idx_memory_sub_claims_type
-ON memory_sub_claims(sub_claim_type, status);
+CREATE INDEX IF NOT EXISTS idx_memory_observations_type
+ON memory_observations(observation_type, status);
 
-CREATE INDEX IF NOT EXISTS idx_memory_sub_claim_sources_node
-ON memory_sub_claim_sources(node_id);
+CREATE INDEX IF NOT EXISTS idx_memory_observation_sources_node
+ON memory_observation_sources(node_id);
 
-CREATE INDEX IF NOT EXISTS idx_memory_interpretation_sub_claims_claim
-ON memory_interpretation_sub_claims(sub_claim_id);
+CREATE INDEX IF NOT EXISTS idx_memory_interpretation_observations_observation
+ON memory_interpretation_observations(observation_id);
 """
 
 MEMORY_INTERPRETATIONS_SQL = """
@@ -868,11 +868,11 @@ class SessionDB:
             cursor.execute("SELECT * FROM entity_nodes_fts LIMIT 0")
         except sqlite3.OperationalError:
             cursor.executescript(ENTITY_FTS_SQL)
-        cursor.executescript(MEMORY_OBSERVATIONS_SQL)
+        cursor.executescript(MEMORY_EVIDENCE_BUNDLES_SQL)
         self._drop_legacy_memory_entity_columns(cursor)
         cursor.executescript(MEMORY_INTERPRETATIONS_SQL)
-        cursor.executescript(MEMORY_SUB_CLAIMS_SQL)
-        for table_name in ("memory_observations", "memory_interpretations"):
+        cursor.executescript(MEMORY_OBSERVATIONS_SQL)
+        for table_name in ("memory_evidence_bundles", "memory_interpretations"):
             for col_name, col_type in {
                 "embedding": "BLOB",
                 "embedding_text": "TEXT NOT NULL DEFAULT ''",
@@ -1126,7 +1126,7 @@ class SessionDB:
             except sqlite3.OperationalError:
                 pass
 
-        for table_name in ("memory_observations", "memory_interpretations"):
+        for table_name in ("memory_evidence_bundles", "memory_interpretations"):
             columns = set(self._table_columns(cursor, table_name))
             for column in ("subject_entity_id", "target_entity_id"):
                 if column not in columns:
@@ -4267,7 +4267,7 @@ class SessionDB:
                 (duplicate_id, duplicate_id),
             )
             conn.execute(
-                "UPDATE memory_observations SET entity_id = ? WHERE entity_id = ?",
+                "UPDATE memory_evidence_bundles SET entity_id = ? WHERE entity_id = ?",
                 (canonical_id, duplicate_id),
             )
             conn.execute(
@@ -4829,50 +4829,17 @@ class SessionDB:
         *,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
-        """Return current/conflicted interpretations that already cite an observation."""
+        """Return current interpretations explicitly linked to an observation."""
         try:
             clean_id = int(observation_id)
         except (TypeError, ValueError):
             return []
         rows = self._conn.execute(
             "SELECT mi.*, en.name AS entity_name "
-            "FROM memory_interpretations mi "
-            "LEFT JOIN entity_nodes en ON en.id = mi.entity_id "
-            "WHERE mi.status IN ('current', 'conflicted') "
-            "AND (mi.evidence_observation_ids LIKE ? OR mi.metadata LIKE ?) "
-            "ORDER BY mi.updated_at DESC, mi.id DESC "
-            "LIMIT ?",
-            (
-                f"%{clean_id}%",
-                f'%"observation_id": {clean_id}%',
-                max(1, int(limit or 20)),
-            ),
-        ).fetchall()
-        out: List[Dict[str, Any]] = []
-        for row in rows:
-            item = self._memory_interpretation_from_row(row)
-            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-            if clean_id in item.get("evidence_observation_ids", []) or metadata.get("observation_id") == clean_id:
-                out.append(item)
-        return out
-
-    def get_interpretations_for_sub_claim(
-        self,
-        sub_claim_id: int,
-        *,
-        limit: int = 20,
-    ) -> List[Dict[str, Any]]:
-        """Return current interpretations explicitly linked to a sub-claim."""
-        try:
-            clean_id = int(sub_claim_id)
-        except (TypeError, ValueError):
-            return []
-        rows = self._conn.execute(
-            "SELECT mi.*, en.name AS entity_name "
-            "FROM memory_interpretation_sub_claims misc "
+            "FROM memory_interpretation_observations misc "
             "JOIN memory_interpretations mi ON mi.id = misc.interpretation_id "
             "LEFT JOIN entity_nodes en ON en.id = mi.entity_id "
-            "WHERE misc.sub_claim_id = ? "
+            "WHERE misc.observation_id = ? "
             "AND mi.status IN ('current', 'conflicted') "
             "ORDER BY mi.updated_at DESC, mi.id DESC "
             "LIMIT ?",
@@ -4926,13 +4893,13 @@ class SessionDB:
                 break
         return out
 
-    def get_unprocessed_facts_for_observation(
+    def get_unprocessed_facts_for_evidence_bundle(
         self,
         *,
         date_key: Optional[str] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
-        """Return today's memory nodes that have not yet supported an observation."""
+        """Return today's facts that have not joined an evidence bundle."""
         day = str(date_key or datetime.now().astimezone().date().isoformat())[:10]
         rows = self._conn.execute(
             "WITH candidate_nodes AS ("
@@ -4943,7 +4910,7 @@ class SessionDB:
             "  WHERE substr(mn.time_key, 1, 10) = ? "
             "  AND mn.fact_type IN ('semantic', 'episodic') "
             "  AND NOT EXISTS ("
-            "    SELECT 1 FROM memory_observation_sources mos WHERE mos.node_id = mn.id"
+            "    SELECT 1 FROM memory_evidence_bundle_sources mos WHERE mos.node_id = mn.id"
             "  ) "
             "  ORDER BY mn.time_key ASC, mn.id ASC "
             "  LIMIT ?"
@@ -5008,86 +4975,86 @@ class SessionDB:
         out = list(grouped.values())[:max(1, int(limit or 100))]
         return out
 
-    def memory_active_task_observations(self, *, limit: int = 50) -> List[Dict[str, Any]]:
-        """Return active task observations for fact-to-task matching."""
+    def memory_active_task_evidence_bundles(self, *, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return active task evidence bundles for fact-to-task matching."""
         rows = self._conn.execute(
             "SELECT mo.*, en.name AS entity_name "
-            "FROM memory_observations mo "
+            "FROM memory_evidence_bundles mo "
             "JOIN entity_nodes en ON en.id = mo.entity_id "
-            "WHERE mo.status = 'active' AND mo.observation_type = 'task' "
+            "WHERE mo.status = 'active' AND mo.bundle_type = 'task' "
             "ORDER BY mo.updated_at DESC, mo.id DESC "
             "LIMIT ?",
             (max(1, int(limit or 50)),),
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def memory_observation_source_ids(self, observation_id: int) -> List[int]:
-        """Return all source node ids for an observation."""
+    def memory_evidence_bundle_source_ids(self, evidence_bundle_id: int) -> List[int]:
+        """Return all source fact ids for an evidence bundle."""
         rows = self._conn.execute(
-            "SELECT node_id FROM memory_observation_sources "
-            "WHERE observation_id = ? ORDER BY node_id",
-            (int(observation_id),),
+            "SELECT node_id FROM memory_evidence_bundle_sources "
+            "WHERE evidence_bundle_id = ? ORDER BY node_id",
+            (int(evidence_bundle_id),),
         ).fetchall()
         return [int(row["node_id"]) for row in rows]
 
-    def find_observed_source_node_ids(self, node_ids: List[int]) -> List[int]:
-        """Return node ids that already support at least one observation."""
+    def find_bundled_source_node_ids(self, node_ids: List[int]) -> List[int]:
+        """Return node ids that already belong to an evidence bundle."""
         clean_ids = self._json_int_list(node_ids)
         if not clean_ids:
             return []
         placeholders = ",".join("?" for _ in clean_ids)
         rows = self._conn.execute(
-            f"SELECT DISTINCT node_id FROM memory_observation_sources "
+            f"SELECT DISTINCT node_id FROM memory_evidence_bundle_sources "
             f"WHERE node_id IN ({placeholders}) ORDER BY node_id",
             clean_ids,
         ).fetchall()
         return [int(row["node_id"]) for row in rows]
 
-    def get_observations_by_ids(self, observation_ids: List[int]) -> List[Dict[str, Any]]:
-        """Return active observations by id, including entity names."""
-        clean_ids = self._json_int_list(observation_ids)
+    def get_evidence_bundles_by_ids(self, evidence_bundle_ids: List[int]) -> List[Dict[str, Any]]:
+        """Return active evidence bundles by id, including entity names."""
+        clean_ids = self._json_int_list(evidence_bundle_ids)
         if not clean_ids:
             return []
         placeholders = ",".join("?" for _ in clean_ids)
         rows = self._conn.execute(
             "SELECT mo.*, en.name AS entity_name "
-            "FROM memory_observations mo "
+            "FROM memory_evidence_bundles mo "
             "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
             f"WHERE mo.id IN ({placeholders}) AND mo.status = 'active'",
             clean_ids,
         ).fetchall()
         by_id = {int(row["id"]): dict(row) for row in rows}
-        return [by_id[observation_id] for observation_id in clean_ids if observation_id in by_id]
+        return [by_id[bundle_id] for bundle_id in clean_ids if bundle_id in by_id]
 
-    def memory_update_observation_metadata(
+    def memory_update_evidence_bundle_metadata(
         self,
-        observation_id: int,
+        evidence_bundle_id: int,
         metadata: Dict[str, Any],
     ) -> None:
-        """Update observation metadata without changing evidence timestamps."""
+        """Update evidence bundle metadata without changing evidence timestamps."""
         metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
 
         def _do(conn):
             conn.execute(
-                "UPDATE memory_observations SET metadata = ? WHERE id = ?",
-                (metadata_str, int(observation_id)),
+                "UPDATE memory_evidence_bundles SET metadata = ? WHERE id = ?",
+                (metadata_str, int(evidence_bundle_id)),
             )
 
         self._execute_write(_do)
 
-    def memory_replace_sub_claims_for_observation(
+    def memory_replace_observations_for_evidence_bundle(
         self,
-        observation_id: int,
-        sub_claims: List[Dict[str, Any]],
+        evidence_bundle_id: int,
+        observations: List[Dict[str, Any]],
     ) -> List[int]:
-        """Replace one observation's derived sub-claims and their fact evidence."""
-        clean_observation_id = int(observation_id)
+        """Replace one evidence bundle's observations and their fact evidence."""
+        clean_bundle_id = int(evidence_bundle_id)
         now_text = datetime.now().astimezone().isoformat()
 
         def _do(conn):
             existing_rows = conn.execute(
-                "SELECT id FROM memory_sub_claims WHERE observation_id = ?",
-                (clean_observation_id,),
+                "SELECT id FROM memory_observations WHERE evidence_bundle_id = ?",
+                (clean_bundle_id,),
             ).fetchall()
             existing_ids = [
                 int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
@@ -5096,55 +5063,55 @@ class SessionDB:
             if existing_ids:
                 placeholders = ",".join("?" for _ in existing_ids)
                 conn.execute(
-                    f"DELETE FROM memory_interpretation_sub_claims "
-                    f"WHERE sub_claim_id IN ({placeholders})",
+                    f"DELETE FROM memory_interpretation_observations "
+                    f"WHERE observation_id IN ({placeholders})",
                     existing_ids,
                 )
                 conn.execute(
-                    f"DELETE FROM memory_sub_claim_sources "
-                    f"WHERE sub_claim_id IN ({placeholders})",
+                    f"DELETE FROM memory_observation_sources "
+                    f"WHERE observation_id IN ({placeholders})",
                     existing_ids,
                 )
             conn.execute(
-                "DELETE FROM memory_sub_claims WHERE observation_id = ?",
-                (clean_observation_id,),
+                "DELETE FROM memory_observations WHERE evidence_bundle_id = ?",
+                (clean_bundle_id,),
             )
 
             inserted_ids: List[int] = []
-            for sub_claim in sub_claims:
-                claim_text = str(sub_claim.get("claim_text") or "").strip()
+            for observation in observations:
+                summary = str(observation.get("summary") or "").strip()
                 source_node_ids = self._json_int_list(
-                    sub_claim.get("source_node_ids", [])
+                    observation.get("source_node_ids", [])
                 )
-                if not claim_text or not source_node_ids:
+                if not summary or not source_node_ids:
                     continue
-                sub_claim_type = str(
-                    sub_claim.get("sub_claim_type") or "context"
+                observation_type = str(
+                    observation.get("observation_type") or "context"
                 ).strip().lower()
                 evidence_mode = str(
-                    sub_claim.get("evidence_mode") or "aggregated"
+                    observation.get("evidence_mode") or "aggregated"
                 ).strip().lower()
                 confidence = max(
                     0.0,
-                    min(1.0, float(sub_claim.get("confidence", 0.5) or 0.5)),
+                    min(1.0, float(observation.get("confidence", 0.5) or 0.5)),
                 )
-                metadata = sub_claim.get("metadata") or {}
+                metadata = observation.get("metadata") or {}
                 if not isinstance(metadata, dict):
                     metadata = {}
-                embedding = self._embedding_to_blob(sub_claim.get("embedding"))
+                embedding = self._embedding_to_blob(observation.get("embedding"))
                 embedding_text = str(
-                    sub_claim.get("embedding_text") or claim_text
+                    observation.get("embedding_text") or summary
                 ).strip()
                 cursor = conn.execute(
-                    "INSERT INTO memory_sub_claims "
-                    "(observation_id, sub_claim_type, claim_text, evidence_mode, "
+                    "INSERT INTO memory_observations "
+                    "(evidence_bundle_id, observation_type, summary, evidence_mode, "
                     "confidence, status, embedding, embedding_text, metadata, "
                     "created_at, updated_at, last_supported_at) "
                     "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
                     (
-                        clean_observation_id,
-                        sub_claim_type,
-                        claim_text,
+                        clean_bundle_id,
+                        observation_type,
+                        summary,
                         evidence_mode,
                         confidence,
                         embedding,
@@ -5155,45 +5122,45 @@ class SessionDB:
                         now_text,
                     ),
                 )
-                sub_claim_id = int(cursor.lastrowid)
-                inserted_ids.append(sub_claim_id)
+                observation_id = int(cursor.lastrowid)
+                inserted_ids.append(observation_id)
                 for node_id in source_node_ids:
                     conn.execute(
-                        "INSERT OR IGNORE INTO memory_sub_claim_sources "
-                        "(sub_claim_id, node_id, relation, confidence) "
+                        "INSERT OR IGNORE INTO memory_observation_sources "
+                        "(observation_id, node_id, relation, confidence) "
                         "VALUES (?, ?, 'support', ?)",
-                        (sub_claim_id, node_id, confidence),
+                        (observation_id, node_id, confidence),
                     )
             return inserted_ids
 
         return self._execute_write(_do)
 
-    def get_sub_claims_for_observations(
+    def get_observations_for_evidence_bundles(
         self,
-        observation_ids: List[int],
+        evidence_bundle_ids: List[int],
     ) -> List[Dict[str, Any]]:
-        """Return active sub-claims with their supporting fact ids."""
-        clean_ids = self._json_int_list(observation_ids)
+        """Return active observations with their supporting fact ids."""
+        clean_ids = self._json_int_list(evidence_bundle_ids)
         if not clean_ids:
             return []
         placeholders = ",".join("?" for _ in clean_ids)
         rows = self._conn.execute(
             "SELECT msc.*, mo.entity_id, mo.topic_key, mo.topic_label, "
             "en.name AS entity_name "
-            "FROM memory_sub_claims msc "
-            "JOIN memory_observations mo ON mo.id = msc.observation_id "
+            "FROM memory_observations msc "
+            "JOIN memory_evidence_bundles mo ON mo.id = msc.evidence_bundle_id "
             "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
-            f"WHERE msc.observation_id IN ({placeholders}) "
+            f"WHERE msc.evidence_bundle_id IN ({placeholders}) "
             "AND msc.status = 'active' "
-            "ORDER BY msc.observation_id, msc.id",
+            "ORDER BY msc.evidence_bundle_id, msc.id",
             clean_ids,
         ).fetchall()
         out: List[Dict[str, Any]] = []
         for row in rows:
             item = dict(row)
             source_rows = self._conn.execute(
-                "SELECT node_id FROM memory_sub_claim_sources "
-                "WHERE sub_claim_id = ? AND relation = 'support' "
+                "SELECT node_id FROM memory_observation_sources "
+                "WHERE observation_id = ? AND relation = 'support' "
                 "ORDER BY node_id",
                 (int(item["id"]),),
             ).fetchall()
@@ -5216,15 +5183,198 @@ class SessionDB:
             out.append(item)
         return out
 
-    def get_deferred_sub_claims_for_interpretation(
+    def get_observations_by_ids(
+        self,
+        observation_ids: List[int],
+    ) -> List[Dict[str, Any]]:
+        """Return active observations by id with bundle and entity context."""
+        clean_ids = self._json_int_list(observation_ids)
+        if not clean_ids:
+            return []
+        placeholders = ",".join("?" for _ in clean_ids)
+        rows = self._conn.execute(
+            "SELECT obs.*, bundle.entity_id, bundle.topic_key, bundle.topic_label, "
+            "en.name AS entity_name "
+            "FROM memory_observations obs "
+            "JOIN memory_evidence_bundles bundle "
+            "ON bundle.id = obs.evidence_bundle_id "
+            "LEFT JOIN entity_nodes en ON en.id = bundle.entity_id "
+            f"WHERE obs.id IN ({placeholders}) AND obs.status = 'active'",
+            clean_ids,
+        ).fetchall()
+        by_id: Dict[int, Dict[str, Any]] = {}
+        for row in rows:
+            item = dict(row)
+            try:
+                item["metadata"] = json.loads(item.get("metadata") or "{}")
+            except (TypeError, ValueError):
+                item["metadata"] = {}
+            item.pop("embedding", None)
+            by_id[int(item["id"])] = item
+        return [
+            by_id[observation_id]
+            for observation_id in clean_ids
+            if observation_id in by_id
+        ]
+
+    def search_memory_observations(
+        self,
+        keyword: Any,
+        *,
+        entities: Optional[List[Any]] = None,
+        top_k: int = 3,
+        entity_ids: Optional[List[int]] = None,
+        query_embedding: Optional[np.ndarray] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search active observations by text, entity, topic, and embedding."""
+        keyword_query = (
+            " ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
+        )
+        terms = [
+            term.strip().lower()
+            for term in re.split(r"\s+|OR", keyword_query)
+            if term.strip()
+        ]
+        entity_terms: List[str] = []
+        for entity in entities or []:
+            name = (
+                str(entity.get("name", "")).strip()
+                if isinstance(entity, dict)
+                else str(entity or "").strip()
+            )
+            if name:
+                entity_terms.append(name.lower())
+        params: List[Any] = []
+        where = ["obs.status = 'active'"]
+        if entity_ids:
+            placeholders = ",".join("?" for _ in entity_ids)
+            where.append(f"bundle.entity_id IN ({placeholders})")
+            params.extend(entity_ids)
+        rows = self._conn.execute(
+            "SELECT obs.*, bundle.entity_id, bundle.topic_key, bundle.topic_label, "
+            "en.name AS entity_name "
+            "FROM memory_observations obs "
+            "JOIN memory_evidence_bundles bundle "
+            "ON bundle.id = obs.evidence_bundle_id "
+            "LEFT JOIN entity_nodes en ON en.id = bundle.entity_id "
+            f"WHERE {' AND '.join(where)}",
+            params,
+        ).fetchall()
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for row in rows:
+            item = dict(row)
+            entity_name = str(item.get("entity_name") or "").lower()
+            haystack = " ".join([
+                str(item.get("summary") or ""),
+                str(item.get("observation_type") or ""),
+                str(item.get("topic_label") or ""),
+                entity_name,
+            ]).lower()
+            matched_terms = [term for term in terms if term in haystack]
+            entity_matches = sum(
+                1
+                for term in entity_terms
+                if term in entity_name or term in haystack
+            )
+            embedding_similarity = self._embedding_similarity(
+                query_embedding,
+                item.get("embedding"),
+            )
+            embedding_match = (
+                embedding_similarity is not None
+                and embedding_similarity >= 0.35
+            )
+            if terms or entity_terms:
+                if entity_terms:
+                    if entity_matches <= 0 and not matched_terms and not embedding_match:
+                        continue
+                elif not matched_terms and not embedding_match:
+                    continue
+            score = (
+                len(matched_terms)
+                + (entity_matches * 1.5)
+                + (max(0.0, float(embedding_similarity or 0.0)) * 1.4)
+                + float(item.get("confidence") or 0.0)
+            )
+            if embedding_similarity is not None:
+                item["embedding_similarity"] = round(
+                    float(embedding_similarity),
+                    4,
+                )
+            try:
+                item["metadata"] = json.loads(item.get("metadata") or "{}")
+            except (TypeError, ValueError):
+                item["metadata"] = {}
+            item.pop("embedding", None)
+            scored.append((score, item))
+        scored.sort(
+            key=lambda pair: (
+                pair[0],
+                pair[1].get("last_supported_at")
+                or pair[1].get("updated_at")
+                or "",
+            ),
+            reverse=True,
+        )
+        return [item for _, item in scored[:top_k]]
+
+    def get_observation_supporting_nodes(
+        self,
+        observation_ids: List[int],
+        *,
+        per_observation: int = 2,
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        """Fetch supporting fact nodes for observation ids."""
+        out: Dict[int, List[Dict[str, Any]]] = {}
+        for observation_id in self._json_int_list(observation_ids):
+            rows = self._conn.execute(
+                "SELECT mn.id, mn.time_key, mn.summary, mn.keywords, "
+                "mn.original_dialog, mn.tags, mn.fact_type, mn.fact_subject, "
+                "mn.fact_kind, mn.task_event_like, mn.task_event_subject, "
+                "mn.task_relevance "
+                "FROM memory_observation_sources source "
+                "JOIN memory_nodes mn ON mn.id = source.node_id "
+                "WHERE source.observation_id = ? AND source.relation = 'support' "
+                "ORDER BY mn.time_key DESC, mn.id DESC LIMIT ?",
+                (observation_id, max(1, int(per_observation))),
+            ).fetchall()
+            nodes: List[Dict[str, Any]] = []
+            for row in rows:
+                nodes.append({
+                    "id": row["id"],
+                    "time_key": row["time_key"],
+                    "summary": row["summary"],
+                    "keywords": (
+                        row["keywords"].split(" ") if row["keywords"] else []
+                    ),
+                    "original_dialog": row["original_dialog"],
+                    "tags": json.loads(row["tags"]) if row["tags"] else [],
+                    "fact_type": self._normalize_memory_fact_type(row["fact_type"]),
+                    "fact_subject": self._normalize_memory_fact_subject(
+                        row["fact_subject"]
+                    ),
+                    "fact_kind": self._normalize_memory_fact_kind(row["fact_kind"]),
+                    "task_event_like": (
+                        None
+                        if row["task_event_like"] is None
+                        else bool(row["task_event_like"])
+                    ),
+                    "task_event_subject": row["task_event_subject"] or "",
+                    "task_relevance": row["task_relevance"] or "",
+                    "node_relations": {},
+                })
+            out[observation_id] = nodes
+        return out
+
+    def get_deferred_observations_for_interpretation(
         self,
         *,
         entity_id: Optional[int],
-        exclude_sub_claim_ids: Optional[List[int]] = None,
+        exclude_observation_ids: Optional[List[int]] = None,
         limit: int = 32,
     ) -> List[Dict[str, Any]]:
-        """Return active sub-claims whose interpretation workflow is deferred."""
-        excluded = set(self._json_int_list(exclude_sub_claim_ids or []))
+        """Return active observations whose interpretation workflow is deferred."""
+        excluded = set(self._json_int_list(exclude_observation_ids or []))
         params: List[Any] = []
         entity_filter = ""
         if entity_id is not None:
@@ -5233,8 +5383,8 @@ class SessionDB:
         rows = self._conn.execute(
             "SELECT msc.*, mo.entity_id, mo.topic_key, mo.topic_label, "
             "en.name AS entity_name "
-            "FROM memory_sub_claims msc "
-            "JOIN memory_observations mo ON mo.id = msc.observation_id "
+            "FROM memory_observations msc "
+            "JOIN memory_evidence_bundles mo ON mo.id = msc.evidence_bundle_id "
             "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
             "WHERE msc.status = 'active' "
             f"{entity_filter}"
@@ -5244,8 +5394,8 @@ class SessionDB:
         out: List[Dict[str, Any]] = []
         for row in rows:
             item = dict(row)
-            sub_claim_id = int(item["id"])
-            if sub_claim_id in excluded:
+            observation_id = int(item["id"])
+            if observation_id in excluded:
                 continue
             try:
                 item["metadata"] = json.loads(item.get("metadata") or "{}")
@@ -5254,10 +5404,10 @@ class SessionDB:
             if item["metadata"].get("interpretation_status") != "deferred":
                 continue
             source_rows = self._conn.execute(
-                "SELECT node_id FROM memory_sub_claim_sources "
-                "WHERE sub_claim_id = ? AND relation = 'support' "
+                "SELECT node_id FROM memory_observation_sources "
+                "WHERE observation_id = ? AND relation = 'support' "
                 "ORDER BY node_id",
-                (sub_claim_id,),
+                (observation_id,),
             ).fetchall()
             item["source_node_ids"] = [
                 int(source_row["node_id"]) for source_row in source_rows
@@ -5276,48 +5426,48 @@ class SessionDB:
                 break
         return out
 
-    def memory_create_sub_claim(
+    def memory_create_observation(
         self,
-        observation_id: int,
-        sub_claim: Dict[str, Any],
+        evidence_bundle_id: int,
+        observation: Dict[str, Any],
     ) -> Optional[int]:
-        """Create one persistent sub-claim and attach its fact evidence."""
-        claim_text = str(sub_claim.get("claim_text") or "").strip()
+        """Create one persistent observation and attach its fact evidence."""
+        summary = str(observation.get("summary") or "").strip()
         source_node_ids = self._json_int_list(
-            sub_claim.get("source_node_ids", [])
+            observation.get("source_node_ids", [])
         )
-        if not claim_text or not source_node_ids:
+        if not summary or not source_node_ids:
             return None
         now_text = datetime.now().astimezone().isoformat()
-        sub_claim_type = str(
-            sub_claim.get("sub_claim_type") or "context"
+        observation_type = str(
+            observation.get("observation_type") or "context"
         ).strip().lower()
         evidence_mode = str(
-            sub_claim.get("evidence_mode") or "aggregated"
+            observation.get("evidence_mode") or "aggregated"
         ).strip().lower()
         confidence = max(
             0.0,
-            min(1.0, float(sub_claim.get("confidence", 0.5) or 0.5)),
+            min(1.0, float(observation.get("confidence", 0.5) or 0.5)),
         )
-        metadata = sub_claim.get("metadata") or {}
+        metadata = observation.get("metadata") or {}
         if not isinstance(metadata, dict):
             metadata = {}
-        embedding = self._embedding_to_blob(sub_claim.get("embedding"))
+        embedding = self._embedding_to_blob(observation.get("embedding"))
         embedding_text = str(
-            sub_claim.get("embedding_text") or claim_text
+            observation.get("embedding_text") or summary
         ).strip()
 
         def _do(conn):
             cursor = conn.execute(
-                "INSERT INTO memory_sub_claims "
-                "(observation_id, sub_claim_type, claim_text, evidence_mode, "
+                "INSERT INTO memory_observations "
+                "(evidence_bundle_id, observation_type, summary, evidence_mode, "
                 "confidence, status, embedding, embedding_text, metadata, "
                 "created_at, updated_at, last_supported_at) "
                 "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
                 (
-                    int(observation_id),
-                    sub_claim_type,
-                    claim_text,
+                    int(evidence_bundle_id),
+                    observation_type,
+                    summary,
                     evidence_mode,
                     confidence,
                     embedding,
@@ -5328,23 +5478,23 @@ class SessionDB:
                     now_text,
                 ),
             )
-            sub_claim_id = int(cursor.lastrowid)
+            observation_id = int(cursor.lastrowid)
             for node_id in source_node_ids:
                 conn.execute(
-                    "INSERT OR IGNORE INTO memory_sub_claim_sources "
-                    "(sub_claim_id, node_id, relation, confidence) "
+                    "INSERT OR IGNORE INTO memory_observation_sources "
+                    "(observation_id, node_id, relation, confidence) "
                     "VALUES (?, ?, 'support', ?)",
-                    (sub_claim_id, node_id, confidence),
+                    (observation_id, node_id, confidence),
                 )
-            return sub_claim_id
+            return observation_id
 
         return self._execute_write(_do)
 
-    def memory_update_sub_claim(
+    def memory_update_observation(
         self,
-        sub_claim_id: int,
+        observation_id: int,
         *,
-        claim_text: str,
+        summary: str,
         evidence_mode: str,
         confidence: float,
         source_node_ids: List[int],
@@ -5352,7 +5502,7 @@ class SessionDB:
         embedding_text: str,
         metadata: Dict[str, Any],
     ) -> None:
-        """Update a sub-claim in place while preserving its stable identity."""
+        """Update an observation in place while preserving its stable identity."""
         clean_source_ids = self._json_int_list(source_node_ids)
         now_text = datetime.now().astimezone().isoformat()
         embedding_blob = self._embedding_to_blob(embedding)
@@ -5360,8 +5510,8 @@ class SessionDB:
 
         def _do(conn):
             existing = conn.execute(
-                "SELECT embedding FROM memory_sub_claims WHERE id = ?",
-                (int(sub_claim_id),),
+                "SELECT embedding FROM memory_observations WHERE id = ?",
+                (int(observation_id),),
             ).fetchone()
             next_embedding = (
                 embedding_blob
@@ -5369,48 +5519,48 @@ class SessionDB:
                 else (existing["embedding"] if existing else None)
             )
             conn.execute(
-                "UPDATE memory_sub_claims SET claim_text = ?, evidence_mode = ?, "
+                "UPDATE memory_observations SET summary = ?, evidence_mode = ?, "
                 "confidence = ?, embedding = ?, embedding_text = ?, metadata = ?, "
                 "updated_at = ?, last_supported_at = ? WHERE id = ?",
                 (
-                    str(claim_text or "").strip(),
+                    str(summary or "").strip(),
                     str(evidence_mode or "aggregated").strip().lower(),
                     confidence_value,
                     next_embedding,
-                    str(embedding_text or claim_text or "").strip(),
+                    str(embedding_text or summary or "").strip(),
                     json.dumps(metadata or {}, ensure_ascii=False),
                     now_text,
                     now_text,
-                    int(sub_claim_id),
+                    int(observation_id),
                 ),
             )
             for node_id in clean_source_ids:
                 conn.execute(
-                    "INSERT OR IGNORE INTO memory_sub_claim_sources "
-                    "(sub_claim_id, node_id, relation, confidence) "
+                    "INSERT OR IGNORE INTO memory_observation_sources "
+                    "(observation_id, node_id, relation, confidence) "
                     "VALUES (?, ?, 'support', ?)",
-                    (int(sub_claim_id), node_id, confidence_value),
+                    (int(observation_id), node_id, confidence_value),
                 )
 
         self._execute_write(_do)
 
-    def memory_update_observation_summary(
+    def memory_update_evidence_bundle_summary(
         self,
-        observation_id: int,
+        evidence_bundle_id: int,
         *,
         summary: str,
         embedding: Optional[np.ndarray] = None,
         embedding_text: Optional[str] = None,
     ) -> None:
-        """Update the deterministic summary derived from active sub-claims."""
+        """Update the deterministic summary derived from active observations."""
         now_text = datetime.now().astimezone().isoformat()
         embedding_blob = self._embedding_to_blob(embedding)
 
         def _do(conn):
             existing = conn.execute(
                 "SELECT embedding, embedding_text, embedding_updated_at "
-                "FROM memory_observations WHERE id = ?",
-                (int(observation_id),),
+                "FROM memory_evidence_bundles WHERE id = ?",
+                (int(evidence_bundle_id),),
             ).fetchone()
             if not existing:
                 return
@@ -5430,7 +5580,7 @@ class SessionDB:
                 else existing["embedding_updated_at"]
             )
             conn.execute(
-                "UPDATE memory_observations SET summary = ?, updated_at = ?, "
+                "UPDATE memory_evidence_bundles SET summary = ?, updated_at = ?, "
                 "embedding = ?, embedding_text = ?, embedding_updated_at = ? "
                 "WHERE id = ?",
                 (
@@ -5439,42 +5589,42 @@ class SessionDB:
                     next_embedding,
                     next_embedding_text,
                     next_embedding_updated_at,
+                    int(evidence_bundle_id),
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def memory_update_observation_metadata(
+        self,
+        observation_id: int,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """Update observation workflow metadata without changing its evidence."""
+        metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE memory_observations SET metadata = ?, updated_at = ? "
+                "WHERE id = ?",
+                (
+                    metadata_str,
+                    datetime.now().astimezone().isoformat(),
                     int(observation_id),
                 ),
             )
 
         self._execute_write(_do)
 
-    def memory_update_sub_claim_metadata(
-        self,
-        sub_claim_id: int,
-        metadata: Dict[str, Any],
-    ) -> None:
-        """Update sub-claim workflow metadata without changing its evidence."""
-        metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
-
-        def _do(conn):
-            conn.execute(
-                "UPDATE memory_sub_claims SET metadata = ?, updated_at = ? "
-                "WHERE id = ?",
-                (
-                    metadata_str,
-                    datetime.now().astimezone().isoformat(),
-                    int(sub_claim_id),
-                ),
-            )
-
-        self._execute_write(_do)
-
-    def memory_link_interpretation_sub_claim(
+    def memory_link_interpretation_observation(
         self,
         interpretation_id: int,
-        sub_claim_id: int,
+        observation_id: int,
         *,
         relation: str = "support",
         confidence: float = 1.0,
     ) -> None:
-        """Persist which sub-claim supports or contradicts an interpretation."""
+        """Persist which observation supports or contradicts an interpretation."""
         clean_relation = str(relation or "support").strip().lower()
         if clean_relation not in {"support", "contradict", "refine"}:
             clean_relation = "support"
@@ -5482,14 +5632,14 @@ class SessionDB:
 
         def _do(conn):
             conn.execute(
-                "INSERT INTO memory_interpretation_sub_claims "
-                "(interpretation_id, sub_claim_id, relation, confidence) "
+                "INSERT INTO memory_interpretation_observations "
+                "(interpretation_id, observation_id, relation, confidence) "
                 "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(interpretation_id, sub_claim_id) DO UPDATE SET "
+                "ON CONFLICT(interpretation_id, observation_id) DO UPDATE SET "
                 "relation = excluded.relation, confidence = excluded.confidence",
                 (
                     int(interpretation_id),
-                    int(sub_claim_id),
+                    int(observation_id),
                     clean_relation,
                     confidence_value,
                 ),
@@ -5497,13 +5647,13 @@ class SessionDB:
 
         self._execute_write(_do)
 
-    def memory_upsert_observation(
+    def memory_upsert_evidence_bundle(
         self,
         *,
         entity_id: int,
         topic_key: str,
         topic_label: str,
-        observation_type: str,
+        bundle_type: str,
         summary: str,
         keywords: List[str],
         source_node_ids: List[int],
@@ -5513,7 +5663,7 @@ class SessionDB:
         metadata: Optional[Dict[str, Any]] = None,
         source_role: str = "initial",
     ) -> int:
-        """Create or update the active observation for an entity/topic/type."""
+        """Create or update the evidence bundle for an entity/topic/type."""
         clean_source_role = str(source_role or "initial").strip().lower()
         if clean_source_role not in {"initial", "matched"}:
             clean_source_role = "initial"
@@ -5525,7 +5675,7 @@ class SessionDB:
             seen.add(node_id)
             clean_source_ids.append(node_id)
         if not clean_source_ids:
-            raise ValueError("memory observation requires at least one source node")
+            raise ValueError("memory evidence bundle requires at least one source node")
 
         placeholders = ",".join("?" for _ in clean_source_ids)
         time_rows = self._conn.execute(
@@ -5544,13 +5694,13 @@ class SessionDB:
 
         def _do(conn):
             existing = conn.execute(
-                "SELECT id, embedding, embedding_text, embedding_updated_at FROM memory_observations "
-                "WHERE entity_id = ? AND topic_key = ? AND observation_type = ? AND status = 'active' "
+                "SELECT id, embedding, embedding_text, embedding_updated_at FROM memory_evidence_bundles "
+                "WHERE entity_id = ? AND topic_key = ? AND bundle_type = ? AND status = 'active' "
                 "ORDER BY updated_at DESC, id DESC LIMIT 1",
-                (entity_id, topic_key, observation_type),
+                (entity_id, topic_key, bundle_type),
             ).fetchone()
             if existing:
-                observation_id = existing["id"] if isinstance(existing, sqlite3.Row) else existing[0]
+                evidence_bundle_id = existing["id"] if isinstance(existing, sqlite3.Row) else existing[0]
                 next_embedding = embedding_blob if embedding_blob is not None else existing["embedding"]
                 next_embedding_text = (
                     clean_embedding_text
@@ -5563,7 +5713,7 @@ class SessionDB:
                     else existing["embedding_updated_at"]
                 )
                 conn.execute(
-                    "UPDATE memory_observations SET "
+                    "UPDATE memory_evidence_bundles SET "
                     "topic_label = ?, summary = ?, keywords = ?, confidence = ?, "
                     "updated_at = ?, last_supported_at = ?, source_time_start = ?, "
                     "source_time_end = ?, embedding = ?, embedding_text = ?, "
@@ -5582,13 +5732,13 @@ class SessionDB:
                         next_embedding_text,
                         next_embedding_updated_at,
                         metadata_str,
-                        observation_id,
+                        evidence_bundle_id,
                     ),
                 )
             else:
                 cursor = conn.execute(
-                    "INSERT INTO memory_observations "
-                    "(entity_id, topic_key, topic_label, observation_type, summary, keywords, "
+                    "INSERT INTO memory_evidence_bundles "
+                    "(entity_id, topic_key, topic_label, bundle_type, summary, keywords, "
                     "confidence, status, created_at, updated_at, last_supported_at, "
                     "source_time_start, source_time_end, embedding, embedding_text, "
                     "embedding_updated_at, metadata) "
@@ -5597,7 +5747,7 @@ class SessionDB:
                         entity_id,
                         topic_key,
                         topic_label,
-                        observation_type,
+                        bundle_type,
                         summary,
                         keywords_str,
                         confidence_value,
@@ -5612,90 +5762,90 @@ class SessionDB:
                         metadata_str,
                     ),
                 )
-                observation_id = cursor.lastrowid
+                evidence_bundle_id = cursor.lastrowid
             for node_id in clean_source_ids:
                 conn.execute(
-                    "INSERT OR IGNORE INTO memory_observation_sources "
-                    "(observation_id, node_id, role, confidence) VALUES (?, ?, ?, ?)",
-                    (observation_id, node_id, clean_source_role, confidence_value),
+                    "INSERT OR IGNORE INTO memory_evidence_bundle_sources "
+                    "(evidence_bundle_id, node_id, role, confidence) VALUES (?, ?, ?, ?)",
+                    (evidence_bundle_id, node_id, clean_source_role, confidence_value),
                 )
-            return observation_id
+            return evidence_bundle_id
 
         return self._execute_write(_do)
 
-    def memory_observation_pending_sources(
+    def memory_evidence_bundle_pending_sources(
         self,
         *,
         entity_id: int,
         topic_key: str,
-        observation_type: Optional[str] = None,
+        bundle_type: Optional[str] = None,
         candidate_node_ids: List[int],
     ) -> Tuple[Optional[Dict[str, Any]], List[int]]:
-        """Return active observation and candidate source ids not yet attached."""
+        """Return an active evidence bundle and unattached candidate fact ids."""
         if not candidate_node_ids:
             return None, []
-        if observation_type:
-            observation = self._conn.execute(
-                "SELECT * FROM memory_observations "
-                "WHERE entity_id = ? AND topic_key = ? AND observation_type = ? AND status = 'active' "
+        if bundle_type:
+            evidence_bundle = self._conn.execute(
+                "SELECT * FROM memory_evidence_bundles "
+                "WHERE entity_id = ? AND topic_key = ? AND bundle_type = ? AND status = 'active' "
                 "ORDER BY updated_at DESC, id DESC LIMIT 1",
-                (entity_id, topic_key, observation_type),
+                (entity_id, topic_key, bundle_type),
             ).fetchone()
         else:
-            observation = self._conn.execute(
-                "SELECT * FROM memory_observations "
+            evidence_bundle = self._conn.execute(
+                "SELECT * FROM memory_evidence_bundles "
                 "WHERE entity_id = ? AND topic_key = ? AND status = 'active' "
                 "ORDER BY updated_at DESC, id DESC LIMIT 1",
                 (entity_id, topic_key),
             ).fetchone()
-        if not observation:
+        if not evidence_bundle:
             return None, list(dict.fromkeys(candidate_node_ids))
-        observation_dict = dict(observation)
-        observation_id = observation_dict["id"]
+        bundle_dict = dict(evidence_bundle)
+        evidence_bundle_id = bundle_dict["id"]
         placeholders = ",".join("?" for _ in candidate_node_ids)
         rows = self._conn.execute(
-            f"SELECT node_id FROM memory_observation_sources "
-            f"WHERE observation_id = ? AND node_id IN ({placeholders})",
-            [observation_id] + candidate_node_ids,
+            f"SELECT node_id FROM memory_evidence_bundle_sources "
+            f"WHERE evidence_bundle_id = ? AND node_id IN ({placeholders})",
+            [evidence_bundle_id] + candidate_node_ids,
         ).fetchall()
         attached = {row["node_id"] for row in rows}
         pending = [node_id for node_id in dict.fromkeys(candidate_node_ids) if node_id not in attached]
-        return observation_dict, pending
+        return bundle_dict, pending
 
-    def memory_observation_pending_source_count(
+    def memory_evidence_bundle_pending_source_count(
         self,
         *,
         entity_id: int,
         topic_key: str,
-        observation_type: Optional[str] = None,
+        bundle_type: Optional[str] = None,
         candidate_node_ids: List[int],
     ) -> Tuple[Optional[int], int]:
-        """Return active observation id and candidate source count not yet attached."""
-        observation, pending = self.memory_observation_pending_sources(
+        """Return active bundle id and candidate source count not yet attached."""
+        evidence_bundle, pending = self.memory_evidence_bundle_pending_sources(
             entity_id=entity_id,
             topic_key=topic_key,
-            observation_type=observation_type,
+            bundle_type=bundle_type,
             candidate_node_ids=candidate_node_ids,
         )
-        return (observation["id"] if observation else None), len(pending)
+        return (evidence_bundle["id"] if evidence_bundle else None), len(pending)
 
-    def get_observations_using_entity_topic(
+    def get_evidence_bundles_using_entity_topic(
         self,
         *,
         entity_id: int,
         topic_key: str,
         query_embedding: Optional[np.ndarray] = None,
     ) -> List[Dict[str, Any]]:
-        """Return active observations for one exact entity/topic pair."""
+        """Return active evidence bundles for one exact entity/topic pair."""
         rows = self._conn.execute(
             "SELECT mo.*, en.name AS entity_name "
-            "FROM memory_observations mo "
+            "FROM memory_evidence_bundles mo "
             "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
             "WHERE mo.entity_id = ? AND mo.topic_key = ? AND mo.status = 'active' "
             "ORDER BY mo.updated_at DESC, mo.id DESC",
             (int(entity_id), str(topic_key)),
         ).fetchall()
-        observations: List[Dict[str, Any]] = []
+        evidence_bundles: List[Dict[str, Any]] = []
         for row in rows:
             item = dict(row)
             embedding_similarity = self._embedding_similarity(
@@ -5705,10 +5855,10 @@ class SessionDB:
             if embedding_similarity is not None:
                 item["embedding_similarity"] = round(float(embedding_similarity), 4)
             item.pop("embedding", None)
-            observations.append(item)
-        return observations
+            evidence_bundles.append(item)
+        return evidence_bundles
 
-    def search_memory_observations(
+    def search_memory_evidence_bundles(
         self,
         keyword: Any,
         *,
@@ -5717,7 +5867,7 @@ class SessionDB:
         entity_ids: Optional[List[int]] = None,
         query_embedding: Optional[np.ndarray] = None,
     ) -> List[Dict[str, Any]]:
-        """Search active observations by keyword/topic/entity."""
+        """Search active evidence bundles by keyword/topic/entity."""
         keyword_query = " ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
         terms = [term.strip().lower() for term in re.split(r"\s+|OR", keyword_query) if term.strip()]
         weak_terms = {"父亲", "母亲", "爸爸", "妈妈", "家人", "家庭", "用户", "偏好", "喜欢", "信息", "记录"}
@@ -5737,7 +5887,7 @@ class SessionDB:
             params.extend(entity_ids)
         rows = self._conn.execute(
             "SELECT mo.*, en.name AS entity_name "
-            "FROM memory_observations mo "
+            "FROM memory_evidence_bundles mo "
             "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
             f"WHERE {' AND '.join(where)}",
             params,
@@ -5781,24 +5931,24 @@ class SessionDB:
         scored.sort(key=lambda pair: (pair[0], pair[1].get("last_supported_at") or ""), reverse=True)
         return [item for _, item in scored[:top_k]]
 
-    def get_observation_supporting_nodes(
+    def get_evidence_bundle_supporting_nodes(
         self,
-        observation_ids: List[int],
+        evidence_bundle_ids: List[int],
         *,
-        per_observation: int = 2,
+        per_evidence_bundle: int = 2,
     ) -> Dict[int, List[Dict[str, Any]]]:
-        """Fetch supporting fact nodes for observation ids."""
+        """Fetch supporting fact nodes for evidence bundle ids."""
         out: Dict[int, List[Dict[str, Any]]] = {}
-        for observation_id in observation_ids:
+        for evidence_bundle_id in evidence_bundle_ids:
             rows = self._conn.execute(
                 "SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.original_dialog, "
                 "mn.tags, mn.fact_type, mn.fact_subject, mn.fact_kind, mn.task_event_like, mn.task_event_subject, mn.task_relevance "
-                "FROM memory_observation_sources mos "
+                "FROM memory_evidence_bundle_sources mos "
                 "JOIN memory_nodes mn ON mn.id = mos.node_id "
-                "WHERE mos.observation_id = ? "
+                "WHERE mos.evidence_bundle_id = ? "
                 "ORDER BY mn.time_key DESC, mn.id DESC "
                 "LIMIT ?",
-                (observation_id, per_observation),
+                (evidence_bundle_id, per_evidence_bundle),
             ).fetchall()
             nodes = []
             for row in rows:
@@ -5822,14 +5972,14 @@ class SessionDB:
                     "task_relevance": row["task_relevance"] or "",
                     "node_relations": {},
                 })
-            out[observation_id] = nodes
+            out[evidence_bundle_id] = nodes
         return out
 
-    def find_duplicated_observation_groups(
+    def find_duplicated_evidence_bundle_groups(
         self,
         entity_ids: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
-        """Return active same-entity/topic/category observation groups that need reflection."""
+        """Return duplicate active evidence bundles grouped by entity/topic/type."""
         params: List[Any] = []
         where = ["mo.status = 'active'"]
         if entity_ids:
@@ -5838,42 +5988,44 @@ class SessionDB:
             params.extend(entity_ids)
         rows = self._conn.execute(
             "SELECT mo.*, en.name AS entity_name "
-            "FROM memory_observations mo "
+            "FROM memory_evidence_bundles mo "
             "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
             f"WHERE {' AND '.join(where)} "
-            "ORDER BY mo.entity_id, mo.topic_key, mo.observation_type, mo.updated_at DESC, mo.id DESC",
+            "ORDER BY mo.entity_id, mo.topic_key, mo.bundle_type, mo.updated_at DESC, mo.id DESC",
             params,
         ).fetchall()
         grouped: Dict[Tuple[int, str, str], List[Dict[str, Any]]] = {}
         for row in rows:
             item = dict(row)
-            category = str(item.get("observation_type") or "observation")
+            category = str(item.get("bundle_type") or "entity_topic")
             grouped.setdefault(
                 (int(item["entity_id"]), str(item["topic_key"]), category),
                 [],
             ).append(item)
 
         groups: List[Dict[str, Any]] = []
-        for (_entity_id, _topic_key, _category), observations in grouped.items():
-            if len(observations) < 2:
+        for (_entity_id, _topic_key, _category), evidence_bundles in grouped.items():
+            if len(evidence_bundles) < 2:
                 continue
-            observation_ids = [int(obs["id"]) for obs in observations]
+            evidence_bundle_ids = [
+                int(bundle["id"]) for bundle in evidence_bundles
+            ]
             source_rows = self._conn.execute(
                 "SELECT DISTINCT mn.id, mn.time_key, mn.summary, mn.keywords, mn.fact_type, mn.fact_subject, mn.fact_kind, "
                 "mn.task_event_like, mn.task_event_subject, mn.task_relevance "
-                "FROM memory_observation_sources mos "
+                "FROM memory_evidence_bundle_sources mos "
                 "JOIN memory_nodes mn ON mn.id = mos.node_id "
-                f"WHERE mos.observation_id IN ({','.join('?' for _ in observation_ids)}) "
+                f"WHERE mos.evidence_bundle_id IN ({','.join('?' for _ in evidence_bundle_ids)}) "
                 "ORDER BY mn.time_key DESC, mn.id DESC",
-                observation_ids,
+                evidence_bundle_ids,
             ).fetchall()
             groups.append({
-                "entity_id": int(observations[0]["entity_id"]),
-                "entity_name": observations[0].get("entity_name") or "",
-                "topic_key": observations[0]["topic_key"],
-                "topic_label": observations[0]["topic_label"],
-                "observation_type": observations[0]["observation_type"],
-                "observations": observations,
+                "entity_id": int(evidence_bundles[0]["entity_id"]),
+                "entity_name": evidence_bundles[0].get("entity_name") or "",
+                "topic_key": evidence_bundles[0]["topic_key"],
+                "topic_label": evidence_bundles[0]["topic_label"],
+                "bundle_type": evidence_bundles[0]["bundle_type"],
+                "evidence_bundles": evidence_bundles,
                 "source_nodes": [
                     {
                         **dict(row),
@@ -5949,18 +6101,18 @@ class SessionDB:
             "nodes": nodes,
         }
 
-    def memory_reflect_observation_decay(
+    def memory_reflect_evidence_bundle_decay(
         self,
         *,
         threshold: Optional[float] = None,
         now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
-        """Evaluate active observations using persisted source-node decay scores.
+        """Evaluate active evidence bundles using source-node decay scores.
 
         The reflect step should call ``memory_reflect_node_decay`` first so the
         source scores represent the current maintenance run.  The aggregate keeps a
         small "fresh support" component so one recent supporting source can keep
-        an observation alive even when it also has many older sources.
+        an evidence bundle alive even when it also has many older sources.
         """
         decay_threshold = max(
             0.0,
@@ -5968,11 +6120,12 @@ class SessionDB:
         )
         now_dt = now or datetime.now().astimezone()
         rows = self._conn.execute(
-            "SELECT mo.id AS observation_id, mo.metadata AS observation_metadata, "
+            "SELECT mo.id AS evidence_bundle_id, "
+            "mo.metadata AS evidence_bundle_metadata, "
             "mos.confidence AS source_confidence, mn.id AS node_id, mn.fact_type, "
             "mn.decay_score, mn.decay_updated_at, mn.decay_half_life_days "
-            "FROM memory_observations mo "
-            "LEFT JOIN memory_observation_sources mos ON mos.observation_id = mo.id "
+            "FROM memory_evidence_bundles mo "
+            "LEFT JOIN memory_evidence_bundle_sources mos ON mos.evidence_bundle_id = mo.id "
             "LEFT JOIN memory_nodes mn ON mn.id = mos.node_id "
             "WHERE mo.status = 'active' "
             "ORDER BY mo.id, mn.time_key DESC, mn.id DESC"
@@ -5980,12 +6133,12 @@ class SessionDB:
 
         grouped: Dict[int, Dict[str, Any]] = {}
         for row in rows:
-            observation_id = int(row["observation_id"])
+            evidence_bundle_id = int(row["evidence_bundle_id"])
             group = grouped.setdefault(
-                observation_id,
+                evidence_bundle_id,
                 {
-                    "id": observation_id,
-                    "metadata": row["observation_metadata"],
+                    "id": evidence_bundle_id,
+                    "metadata": row["evidence_bundle_metadata"],
                     "sources": [],
                 },
             )
@@ -6010,7 +6163,7 @@ class SessionDB:
             })
 
         evaluated: List[Dict[str, Any]] = []
-        for observation_id, group in grouped.items():
+        for evidence_bundle_id, group in grouped.items():
             sources = group["sources"]
             if not sources:
                 average_score = 0.0
@@ -6030,7 +6183,7 @@ class SessionDB:
                 combined_score = (0.70 * average_score) + (0.30 * max_score)
             action = "deactivate" if combined_score < decay_threshold else "keep"
             evaluated.append({
-                "id": observation_id,
+                "id": evidence_bundle_id,
                 "action": action,
                 "score": combined_score,
                 "average_score": average_score,
@@ -6045,8 +6198,8 @@ class SessionDB:
 
             def _do(conn):
                 for item in evaluated:
-                    observation_id = int(item["id"])
-                    metadata_row = grouped[observation_id].get("metadata")
+                    evidence_bundle_id = int(item["id"])
+                    metadata_row = grouped[evidence_bundle_id].get("metadata")
                     try:
                         metadata = json.loads(metadata_row or "{}")
                     except json.JSONDecodeError:
@@ -6062,14 +6215,14 @@ class SessionDB:
                     metadata_str = json.dumps(metadata, ensure_ascii=False)
                     if item["action"] == "deactivate":
                         conn.execute(
-                            "UPDATE memory_observations SET status = 'inactive', metadata = ?, updated_at = ? "
+                            "UPDATE memory_evidence_bundles SET status = 'inactive', metadata = ?, updated_at = ? "
                             "WHERE id = ?",
-                            (metadata_str, evaluated_at, observation_id),
+                            (metadata_str, evaluated_at, evidence_bundle_id),
                         )
                     else:
                         conn.execute(
-                            "UPDATE memory_observations SET metadata = ? WHERE id = ?",
-                            (metadata_str, observation_id),
+                            "UPDATE memory_evidence_bundles SET metadata = ? WHERE id = ?",
+                            (metadata_str, evidence_bundle_id),
                         )
 
             self._execute_write(_do)
@@ -6079,7 +6232,7 @@ class SessionDB:
             "inactivated": len(to_deactivate),
             "would_inactivate": len(to_deactivate),
             "threshold": decay_threshold,
-            "observations": evaluated,
+            "evidence_bundles": evaluated,
         }
 
     def memory_reflect_task_inactivity(
@@ -6208,12 +6361,12 @@ class SessionDB:
             ],
         }
 
-    def memory_replace_observation_group(
+    def memory_replace_evidence_bundle_group(
         self,
         *,
-        keep_observation_id: int,
-        remove_observation_ids: List[int],
-        observation_type: str,
+        keep_evidence_bundle_id: int,
+        remove_evidence_bundle_ids: List[int],
+        bundle_type: str,
         summary: str,
         keywords: List[str],
         confidence: float,
@@ -6223,15 +6376,15 @@ class SessionDB:
         metadata: Optional[Dict[str, Any]] = None,
         source_roles: Optional[Dict[int, str]] = None,
     ) -> None:
-        """Replace a duplicate observation group while preserving source roles."""
+        """Replace duplicate evidence bundles while preserving source roles."""
         clean_remove_ids = [
-            int(obs_id)
-            for obs_id in dict.fromkeys(remove_observation_ids)
-            if int(obs_id) != keep_observation_id
+            int(bundle_id)
+            for bundle_id in dict.fromkeys(remove_evidence_bundle_ids)
+            if int(bundle_id) != keep_evidence_bundle_id
         ]
         clean_source_ids = [int(node_id) for node_id in dict.fromkeys(source_node_ids)]
         if not clean_source_ids:
-            raise ValueError("reflected observation requires at least one source node")
+            raise ValueError("reflected evidence bundle requires at least one source node")
         clean_source_roles: Dict[int, str] = {}
         for node_id, role in (source_roles or {}).items():
             try:
@@ -6257,12 +6410,12 @@ class SessionDB:
         source_time_end = time_rows["end_time"] if time_rows else None
 
         def _do(conn):
-            source_observation_ids = [keep_observation_id, *clean_remove_ids]
-            source_observation_placeholders = ",".join("?" for _ in source_observation_ids)
+            source_bundle_ids = [keep_evidence_bundle_id, *clean_remove_ids]
+            source_bundle_placeholders = ",".join("?" for _ in source_bundle_ids)
             existing_source_rows = conn.execute(
-                "SELECT node_id, role FROM memory_observation_sources "
-                f"WHERE observation_id IN ({source_observation_placeholders})",
-                source_observation_ids,
+                "SELECT node_id, role FROM memory_evidence_bundle_sources "
+                f"WHERE evidence_bundle_id IN ({source_bundle_placeholders})",
+                source_bundle_ids,
             ).fetchall()
             role_priority = {"supporting": 0, "matched": 1, "initial": 2}
             existing_source_roles: Dict[int, str] = {}
@@ -6276,8 +6429,8 @@ class SessionDB:
                     existing_source_roles[node_id] = role
             existing = conn.execute(
                 "SELECT embedding, embedding_text, embedding_updated_at "
-                "FROM memory_observations WHERE id = ?",
-                (keep_observation_id,),
+                "FROM memory_evidence_bundles WHERE id = ?",
+                (keep_evidence_bundle_id,),
             ).fetchone()
             next_embedding = embedding_blob if embedding_blob is not None else (existing["embedding"] if existing else None)
             next_embedding_text = (
@@ -6291,14 +6444,14 @@ class SessionDB:
                 else (existing["embedding_updated_at"] if existing else None)
             )
             conn.execute(
-                "UPDATE memory_observations SET "
-                "observation_type = ?, summary = ?, keywords = ?, confidence = ?, "
+                "UPDATE memory_evidence_bundles SET "
+                "bundle_type = ?, summary = ?, keywords = ?, confidence = ?, "
                 "updated_at = ?, last_supported_at = ?, source_time_start = ?, "
                 "source_time_end = ?, embedding = ?, embedding_text = ?, "
                 "embedding_updated_at = ?, metadata = ? "
                 "WHERE id = ?",
                 (
-                    observation_type,
+                    bundle_type,
                     summary,
                     keywords_str,
                     confidence_value,
@@ -6310,50 +6463,50 @@ class SessionDB:
                     next_embedding_text,
                     next_embedding_updated_at,
                     metadata_str,
-                    keep_observation_id,
+                    keep_evidence_bundle_id,
                 ),
             )
             if clean_remove_ids:
                 remove_placeholders = ",".join("?" for _ in clean_remove_ids)
-                sub_claim_rows = conn.execute(
-                    f"SELECT id FROM memory_sub_claims "
-                    f"WHERE observation_id IN ({remove_placeholders})",
+                observation_rows = conn.execute(
+                    f"SELECT id FROM memory_observations "
+                    f"WHERE evidence_bundle_id IN ({remove_placeholders})",
                     clean_remove_ids,
                 ).fetchall()
-                sub_claim_ids = [
+                observation_ids = [
                     int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
-                    for row in sub_claim_rows
+                    for row in observation_rows
                 ]
-                if sub_claim_ids:
-                    sub_claim_placeholders = ",".join(
-                        "?" for _ in sub_claim_ids
+                if observation_ids:
+                    observation_placeholders = ",".join(
+                        "?" for _ in observation_ids
                     )
                     conn.execute(
-                        f"DELETE FROM memory_interpretation_sub_claims "
-                        f"WHERE sub_claim_id IN ({sub_claim_placeholders})",
-                        sub_claim_ids,
+                        f"DELETE FROM memory_interpretation_observations "
+                        f"WHERE observation_id IN ({observation_placeholders})",
+                        observation_ids,
                     )
                     conn.execute(
-                        f"DELETE FROM memory_sub_claim_sources "
-                        f"WHERE sub_claim_id IN ({sub_claim_placeholders})",
-                        sub_claim_ids,
+                        f"DELETE FROM memory_observation_sources "
+                        f"WHERE observation_id IN ({observation_placeholders})",
+                        observation_ids,
                     )
                     conn.execute(
-                        f"DELETE FROM memory_sub_claims "
-                        f"WHERE id IN ({sub_claim_placeholders})",
-                        sub_claim_ids,
+                        f"DELETE FROM memory_observations "
+                        f"WHERE id IN ({observation_placeholders})",
+                        observation_ids,
                     )
                 conn.execute(
-                    f"DELETE FROM memory_observation_sources WHERE observation_id IN ({remove_placeholders})",
+                    f"DELETE FROM memory_evidence_bundle_sources WHERE evidence_bundle_id IN ({remove_placeholders})",
                     clean_remove_ids,
                 )
                 conn.execute(
-                    f"DELETE FROM memory_observations WHERE id IN ({remove_placeholders})",
+                    f"DELETE FROM memory_evidence_bundles WHERE id IN ({remove_placeholders})",
                     clean_remove_ids,
                 )
             conn.execute(
-                "DELETE FROM memory_observation_sources WHERE observation_id = ?",
-                (keep_observation_id,),
+                "DELETE FROM memory_evidence_bundle_sources WHERE evidence_bundle_id = ?",
+                (keep_evidence_bundle_id,),
             )
             for node_id in clean_source_ids:
                 role = clean_source_roles.get(
@@ -6361,9 +6514,9 @@ class SessionDB:
                     existing_source_roles.get(node_id, "supporting"),
                 )
                 conn.execute(
-                    "INSERT OR IGNORE INTO memory_observation_sources "
-                    "(observation_id, node_id, role, confidence) VALUES (?, ?, ?, ?)",
-                    (keep_observation_id, node_id, role, confidence_value),
+                    "INSERT OR IGNORE INTO memory_evidence_bundle_sources "
+                    "(evidence_bundle_id, node_id, role, confidence) VALUES (?, ?, ?, ?)",
+                    (keep_evidence_bundle_id, node_id, role, confidence_value),
                 )
 
         self._execute_write(_do)
