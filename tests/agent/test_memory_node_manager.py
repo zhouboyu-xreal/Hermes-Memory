@@ -1071,6 +1071,83 @@ def test_memory_node_embeddings_reconstruct_requested_vectors(db, monkeypatch):
     assert np.allclose(vectors[22], np.array([1.0, 1.0, 0.0], dtype=np.float32))
 
 
+def test_observation_evidence_score_uses_centroid_and_max_source_similarity():
+    fact_embedding = np.array([1.0, 0.0], dtype=np.float32)
+    source_embeddings = {
+        11: np.array([0.7, 0.7], dtype=np.float32),
+        12: np.array([0.7, -0.7], dtype=np.float32),
+    }
+    centroid_match = {
+        "source_node_ids": [11, 12],
+        "evidence_centroid_embedding": np.array([1.0, 0.0], dtype=np.float32),
+    }
+
+    score, centroid_similarity, max_source_similarity = (
+        MemoryNodeManager._score_fact_against_observation_evidence(
+            fact_embedding,
+            centroid_match,
+            source_embeddings,
+        )
+    )
+
+    assert centroid_similarity == pytest.approx(1.0)
+    assert max_source_similarity == pytest.approx(2 ** -0.5)
+    assert score == centroid_similarity
+
+    source_match = {
+        "source_node_ids": [21],
+        "evidence_centroid_embedding": np.array([0.0, 1.0], dtype=np.float32),
+    }
+    score, centroid_similarity, max_source_similarity = (
+        MemoryNodeManager._score_fact_against_observation_evidence(
+            fact_embedding,
+            source_match,
+            {21: np.array([1.0, 0.0], dtype=np.float32)},
+        )
+    )
+
+    assert centroid_similarity == pytest.approx(0.0)
+    assert max_source_similarity == pytest.approx(1.0)
+    assert score == max_source_similarity
+
+
+def test_observation_persists_evidence_centroid_embedding(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    source_id = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack alerts.",
+        keywords=["Slack", "alerts"],
+    )
+    evidence_bundle_id = db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="slack-alerts",
+        topic_label="Slack alerts",
+        bundle_type="entity_topic",
+        source_node_ids=[source_id],
+    )
+    centroid = np.array([0.6, 0.8], dtype=np.float32)
+
+    observation_id = db.memory_create_observation(
+        evidence_bundle_id,
+        {
+            "observation_type": "preference_signal",
+            "summary": "Alice prefers Slack alerts.",
+            "source_node_ids": [source_id],
+            "evidence_centroid_embedding": centroid,
+        },
+    )
+
+    assert observation_id is not None
+    observation = db.get_observations_for_evidence_bundles(
+        [evidence_bundle_id]
+    )[0]
+    assert np.allclose(
+        observation["evidence_centroid_embedding"],
+        centroid,
+    )
+
+
 def _add_task_interpretation(
     db,
     *,
@@ -3038,7 +3115,10 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
     assert any("interpretation 生成模块" in prompt for prompt in mgr.llm_prompts)
 
 
-def test_incremental_observation_update_preserves_identity_and_rebuilds_summary(db):
+def test_incremental_observation_update_preserves_identity_and_rebuilds_summary(
+    db,
+    monkeypatch,
+):
     alice = db.entity_add_entity("Alice", "PERSON")
     first_node = _add_memory_node(
         db,
@@ -3107,6 +3187,19 @@ def test_incremental_observation_update_preserves_identity_and_rebuilds_summary(
         bundle_type="entity_topic",
         source_node_ids=[first_node, second_node],
     )
+    fact_vectors = {
+        first_node: np.ones(1536, dtype=np.float32),
+        second_node: np.ones(1536, dtype=np.float32),
+    }
+    monkeypatch.setattr(
+        db,
+        "memory_node_embeddings",
+        lambda node_ids: {
+            node_id: fact_vectors[node_id]
+            for node_id in node_ids
+            if node_id in fact_vectors
+        },
+    )
     mgr._llm_outputs.append(json.dumps({
         "observation_type": "task_progress",
         "summary": (
@@ -3128,6 +3221,10 @@ def test_incremental_observation_update_preserves_identity_and_rebuilds_summary(
     assert len(observations) == 1
     assert observations[0]["id"] == stable_observation_id
     assert observations[0]["source_node_ids"] == [first_node, second_node]
+    assert np.allclose(
+        observations[0]["evidence_centroid_embedding"],
+        np.ones(1536, dtype=np.float32) / np.sqrt(1536),
+    )
     assert observations[0]["metadata"]["revision"] == 2
     linked_observation_id = db._conn.execute(
         "SELECT observation_id FROM memory_interpretation_observations "
@@ -3135,15 +3232,13 @@ def test_incremental_observation_update_preserves_identity_and_rebuilds_summary(
         (interpretation_id,),
     ).fetchone()["observation_id"]
     assert linked_observation_id == stable_observation_id
-    evidence_bundle = db.get_evidence_bundles_by_ids(
-        [evidence_bundle_id]
-    )[0]
-    assert evidence_bundle["summary"] == (
+    assert observations[0]["summary"] == (
         "Alice implemented the alert routing fallback and verified its tests."
     )
-    assert evidence_bundle["embedding_text"] == evidence_bundle["summary"]
-    assert embedding_client.texts[-1] == evidence_bundle["summary"]
-    assert json.loads(evidence_bundle["metadata"]) == {}
+    assert observations[0]["embedding_text"].endswith(
+        observations[0]["summary"]
+    )
+    assert embedding_client.texts[-1] == observations[0]["embedding_text"]
 
 
 def test_interpretation_generation_skips_observation_without_observations(db):
@@ -4542,7 +4637,10 @@ def test_observation_type_gate_rejects_incompatible_interpretation(db):
     assert reason == "observation_type_gate"
 
 
-def test_behavioral_preference_observation_only_allows_inferred_preference(db):
+def test_behavioral_preference_observation_only_allows_inferred_preference(
+    db,
+    monkeypatch,
+):
     alice = db.entity_add_entity("Alice", "PERSON")
     node_ids = []
     for index in range(2):
@@ -4556,6 +4654,15 @@ def test_behavioral_preference_observation_only_allows_inferred_preference(db):
         )
         db.entity_link_node(node_id, alice)
         node_ids.append(node_id)
+    monkeypatch.setattr(
+        db,
+        "memory_node_embeddings",
+        lambda requested_ids: {
+            node_id: np.ones(1536, dtype=np.float32)
+            for node_id in requested_ids
+            if node_id in node_ids
+        },
+    )
     observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",

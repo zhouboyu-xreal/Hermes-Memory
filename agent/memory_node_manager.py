@@ -42,7 +42,7 @@ import threading
 import time
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import numpy as np
@@ -2275,6 +2275,75 @@ class MemoryNodeManager:
             return 0.0
         return float(np.dot(left_vec, right_vec))
 
+    @classmethod
+    def _embedding_centroid(
+        cls,
+        embeddings: Iterable[Any],
+    ) -> Optional[np.ndarray]:
+        vectors = [
+            vector
+            for value in embeddings
+            if (vector := cls._as_embedding_vector(value)) is not None
+        ]
+        if not vectors:
+            return None
+        first_shape = vectors[0].shape
+        compatible = [vector for vector in vectors if vector.shape == first_shape]
+        if not compatible:
+            return None
+        return cls._as_embedding_vector(
+            np.mean(np.stack(compatible), axis=0)
+        )
+
+    def _evidence_centroid_for_sources(
+        self,
+        source_nodes: List[Dict[str, Any]],
+    ) -> Optional[np.ndarray]:
+        source_ids = [
+            int(self._node_id(node))
+            for node in source_nodes
+            if self._node_id(node) is not None
+        ]
+        embeddings = self._db.memory_node_embeddings(source_ids)
+        return self._embedding_centroid(
+            embeddings.get(source_id)
+            for source_id in source_ids
+        )
+
+    @classmethod
+    def _score_fact_against_observation_evidence(
+        cls,
+        fact_embedding: Any,
+        observation: Dict[str, Any],
+        fact_embeddings: Dict[int, np.ndarray],
+    ) -> Tuple[float, float, float]:
+        source_embeddings = [
+            fact_embeddings.get(int(source_node_id))
+            for source_node_id in observation.get("source_node_ids", [])
+        ]
+        evidence_centroid = observation.get("evidence_centroid_embedding")
+        if evidence_centroid is None:
+            evidence_centroid = cls._embedding_centroid(source_embeddings)
+        centroid_similarity = cls._embedding_similarity(
+            fact_embedding,
+            evidence_centroid,
+        )
+        max_source_similarity = max(
+            (
+                cls._embedding_similarity(
+                    fact_embedding,
+                    source_embedding,
+                )
+                for source_embedding in source_embeddings
+            ),
+            default=0.0,
+        )
+        return (
+            max(centroid_similarity, max_source_similarity),
+            centroid_similarity,
+            max_source_similarity,
+        )
+
     @staticmethod
     def _fact_match_text(fact: Dict[str, Any]) -> str:
         keywords = fact.get("keywords", [])
@@ -2590,6 +2659,7 @@ class MemoryNodeManager:
                     f"Observation type: {observation_type}",
                     f"Summary text: {summary}",
                 ]),
+                "evidence_centroid_embedding": centroid,
                 "metadata": {
                     "source": "evidence_bundle_fact_clustering",
                     "allowed_interpretation_types": allowed_interpretation_types,
@@ -2753,6 +2823,9 @@ class MemoryNodeManager:
             ],
             "embedding": self._embed_memory_layer_text(embedding_text),
             "embedding_text": embedding_text,
+            "evidence_centroid_embedding": (
+                self._evidence_centroid_for_sources(source_nodes)
+            ),
             "metadata": metadata,
         }
 
@@ -2806,11 +2879,19 @@ class MemoryNodeManager:
                     and int(self._node_id(fact)) not in assigned_fact_ids
                 )
             ]
-            fact_embeddings = self._db.memory_node_embeddings([
+            relevant_fact_ids = {
                 int(self._node_id(fact))
                 for fact in new_facts
                 if self._node_id(fact) is not None
-            ])
+            }
+            relevant_fact_ids.update(
+                int(node_id)
+                for observation in existing_observations
+                for node_id in observation.get("source_node_ids", [])
+            )
+            fact_embeddings = self._db.memory_node_embeddings(
+                sorted(relevant_fact_ids)
+            )
             matched: Dict[int, List[Dict[str, Any]]] = {}
             unmatched: List[Dict[str, Any]] = []
             for fact in new_facts:
@@ -2821,22 +2902,54 @@ class MemoryNodeManager:
                     for observation in existing_observations
                     if observation.get("observation_type") == implicit_observation_type
                 ]
-                scored = [
+                scored = []
+                for observation in candidates:
                     (
-                        self._embedding_similarity(
-                            fact_embeddings.get(fact_id),
-                            observation.get("embedding"),
-                        ),
+                        match_similarity,
+                        centroid_similarity,
+                        max_source_similarity,
+                    ) = self._score_fact_against_observation_evidence(
+                        fact_embeddings.get(fact_id),
                         observation,
+                        fact_embeddings,
                     )
-                    for observation in candidates
-                ]
+                    scored.append((
+                        match_similarity,
+                        centroid_similarity,
+                        max_source_similarity,
+                        observation,
+                    ))
                 scored.sort(key=lambda item: item[0], reverse=True)
+                best_match = scored[0] if scored else None
+                self._log_info(
+                    "memory_reflect",
+                    "observation_evidence_similarity_scored",
+                    {
+                        "evidence_bundle_id": evidence_bundle_id,
+                        "fact_id": fact_id,
+                        "observation_type": implicit_observation_type,
+                        "best_observation_id": (
+                            int(best_match[3]["id"])
+                            if best_match
+                            else None
+                        ),
+                        "match_similarity": round(best_match[0], 4)
+                        if best_match
+                        else 0.0,
+                        "centroid_similarity": round(best_match[1], 4)
+                        if best_match
+                        else 0.0,
+                        "max_source_similarity": round(best_match[2], 4)
+                        if best_match
+                        else 0.0,
+                        "threshold": OBSERVATION_MATCH_SIMILARITY_THRESHOLD,
+                    },
+                )
                 if (
-                    scored
-                    and scored[0][0] >= OBSERVATION_MATCH_SIMILARITY_THRESHOLD
+                    best_match
+                    and best_match[0] >= OBSERVATION_MATCH_SIMILARITY_THRESHOLD
                 ):
-                    matched.setdefault(int(scored[0][1]["id"]), []).append(fact)
+                    matched.setdefault(int(best_match[3]["id"]), []).append(fact)
                 else:
                     unmatched.append(fact)
 
@@ -2890,6 +3003,9 @@ class MemoryNodeManager:
                     source_node_ids=record["source_node_ids"],
                     embedding=record["embedding"],
                     embedding_text=record["embedding_text"],
+                    evidence_centroid_embedding=record[
+                        "evidence_centroid_embedding"
+                    ],
                     metadata=record["metadata"],
                 )
                 touched_observation_ids.append(observation_id)

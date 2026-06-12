@@ -356,6 +356,7 @@ CREATE TABLE IF NOT EXISTS memory_observations (
     status TEXT NOT NULL DEFAULT 'active',
     embedding BLOB,
     embedding_text TEXT NOT NULL DEFAULT '',
+    evidence_centroid_embedding BLOB,
     metadata TEXT DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -5110,12 +5111,16 @@ class SessionDB:
                 embedding_text = str(
                     observation.get("embedding_text") or summary
                 ).strip()
+                evidence_centroid_embedding = self._embedding_to_blob(
+                    observation.get("evidence_centroid_embedding")
+                )
                 cursor = conn.execute(
                     "INSERT INTO memory_observations "
                     "(evidence_bundle_id, observation_type, summary, evidence_mode, "
-                    "confidence, status, embedding, embedding_text, metadata, "
-                    "created_at, updated_at, last_supported_at) "
-                    "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+                    "confidence, status, embedding, embedding_text, "
+                    "evidence_centroid_embedding, metadata, created_at, updated_at, "
+                    "last_supported_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
                     (
                         clean_bundle_id,
                         observation_type,
@@ -5124,6 +5129,7 @@ class SessionDB:
                         confidence,
                         embedding,
                         embedding_text,
+                        evidence_centroid_embedding,
                         json.dumps(metadata, ensure_ascii=False),
                         now_text,
                         now_text,
@@ -5188,6 +5194,15 @@ class SessionDB:
                     ).copy()
                 except (TypeError, ValueError):
                     item["embedding"] = None
+            stored_centroid = item.get("evidence_centroid_embedding")
+            if stored_centroid is not None:
+                try:
+                    item["evidence_centroid_embedding"] = np.frombuffer(
+                        bytes(stored_centroid),
+                        dtype=np.float32,
+                    ).copy()
+                except (TypeError, ValueError):
+                    item["evidence_centroid_embedding"] = None
             out.append(item)
         return out
 
@@ -5218,6 +5233,7 @@ class SessionDB:
             except (TypeError, ValueError):
                 item["metadata"] = {}
             item.pop("embedding", None)
+            item.pop("evidence_centroid_embedding", None)
             by_id[int(item["id"])] = item
         return [
             by_id[observation_id]
@@ -5314,6 +5330,7 @@ class SessionDB:
             except (TypeError, ValueError):
                 item["metadata"] = {}
             item.pop("embedding", None)
+            item.pop("evidence_centroid_embedding", None)
             scored.append((score, item))
         scored.sort(
             key=lambda pair: (
@@ -5429,6 +5446,15 @@ class SessionDB:
                     ).copy()
                 except (TypeError, ValueError):
                     item["embedding"] = None
+            stored_centroid = item.get("evidence_centroid_embedding")
+            if stored_centroid is not None:
+                try:
+                    item["evidence_centroid_embedding"] = np.frombuffer(
+                        bytes(stored_centroid),
+                        dtype=np.float32,
+                    ).copy()
+                except (TypeError, ValueError):
+                    item["evidence_centroid_embedding"] = None
             out.append(item)
             if len(out) >= max(1, int(limit)):
                 break
@@ -5464,14 +5490,18 @@ class SessionDB:
         embedding_text = str(
             observation.get("embedding_text") or summary
         ).strip()
+        evidence_centroid_embedding = self._embedding_to_blob(
+            observation.get("evidence_centroid_embedding")
+        )
 
         def _do(conn):
             cursor = conn.execute(
                 "INSERT INTO memory_observations "
                 "(evidence_bundle_id, observation_type, summary, evidence_mode, "
-                "confidence, status, embedding, embedding_text, metadata, "
-                "created_at, updated_at, last_supported_at) "
-                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+                "confidence, status, embedding, embedding_text, "
+                "evidence_centroid_embedding, metadata, created_at, updated_at, "
+                "last_supported_at) "
+                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     int(evidence_bundle_id),
                     observation_type,
@@ -5480,6 +5510,7 @@ class SessionDB:
                     confidence,
                     embedding,
                     embedding_text,
+                    evidence_centroid_embedding,
                     json.dumps(metadata, ensure_ascii=False),
                     now_text,
                     now_text,
@@ -5508,17 +5539,22 @@ class SessionDB:
         source_node_ids: List[int],
         embedding: Optional[np.ndarray],
         embedding_text: str,
+        evidence_centroid_embedding: Optional[np.ndarray],
         metadata: Dict[str, Any],
     ) -> None:
         """Update an observation in place while preserving its stable identity."""
         clean_source_ids = self._json_int_list(source_node_ids)
         now_text = datetime.now().astimezone().isoformat()
         embedding_blob = self._embedding_to_blob(embedding)
+        evidence_centroid_blob = self._embedding_to_blob(
+            evidence_centroid_embedding
+        )
         confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
 
         def _do(conn):
             existing = conn.execute(
-                "SELECT embedding FROM memory_observations WHERE id = ?",
+                "SELECT embedding, evidence_centroid_embedding "
+                "FROM memory_observations WHERE id = ?",
                 (int(observation_id),),
             ).fetchone()
             next_embedding = (
@@ -5526,16 +5562,27 @@ class SessionDB:
                 if embedding_blob is not None
                 else (existing["embedding"] if existing else None)
             )
+            next_evidence_centroid = (
+                evidence_centroid_blob
+                if evidence_centroid_blob is not None
+                else (
+                    existing["evidence_centroid_embedding"]
+                    if existing
+                    else None
+                )
+            )
             conn.execute(
                 "UPDATE memory_observations SET summary = ?, evidence_mode = ?, "
-                "confidence = ?, embedding = ?, embedding_text = ?, metadata = ?, "
-                "updated_at = ?, last_supported_at = ? WHERE id = ?",
+                "confidence = ?, embedding = ?, embedding_text = ?, "
+                "evidence_centroid_embedding = ?, metadata = ?, updated_at = ?, "
+                "last_supported_at = ? WHERE id = ?",
                 (
                     str(summary or "").strip(),
                     str(evidence_mode or "aggregated").strip().lower(),
                     confidence_value,
                     next_embedding,
                     str(embedding_text or summary or "").strip(),
+                    next_evidence_centroid,
                     json.dumps(metadata or {}, ensure_ascii=False),
                     now_text,
                     now_text,
