@@ -2588,7 +2588,7 @@ class MemoryNodeManager:
                 "embedding": centroid,
                 "embedding_text": "\n".join([
                     f"Observation type: {observation_type}",
-                    f"Claim: {summary}",
+                    f"Summary text: {summary}",
                 ]),
                 "metadata": {
                     "source": "evidence_bundle_fact_clustering",
@@ -2739,7 +2739,7 @@ class MemoryNodeManager:
             metadata["last_change_summary"] = change_summary
         embedding_text = "\n".join([
             f"Observation type: {observation_type}",
-            f"Claim: {summary}",
+            f"Summary text: {summary}",
         ])
         return {
             "observation_type": observation_type,

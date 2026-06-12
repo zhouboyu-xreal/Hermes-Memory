@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
-import numpy as np
 import requests
 from dotenv import load_dotenv
 
@@ -31,7 +30,8 @@ if str(REPO_ROOT) not in sys.path:
 from agent.memory_node_manager import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, MemoryNodeManager
 from hermes_cli.config import load_config
 from hermes_constants import get_hermes_home
-from hermes_state import EMBEDDING_DIM, SessionDB
+import hermes_state
+from hermes_state import SessionDB
 
 
 DEFAULT_INPUT = Path("/Users/zhouboyu/Downloads/history_dialogue.json")
@@ -98,23 +98,6 @@ PYTHON_TEST_SAMPLES: List[Dict[str, List[Dict[str, str]]]] = [
 ]
 
 
-class StableEmbeddingClient:
-    """Small deterministic embedding stand-in for store-path isolation."""
-
-    def embed_text(self, text: str) -> np.ndarray:
-        vec = np.zeros((1, EMBEDDING_DIM), dtype=np.float32)
-        encoded = str(text or "").encode("utf-8")
-        if not encoded:
-            vec[0, 0] = 1.0
-            return vec
-        for idx, byte in enumerate(encoded):
-            vec[0, (idx + byte) % EMBEDDING_DIM] += (byte % 17) + 1
-        norm = float(np.linalg.norm(vec))
-        if norm > 0:
-            vec /= norm
-        return vec
-
-
 class StoreFactExtractionManager(MemoryNodeManager):
     """Use real retain extraction, but skip unrelated async graph work."""
 
@@ -128,16 +111,11 @@ class StoreFactExtractionManager(MemoryNodeManager):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self._embedding_client = StableEmbeddingClient()
         self.report_rows = report_rows
         self._test_llm_max_tokens = max(1, int(llm_max_tokens))
         self._test_llm_thinking = str(llm_thinking)
         self._test_llm_json_mode = bool(llm_json_mode)
         self._test_llm_call_count = 0
-
-    def _ensure_embedding_client(self) -> bool:
-        self._embedding_client = StableEmbeddingClient()
-        return True
 
     def _call_llm(self, prompt: str) -> str | None:
         self._test_llm_call_count += 1
@@ -502,6 +480,73 @@ def configure_logging(log_path: Path, log_level: str, manager_log_level: str) ->
         getattr(logging, str(manager_log_level).upper(), logging.INFO)
     )
 
+
+def validate_embedding_runtime(
+    manager: MemoryNodeManager,
+    db: SessionDB,
+    embedding_config: Dict[str, Any],
+) -> None:
+    """Fail early when the test cannot exercise real vector clustering."""
+    logging.info(
+        "Embedding runtime: executable=%s python=%s faiss_available=%s "
+        "faiss_index=%s configured_provider=%s configured_model=%s "
+        "configured_dimensions=%s",
+        sys.executable,
+        sys.version.split()[0],
+        hermes_state._HAS_FAISS,
+        db._memory_faiss_index is not None,
+        embedding_config.get("provider"),
+        embedding_config.get("model"),
+        embedding_config.get("dimensions"),
+    )
+    if not hermes_state._HAS_FAISS or db._memory_faiss_index is None:
+        raise RuntimeError(
+            "FAISS is unavailable in the active Python environment "
+            f"({sys.executable}). Run this script with an environment that "
+            "provides the 'faiss' module."
+        )
+    if not manager._ensure_embedding_client():
+        raise RuntimeError("Failed to initialize the configured embedding client")
+
+    probe = manager._embedding_client.embed_text(
+        "memory embedding runtime validation"
+    )
+    if probe is None:
+        raise RuntimeError(
+            "The configured embedding provider returned no vector. Check "
+            "memory.yaml embedding credentials, base_url, and model."
+        )
+    probe_vector = manager._as_embedding_vector(probe)
+    if probe_vector is None:
+        raise RuntimeError("The configured embedding provider returned an invalid vector")
+    if probe_vector.size != hermes_state.EMBEDDING_DIM:
+        raise RuntimeError(
+            "Embedding dimension mismatch: provider returned "
+            f"{probe_vector.size}, but memory.yaml configured "
+            f"{hermes_state.EMBEDDING_DIM}."
+        )
+    logging.info(
+        "Embedding probe succeeded: dimensions=%s normalized_norm=%.6f",
+        probe_vector.size,
+        float((probe_vector @ probe_vector) ** 0.5),
+    )
+
+
+def log_faiss_state(db: SessionDB, event: str) -> None:
+    index = db._memory_faiss_index
+    logging.info(
+        "FAISS state event=%s ntotal=%s id_map=%s index_path=%s "
+        "index_exists=%s ids_path=%s ids_exists=%s",
+        event,
+        int(index.ntotal) if index is not None else None,
+        len(db._memory_faiss_id_map),
+        db._memory_faiss_save_path,
+        db._memory_faiss_save_path.exists(),
+        db._memory_faiss_ids_path,
+        db._memory_faiss_ids_path.exists(),
+    )
+
+
 def main() -> int:
     load_dotenv(REPO_ROOT / ".env")
     load_dotenv(get_hermes_home() / ".env")
@@ -557,6 +602,12 @@ def main() -> int:
         llm_thinking=args.llm_thinking,
         llm_json_mode=args.llm_json_mode,
     )
+    try:
+        validate_embedding_runtime(manager, db, embedding_config)
+        log_faiss_state(db, "initialized")
+    except Exception:
+        db.close()
+        raise
 
     stored_turns = 0
     stored_facts = 0
@@ -634,6 +685,7 @@ def main() -> int:
                 )
                 
                 if args.enable_reflect and is_last_turn:
+                    log_faiss_state(db, f"before_reflect:{sample_id}")
                     logging.info(
                         "Running reflect after sample %s",
                         sample_id,
@@ -657,6 +709,7 @@ def main() -> int:
                         reflect_report.get("interpretations_generated"),
                     )
     finally:
+        log_faiss_state(db, "finished")
         db.close()
 
     summary = {
