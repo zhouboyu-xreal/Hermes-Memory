@@ -60,7 +60,6 @@ DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
 
 # ── Memory graph relation defaults ────────────────────────────────────────
-
 SEMANTIC_RELATION_TYPE = "semantic"
 TEMPORAL_RELATION_TYPE = "temporal"
 CAUSAL_RELATION_GRAPH_TYPE = "causal"
@@ -84,6 +83,10 @@ OBSERVATION_INTERPRETATION_TYPES = {
     "behavior_pattern": {"behavior_pattern", "inferred_preference"},
     "context": {"insight"},
 }
+# DECAY
+MEMORY_SEMANTIC_FACT_HALF_LIFE_DAYS = 365.0
+MEMORY_EPISODIC_FACT_HALF_LIFE_DAYS = 90.0
+
 
 OBSERVATION_CREATE_PROMPT = """你是长期记忆系统的 observation 生成模块。observation 是 evidence_bundle 内由一组相似事实直接支持的、稳定且可独立演化的具体陈述。
 
@@ -5989,8 +5992,6 @@ class MemoryNodeManager:
         *,
         limit: int = 100,
         reflect_timestamp: Optional[Any] = None,
-        fact_half_life_days: Optional[float] = None,
-        experience_half_life_days: Optional[float] = None,
         task_active_to_paused_days: Optional[float] = None,
         task_stale_days: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -6020,8 +6021,6 @@ class MemoryNodeManager:
                 "limit": limit,
                 "reflect_timestamp": reflect_now.isoformat(),
                 "reflect_date_key": reflect_date_key,
-                "fact_half_life_days": fact_half_life_days,
-                "experience_half_life_days": experience_half_life_days,
                 "task_active_to_paused_days": task_active_to_paused_days,
                 "task_stale_days": task_stale_days,
             })
@@ -6056,9 +6055,10 @@ class MemoryNodeManager:
         report["interpretations_generated"] = self._reflect_generate_interpretations_using_observations(
             report["changed_evidence_bundle_ids"]
         )
+        
         node_decay_report = self._db.memory_reflect_node_decay(
-            fact_half_life_days=fact_half_life_days,
-            experience_half_life_days=experience_half_life_days,
+            fact_half_life_days=MEMORY_SEMANTIC_FACT_HALF_LIFE_DAYS,
+            experience_half_life_days=MEMORY_EPISODIC_FACT_HALF_LIFE_DAYS,
             now=reflect_now,
         )
         task_inactivity_report = self._db.memory_reflect_task_inactivity(
