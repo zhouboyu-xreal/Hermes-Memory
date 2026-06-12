@@ -322,18 +322,11 @@ CREATE TABLE IF NOT EXISTS memory_evidence_bundles (
     topic_key TEXT NOT NULL,
     topic_label TEXT NOT NULL,
     bundle_type TEXT NOT NULL DEFAULT 'entity_topic',
-    summary TEXT NOT NULL,
-    keywords TEXT NOT NULL,
-    confidence REAL DEFAULT 1.0,
-    status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     last_supported_at TEXT,
     source_time_start TEXT,
     source_time_end TEXT,
-    embedding BLOB,
-    embedding_text TEXT NOT NULL DEFAULT '',
-    embedding_updated_at TEXT,
     metadata TEXT DEFAULT '{}'
 );
 
@@ -346,10 +339,7 @@ CREATE TABLE IF NOT EXISTS memory_evidence_bundle_sources (
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_evidence_bundles_entity_topic
-ON memory_evidence_bundles(entity_id, topic_key, status);
-
-CREATE INDEX IF NOT EXISTS idx_memory_evidence_bundles_status
-ON memory_evidence_bundles(status);
+ON memory_evidence_bundles(entity_id, topic_key, bundle_type);
 
 CREATE INDEX IF NOT EXISTS idx_memory_evidence_bundle_sources_node
 ON memory_evidence_bundle_sources(node_id);
@@ -869,10 +859,11 @@ class SessionDB:
         except sqlite3.OperationalError:
             cursor.executescript(ENTITY_FTS_SQL)
         cursor.executescript(MEMORY_EVIDENCE_BUNDLES_SQL)
+        self._drop_obsolete_evidence_bundle_columns(cursor)
         self._drop_legacy_memory_entity_columns(cursor)
         cursor.executescript(MEMORY_INTERPRETATIONS_SQL)
         cursor.executescript(MEMORY_OBSERVATIONS_SQL)
-        for table_name in ("memory_evidence_bundles", "memory_interpretations"):
+        for table_name in ("memory_interpretations",):
             for col_name, col_type in {
                 "embedding": "BLOB",
                 "embedding_text": "TEXT NOT NULL DEFAULT ''",
@@ -1107,6 +1098,38 @@ class SessionDB:
         except (TypeError, ValueError):
             return None
         return None
+
+    def _drop_obsolete_evidence_bundle_columns(
+        self,
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        """Keep evidence bundles as entity/topic fact containers only."""
+        for index_name in (
+            "idx_memory_evidence_bundles_entity_topic",
+            "idx_memory_evidence_bundles_status",
+        ):
+            cursor.execute(f"DROP INDEX IF EXISTS {index_name}")
+
+        columns = set(self._table_columns(cursor, "memory_evidence_bundles"))
+        for column in (
+            "summary",
+            "keywords",
+            "embedding",
+            "embedding_text",
+            "embedding_updated_at",
+            "confidence",
+            "active",
+            "status",
+        ):
+            if column in columns:
+                cursor.execute(
+                    f"ALTER TABLE memory_evidence_bundles DROP COLUMN {column}"
+                )
+
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_evidence_bundles_entity_topic "
+            "ON memory_evidence_bundles(entity_id, topic_key, bundle_type)"
+        )
 
     def _drop_legacy_memory_entity_columns(self, cursor: sqlite3.Cursor) -> None:
         """Remove old subject/target entity id columns; no legacy data backfill."""
@@ -4975,19 +4998,6 @@ class SessionDB:
         out = list(grouped.values())[:max(1, int(limit or 100))]
         return out
 
-    def memory_active_task_evidence_bundles(self, *, limit: int = 50) -> List[Dict[str, Any]]:
-        """Return active task evidence bundles for fact-to-task matching."""
-        rows = self._conn.execute(
-            "SELECT mo.*, en.name AS entity_name "
-            "FROM memory_evidence_bundles mo "
-            "JOIN entity_nodes en ON en.id = mo.entity_id "
-            "WHERE mo.status = 'active' AND mo.bundle_type = 'task' "
-            "ORDER BY mo.updated_at DESC, mo.id DESC "
-            "LIMIT ?",
-            (max(1, int(limit or 50)),),
-        ).fetchall()
-        return [dict(row) for row in rows]
-
     def memory_evidence_bundle_source_ids(self, evidence_bundle_id: int) -> List[int]:
         """Return all source fact ids for an evidence bundle."""
         rows = self._conn.execute(
@@ -5011,7 +5021,7 @@ class SessionDB:
         return [int(row["node_id"]) for row in rows]
 
     def get_evidence_bundles_by_ids(self, evidence_bundle_ids: List[int]) -> List[Dict[str, Any]]:
-        """Return active evidence bundles by id, including entity names."""
+        """Return evidence bundle containers by id, including entity names."""
         clean_ids = self._json_int_list(evidence_bundle_ids)
         if not clean_ids:
             return []
@@ -5020,7 +5030,7 @@ class SessionDB:
             "SELECT mo.*, en.name AS entity_name "
             "FROM memory_evidence_bundles mo "
             "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
-            f"WHERE mo.id IN ({placeholders}) AND mo.status = 'active'",
+            f"WHERE mo.id IN ({placeholders})",
             clean_ids,
         ).fetchall()
         by_id = {int(row["id"]): dict(row) for row in rows}
@@ -5544,57 +5554,6 @@ class SessionDB:
 
         self._execute_write(_do)
 
-    def memory_update_evidence_bundle_summary(
-        self,
-        evidence_bundle_id: int,
-        *,
-        summary: str,
-        embedding: Optional[np.ndarray] = None,
-        embedding_text: Optional[str] = None,
-    ) -> None:
-        """Update the deterministic summary derived from active observations."""
-        now_text = datetime.now().astimezone().isoformat()
-        embedding_blob = self._embedding_to_blob(embedding)
-
-        def _do(conn):
-            existing = conn.execute(
-                "SELECT embedding, embedding_text, embedding_updated_at "
-                "FROM memory_evidence_bundles WHERE id = ?",
-                (int(evidence_bundle_id),),
-            ).fetchone()
-            if not existing:
-                return
-            next_embedding = (
-                embedding_blob
-                if embedding_blob is not None
-                else existing["embedding"]
-            )
-            next_embedding_text = (
-                str(embedding_text or "").strip()
-                if embedding_text is not None
-                else (existing["embedding_text"] or "")
-            )
-            next_embedding_updated_at = (
-                now_text
-                if embedding_blob is not None
-                else existing["embedding_updated_at"]
-            )
-            conn.execute(
-                "UPDATE memory_evidence_bundles SET summary = ?, updated_at = ?, "
-                "embedding = ?, embedding_text = ?, embedding_updated_at = ? "
-                "WHERE id = ?",
-                (
-                    str(summary or "").strip(),
-                    now_text,
-                    next_embedding,
-                    next_embedding_text,
-                    next_embedding_updated_at,
-                    int(evidence_bundle_id),
-                ),
-            )
-
-        self._execute_write(_do)
-
     def memory_update_observation_metadata(
         self,
         observation_id: int,
@@ -5653,13 +5612,8 @@ class SessionDB:
         entity_id: int,
         topic_key: str,
         topic_label: str,
-        bundle_type: str,
-        summary: str,
-        keywords: List[str],
         source_node_ids: List[int],
-        confidence: float = 1.0,
-        embedding: Optional[np.ndarray] = None,
-        embedding_text: Optional[str] = None,
+        bundle_type: str = "entity_topic",
         metadata: Optional[Dict[str, Any]] = None,
         source_role: str = "initial",
     ) -> int:
@@ -5686,51 +5640,28 @@ class SessionDB:
         source_time_start = time_rows["start_time"] if time_rows else None
         source_time_end = time_rows["end_time"] if time_rows else None
         now_text = datetime.now().astimezone().isoformat()
-        keywords_str = " ".join(keywords) if isinstance(keywords, list) else str(keywords or "")
         metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
-        confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
-        embedding_blob = self._embedding_to_blob(embedding)
-        clean_embedding_text = None if embedding_text is None else str(embedding_text or "").strip()
 
         def _do(conn):
             existing = conn.execute(
-                "SELECT id, embedding, embedding_text, embedding_updated_at FROM memory_evidence_bundles "
-                "WHERE entity_id = ? AND topic_key = ? AND bundle_type = ? AND status = 'active' "
+                "SELECT id FROM memory_evidence_bundles "
+                "WHERE entity_id = ? AND topic_key = ? AND bundle_type = ? "
                 "ORDER BY updated_at DESC, id DESC LIMIT 1",
                 (entity_id, topic_key, bundle_type),
             ).fetchone()
             if existing:
                 evidence_bundle_id = existing["id"] if isinstance(existing, sqlite3.Row) else existing[0]
-                next_embedding = embedding_blob if embedding_blob is not None else existing["embedding"]
-                next_embedding_text = (
-                    clean_embedding_text
-                    if clean_embedding_text is not None
-                    else (existing["embedding_text"] or "")
-                )
-                next_embedding_updated_at = (
-                    now_text
-                    if embedding_blob is not None
-                    else existing["embedding_updated_at"]
-                )
                 conn.execute(
                     "UPDATE memory_evidence_bundles SET "
-                    "topic_label = ?, summary = ?, keywords = ?, confidence = ?, "
-                    "updated_at = ?, last_supported_at = ?, source_time_start = ?, "
-                    "source_time_end = ?, embedding = ?, embedding_text = ?, "
-                    "embedding_updated_at = ?, metadata = ? "
+                    "topic_label = ?, updated_at = ?, last_supported_at = ?, "
+                    "source_time_start = ?, source_time_end = ?, metadata = ? "
                     "WHERE id = ?",
                     (
                         topic_label,
-                        summary,
-                        keywords_str,
-                        confidence_value,
                         now_text,
                         now_text,
                         source_time_start,
                         source_time_end,
-                        next_embedding,
-                        next_embedding_text,
-                        next_embedding_updated_at,
                         metadata_str,
                         evidence_bundle_id,
                     ),
@@ -5738,27 +5669,19 @@ class SessionDB:
             else:
                 cursor = conn.execute(
                     "INSERT INTO memory_evidence_bundles "
-                    "(entity_id, topic_key, topic_label, bundle_type, summary, keywords, "
-                    "confidence, status, created_at, updated_at, last_supported_at, "
-                    "source_time_start, source_time_end, embedding, embedding_text, "
-                    "embedding_updated_at, metadata) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(entity_id, topic_key, topic_label, bundle_type, created_at, "
+                    "updated_at, last_supported_at, source_time_start, source_time_end, metadata) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         entity_id,
                         topic_key,
                         topic_label,
                         bundle_type,
-                        summary,
-                        keywords_str,
-                        confidence_value,
                         now_text,
                         now_text,
                         now_text,
                         source_time_start,
                         source_time_end,
-                        embedding_blob,
-                        clean_embedding_text or "",
-                        now_text if embedding_blob is not None else None,
                         metadata_str,
                     ),
                 )
@@ -5767,7 +5690,7 @@ class SessionDB:
                 conn.execute(
                     "INSERT OR IGNORE INTO memory_evidence_bundle_sources "
                     "(evidence_bundle_id, node_id, role, confidence) VALUES (?, ?, ?, ?)",
-                    (evidence_bundle_id, node_id, clean_source_role, confidence_value),
+                    (evidence_bundle_id, node_id, clean_source_role, 1.0),
                 )
             return evidence_bundle_id
 
@@ -5787,14 +5710,14 @@ class SessionDB:
         if bundle_type:
             evidence_bundle = self._conn.execute(
                 "SELECT * FROM memory_evidence_bundles "
-                "WHERE entity_id = ? AND topic_key = ? AND bundle_type = ? AND status = 'active' "
+                "WHERE entity_id = ? AND topic_key = ? AND bundle_type = ? "
                 "ORDER BY updated_at DESC, id DESC LIMIT 1",
                 (entity_id, topic_key, bundle_type),
             ).fetchone()
         else:
             evidence_bundle = self._conn.execute(
                 "SELECT * FROM memory_evidence_bundles "
-                "WHERE entity_id = ? AND topic_key = ? AND status = 'active' "
+                "WHERE entity_id = ? AND topic_key = ? "
                 "ORDER BY updated_at DESC, id DESC LIMIT 1",
                 (entity_id, topic_key),
             ).fetchone()
@@ -5834,102 +5757,17 @@ class SessionDB:
         *,
         entity_id: int,
         topic_key: str,
-        query_embedding: Optional[np.ndarray] = None,
     ) -> List[Dict[str, Any]]:
-        """Return active evidence bundles for one exact entity/topic pair."""
+        """Return evidence bundle containers for one exact entity/topic pair."""
         rows = self._conn.execute(
             "SELECT mo.*, en.name AS entity_name "
             "FROM memory_evidence_bundles mo "
             "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
-            "WHERE mo.entity_id = ? AND mo.topic_key = ? AND mo.status = 'active' "
+            "WHERE mo.entity_id = ? AND mo.topic_key = ? "
             "ORDER BY mo.updated_at DESC, mo.id DESC",
             (int(entity_id), str(topic_key)),
         ).fetchall()
-        evidence_bundles: List[Dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            embedding_similarity = self._embedding_similarity(
-                query_embedding,
-                item.get("embedding"),
-            )
-            if embedding_similarity is not None:
-                item["embedding_similarity"] = round(float(embedding_similarity), 4)
-            item.pop("embedding", None)
-            evidence_bundles.append(item)
-        return evidence_bundles
-
-    def search_memory_evidence_bundles(
-        self,
-        keyword: Any,
-        *,
-        entities: Optional[List[Any]] = None,
-        top_k: int = 3,
-        entity_ids: Optional[List[int]] = None,
-        query_embedding: Optional[np.ndarray] = None,
-    ) -> List[Dict[str, Any]]:
-        """Search active evidence bundles by keyword/topic/entity."""
-        keyword_query = " ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
-        terms = [term.strip().lower() for term in re.split(r"\s+|OR", keyword_query) if term.strip()]
-        weak_terms = {"父亲", "母亲", "爸爸", "妈妈", "家人", "家庭", "用户", "偏好", "喜欢", "信息", "记录"}
-        entity_terms: List[str] = []
-        for entity in entities or []:
-            if isinstance(entity, dict):
-                name = str(entity.get("name", "")).strip()
-            else:
-                name = str(entity or "").strip()
-            if name:
-                entity_terms.append(name.lower())
-        params: List[Any] = []
-        where = ["status = 'active'"]
-        if entity_ids:
-            placeholders = ",".join("?" for _ in entity_ids)
-            where.append(f"entity_id IN ({placeholders})")
-            params.extend(entity_ids)
-        rows = self._conn.execute(
-            "SELECT mo.*, en.name AS entity_name "
-            "FROM memory_evidence_bundles mo "
-            "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
-            f"WHERE {' AND '.join(where)}",
-            params,
-        ).fetchall()
-        scored: List[Tuple[float, Dict[str, Any]]] = []
-        for row in rows:
-            item = dict(row)
-            entity_name_text = str(item.get("entity_name", "") or "").lower()
-            haystack = f"{item.get('summary', '')} {item.get('keywords', '')} {item.get('topic_label', '')} {entity_name_text}".lower()
-            matched_terms = [term for term in terms if term in haystack]
-            strong_keyword_matches = sum(1 for term in matched_terms if term not in weak_terms)
-            weak_keyword_matches = len(matched_terms) - strong_keyword_matches
-            entity_matches = sum(
-                1
-                for term in entity_terms
-                if term in entity_name_text or term in haystack
-            )
-            embedding_similarity = self._embedding_similarity(query_embedding, item.get("embedding"))
-            embedding_match = embedding_similarity is not None and embedding_similarity >= 0.35
-            strong_embedding_match = embedding_similarity is not None and embedding_similarity >= 0.55
-            if terms or entity_terms:
-                if entity_terms:
-                    if entity_matches <= 0 and strong_keyword_matches < 2 and not strong_embedding_match:
-                        continue
-                elif strong_keyword_matches <= 0 and len(matched_terms) < 2 and not embedding_match:
-                    continue
-            else:
-                strong_keyword_matches = 1
-            embedding_score = max(0.0, float(embedding_similarity or 0.0))
-            score = (
-                strong_keyword_matches
-                + (weak_keyword_matches * 0.25)
-                + (entity_matches * 1.5)
-                + (embedding_score * 1.4)
-                + float(item.get("confidence") or 0.0)
-            )
-            if embedding_similarity is not None:
-                item["embedding_similarity"] = round(float(embedding_similarity), 4)
-            item.pop("embedding", None)
-            scored.append((score, item))
-        scored.sort(key=lambda pair: (pair[0], pair[1].get("last_supported_at") or ""), reverse=True)
-        return [item for _, item in scored[:top_k]]
+        return [dict(row) for row in rows]
 
     def get_evidence_bundle_supporting_nodes(
         self,
@@ -5979,9 +5817,9 @@ class SessionDB:
         self,
         entity_ids: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
-        """Return duplicate active evidence bundles grouped by entity/topic/type."""
+        """Return duplicate evidence bundles grouped by entity/topic/type."""
         params: List[Any] = []
-        where = ["mo.status = 'active'"]
+        where: List[str] = []
         if entity_ids:
             placeholders = ",".join("?" for _ in entity_ids)
             where.append(f"mo.entity_id IN ({placeholders})")
@@ -5990,7 +5828,7 @@ class SessionDB:
             "SELECT mo.*, en.name AS entity_name "
             "FROM memory_evidence_bundles mo "
             "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
-            f"WHERE {' AND '.join(where)} "
+            f"{'WHERE ' + ' AND '.join(where) if where else ''} "
             "ORDER BY mo.entity_id, mo.topic_key, mo.bundle_type, mo.updated_at DESC, mo.id DESC",
             params,
         ).fetchall()
@@ -6099,140 +5937,6 @@ class SessionDB:
             "experience_half_life_days": experience_half_life,
             "evaluated_at": evaluated_at,
             "nodes": nodes,
-        }
-
-    def memory_reflect_evidence_bundle_decay(
-        self,
-        *,
-        threshold: Optional[float] = None,
-        now: Optional[datetime] = None,
-    ) -> Dict[str, Any]:
-        """Evaluate active evidence bundles using source-node decay scores.
-
-        The reflect step should call ``memory_reflect_node_decay`` first so the
-        source scores represent the current maintenance run.  The aggregate keeps a
-        small "fresh support" component so one recent supporting source can keep
-        an evidence bundle alive even when it also has many older sources.
-        """
-        decay_threshold = max(
-            0.0,
-            min(1.0, float(threshold if threshold is not None else self._MEMORY_OBSERVATION_DECAY_THRESHOLD)),
-        )
-        now_dt = now or datetime.now().astimezone()
-        rows = self._conn.execute(
-            "SELECT mo.id AS evidence_bundle_id, "
-            "mo.metadata AS evidence_bundle_metadata, "
-            "mos.confidence AS source_confidence, mn.id AS node_id, mn.fact_type, "
-            "mn.decay_score, mn.decay_updated_at, mn.decay_half_life_days "
-            "FROM memory_evidence_bundles mo "
-            "LEFT JOIN memory_evidence_bundle_sources mos ON mos.evidence_bundle_id = mo.id "
-            "LEFT JOIN memory_nodes mn ON mn.id = mos.node_id "
-            "WHERE mo.status = 'active' "
-            "ORDER BY mo.id, mn.time_key DESC, mn.id DESC"
-        ).fetchall()
-
-        grouped: Dict[int, Dict[str, Any]] = {}
-        for row in rows:
-            evidence_bundle_id = int(row["evidence_bundle_id"])
-            group = grouped.setdefault(
-                evidence_bundle_id,
-                {
-                    "id": evidence_bundle_id,
-                    "metadata": row["evidence_bundle_metadata"],
-                    "sources": [],
-                },
-            )
-            if row["node_id"] is None:
-                continue
-            fact_type = self._normalize_memory_fact_type(row["fact_type"])
-            try:
-                score = float(row["decay_score"] if row["decay_score"] is not None else 1.0)
-            except (TypeError, ValueError):
-                score = 1.0
-            try:
-                confidence = float(row["source_confidence"] or 1.0)
-            except (TypeError, ValueError):
-                confidence = 1.0
-            group["sources"].append({
-                "node_id": int(row["node_id"]),
-                "fact_type": fact_type,
-                "score": score,
-                "confidence": max(0.0, confidence),
-                "decay_updated_at": row["decay_updated_at"],
-                "decay_half_life_days": row["decay_half_life_days"],
-            })
-
-        evaluated: List[Dict[str, Any]] = []
-        for evidence_bundle_id, group in grouped.items():
-            sources = group["sources"]
-            if not sources:
-                average_score = 0.0
-                max_score = 0.0
-                combined_score = 0.0
-            else:
-                weights = [
-                    source["confidence"] if source["confidence"] > 0 else 1.0
-                    for source in sources
-                ]
-                total_weight = sum(weights) or float(len(sources))
-                average_score = sum(
-                    source["score"] * weight
-                    for source, weight in zip(sources, weights)
-                ) / total_weight
-                max_score = max(source["score"] for source in sources)
-                combined_score = (0.70 * average_score) + (0.30 * max_score)
-            action = "deactivate" if combined_score < decay_threshold else "keep"
-            evaluated.append({
-                "id": evidence_bundle_id,
-                "action": action,
-                "score": combined_score,
-                "average_score": average_score,
-                "max_score": max_score,
-                "source_count": len(sources),
-            })
-
-        to_deactivate = [item for item in evaluated if item["action"] == "deactivate"]
-
-        if evaluated:
-            evaluated_at = now_dt.isoformat()
-
-            def _do(conn):
-                for item in evaluated:
-                    evidence_bundle_id = int(item["id"])
-                    metadata_row = grouped[evidence_bundle_id].get("metadata")
-                    try:
-                        metadata = json.loads(metadata_row or "{}")
-                    except json.JSONDecodeError:
-                        metadata = {}
-                    metadata["decay"] = {
-                        "score": item["score"],
-                        "average_score": item["average_score"],
-                        "max_score": item["max_score"],
-                        "threshold": decay_threshold,
-                        "source_count": item["source_count"],
-                        "evaluated_at": evaluated_at,
-                    }
-                    metadata_str = json.dumps(metadata, ensure_ascii=False)
-                    if item["action"] == "deactivate":
-                        conn.execute(
-                            "UPDATE memory_evidence_bundles SET status = 'inactive', metadata = ?, updated_at = ? "
-                            "WHERE id = ?",
-                            (metadata_str, evaluated_at, evidence_bundle_id),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE memory_evidence_bundles SET metadata = ? WHERE id = ?",
-                            (metadata_str, evidence_bundle_id),
-                        )
-
-            self._execute_write(_do)
-
-        return {
-            "evaluated": len(evaluated),
-            "inactivated": len(to_deactivate),
-            "would_inactivate": len(to_deactivate),
-            "threshold": decay_threshold,
-            "evidence_bundles": evaluated,
         }
 
     def memory_reflect_task_inactivity(
@@ -6366,13 +6070,8 @@ class SessionDB:
         *,
         keep_evidence_bundle_id: int,
         remove_evidence_bundle_ids: List[int],
-        bundle_type: str,
-        summary: str,
-        keywords: List[str],
-        confidence: float,
         source_node_ids: List[int],
-        embedding: Optional[np.ndarray] = None,
-        embedding_text: Optional[str] = None,
+        bundle_type: str = "entity_topic",
         metadata: Optional[Dict[str, Any]] = None,
         source_roles: Optional[Dict[int, str]] = None,
     ) -> None:
@@ -6401,11 +6100,7 @@ class SessionDB:
             clean_source_ids,
         ).fetchone()
         now_text = datetime.now().astimezone().isoformat()
-        keywords_str = " ".join(keywords) if isinstance(keywords, list) else str(keywords or "")
-        confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
         metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
-        embedding_blob = self._embedding_to_blob(embedding)
-        clean_embedding_text = None if embedding_text is None else str(embedding_text or "").strip()
         source_time_start = time_rows["start_time"] if time_rows else None
         source_time_end = time_rows["end_time"] if time_rows else None
 
@@ -6427,41 +6122,17 @@ class SessionDB:
                 previous = existing_source_roles.get(node_id)
                 if previous is None or role_priority[role] > role_priority[previous]:
                     existing_source_roles[node_id] = role
-            existing = conn.execute(
-                "SELECT embedding, embedding_text, embedding_updated_at "
-                "FROM memory_evidence_bundles WHERE id = ?",
-                (keep_evidence_bundle_id,),
-            ).fetchone()
-            next_embedding = embedding_blob if embedding_blob is not None else (existing["embedding"] if existing else None)
-            next_embedding_text = (
-                clean_embedding_text
-                if clean_embedding_text is not None
-                else ((existing["embedding_text"] or "") if existing else "")
-            )
-            next_embedding_updated_at = (
-                now_text
-                if embedding_blob is not None
-                else (existing["embedding_updated_at"] if existing else None)
-            )
             conn.execute(
                 "UPDATE memory_evidence_bundles SET "
-                "bundle_type = ?, summary = ?, keywords = ?, confidence = ?, "
-                "updated_at = ?, last_supported_at = ?, source_time_start = ?, "
-                "source_time_end = ?, embedding = ?, embedding_text = ?, "
-                "embedding_updated_at = ?, metadata = ? "
+                "bundle_type = ?, updated_at = ?, last_supported_at = ?, "
+                "source_time_start = ?, source_time_end = ?, metadata = ? "
                 "WHERE id = ?",
                 (
                     bundle_type,
-                    summary,
-                    keywords_str,
-                    confidence_value,
                     now_text,
                     now_text,
                     source_time_start,
                     source_time_end,
-                    next_embedding,
-                    next_embedding_text,
-                    next_embedding_updated_at,
                     metadata_str,
                     keep_evidence_bundle_id,
                 ),
@@ -6516,7 +6187,7 @@ class SessionDB:
                 conn.execute(
                     "INSERT OR IGNORE INTO memory_evidence_bundle_sources "
                     "(evidence_bundle_id, node_id, role, confidence) VALUES (?, ?, ?, ?)",
-                    (keep_evidence_bundle_id, node_id, role, confidence_value),
+                    (keep_evidence_bundle_id, node_id, role, 1.0),
                 )
 
         self._execute_write(_do)

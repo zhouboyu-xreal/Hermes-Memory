@@ -867,8 +867,17 @@ def test_reflect_if_due_async_runs_after_queued_store(db):
         memory_config={"reflect_interval_seconds": 3600},
     )
     events = []
+    reflect_calls = []
     release_store = threading.Event()
     store_started = threading.Event()
+    reflect_timestamp = datetime(
+        2026,
+        6,
+        12,
+        9,
+        30,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
 
     def fake_store_turn(*_args, **_kwargs):
         events.append("store-start")
@@ -877,23 +886,32 @@ def test_reflect_if_due_async_runs_after_queued_store(db):
         events.append("store-finish")
         return True
 
-    def fake_reflect(*_args, **_kwargs):
+    def fake_reflect(*_args, **kwargs):
         events.append("reflect")
+        reflect_calls.append(kwargs)
         return {"merged": 0}
 
     mgr.store_turn = fake_store_turn
     mgr.reflect = fake_reflect
-    db.get_unobserved_nodes_for_observation = lambda **_kwargs: [{"node_id": 1}]
+    db.get_unprocessed_facts_for_evidence_bundle = (
+        lambda **_kwargs: [{"node_id": 1}]
+    )
     mgr._last_successful_reflect_at = time.time() - 3601
 
     assert mgr.store_turn_async("第一轮", "回答一") is True
     assert store_started.wait(timeout=1.0)
-    assert mgr.reflect_if_due_async() is True
+    assert mgr.reflect_if_due_async(reflect_timestamp=reflect_timestamp) is True
     assert mgr.reflect_if_due_async() is False
     release_store.set()
     assert mgr.flush_store_queue(timeout=2.0) is True
 
     assert events == ["store-start", "store-finish", "reflect"]
+    assert reflect_calls == [
+        {
+            "limit": 100,
+            "reflect_timestamp": reflect_timestamp,
+        }
+    ]
     assert mgr._reflect_queued_or_running is False
     assert float(db.get_meta("memory_node_last_successful_reflect_at")) > 0
 
@@ -999,6 +1017,14 @@ def test_memory_time_key_uses_local_timezone_offset():
     assert local_offset in key
 
 
+def test_parse_reflect_timestamp_can_be_called_from_instance(db):
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    parsed = mgr._parse_reflect_timestamp("2026-06-12T09:30:00+08:00")
+
+    assert parsed == datetime(2026, 6, 12, 9, 30, tzinfo=timezone(timedelta(hours=8)))
+
+
 def _add_memory_node(
     db,
     *,
@@ -1065,8 +1091,6 @@ def _add_task_interpretation(
             topic_key=topic_key,
             topic_label=topic_label,
             bundle_type="observation",
-            summary=summary,
-            keywords=keywords or [topic_label],
             source_node_ids=source_node_ids,
             metadata={"observation_kind": "timeline"},
         )
@@ -1690,12 +1714,27 @@ def test_resolve_recall_intent_prefers_confident_llm_but_keeps_evidence_override
     ) == "evidence"
 
 
-def test_search_memory_evidence_bundles_uses_entities(db):
+def test_memory_evidence_bundle_schema_contains_only_container_fields(db):
     columns = {
         row["name"]
         for row in db._conn.execute("PRAGMA table_info(memory_evidence_bundles)").fetchall()
     }
-    assert {"embedding", "embedding_text", "embedding_updated_at"}.issubset(columns)
+    assert columns == {
+        "id",
+        "entity_id",
+        "topic_key",
+        "topic_label",
+        "bundle_type",
+        "created_at",
+        "updated_at",
+        "last_supported_at",
+        "source_time_start",
+        "source_time_end",
+        "metadata",
+    }
+
+
+def test_memory_evidence_bundle_upsert_only_maintains_container_and_sources(db):
     node_id = _add_memory_node(
         db,
         time_key="2026-05-01 10:00:00",
@@ -1703,95 +1742,18 @@ def test_search_memory_evidence_bundles_uses_entities(db):
         keywords=["Slack"],
     )
     alice = db.entity_add_entity("Alice", "PERSON")
-    db.memory_upsert_evidence_bundle(
+    bundle_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alerts",
         topic_label="alerts",
-        bundle_type="insight",
-        summary="The user prefers concise escalation notes.",
-        keywords=["escalation"],
         source_node_ids=[node_id],
-        confidence=0.8,
     )
 
-    results = db.search_memory_evidence_bundles(
-        ["unrelated"],
-        entities=[{"name": "Alice", "type": "PERSON"}],
-        top_k=3,
-    )
-
-    assert [row["entity_name"] for row in results] == ["Alice"]
-
-
-def test_search_memory_evidence_bundles_uses_embedding_similarity(db):
-    source_id = _add_memory_node(
-        db,
-        time_key="2026-05-01 10:00:00",
-        summary="The user asked to discuss architecture before code.",
-        keywords=["architecture"],
-    )
-    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
-    matching_id = db.memory_upsert_evidence_bundle(
-        entity_id=hermes,
-        topic_key="workflow",
-        topic_label="workflow",
-        bundle_type="preference",
-        summary="The workflow favors design calibration before implementation.",
-        keywords=["architecture"],
-        source_node_ids=[source_id],
-        confidence=0.8,
-        embedding=np.array([[1.0, 0.0]], dtype=np.float32),
-        embedding_text="design calibration before implementation",
-    )
-    db.memory_upsert_evidence_bundle(
-        entity_id=hermes,
-        topic_key="calendar",
-        topic_label="calendar",
-        bundle_type="insight",
-        summary="Calendar cleanup is unrelated.",
-        keywords=["calendar"],
-        source_node_ids=[source_id],
-        confidence=0.95,
-        embedding=np.array([[0.0, 1.0]], dtype=np.float32),
-        embedding_text="calendar cleanup",
-    )
-
-    results = db.search_memory_evidence_bundles(
-        ["alignment"],
-        top_k=5,
-        query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
-    )
-
-    assert [item["id"] for item in results] == [matching_id]
-    assert results[0]["embedding_similarity"] == pytest.approx(1.0)
-
-
-def test_search_memory_evidence_bundles_rejects_weak_family_term_entity_mismatch(db):
-    node_id = _add_memory_node(
-        db,
-        time_key="2026-05-01 10:00:00",
-        summary="小明父亲退休后保留了自驾游偏好。",
-        keywords=["小明父亲", "退休", "自驾游"],
-    )
-    xiaoming_father = db.entity_add_entity("小明父亲", "PERSON")
-    db.memory_upsert_evidence_bundle(
-        entity_id=xiaoming_father,
-        topic_key="家庭",
-        topic_label="家庭",
-        bundle_type="insight",
-        summary="小明父亲退休后保留了对开车自驾游和苹果的偏好。",
-        keywords=["退休", "自驾游", "苹果"],
-        source_node_ids=[node_id],
-        confidence=0.7,
-    )
-
-    results = db.search_memory_evidence_bundles(
-        ["父亲", "中学", "校长"],
-        entities=[{"name": "小张父亲", "type": "PERSON"}],
-        top_k=3,
-    )
-
-    assert results == []
+    bundle = db.get_evidence_bundles_by_ids([bundle_id])[0]
+    assert bundle["entity_name"] == "Alice"
+    assert bundle["topic_key"] == "alerts"
+    assert bundle["bundle_type"] == "entity_topic"
+    assert db.memory_evidence_bundle_source_ids(bundle["id"]) == [node_id]
 
 
 def test_entity_link_records_co_entities(db):
@@ -1959,10 +1921,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         topic_key="alerts",
         topic_label="alerts",
         bundle_type="entity_topic",
-        summary="Alice prefers Slack for urgent alerts.",
-        keywords=["Slack", "alerts"],
         source_node_ids=[first_node],
-        confidence=0.8,
         metadata={"observation_kind": "context"},
     )
     second_observation = db.memory_upsert_evidence_bundle(
@@ -1970,10 +1929,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         topic_key="alerts",
         topic_label="alerts",
         bundle_type="entity_topic",
-        summary="Alice routes incident notifications through Slack.",
-        keywords=["Slack", "notifications"],
         source_node_ids=[second_node],
-        confidence=0.75,
         metadata={"observation_kind": "context"},
     )
     mgr = _NoAsyncMemoryNodeManager(
@@ -2079,8 +2035,6 @@ def test_reflect_keeps_insight_and_task_observations_separate(db):
         topic_key="alerts",
         topic_label="alerts",
         bundle_type="insight",
-        summary="Alice prefers Slack for urgent alerts.",
-        keywords=["Slack", "alerts"],
         source_node_ids=[node_ids[0]],
     )
     task_id = db.memory_upsert_evidence_bundle(
@@ -2088,8 +2042,6 @@ def test_reflect_keeps_insight_and_task_observations_separate(db):
         topic_key="alerts",
         topic_label="alerts",
         bundle_type="task",
-        summary="Alice is actively implementing Slack alert routing.",
-        keywords=["Slack", "alerts", "routing"],
         source_node_ids=[node_ids[1]],
         metadata={
             "task_status": "active",
@@ -2109,8 +2061,7 @@ def test_reflect_keeps_insight_and_task_observations_separate(db):
     ]
 
 
-def test_reflect_observation_decay_uses_fact_type_half_lives(db):
-    alice = db.entity_add_entity("Alice", "PERSON")
+def test_reflect_node_decay_uses_fact_type_half_lives_without_mutating_bundles(db):
     world_node = _add_memory_node(
         db,
         time_key="2026-01-01 10:00:00",
@@ -2125,42 +2076,11 @@ def test_reflect_observation_decay_uses_fact_type_half_lives(db):
         keywords=["Alice", "Slack"],
         fact_type="episodic",
     )
-    world_observation = db.memory_upsert_evidence_bundle(
-        entity_id=alice,
-        topic_key="world-alerts",
-        topic_label="world alerts",
-        bundle_type="insight",
-        summary="Alice prefers Slack for urgent alerts.",
-        keywords=["Slack", "alerts"],
-        source_node_ids=[world_node],
-    )
-    experience_observation = db.memory_upsert_evidence_bundle(
-        entity_id=alice,
-        topic_key="experience-alerts",
-        topic_label="experience alerts",
-        bundle_type="insight",
-        summary="Hermes has prior Slack alert routing experience for Alice.",
-        keywords=["Slack", "alerts"],
-        source_node_ids=[experience_node],
-    )
-
     node_report = db.memory_reflect_node_decay(
         fact_half_life_days=365,
         experience_half_life_days=30,
         now=datetime(2026, 4, 1, 0, 0, 0),
     )
-    report = db.memory_reflect_evidence_bundle_decay(
-        threshold=0.3,
-        now=datetime(2026, 4, 1, 0, 0, 0),
-    )
-
-    rows = {
-        row["id"]: row["status"]
-        for row in db._conn.execute(
-            "SELECT id, status FROM memory_evidence_bundles WHERE id IN (?, ?)",
-            (world_observation, experience_observation),
-        ).fetchall()
-    }
     node_scores = {
         row["id"]: row["decay_score"]
         for row in db._conn.execute(
@@ -2170,9 +2090,6 @@ def test_reflect_observation_decay_uses_fact_type_half_lives(db):
     }
     assert node_report["updated"] == 2
     assert node_scores[world_node] > node_scores[experience_node]
-    assert report["inactivated"] == 1
-    assert rows[world_observation] == "active"
-    assert rows[experience_observation] == "inactive"
 
 
 def test_task_inactivity_policy_pauses_and_stales_idle_tasks(db):
@@ -2285,87 +2202,6 @@ def test_memory_node_manager_reflect_reports_task_inactivity(db):
         (interpretation_id,),
     ).fetchone()["metadata"])
     assert metadata["task_status"] == "paused"
-
-
-def test_search_memory_evidence_bundles_ignores_inactive_observations(db):
-    alice = db.entity_add_entity("Alice", "PERSON")
-    active_node = _add_memory_node(
-        db,
-        time_key="2026-05-01 10:00:00",
-        summary="Alice currently prefers Slack for urgent alerts.",
-        keywords=["Alice", "Slack"],
-    )
-    stale_node = _add_memory_node(
-        db,
-        time_key="2000-01-01 10:00:00",
-        summary="Alice once preferred email alerts.",
-        keywords=["Alice", "email"],
-    )
-    active_observation = db.memory_upsert_evidence_bundle(
-        entity_id=alice,
-        topic_key="slack-alerts",
-        topic_label="Slack alerts",
-        bundle_type="insight",
-        summary="Alice currently prefers Slack for urgent alerts.",
-        keywords=["Slack", "alerts"],
-        source_node_ids=[active_node],
-    )
-    inactive_observation = db.memory_upsert_evidence_bundle(
-        entity_id=alice,
-        topic_key="email-alerts",
-        topic_label="email alerts",
-        bundle_type="insight",
-        summary="Alice once preferred email alerts.",
-        keywords=["email", "alerts"],
-        source_node_ids=[stale_node],
-    )
-    db._conn.execute(
-        "UPDATE memory_evidence_bundles SET status = 'inactive' WHERE id = ?",
-        (inactive_observation,),
-    )
-
-    results = db.search_memory_evidence_bundles(["Alice", "alerts"], top_k=5)
-
-    assert [item["id"] for item in results] == [active_observation]
-
-
-def test_memory_node_manager_reflect_inactivates_stale_observations(db):
-    alice = db.entity_add_entity("Alice", "PERSON")
-    old_node = _add_memory_node(
-        db,
-        time_key="2000-01-01 10:00:00",
-        summary="Alice used email alerts long ago.",
-        keywords=["Alice", "email"],
-        fact_type="episodic",
-    )
-    observation_id = db.memory_upsert_evidence_bundle(
-        entity_id=alice,
-        topic_key="email-alerts",
-        topic_label="email alerts",
-        bundle_type="insight",
-        summary="Alice used email alerts long ago.",
-        keywords=["email", "alerts"],
-        source_node_ids=[old_node],
-    )
-    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
-
-    report = mgr.reflect(
-        experience_half_life_days=7,
-        observation_decay_threshold=0.9,
-    )
-
-    row = db._conn.execute(
-        "SELECT mo.status, mn.decay_score "
-        "FROM memory_evidence_bundles mo "
-        "JOIN memory_evidence_bundle_sources mos ON mos.observation_id = mo.id "
-        "JOIN memory_nodes mn ON mn.id = mos.node_id "
-        "WHERE mo.id = ?",
-        (observation_id,),
-    ).fetchone()
-    assert report["node_decay"]["updated"] == 1
-    assert report["evidence_bundles_inactivated"] == 1
-    assert row["status"] == "inactive"
-    assert row["decay_score"] < 0.9
 
 
 def test_recall_formats_semantic_and_episodic_sections(db, monkeypatch):
@@ -2555,8 +2391,6 @@ def test_recall_expands_interpretation_to_evidence_observations(db, monkeypatch)
         topic_key="architecture-first",
         topic_label="Architecture-first workflow",
         bundle_type="entity_topic",
-        summary="Architecture-first workflow evidence.",
-        keywords=["architecture", "discussion"],
         source_node_ids=[source_id],
     )
     observation_id = db.memory_create_observation(
@@ -2657,11 +2491,10 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
         llm_outputs=[
             json.dumps(retain_payload),
             json.dumps({
-                "category": "observation",
+                "observation_type": "context",
                 "summary": "Alice's urgent alert workflow is Slack-centered.",
-                "keywords": ["Slack", "alerts"],
                 "confidence": 0.86,
-                "metadata": {"observation_kind": "context"},
+                "change_summary": "Created from the initial supporting facts.",
             }),
         ],
     )
@@ -2673,14 +2506,19 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
     assert report["evidence_bundles_consolidated"] == 1
     assert report["evidence_bundle_reflect"]["fact_clusters_consolidated"] == 1
 
-    observation = db._conn.execute(
-        "SELECT mo.summary, mo.topic_key, mo.observation_type, mo.metadata, en.name AS entity_name "
-        "FROM memory_evidence_bundles mo "
-        "JOIN entity_nodes en ON en.id = mo.entity_id"
+    bundle = db._conn.execute(
+        "SELECT bundle.*, en.name AS entity_name "
+        "FROM memory_evidence_bundles bundle "
+        "JOIN entity_nodes en ON en.id = bundle.entity_id"
     ).fetchone()
-    assert observation["entity_name"] == "Alice"
-    assert observation["topic_key"] == "slack-alerts"
-    assert observation["observation_type"] == "observation"
+    observation = db._conn.execute(
+        "SELECT summary, observation_type, metadata "
+        "FROM memory_observations WHERE evidence_bundle_id = ?",
+        (bundle["id"],),
+    ).fetchone()
+    assert bundle["entity_name"] == "Alice"
+    assert bundle["topic_key"] == "slack-alerts"
+    assert observation["observation_type"] == "context"
     assert json.loads(observation["metadata"])["observation_kind"] == "context"
     assert observation["summary"] == "Alice's urgent alert workflow is Slack-centered."
     sources = db._conn.execute("SELECT node_id FROM memory_evidence_bundle_sources").fetchall()
@@ -3054,6 +2892,43 @@ def test_cluster_unprocessed_facts_returns_only_structural_fields(db):
     assert clusters[0]["can_create_evidence_bundle"] is True
 
 
+def test_existing_evidence_bundle_match_reuses_cluster_sources(db, monkeypatch):
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    source_nodes = [
+        {"node_id": 11, "summary": "Alice refined alert routing."},
+        {"node_id": 12, "summary": "Alice verified alert routing."},
+    ]
+    cluster = {
+        "entity_id": 1,
+        "entity_name": "Alice",
+        "topic_key": "alert-routing",
+        "topic_label": "alert-routing",
+        "source_nodes": source_nodes,
+        "source_node_ids": [11, 12],
+        "can_create_evidence_bundle": True,
+    }
+    matched_clusters = []
+
+    monkeypatch.setattr(
+        mgr,
+        "_node_id",
+        lambda _node: pytest.fail("cluster source ids should not be rebuilt"),
+    )
+    monkeypatch.setattr(
+        mgr,
+        "_match_fact_cluster_to_existing_evidence_bundle",
+        lambda candidate: matched_clusters.append(candidate) or None,
+    )
+
+    result = mgr._update_existing_evidence_bundle_from_fact_cluster(
+        cluster,
+        consumed_node_ids=set(),
+    )
+
+    assert result is None
+    assert matched_clusters == [cluster]
+
+
 def test_reflect_generates_interpretation_from_consolidated_observation(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     node_ids = []
@@ -3180,8 +3055,6 @@ def test_incremental_observation_update_preserves_identity_and_rebuilds_summary(
         topic_key="alert-routing",
         topic_label="alert routing",
         bundle_type="entity_topic",
-        summary="Temporary container summary.",
-        keywords=["alerts"],
         source_node_ids=[first_node],
     )
     mgr = _NoAsyncMemoryNodeManager(
@@ -3232,8 +3105,6 @@ def test_incremental_observation_update_preserves_identity_and_rebuilds_summary(
         topic_key="alert-routing",
         topic_label="alert routing",
         bundle_type="entity_topic",
-        summary="This value must be replaced from observations.",
-        keywords=["alerts"],
         source_node_ids=[first_node, second_node],
     )
     mgr._llm_outputs.append(json.dumps({
@@ -3289,8 +3160,6 @@ def test_interpretation_generation_skips_observation_without_observations(db):
         topic_key="alert-routing",
         topic_label="alert routing",
         bundle_type="observation",
-        summary="Alice discussed alert routing.",
-        keywords=["alert-routing"],
         source_node_ids=[node_id],
         metadata={},
     )
@@ -3336,8 +3205,6 @@ def test_deferred_interpretation_context_is_loaded_from_observations(db):
             topic_key=f"slack-routing-{index}",
             topic_label=f"Slack routing {index}",
             bundle_type="entity_topic",
-            summary=f"parent observation text {index}",
-            keywords=["parent-only-keyword"],
             source_node_ids=[node_id],
             metadata={"parent_only": True},
         )
@@ -3437,8 +3304,6 @@ def test_interpretation_linker_reuses_existing_observation_evidence_without_llm(
         topic_key="slack-alerts",
         topic_label="Slack alerts",
         bundle_type="observation",
-        summary="Alice's urgent alert workflow is Slack-centered.",
-        keywords=["Slack", "alerts"],
         source_node_ids=[first, second],
         metadata={"observation_kind": "context"},
     )
@@ -3488,8 +3353,6 @@ def test_interpretation_linker_matches_preference_by_entity_topic_without_llm(db
         topic_key="architecture-planning",
         topic_label="architecture planning",
         bundle_type="observation",
-        summary="Alice has repeatedly preferred architecture discussion before implementation.",
-        keywords=["architecture", "planning"],
         source_node_ids=[source],
         metadata={"observation_kind": "event_pattern"},
     )
@@ -3570,8 +3433,6 @@ def test_interpretation_linker_respects_observation_candidate_type_gate(db):
         topic_key="memory-matching",
         topic_label="memory matching",
         bundle_type="observation",
-        summary="用户正在推进 observation 与 interpretation 的匹配实现任务。",
-        keywords=["memory", "matching"],
         source_node_ids=[source],
         metadata={
             "observation_kind": "task_signal",
@@ -3641,8 +3502,6 @@ def test_interpretation_generation_clusters_unmatched_observations(db):
         topic_key="memory-interpretation",
         topic_label="memory interpretation",
         bundle_type="observation",
-        summary="用户要求设计 observation 与 interpretation 的匹配策略。",
-        keywords=["memory", "interpretation"],
         source_node_ids=[first_source],
         metadata={
             "observation_kind": "task_signal",
@@ -3656,8 +3515,6 @@ def test_interpretation_generation_clusters_unmatched_observations(db):
         topic_key="memory-implementation",
         topic_label="memory implementation",
         bundle_type="observation",
-        summary="助手开始实现 observation 与 interpretation 的 cheap matcher。",
-        keywords=["memory", "interpretation"],
         source_node_ids=[second_source],
         metadata={
             "observation_kind": "state_change",
@@ -3730,8 +3587,6 @@ def test_interpretation_generation_defers_weak_single_observation(db):
         topic_key="memory-indexing",
         topic_label="memory indexing",
         bundle_type="observation",
-        summary="Hermes memory recall discussion has indexing context.",
-        keywords=["memory", "indexing"],
         source_node_ids=[source],
         metadata={
             "observation_kind": "context",
@@ -3772,8 +3627,6 @@ def test_interpretation_generation_defers_single_fact_insight_before_llm(db):
         topic_key="memory-recall",
         topic_label="memory recall",
         bundle_type="observation",
-        summary="Hermes memory system changed one recall label.",
-        keywords=["memory", "recall"],
         source_node_ids=[source],
         metadata={
             "observation_kind": "state_change",
@@ -3839,8 +3692,6 @@ def test_interpretation_generation_does_not_use_global_batch_threshold_for_weak_
                 topic_key=f"ordinary-context-{index}",
                 topic_label=f"ordinary context {index}",
                 bundle_type="observation",
-                summary=f"Hermes area {index} has ordinary context.",
-                keywords=[f"area-{index}", "ordinary"],
                 source_node_ids=[source],
                 metadata={
                     "observation_kind": "context",
@@ -3881,8 +3732,6 @@ def test_interpretation_generation_skips_final_observation_when_basis_unchanged(
         topic_key="architecture-notes",
         topic_label="architecture notes",
         bundle_type="observation",
-        summary="Alice prefers brief architecture notes before code changes.",
-        keywords=["architecture", "brief"],
         source_node_ids=[source],
         metadata={
             "observation_kind": "preference_signal",
@@ -3942,8 +3791,6 @@ def test_interpretation_generation_reuses_deferred_observation_in_new_cluster(db
         topic_key="memory-indexing",
         topic_label="memory indexing",
         bundle_type="observation",
-        summary="Hermes memory recall discussion has indexing context.",
-        keywords=["memory", "indexing"],
         source_node_ids=[first_source],
         metadata={
             "observation_kind": "context",
@@ -3960,8 +3807,6 @@ def test_interpretation_generation_reuses_deferred_observation_in_new_cluster(db
         topic_key="memory-indexing",
         topic_label="memory indexing followup",
         bundle_type="observation_followup",
-        summary="Hermes memory recall discussion connected indexing context to recall quality.",
-        keywords=["memory", "indexing", "recall"],
         source_node_ids=[second_source],
         metadata={
             "observation_kind": "context",
@@ -4100,7 +3945,7 @@ def test_store_turn_can_consolidate_task_observation(db):
     assert report["evidence_bundles_consolidated"] == 1
 
     observation = db._conn.execute(
-        "SELECT observation_type, summary, metadata FROM memory_evidence_bundles"
+        "SELECT observation_type, summary, metadata FROM memory_observations"
     ).fetchone()
     metadata = json.loads(observation["metadata"])
     assert observation["observation_type"] == "observation"
@@ -4179,7 +4024,8 @@ def test_reflect_updates_observation_by_entity_and_topic(db):
     assert report["evidence_bundle_reflect"]["entity_topic_node_count"] == 1
     assert db.memory_evidence_bundle_source_ids(observation_id) == [source_node, new_node]
     row = db._conn.execute(
-        "SELECT summary, metadata FROM memory_evidence_bundles WHERE id = ?",
+        "SELECT summary, metadata FROM memory_observations "
+        "WHERE evidence_bundle_id = ? ORDER BY updated_at DESC LIMIT 1",
         (observation_id,),
     ).fetchone()
     assert "reflect 调度机制" in row["summary"]
@@ -4402,8 +4248,6 @@ def test_reflect_updates_existing_observation_by_entity_topic(db):
         topic_key="alert-routing",
         topic_label="alert-routing",
         bundle_type="observation",
-        summary="Alice has an alert routing history.",
-        keywords=["alert-routing"],
         source_node_ids=[old_node],
         metadata={"observation_kind": "timeline"},
     )
@@ -4456,7 +4300,8 @@ def test_reflect_updates_existing_observation_by_entity_topic(db):
         [unrelated_task_node]
     )
     row = db._conn.execute(
-        "SELECT summary, metadata FROM memory_evidence_bundles WHERE id = ?",
+        "SELECT summary, metadata FROM memory_observations "
+        "WHERE evidence_bundle_id = ? ORDER BY updated_at DESC LIMIT 1",
         (observation_id,),
     ).fetchone()
     assert row["summary"] == "Alice has continued refining alert routing over time."
@@ -4481,10 +4326,7 @@ def test_reflect_clusters_facts_before_updating_existing_observation(db):
         topic_key="alert-routing",
         topic_label="alert-routing",
         bundle_type="observation",
-        summary="Alice has an established alert routing workflow.",
-        keywords=["alert-routing", "Slack"],
         source_node_ids=[old_node],
-        confidence=0.82,
         metadata={"observation_kind": "event_cluster"},
     )
     new_nodes = []
@@ -4567,18 +4409,12 @@ def test_fact_cluster_candidates_always_include_exact_entity_topic_observation(d
         entity_id=alice,
         topic_key="alert-routing",
         topic_label="alert-routing",
-        bundle_type="observation",
-        summary="Alice has an alert routing workflow.",
-        keywords=["alert-routing"],
         source_node_ids=[old_node],
     )
     other_topic_observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="health-management",
         topic_label="health-management",
-        bundle_type="observation",
-        summary="Alice has a health management routine.",
-        keywords=["health"],
         source_node_ids=[old_node],
     )
     new_node = _add_memory_node(
@@ -4588,11 +4424,6 @@ def test_fact_cluster_candidates_always_include_exact_entity_topic_observation(d
         keywords=["alert-routing"],
     )
     db.entity_link_node(new_node, alice)
-    monkeypatch.setattr(
-        db,
-        "search_memory_evidence_bundles",
-        lambda *args, **kwargs: pytest.fail("exact cluster matching must not use broad search"),
-    )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
     candidates = mgr._candidate_evidence_bundles_for_fact_cluster({
@@ -4642,8 +4473,6 @@ def test_observation_observations_preserve_fact_to_interpretation_type_mapping(d
         topic_key="alert-routing",
         topic_label="alert routing",
         bundle_type="observation",
-        summary="Alice has several alert routing requirements and activities.",
-        keywords=["alerts"],
         source_node_ids=[task_node, preference_node, constraint_node],
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
@@ -4684,8 +4513,6 @@ def test_observation_type_gate_rejects_incompatible_interpretation(db):
         topic_key="alert-routing",
         topic_label="alert routing",
         bundle_type="observation",
-        summary="Alice has an alert routing preference.",
-        keywords=["alerts"],
         source_node_ids=[node_id],
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
@@ -4734,8 +4561,6 @@ def test_behavioral_preference_observation_only_allows_inferred_preference(db):
         topic_key="alert-routing",
         topic_label="alert routing",
         bundle_type="observation",
-        summary="Alice repeatedly selected Slack for urgent alerts.",
-        keywords=["Slack", "alerts"],
         source_node_ids=node_ids,
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
@@ -4915,8 +4740,6 @@ def test_recall_includes_observations_and_supporting_facts(db, monkeypatch):
         topic_key="slack-alerts",
         topic_label="Slack alerts",
         bundle_type="entity_topic",
-        summary="Slack alert workflow evidence.",
-        keywords=["Slack", "alerts"],
         source_node_ids=source_ids,
     )
     observation_id = db.memory_create_observation(

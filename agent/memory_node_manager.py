@@ -2106,10 +2106,8 @@ class MemoryNodeManager:
             "topic_key": evidence_bundle.get("topic_key"),
             "topic_label": evidence_bundle.get("topic_label"),
             "bundle_type": evidence_bundle.get("bundle_type"),
-            "summary": cls._reflect_log_text(evidence_bundle.get("summary")),
-            "keywords": evidence_bundle.get("keywords"),
-            "confidence": evidence_bundle.get("confidence"),
-            "status": evidence_bundle.get("status"),
+            "source_time_start": evidence_bundle.get("source_time_start"),
+            "source_time_end": evidence_bundle.get("source_time_end"),
             "metadata": metadata,
         }
 
@@ -2755,47 +2753,6 @@ class MemoryNodeManager:
             "metadata": metadata,
         }
 
-    def _refresh_evidence_bundle_summary_from_observations(
-        self,
-        evidence_bundle: Dict[str, Any],
-        observations: List[Dict[str, Any]],
-    ) -> None:
-        """Derive evidence bundle text without another LLM call."""
-        type_order = {
-            "task_state": 0,
-            "task_progress": 1,
-            "decision": 2,
-            "constraint": 3,
-            "problem": 4,
-            "strategy": 5,
-            "preference_signal": 6,
-            "behavior_pattern": 7,
-            "context": 8,
-        }
-        ordered = sorted(
-            (
-                item for item in observations
-                if str(item.get("summary") or "").strip()
-            ),
-            key=lambda item: (
-                type_order.get(str(item.get("observation_type") or ""), 99),
-                str(item.get("updated_at") or ""),
-                int(item.get("id") or 0),
-            ),
-        )
-        summary = "\n".join(
-            str(item.get("summary") or "").strip()
-            for item in ordered
-        )
-        if not summary:
-            return
-        self._db.memory_update_evidence_bundle_summary(
-            int(evidence_bundle["id"]),
-            summary=summary,
-            embedding=self._embed_memory_layer_text(summary),
-            embedding_text=summary,
-        )
-
     def _update_observations_for_evidence_bundles(
         self,
         evidence_bundle_ids: List[int],
@@ -2974,13 +2931,6 @@ class MemoryNodeManager:
                     touched_observation_ids.append(observation_id)
                     bundle_observation_ids.append(observation_id)
 
-            current_observations = self._db.get_observations_for_evidence_bundles(
-                [evidence_bundle_id]
-            )
-            self._refresh_evidence_bundle_summary_from_observations(
-                evidence_bundle,
-                current_observations,
-            )
             self._log_info(
                 "memory_reflect",
                 "evidence_bundle_observations_incrementally_updated",
@@ -3057,48 +3007,6 @@ class MemoryNodeManager:
         winner = sorted(counts.values(), key=lambda item: (-item["count"], item["order"]))[0]
         return int(winner["entity_id"]), str(winner["entity_name"] or "")
         
-    def _build_evidence_bundle_from_facts(
-        self,
-        *,
-        source_nodes: List[Dict[str, Any]],
-        existing_evidence_bundle: Optional[Dict[str, Any]] = None,
-        related_evidence_bundles: Optional[List[Dict[str, Any]]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Build structural fields; observations exclusively own the summary."""
-        summary = str(
-            (existing_evidence_bundle or {}).get("summary") or ""
-        ).strip()
-
-        keywords: List[str] = []
-        for item in [
-            existing_evidence_bundle,
-            *(related_evidence_bundles or []),
-        ]:
-            if not item:
-                continue
-            keywords.extend(
-                self._normalize_keywords(
-                    str(item.get("keywords") or "").split()
-                )
-            )
-        for node in source_nodes:
-            keywords.extend(self._normalize_keywords(node.get("keywords", [])))
-        keywords = list(dict.fromkeys(keywords))
-        return {
-            "summary": summary,
-            "bundle_type": "entity_topic",
-            "keywords": keywords,
-            "confidence": max(
-                [float((existing_evidence_bundle or {}).get("confidence") or 0.0)]
-                + [
-                    float(item.get("confidence") or 0.0)
-                    for item in related_evidence_bundles or []
-                ]
-                + [0.7]
-            ),
-            "metadata": {},
-        }
-
     @staticmethod
     def _filter_int_ids(values: Any, allowed: set[int]) -> List[int]:
         if not isinstance(values, list):
@@ -4878,7 +4786,6 @@ class MemoryNodeManager:
             return self._db.get_evidence_bundles_using_entity_topic(
                 entity_id=entity_id,
                 topic_key=self._topic_key(cluster.get("topic_key") or "general"),
-                query_embedding=None,
             )
         except Exception:
             return []
@@ -4907,29 +4814,33 @@ class MemoryNodeManager:
     ) -> Optional[int]:
         if not self._db:
             return None
-        source_nodes = [
-            fact
-            for fact in cluster.get("source_nodes", [])
-            if (
-                self._node_id(fact) is not None
-                and self._node_id(fact) not in consumed_node_ids
-            )
-        ]
+        source_nodes = list(cluster.get("source_nodes") or [])
         source_node_ids = [
             int(node_id)
-            for node_id in dict.fromkeys(
-                self._node_id(fact)
-                for fact in source_nodes
-                if self._node_id(fact) is not None
-            )
+            for node_id in cluster.get("source_node_ids", [])
+            if node_id is not None
         ]
+        overlapping_node_ids = consumed_node_ids.intersection(source_node_ids)
+        cluster_for_match = cluster
+        if overlapping_node_ids:
+            source_node_ids = [
+                node_id
+                for node_id in source_node_ids
+                if node_id not in overlapping_node_ids
+            ]
+            remaining_node_ids = set(source_node_ids)
+            source_nodes = [
+                fact
+                for fact in source_nodes
+                if self._node_id(fact) in remaining_node_ids
+            ]
+            cluster_for_match = {
+                **cluster,
+                "source_nodes": source_nodes,
+                "source_node_ids": source_node_ids,
+            }
         if not source_node_ids:
             return None
-        cluster_for_match = {
-            **cluster,
-            "source_nodes": source_nodes,
-            "source_node_ids": source_node_ids,
-        }
         match = self._match_fact_cluster_to_existing_evidence_bundle(cluster_for_match)
         if not match:
             return None
@@ -4947,27 +4858,13 @@ class MemoryNodeManager:
             consumed_node_ids.update(source_node_ids)
             return evidence_bundle_id
 
-        generated = self._build_evidence_bundle_from_facts(
-            source_nodes=source_nodes,
-            existing_evidence_bundle=existing_bundle,
-        )
-        if not generated:
-            return None
-        metadata = {}
+        metadata = self._json_dict(existing_bundle.get("metadata", {}))
         stored_source_ids = list(dict.fromkeys(existing_source_ids + pending_source_ids))
-        bundle_keywords = generated["keywords"] or self._normalize_keywords(
-            existing_bundle.get("keywords", "")
-        )
         self._db.memory_replace_evidence_bundle_group(
             keep_evidence_bundle_id=evidence_bundle_id,
             remove_evidence_bundle_ids=[],
-            bundle_type=generated["bundle_type"],
-            summary=generated["summary"],
-            keywords=bundle_keywords,
-            confidence=generated["confidence"],
+            bundle_type=str(existing_bundle.get("bundle_type") or "entity_topic"),
             source_node_ids=stored_source_ids,
-            embedding=None,
-            embedding_text=None,
             metadata=metadata,
             source_roles={
                 node_id: "matched"
@@ -4988,7 +4885,7 @@ class MemoryNodeManager:
             "reason": reason,
             "supporting_facts": self._reflect_fact_log_items(supporting_nodes + source_nodes),
             "updated_evidence_bundle": {
-                **self._reflect_evidence_bundle_log_item(generated),
+                **self._reflect_evidence_bundle_log_item(existing_bundle),
                 "metadata": metadata,
             },
         })
@@ -5085,38 +4982,37 @@ class MemoryNodeManager:
             return None
         if not cluster.get("can_create_evidence_bundle", True):
             return None
-        source_nodes = [
-            fact
-            for fact in cluster.get("source_nodes", [])
-            if (self._node_id(fact) is not None and self._node_id(fact) not in consumed_node_ids)
+        source_nodes = list(cluster.get("source_nodes") or [])
+        source_node_ids = [
+            int(node_id)
+            for node_id in cluster.get("source_node_ids", [])
+            if node_id is not None
         ]
-        source_node_ids = [self._node_id(fact) for fact in source_nodes if self._node_id(fact) is not None]
-        source_node_ids = [int(node_id) for node_id in dict.fromkeys(source_node_ids)]
+        overlapping_node_ids = consumed_node_ids.intersection(source_node_ids)
+        if overlapping_node_ids:
+            source_node_ids = [
+                node_id
+                for node_id in source_node_ids
+                if node_id not in overlapping_node_ids
+            ]
+            remaining_node_ids = set(source_node_ids)
+            source_nodes = [
+                fact
+                for fact in source_nodes
+                if self._node_id(fact) in remaining_node_ids
+            ]
         if len(source_node_ids) < 2:
             return None
 
         entity_id = int(cluster["entity_id"])
         topic_key = str(cluster.get("topic_key") or "general")
-        
-        evidence_bundle = self._build_evidence_bundle_from_facts(
-            source_nodes=source_nodes,
-            existing_evidence_bundle=None,
-        )
-        if not evidence_bundle:
-            return None
         bundle_metadata = {}
-        bundle_keywords = evidence_bundle["keywords"] or [topic_key]
         evidence_bundle_id = self._db.memory_upsert_evidence_bundle(
             entity_id=entity_id,
             topic_key=topic_key,
             topic_label=str(cluster.get("topic_label") or topic_key),
-            bundle_type=evidence_bundle["bundle_type"],
-            summary=evidence_bundle["summary"],
-            keywords=bundle_keywords,
             source_node_ids=source_node_ids,
-            confidence=evidence_bundle["confidence"],
-            embedding=None,
-            embedding_text=None,
+            bundle_type="entity_topic",
             metadata=bundle_metadata,
             source_role="initial",
         )
@@ -5134,7 +5030,7 @@ class MemoryNodeManager:
                 "source_node_ids": source_node_ids,
                 "source_facts": self._reflect_fact_log_items(source_nodes),
                 "generated_evidence_bundle": {
-                    **self._reflect_evidence_bundle_log_item(evidence_bundle),
+                    "bundle_type": "entity_topic",
                     "metadata": bundle_metadata,
                 },
             }
@@ -5392,7 +5288,10 @@ class MemoryNodeManager:
                             "Memory reflect due but skipped: no unobserved facts",
                         )
                         continue
-                    report = self.reflect(limit=int(task.get("limit") or 100))
+                    report = self.reflect(
+                        limit=int(task.get("limit") or 100),
+                        reflect_timestamp=task.get("reflect_timestamp"),
+                    )
                     if not report.get("error"):
                         completed_at = time.time()
                         with self._store_worker_lock:
@@ -5509,6 +5408,7 @@ class MemoryNodeManager:
         self,
         *,
         limit: int = 100,
+        reflect_timestamp: Optional[Any] = None,
         llm_client: Any = None,
         llm_model: Optional[str] = None,
         llm_base_url: Optional[str] = None,
@@ -5543,6 +5443,7 @@ class MemoryNodeManager:
             task = {
                 "kind": "reflect",
                 "limit": max(1, int(limit or 100)),
+                "reflect_timestamp": reflect_timestamp,
                 "llm_config": self._llm_config_snapshot(
                     llm_client=llm_client,
                     llm_model=llm_model,
@@ -5877,22 +5778,8 @@ class MemoryNodeManager:
         if not source_ids:
             return False
         keep_bundle = evidence_bundles[0]
-        related_bundles = evidence_bundles[1:]
-        prompt_source_nodes = group.get("pending_source_nodes", [])
-        generated = self._build_evidence_bundle_from_facts(
-            source_nodes=prompt_source_nodes,
-            existing_evidence_bundle=keep_bundle,
-            related_evidence_bundles=related_bundles,
-        )
-        if not generated:
-            return False
-        bundle_type = generated["bundle_type"]
-        metadata = {}
-        keywords = generated["keywords"]
-        if not keywords:
-            for item in evidence_bundles:
-                keywords.extend(self._normalize_keywords(str(item.get("keywords", "")).split()))
-            keywords = list(dict.fromkeys(keywords))
+        bundle_type = str(keep_bundle.get("bundle_type") or "entity_topic")
+        metadata = self._json_dict(keep_bundle.get("metadata", {}))
         remove_ids = [
             int(evidence_bundle["id"])
             for evidence_bundle in evidence_bundles[1:]
@@ -5914,10 +5801,7 @@ class MemoryNodeManager:
                 ],
                 "supporting_facts": self._reflect_fact_log_items(source_nodes),
                 "merged_evidence_bundle": {
-                    "summary": self._reflect_log_text(generated["summary"]),
                     "bundle_type": bundle_type,
-                    "keywords": keywords,
-                    "confidence": generated["confidence"],
                     "metadata": metadata,
                 },
             })
@@ -5925,12 +5809,7 @@ class MemoryNodeManager:
             keep_evidence_bundle_id=int(keep_bundle["id"]),
             remove_evidence_bundle_ids=remove_ids,
             bundle_type=bundle_type,
-            summary=generated["summary"],
-            keywords=keywords,
-            confidence=generated["confidence"],
             source_node_ids=source_ids,
-            embedding=None,
-            embedding_text=None,
             metadata=metadata,
             source_roles={
                 int(node_id): "matched"
@@ -6075,10 +5954,10 @@ class MemoryNodeManager:
             "changed_evidence_bundle_ids": list(dict.fromkeys(changed_evidence_bundle_ids)),
         }
 
+    @staticmethod
     def _parse_reflect_timestamp(
         reflect_timestamp: Optional[Any] = None,
-    ):
-        
+    ) -> datetime:
         if reflect_timestamp is None:
             reflect_now = datetime.now().astimezone()
         elif isinstance(reflect_timestamp, datetime):
@@ -6103,7 +5982,7 @@ class MemoryNodeManager:
                     reflect_timestamp,
                 )
                 reflect_now = datetime.now().astimezone()
-        return reflect_now 
+        return reflect_now
 
     def reflect(
         self,
@@ -6112,7 +5991,6 @@ class MemoryNodeManager:
         reflect_timestamp: Optional[Any] = None,
         fact_half_life_days: Optional[float] = None,
         experience_half_life_days: Optional[float] = None,
-        observation_decay_threshold: Optional[float] = None,
         task_active_to_paused_days: Optional[float] = None,
         task_stale_days: Optional[float] = None,
     ) -> Dict[str, Any]:
@@ -6144,7 +6022,6 @@ class MemoryNodeManager:
                 "reflect_date_key": reflect_date_key,
                 "fact_half_life_days": fact_half_life_days,
                 "experience_half_life_days": experience_half_life_days,
-                "observation_decay_threshold": observation_decay_threshold,
                 "task_active_to_paused_days": task_active_to_paused_days,
                 "task_stale_days": task_stale_days,
             })
@@ -6184,20 +6061,13 @@ class MemoryNodeManager:
             experience_half_life_days=experience_half_life_days,
             now=reflect_now,
         )
-        decay_report = self._db.memory_reflect_evidence_bundle_decay(
-            threshold=observation_decay_threshold,
-            now=reflect_now,
-        )
         task_inactivity_report = self._db.memory_reflect_task_inactivity(
             active_to_paused_days=task_active_to_paused_days,
             stale_days=task_stale_days,
             now=reflect_now,
         )
         report["node_decay"] = node_decay_report
-        report["evidence_bundle_decay"] = decay_report
         report["task_inactivity"] = task_inactivity_report
-        report["evidence_bundles_inactivated"] = decay_report.get("inactivated", 0)
-        report["evidence_bundles_would_inactivate"] = decay_report.get("would_inactivate", 0)
         report["tasks_paused"] = task_inactivity_report.get("paused", 0)
         report["tasks_stale"] = task_inactivity_report.get("stale", 0)
         self._log_info(
@@ -6211,10 +6081,6 @@ class MemoryNodeManager:
                 "evidence_bundle_groups_merged": report.get("evidence_bundle_groups_merged", 0),
                 "observations_updated": report.get("observations_updated", 0),
                 "interpretations_generated": report.get("interpretations_generated", 0),
-                "evidence_bundles_inactivated": report.get(
-                    "evidence_bundles_inactivated",
-                    0,
-                ),
                 "tasks_paused": report.get("tasks_paused", 0),
                 "tasks_stale": report.get("tasks_stale", 0),
             })

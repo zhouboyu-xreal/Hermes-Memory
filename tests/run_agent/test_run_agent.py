@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import uuid
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
@@ -2228,6 +2229,14 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert memory_node_manager.store_turn_async.call_count == 5
         assert memory_node_manager.reflect_if_due_async.call_count == 5
+        for store_call, reflect_call in zip(
+            memory_node_manager.store_turn_async.call_args_list,
+            memory_node_manager.reflect_if_due_async.call_args_list,
+        ):
+            turn_timestamp = store_call.kwargs["turn_timestamp"]
+            assert isinstance(turn_timestamp, datetime)
+            assert turn_timestamp.tzinfo is not None
+            assert reflect_call.kwargs["reflect_timestamp"] is turn_timestamp
         memory_node_manager.reflect.assert_not_called()
 
     def test_tool_calls_then_stop(self, agent):

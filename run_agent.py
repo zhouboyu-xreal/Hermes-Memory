@@ -10016,6 +10016,7 @@ class AIAgent:
         # ``hermes logs --session <id>`` can filter a single conversation.
         from hermes_logging import set_session_context
         set_session_context(self.session_id)
+        turn_timestamp = datetime.now().astimezone()
 
         # If the previous turn activated fallback, restore the primary
         # runtime so this turn gets a fresh attempt with the preferred model.
@@ -13421,6 +13422,7 @@ class AIAgent:
                     self._memory_node_manager.store_turn_async(
                         user_message=_store_msg,
                         assistant_response=_store_resp,
+                        turn_timestamp=turn_timestamp,
                         llm_client=self.client,
                         llm_model=self.model,
                         llm_base_url=self.base_url,
@@ -13430,6 +13432,7 @@ class AIAgent:
                 pass
             try:
                 self._memory_node_manager.reflect_if_due_async(
+                    reflect_timestamp=turn_timestamp,
                     llm_client=self.client,
                     llm_model=self.model,
                     llm_base_url=self.base_url,
