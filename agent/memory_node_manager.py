@@ -2358,7 +2358,7 @@ class MemoryNodeManager:
         return "episodic", "episodic_dominant"
 
     @classmethod
-    def _observation_type_for_fact(cls, fact: Dict[str, Any]) -> str:
+    def _implicit_observation_type_for_fact(cls, fact: Dict[str, Any]) -> str:
         """Map fact evidence semantics to the claim it can directly support."""
         fact_kind = str(fact.get("fact_kind") or "other").strip().lower()
         fact_type = cls._normalize_fact_type(fact.get("fact_type", "semantic"))
@@ -2484,12 +2484,12 @@ class MemoryNodeManager:
         clusters: List[Dict[str, Any]] = []
         for fact in facts:
             node_id = int(self._node_id(fact))
-            observation_type = self._observation_type_for_fact(fact)
+            implicit_observation_type = self._implicit_observation_type_for_fact(fact)
             fact_embedding = embeddings.get(node_id)
             best_cluster = None
             best_similarity = -1.0
             for cluster in clusters:
-                if cluster["observation_type"] != observation_type:
+                if cluster["observation_type"] != implicit_observation_type:
                     continue
                 similarity = self._embedding_similarity(
                     fact_embedding,
@@ -2504,7 +2504,7 @@ class MemoryNodeManager:
             ):
                 vector = self._as_embedding_vector(fact_embedding)
                 clusters.append({
-                    "observation_type": observation_type,
+                    "observation_type": implicit_observation_type,
                     "source_nodes": [fact],
                     "vectors": [vector] if vector is not None else [],
                     "centroid": vector,
@@ -2855,11 +2855,11 @@ class MemoryNodeManager:
             unmatched: List[Dict[str, Any]] = []
             for fact in new_facts:
                 fact_id = int(self._node_id(fact))
-                fact_type = self._observation_type_for_fact(fact)
+                implicit_observation_type = self._implicit_observation_type_for_fact(fact)
                 candidates = [
                     observation
                     for observation in existing_observations
-                    if observation.get("observation_type") == fact_type
+                    if observation.get("observation_type") == implicit_observation_type
                 ]
                 scored = [
                     (
@@ -6075,6 +6075,36 @@ class MemoryNodeManager:
             "changed_evidence_bundle_ids": list(dict.fromkeys(changed_evidence_bundle_ids)),
         }
 
+    def _parse_reflect_timestamp(
+        reflect_timestamp: Optional[Any] = None,
+    ):
+        
+        if reflect_timestamp is None:
+            reflect_now = datetime.now().astimezone()
+        elif isinstance(reflect_timestamp, datetime):
+            reflect_now = (
+                reflect_timestamp.astimezone()
+                if reflect_timestamp.tzinfo is None
+                else reflect_timestamp
+            )
+        else:
+            try:
+                parsed_reflect_timestamp = datetime.fromisoformat(
+                    str(reflect_timestamp).replace("Z", "+00:00")
+                )
+                reflect_now = (
+                    parsed_reflect_timestamp.astimezone()
+                    if parsed_reflect_timestamp.tzinfo is None
+                    else parsed_reflect_timestamp
+                )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid memory reflect timestamp %r; using current time",
+                    reflect_timestamp,
+                )
+                reflect_now = datetime.now().astimezone()
+        return reflect_now 
+
     def reflect(
         self,
         *,
@@ -6103,30 +6133,7 @@ class MemoryNodeManager:
                 "evidence_bundles_consolidated": 0,
                 "error": "memory database unavailable",
             }
-        if reflect_timestamp is None:
-            reflect_now = datetime.now().astimezone()
-        elif isinstance(reflect_timestamp, datetime):
-            reflect_now = (
-                reflect_timestamp.astimezone()
-                if reflect_timestamp.tzinfo is None
-                else reflect_timestamp
-            )
-        else:
-            try:
-                parsed_reflect_timestamp = datetime.fromisoformat(
-                    str(reflect_timestamp).replace("Z", "+00:00")
-                )
-                reflect_now = (
-                    parsed_reflect_timestamp.astimezone()
-                    if parsed_reflect_timestamp.tzinfo is None
-                    else parsed_reflect_timestamp
-                )
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Invalid memory reflect timestamp %r; using current time",
-                    reflect_timestamp,
-                )
-                reflect_now = datetime.now().astimezone()
+        reflect_now = self._parse_reflect_timestamp(reflect_timestamp)
         reflect_date_key = reflect_now.date().isoformat()
         self._log_info(
             "memory_reflect",
