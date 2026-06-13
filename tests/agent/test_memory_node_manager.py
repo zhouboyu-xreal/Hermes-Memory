@@ -1071,44 +1071,38 @@ def test_memory_node_embeddings_reconstruct_requested_vectors(db, monkeypatch):
     assert np.allclose(vectors[22], np.array([1.0, 1.0, 0.0], dtype=np.float32))
 
 
-def test_observation_evidence_score_uses_centroid_and_max_source_similarity():
-    fact_embedding = np.array([1.0, 0.0], dtype=np.float32)
-    source_embeddings = {
-        11: np.array([0.7, 0.7], dtype=np.float32),
-        12: np.array([0.7, -0.7], dtype=np.float32),
+def test_observation_cluster_score_uses_centroid_source_and_coverage():
+    fact_embeddings = {
+        21: np.array([0.6, 0.8], dtype=np.float32),
+        22: np.array([0.8, 0.6], dtype=np.float32),
+        11: np.array([1.0, 0.0], dtype=np.float32),
     }
-    centroid_match = {
-        "source_node_ids": [11, 12],
-        "evidence_centroid_embedding": np.array([1.0, 0.0], dtype=np.float32),
+    cluster_centroid = MemoryNodeManager._embedding_centroid([
+        fact_embeddings[21],
+        fact_embeddings[22],
+    ])
+    observation = {
+        "source_node_ids": [11],
+        "evidence_centroid_embedding": fact_embeddings[11],
     }
 
-    score, centroid_similarity, max_source_similarity = (
-        MemoryNodeManager._score_fact_against_observation_evidence(
-            fact_embedding,
-            centroid_match,
-            source_embeddings,
+    score, centroid_similarity, max_source_similarity, coverage_similarity = (
+        MemoryNodeManager._score_fact_cluster_against_observation_evidence(
+            [21, 22],
+            cluster_centroid,
+            observation,
+            fact_embeddings,
         )
     )
 
-    assert centroid_similarity == pytest.approx(1.0)
-    assert max_source_similarity == pytest.approx(2 ** -0.5)
-    assert score == centroid_similarity
-
-    source_match = {
-        "source_node_ids": [21],
-        "evidence_centroid_embedding": np.array([0.0, 1.0], dtype=np.float32),
-    }
-    score, centroid_similarity, max_source_similarity = (
-        MemoryNodeManager._score_fact_against_observation_evidence(
-            fact_embedding,
-            source_match,
-            {21: np.array([1.0, 0.0], dtype=np.float32)},
-        )
+    assert centroid_similarity == pytest.approx(2 ** -0.5)
+    assert max_source_similarity == pytest.approx(0.8)
+    assert coverage_similarity == pytest.approx(0.7)
+    assert score == pytest.approx(
+        0.55 * centroid_similarity
+        + 0.25 * max_source_similarity
+        + 0.20 * coverage_similarity
     )
-
-    assert centroid_similarity == pytest.approx(0.0)
-    assert max_source_similarity == pytest.approx(1.0)
-    assert score == max_source_similarity
 
 
 def test_observation_type_match_rule_uses_layered_thresholds():
@@ -1410,6 +1404,109 @@ def test_incremental_observation_update_accepts_compatible_fact_type(
         request_node,
         action_node,
     ]
+
+
+def test_fact_cluster_matches_observation_before_individual_facts(
+    db,
+    monkeypatch,
+):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    historical_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 09:00:00",
+        summary="Alice is improving alert reliability.",
+        keywords=["alert-reliability"],
+        fact_type="episodic",
+        fact_kind="context",
+    )
+    first_new_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice found alert delivery gaps.",
+        keywords=["alert-reliability"],
+        fact_type="episodic",
+        fact_kind="context",
+    )
+    second_new_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 11:00:00",
+        summary="Alice confirmed alert reliability needs improvement.",
+        keywords=["alert-reliability"],
+        fact_type="episodic",
+        fact_kind="context",
+    )
+    for node_id in (historical_node, first_new_node, second_new_node):
+        db.entity_link_node(node_id, alice)
+    evidence_bundle_id = db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="alert-reliability",
+        topic_label="alert reliability",
+        bundle_type="entity_topic",
+        source_node_ids=[historical_node],
+    )
+    observation_id = db.memory_create_observation(
+        evidence_bundle_id,
+        {
+            "observation_type": "context",
+            "summary": "Alice is improving alert reliability.",
+            "source_node_ids": [historical_node],
+            "evidence_centroid_embedding": np.array(
+                [1.0, 0.0],
+                dtype=np.float32,
+            ),
+        },
+    )
+    db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="alert-reliability",
+        topic_label="alert reliability",
+        bundle_type="entity_topic",
+        source_node_ids=[first_new_node, second_new_node],
+        source_role="matched",
+    )
+    vectors = {
+        historical_node: np.array([1.0, 0.0], dtype=np.float32),
+        first_new_node: np.array([0.6, 0.8], dtype=np.float32),
+        second_new_node: np.array([0.8, 0.6], dtype=np.float32),
+    }
+    monkeypatch.setattr(
+        db,
+        "memory_node_embeddings",
+        lambda node_ids: {
+            node_id: vectors[node_id]
+            for node_id in node_ids
+            if node_id in vectors
+        },
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps({
+            "observation_type": "context",
+            "summary": (
+                "Alice is improving alert reliability after identifying "
+                "delivery gaps."
+            ),
+            "confidence": 0.9,
+        })],
+    )
+
+    touched_ids = mgr._update_observations_for_evidence_bundles(
+        [evidence_bundle_id]
+    )
+
+    assert touched_ids == [observation_id]
+    observations = db.get_observations_for_evidence_bundles(
+        [evidence_bundle_id]
+    )
+    assert len(observations) == 1
+    assert observations[0]["source_node_ids"] == [
+        historical_node,
+        first_new_node,
+        second_new_node,
+    ]
+    assert f'"fact_id": {first_new_node}' in mgr.llm_prompts[0]
+    assert f'"fact_id": {second_new_node}' in mgr.llm_prompts[0]
 
 
 def _add_task_interpretation(

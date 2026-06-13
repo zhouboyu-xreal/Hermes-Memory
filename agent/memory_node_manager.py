@@ -75,6 +75,9 @@ OBSERVATION_EMBEDDING_SIMILARITY_THRESHOLD = 0.72
 OBSERVATION_EXACT_TYPE_SIMILARITY_THRESHOLD = 0.62
 OBSERVATION_COMPATIBLE_TYPE_SIMILARITY_THRESHOLD = 0.72
 OBSERVATION_MIN_FACTS_FOR_NEW_CLUSTER = 2
+OBSERVATION_CLUSTER_CENTROID_WEIGHT = 0.55
+OBSERVATION_CLUSTER_MAX_SOURCE_WEIGHT = 0.25
+OBSERVATION_CLUSTER_COVERAGE_WEIGHT = 0.20
 OBSERVATION_TYPE_COMPATIBILITY_GROUPS = {
     "task": {
         "task_state",
@@ -2650,37 +2653,98 @@ class MemoryNodeManager:
         )
 
     @classmethod
-    def _score_fact_against_observation_evidence(
+    def _score_fact_cluster_against_observation_evidence(
         cls,
-        fact_embedding: Any,
+        cluster_source_node_ids: List[int],
+        cluster_centroid: Any,
         observation: Dict[str, Any],
         fact_embeddings: Dict[int, np.ndarray],
-    ) -> Tuple[float, float, float]:
-        source_embeddings = [
+    ) -> Tuple[float, float, float, float]:
+        """Score how completely one fact cluster supports an observation."""
+        cluster_embeddings = [
+            fact_embeddings.get(int(source_node_id))
+            for source_node_id in cluster_source_node_ids
+        ]
+        cluster_embeddings = [
+            embedding
+            for embedding in cluster_embeddings
+            if cls._as_embedding_vector(embedding) is not None
+        ]
+        observation_source_embeddings = [
             fact_embeddings.get(int(source_node_id))
             for source_node_id in observation.get("source_node_ids", [])
         ]
-        evidence_centroid = observation.get("evidence_centroid_embedding")
-        if evidence_centroid is None:
-            evidence_centroid = cls._embedding_centroid(source_embeddings)
-        centroid_similarity = cls._embedding_similarity(
-            fact_embedding,
-            evidence_centroid,
+        observation_source_embeddings = [
+            embedding
+            for embedding in observation_source_embeddings
+            if cls._as_embedding_vector(embedding) is not None
+        ]
+        observation_centroid = observation.get(
+            "evidence_centroid_embedding"
         )
+        if observation_centroid is None:
+            observation_centroid = cls._embedding_centroid(
+                observation_source_embeddings
+            )
+        normalized_cluster_centroid = cls._as_embedding_vector(
+            cluster_centroid
+        )
+        if normalized_cluster_centroid is None:
+            normalized_cluster_centroid = cls._embedding_centroid(
+                cluster_embeddings
+            )
+        centroid_similarity = cls._embedding_similarity(
+            normalized_cluster_centroid,
+            observation_centroid,
+        )
+        cross_source_similarities = [
+            cls._embedding_similarity(
+                cluster_embedding,
+                observation_source_embedding,
+            )
+            for cluster_embedding in cluster_embeddings
+            for observation_source_embedding in observation_source_embeddings
+        ]
         max_source_similarity = max(
-            (
-                cls._embedding_similarity(
-                    fact_embedding,
-                    source_embedding,
-                )
-                for source_embedding in source_embeddings
-            ),
+            cross_source_similarities,
             default=0.0,
         )
+        fact_coverage_similarities = [
+            max(
+                cls._embedding_similarity(
+                    cluster_embedding,
+                    observation_centroid,
+                ),
+                max(
+                    (
+                        cls._embedding_similarity(
+                            cluster_embedding,
+                            observation_source_embedding,
+                        )
+                        for observation_source_embedding
+                        in observation_source_embeddings
+                    ),
+                    default=0.0,
+                ),
+            )
+            for cluster_embedding in cluster_embeddings
+        ]
+        coverage_similarity = (
+            sum(fact_coverage_similarities)
+            / len(fact_coverage_similarities)
+            if fact_coverage_similarities
+            else 0.0
+        )
+        score = (
+            OBSERVATION_CLUSTER_CENTROID_WEIGHT * centroid_similarity
+            + OBSERVATION_CLUSTER_MAX_SOURCE_WEIGHT * max_source_similarity
+            + OBSERVATION_CLUSTER_COVERAGE_WEIGHT * coverage_similarity
+        )
         return (
-            max(centroid_similarity, max_source_similarity),
+            score,
             centroid_similarity,
             max_source_similarity,
+            coverage_similarity,
         )
 
     @staticmethod
@@ -3307,15 +3371,31 @@ class MemoryNodeManager:
             fact_embeddings = self._db.memory_node_embeddings(
                 sorted(relevant_fact_ids)
             )
+            fact_clusters = (
+                self._cluster_evidence_bundle_facts_into_observations(
+                    new_facts
+                )
+            )
             matched: Dict[int, List[Dict[str, Any]]] = {}
-            unmatched: List[Dict[str, Any]] = []
-            for fact in new_facts:
-                fact_id = int(self._node_id(fact))
-                implicit_observation_type = self._implicit_observation_type_for_fact(fact)
+            unmatched_clusters: List[Dict[str, Any]] = []
+            new_facts_by_id = {
+                int(self._node_id(fact)): fact
+                for fact in new_facts
+                if self._node_id(fact) is not None
+            }
+            for cluster in fact_clusters:
+                cluster_source_ids = [
+                    int(node_id)
+                    for node_id in cluster.get("source_node_ids", [])
+                    if node_id is not None
+                ]
+                cluster_observation_type = str(
+                    cluster.get("observation_type") or "context"
+                )
                 scored = []
                 for observation in existing_observations:
                     match_rule, threshold = self._observation_type_match_rule(
-                        implicit_observation_type,
+                        cluster_observation_type,
                         str(observation.get("observation_type") or ""),
                     )
                     if threshold is None:
@@ -3324,8 +3404,10 @@ class MemoryNodeManager:
                         match_similarity,
                         centroid_similarity,
                         max_source_similarity,
-                    ) = self._score_fact_against_observation_evidence(
-                        fact_embeddings.get(fact_id),
+                        coverage_similarity,
+                    ) = self._score_fact_cluster_against_observation_evidence(
+                        cluster_source_ids,
+                        cluster.get("evidence_centroid_embedding"),
                         observation,
                         fact_embeddings,
                     )
@@ -3333,28 +3415,30 @@ class MemoryNodeManager:
                         match_similarity,
                         centroid_similarity,
                         max_source_similarity,
+                        coverage_similarity,
                         observation,
                         match_rule,
                         threshold,
                     ))
                 scored.sort(
                     key=lambda item: (
-                        item[0] >= item[5],
+                        item[0] >= item[6],
                         item[0],
-                        item[4] == "exact",
+                        item[5] == "exact",
                     ),
                     reverse=True,
                 )
                 best_match = scored[0] if scored else None
                 self._log_info(
                     "memory_reflect",
-                    "observation_evidence_similarity_scored",
+                    "observation_cluster_evidence_similarity_scored",
                     {
                         "evidence_bundle_id": evidence_bundle_id,
-                        "fact_id": fact_id,
-                        "observation_type": implicit_observation_type,
+                        "cluster_source_node_ids": cluster_source_ids,
+                        "cluster_source_count": len(cluster_source_ids),
+                        "observation_type": cluster_observation_type,
                         "best_observation_id": (
-                            int(best_match[3]["id"])
+                            int(best_match[4]["id"])
                             if best_match
                             else None
                         ),
@@ -3367,17 +3451,34 @@ class MemoryNodeManager:
                         "max_source_similarity": round(best_match[2], 4)
                         if best_match
                         else 0.0,
-                        "type_match": best_match[4] if best_match else "none",
-                        "threshold": best_match[5] if best_match else None,
+                        "coverage_similarity": round(best_match[3], 4)
+                        if best_match
+                        else 0.0,
+                        "type_match": best_match[5] if best_match else "none",
+                        "threshold": best_match[6] if best_match else None,
                     },
                 )
                 if (
                     best_match
-                    and best_match[0] >= best_match[5]
+                    and best_match[0] >= best_match[6]
                 ):
-                    matched.setdefault(int(best_match[3]["id"]), []).append(fact)
+                    observation_id = int(best_match[4]["id"])
+                    matched_facts = matched.setdefault(observation_id, [])
+                    matched_fact_ids = {
+                        int(self._node_id(fact))
+                        for fact in matched_facts
+                        if self._node_id(fact) is not None
+                    }
+                    matched_facts.extend(
+                        new_facts_by_id[node_id]
+                        for node_id in cluster_source_ids
+                        if (
+                            node_id in new_facts_by_id
+                            and node_id not in matched_fact_ids
+                        )
+                    )
                 else:
-                    unmatched.append(fact)
+                    unmatched_clusters.append(cluster)
 
             by_id = {
                 int(observation["id"]): observation
@@ -3446,9 +3547,7 @@ class MemoryNodeManager:
                 touched_observation_ids.append(observation_id)
                 bundle_observation_ids.append(observation_id)
 
-            for candidate in self._cluster_evidence_bundle_facts_into_observations(
-                unmatched
-            ):
+            for candidate in unmatched_clusters:
                 candidate_source_ids = [
                     int(node_id)
                     for node_id in candidate.get("source_node_ids", [])
