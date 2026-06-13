@@ -351,6 +351,8 @@ MEMORY_OBSERVATIONS_SQL = """
 CREATE TABLE IF NOT EXISTS memory_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     evidence_bundle_id INTEGER NOT NULL REFERENCES memory_evidence_bundles(id) ON DELETE CASCADE,
+    entity_name TEXT NOT NULL DEFAULT '',
+    topic_key TEXT NOT NULL DEFAULT '',
     observation_type TEXT NOT NULL,
     summary TEXT NOT NULL,
     evidence_mode TEXT NOT NULL DEFAULT 'aggregated',
@@ -878,6 +880,26 @@ class SessionDB:
         self._drop_legacy_memory_entity_columns(cursor)
         cursor.executescript(MEMORY_INTERPRETATIONS_SQL)
         cursor.executescript(MEMORY_OBSERVATIONS_SQL)
+        for col_name in ("entity_name", "topic_key"):
+            try:
+                cursor.execute(
+                    "ALTER TABLE memory_observations "
+                    f"ADD COLUMN {col_name} TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError:
+                pass
+        cursor.execute(
+            "UPDATE memory_observations SET "
+            "entity_name = COALESCE(("
+            "SELECT en.name FROM memory_evidence_bundles bundle "
+            "LEFT JOIN entity_nodes en ON en.id = bundle.entity_id "
+            "WHERE bundle.id = memory_observations.evidence_bundle_id"
+            "), ''), "
+            "topic_key = COALESCE(("
+            "SELECT bundle.topic_key FROM memory_evidence_bundles bundle "
+            "WHERE bundle.id = memory_observations.evidence_bundle_id"
+            "), '')"
+        )
         for table_name in ("memory_interpretations",):
             for col_name, col_type in {
                 "embedding": "BLOB",
@@ -4309,6 +4331,13 @@ class SessionDB:
                 (canonical_id, duplicate_id),
             )
             conn.execute(
+                "UPDATE memory_observations SET entity_name = ? "
+                "WHERE evidence_bundle_id IN ("
+                "SELECT id FROM memory_evidence_bundles WHERE entity_id = ?"
+                ")",
+                (canonical["name"], canonical_id),
+            )
+            conn.execute(
                 "UPDATE memory_interpretations SET entity_id = ? WHERE entity_id = ?",
                 (canonical_id, duplicate_id),
             )
@@ -5130,6 +5159,23 @@ class SessionDB:
         now_text = datetime.now().astimezone().isoformat()
 
         def _do(conn):
+            bundle_context = conn.execute(
+                "SELECT bundle.topic_key, en.name AS entity_name "
+                "FROM memory_evidence_bundles bundle "
+                "LEFT JOIN entity_nodes en ON en.id = bundle.entity_id "
+                "WHERE bundle.id = ?",
+                (clean_bundle_id,),
+            ).fetchone()
+            entity_name = (
+                str(bundle_context["entity_name"] or "")
+                if bundle_context
+                else ""
+            )
+            topic_key = (
+                str(bundle_context["topic_key"] or "")
+                if bundle_context
+                else ""
+            )
             existing_rows = conn.execute(
                 "SELECT id FROM memory_observations WHERE evidence_bundle_id = ?",
                 (clean_bundle_id,),
@@ -5185,13 +5231,16 @@ class SessionDB:
                 )
                 cursor = conn.execute(
                     "INSERT INTO memory_observations "
-                    "(evidence_bundle_id, observation_type, summary, evidence_mode, "
+                    "(evidence_bundle_id, entity_name, topic_key, "
+                    "observation_type, summary, evidence_mode, "
                     "confidence, status, embedding, embedding_text, "
                     "evidence_centroid_embedding, metadata, created_at, updated_at, "
                     "last_supported_at) "
-                    "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
                     (
                         clean_bundle_id,
+                        entity_name,
+                        topic_key,
                         observation_type,
                         summary,
                         evidence_mode,
@@ -5564,15 +5613,35 @@ class SessionDB:
         )
 
         def _do(conn):
+            bundle_context = conn.execute(
+                "SELECT bundle.topic_key, en.name AS entity_name "
+                "FROM memory_evidence_bundles bundle "
+                "LEFT JOIN entity_nodes en ON en.id = bundle.entity_id "
+                "WHERE bundle.id = ?",
+                (int(evidence_bundle_id),),
+            ).fetchone()
+            entity_name = (
+                str(bundle_context["entity_name"] or "")
+                if bundle_context
+                else ""
+            )
+            topic_key = (
+                str(bundle_context["topic_key"] or "")
+                if bundle_context
+                else ""
+            )
             cursor = conn.execute(
                 "INSERT INTO memory_observations "
-                "(evidence_bundle_id, observation_type, summary, evidence_mode, "
+                "(evidence_bundle_id, entity_name, topic_key, "
+                "observation_type, summary, evidence_mode, "
                 "confidence, status, embedding, embedding_text, "
                 "evidence_centroid_embedding, metadata, created_at, updated_at, "
                 "last_supported_at) "
-                "VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     int(evidence_bundle_id),
+                    entity_name,
+                    topic_key,
                     observation_type,
                     summary,
                     evidence_mode,
@@ -5622,8 +5691,13 @@ class SessionDB:
 
         def _do(conn):
             existing = conn.execute(
-                "SELECT embedding, evidence_centroid_embedding "
-                "FROM memory_observations WHERE id = ?",
+                "SELECT obs.embedding, obs.evidence_centroid_embedding, "
+                "bundle.topic_key, en.name AS entity_name "
+                "FROM memory_observations obs "
+                "JOIN memory_evidence_bundles bundle "
+                "ON bundle.id = obs.evidence_bundle_id "
+                "LEFT JOIN entity_nodes en ON en.id = bundle.entity_id "
+                "WHERE obs.id = ?",
                 (int(observation_id),),
             ).fetchone()
             next_embedding = (
@@ -5641,11 +5715,14 @@ class SessionDB:
                 )
             )
             conn.execute(
-                "UPDATE memory_observations SET summary = ?, evidence_mode = ?, "
+                "UPDATE memory_observations SET entity_name = ?, topic_key = ?, "
+                "summary = ?, evidence_mode = ?, "
                 "confidence = ?, embedding = ?, embedding_text = ?, "
                 "evidence_centroid_embedding = ?, metadata = ?, updated_at = ?, "
                 "last_supported_at = ? WHERE id = ?",
                 (
+                    str(existing["entity_name"] or "") if existing else "",
+                    str(existing["topic_key"] or "") if existing else "",
                     str(summary or "").strip(),
                     str(evidence_mode or "aggregated").strip().lower(),
                     confidence_value,

@@ -1284,10 +1284,40 @@ def test_observation_persists_evidence_centroid_embedding(db):
     observation = db.get_observations_for_evidence_bundles(
         [evidence_bundle_id]
     )[0]
+    stored_context = db._conn.execute(
+        "SELECT entity_name, topic_key FROM memory_observations WHERE id = ?",
+        (observation_id,),
+    ).fetchone()
+    assert stored_context["entity_name"] == "Alice"
+    assert stored_context["topic_key"] == "slack-alerts"
     assert np.allclose(
         observation["evidence_centroid_embedding"],
         centroid,
     )
+
+    db._conn.execute(
+        "UPDATE memory_observations SET entity_name = '', topic_key = '' "
+        "WHERE id = ?",
+        (observation_id,),
+    )
+    db._conn.commit()
+    db.memory_update_observation(
+        observation_id,
+        summary="Alice strongly prefers Slack alerts.",
+        evidence_mode="explicit",
+        confidence=0.9,
+        source_node_ids=[source_id],
+        embedding=None,
+        embedding_text="Alice strongly prefers Slack alerts.",
+        evidence_centroid_embedding=centroid,
+        metadata={},
+    )
+    refreshed_context = db._conn.execute(
+        "SELECT entity_name, topic_key FROM memory_observations WHERE id = ?",
+        (observation_id,),
+    ).fetchone()
+    assert refreshed_context["entity_name"] == "Alice"
+    assert refreshed_context["topic_key"] == "slack-alerts"
 
 
 def test_incremental_observation_update_accepts_compatible_fact_type(
