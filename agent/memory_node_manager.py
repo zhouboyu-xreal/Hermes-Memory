@@ -70,8 +70,61 @@ INTERPRETATION_MIN_CLUSTER_SIZE = 2
 INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT = 30
 INTERPRETATION_SINGLE_OBSERVATION_CONFIDENCE_CAP = 0.75
 
+MIN_FACTS_FOR_NEW_EVIDENCE_BUNDLE = 1
 OBSERVATION_EMBEDDING_SIMILARITY_THRESHOLD = 0.72
-OBSERVATION_MATCH_SIMILARITY_THRESHOLD = 0.78
+OBSERVATION_EXACT_TYPE_SIMILARITY_THRESHOLD = 0.62
+OBSERVATION_COMPATIBLE_TYPE_SIMILARITY_THRESHOLD = 0.72
+OBSERVATION_MIN_FACTS_FOR_NEW_CLUSTER = 2
+OBSERVATION_TYPE_COMPATIBILITY_GROUPS = {
+    "task": {
+        "task_state",
+        "task_progress",
+        "decision",
+        "problem",
+    },
+    "knowledge": {
+        "context",
+        "strategy",
+    },
+}
+OBSERVATION_TYPE_PRIORITY = {
+    "constraint": 90,
+    "preference_signal": 80,
+    "decision": 70,
+    "problem": 60,
+    "task_progress": 50,
+    "task_state": 40,
+    "strategy": 30,
+    "behavior_pattern": 20,
+    "context": 10,
+}
+EVIDENCE_BUNDLE_TOPIC_SIMILARITY_THRESHOLD = 0.82
+EVIDENCE_BUNDLE_WEAK_TOPIC_SUFFIXES = (
+    "建议",
+    "方案",
+    "方法",
+    "策略",
+    "状态",
+    "情况",
+    "进展",
+)
+EVIDENCE_BUNDLE_GENERIC_TOPICS = {
+    "建议",
+    "方案",
+    "方法",
+    "策略",
+    "状态",
+    "情况",
+    "进展",
+    "健康",
+    "工作",
+    "生活",
+    "项目",
+    "系统",
+    "功能",
+    "问题",
+    "管理",
+}
 OBSERVATION_INTERPRETATION_TYPES = {
     "task_state": {"task", "project_state", "constraint"},
     "task_progress": {"task", "project_state"},
@@ -83,6 +136,44 @@ OBSERVATION_INTERPRETATION_TYPES = {
     "behavior_pattern": {"behavior_pattern", "inferred_preference"},
     "context": {"insight"},
 }
+OBSERVATION_TYPE_GUIDANCE = {
+    "task_state": (
+        "任务状态：归纳主体当前想完成、被要求完成或仍待处理的目标。"
+        "融合目标、范围、约束和未解决项；不要把已经完成的动作继续写成待办。"
+    ),
+    "task_progress": (
+        "任务进展：归纳围绕同一任务已经发生的动作、里程碑和状态变化。"
+        "突出时间顺序与最新进度，必要时用“从 A 变为 B”保留关键转折。"
+    ),
+    "decision": (
+        "决策：归纳主体已经明确选择、确认、放弃或否决的方案。"
+        "保留明确出现的决策对象、结果及理由；新决策覆盖旧决策时以最新结论为准。"
+    ),
+    "preference_signal": (
+        "偏好信号：归纳主体明确表达的喜欢、不喜欢、接受、拒绝或取舍倾向。"
+        "保留偏好对象、方向、适用条件和明确理由，不得把一次行为推断为稳定偏好。"
+    ),
+    "constraint": (
+        "约束：归纳必须遵守、必须避免或客观限制可选空间的边界条件。"
+        "保留约束对象、适用范围、触发条件及来源，不要改写成一般建议。"
+    ),
+    "problem": (
+        "问题：归纳已出现的故障、困难、冲突、风险或负面状态。"
+        "保留问题表现、影响、明确原因和当前处理状态，不得猜测未被证据支持的原因。"
+    ),
+    "strategy": (
+        "策略：归纳为实现同一目标提出或采用的方法、原则和步骤。"
+        "合并重复建议，组织成连贯方案；保留互补方法和适用条件，避免逐条堆砌建议。"
+    ),
+    "behavior_pattern": (
+        "行为模式：归纳多个事件共同支持的重复行为、习惯或稳定趋势。"
+        "说明反复发生的行为及典型情境；单次事件不足以形成行为模式。"
+    ),
+    "context": (
+        "背景语境：归纳理解主体或主题所需的稳定事实、处境和关系。"
+        "保留有解释力的背景及当前情况，不要混入待办、建议或高层人格推断。"
+    ),
+}
 # DECAY
 MEMORY_SEMANTIC_FACT_HALF_LIFE_DAYS = 365.0
 MEMORY_EPISODIC_FACT_HALF_LIFE_DAYS = 90.0
@@ -90,12 +181,29 @@ MEMORY_EPISODIC_FACT_HALF_LIFE_DAYS = 90.0
 
 OBSERVATION_CREATE_PROMPT = """你是长期记忆系统的 observation 生成模块。observation 是 evidence_bundle 内由一组相似事实直接支持的、稳定且可独立演化的具体陈述。
 
+三层记忆架构：
+- fact：原始证据层，保存对话明确支持的事件、知识、决定、约束、错误、建议和结果。
+- observation：从多个 facts 中归纳历史模式、进展或状态变化；不要在摘要中提前归纳。
+- interpretation：对用户偏好、任务状态和行动策略的高层理解；不要生成无直接证据的推断。
+
+当前 observation_type 的含义：
+{observation_type_definition}
+
+归纳步骤：
+1. 找出所有 facts 共同支持的核心命题。
+2. 判断其余 facts 是补充细节、限定条件、重复证据，还是对状态的更新。
+3. 将这些信息融合为一个当前命题，而不是选择一条代表性 fact，也不是逐条拼接 facts。
+
 约束：
 1. 只能使用输入 facts 中明确出现的信息，不得补充推断。
-2. summary 必须自包含，保留具体对象、动作、条件、结果和当前状态。
-3. observation_type 必须保持为 requested_observation_type。
-4. 不要生成 interpretation、行动建议或用户画像。
-5. 只返回一个合法 JSON object，不要使用 Markdown。
+2. summary 必须体现 requested_observation_type 的归纳目标，并覆盖所有与核心命题相关且不重复的证据。
+3. 对重复信息进行合并；对互补信息建立清晰关系；对时间变化优先表达最新状态，必要时保留关键转折。
+4. summary 必须自包含，明确主体、对象、动作或状态、必要条件与结果；通常使用 1 至 3 句连贯陈述。
+5. 不要写“多条事实表明”“根据上述 facts”等证据处理过程，不要输出事实清单。
+6. observation_type 必须保持为 requested_observation_type。
+7. 不要生成 interpretation、额外行动建议或用户画像。
+8. confidence 表示输入 facts 对该 summary 的直接支持程度，不表示内容的重要性。
+9. 只返回一个合法 JSON object，不要使用 Markdown。
 
 输出格式：
 {{
@@ -113,14 +221,31 @@ facts:
 
 OBSERVATION_UPDATE_PROMPT = """你是长期记忆系统的 observation 增量更新模块。请用新增 facts 更新既有命题，同时保持命题身份和历史语义稳定。
 
+三层记忆架构：
+- fact：原始证据层，保存对话明确支持的事件、知识、决定、约束、错误、建议和结果。
+- observation：从多个 facts 中归纳历史模式、进展或状态变化；不要在摘要中提前归纳。
+- interpretation：对用户偏好、任务状态和行动策略的高层理解；不要生成无直接证据的推断。
+
+当前 observation_type 的含义：
+{observation_type_definition}
+
+更新步骤：
+1. 把 existing_observation 视为历史 facts 已形成的归纳结果，把 new_facts 视为新增证据。
+2. 判断新增证据是在确认、补充、限定、推进、纠正还是推翻既有命题。
+3. 重新写出一条融合后的当前命题；禁止把 new_facts 机械追加到旧 summary 末尾。
+
 约束：
 1. 只能使用 existing_observation 与 new_facts 中明确出现的信息。
-2. 保留仍被历史 facts 支持的内容；新增事实只能补充、细化、确认或更新状态。
-3. 除非新增事实明确推翻旧内容，否则不要重写成不同主题。
-4. observation_type 必须保持不变。
-5. summary 必须自包含，保留具体对象、动作、条件、结果和当前状态。
-6. 不要生成 interpretation、行动建议或用户画像。
-7. 只返回一个合法 JSON object，不要使用 Markdown。
+2. 保留仍被支持且对当前命题有用的历史信息，删除重复、过时或已被明确取代的表述。
+3. 对 task_state、task_progress、decision 和 problem，优先表达最新状态；仅在关键转折有助于理解时保留历史状态。
+4. 对 preference_signal、constraint、strategy、behavior_pattern 和 context，融合新增条件与证据，不得仅因一次事件扩大为稳定结论。
+5. 除非新增事实明确纠正或推翻旧内容，否则不要改变命题主题。
+6. summary 必须体现 observation_type 的归纳目标，自包含且通常使用 1 至 3 句连贯陈述，不要输出事实清单。
+7. observation_type 必须保持不变。
+8. change_summary 只简述本次语义变化，例如“补充适用条件”或“状态由待处理更新为已完成”；若只是重复确认则写“新增证据确认既有命题”。
+9. 不要生成 interpretation、额外行动建议或用户画像。
+10. confidence 表示全部现有证据对更新后 summary 的直接支持程度。
+11. 只返回一个合法 JSON object，不要使用 Markdown。
 
 输出格式：
 {{
@@ -1987,6 +2112,220 @@ class MemoryNodeManager:
             out.append(topic_key)
         return out or ["general"]
 
+    @classmethod
+    def _generalize_topic_key(cls, topic: Any) -> str:
+        """Remove only safe, weak suffixes from a topic key."""
+        topic_key = cls._topic_key(topic)
+        for suffix in EVIDENCE_BUNDLE_WEAK_TOPIC_SUFFIXES:
+            if not topic_key.endswith(suffix):
+                continue
+            candidate = topic_key[:-len(suffix)].rstrip("-")
+            if candidate.endswith("的"):
+                candidate = candidate[:-1].rstrip("-")
+            if (
+                len(candidate) >= 2
+                and candidate not in EVIDENCE_BUNDLE_GENERIC_TOPICS
+            ):
+                return candidate
+        return topic_key
+
+    @classmethod
+    def _topic_embedding_match_allowed(
+        cls,
+        left_topic: Any,
+        right_topic: Any,
+    ) -> bool:
+        """Require a lexical anchor and reject broad-to-specific absorption."""
+        left = cls._generalize_topic_key(left_topic)
+        right = cls._generalize_topic_key(right_topic)
+        if left == right:
+            return True
+        if (
+            left in EVIDENCE_BUNDLE_GENERIC_TOPICS
+            or right in EVIDENCE_BUNDLE_GENERIC_TOPICS
+        ):
+            return False
+        left_chars = {char for char in left if char != "-"}
+        right_chars = {char for char in right if char != "-"}
+        if not left_chars or not right_chars:
+            return False
+        lexical_affinity = len(left_chars & right_chars) / len(
+            left_chars | right_chars
+        )
+        return lexical_affinity >= 0.5
+
+    def _topic_only_embedding(
+        self,
+        topic: Any,
+        cache: Dict[str, Optional[np.ndarray]],
+    ) -> Optional[np.ndarray]:
+        topic_key = self._topic_key(topic)
+        if topic_key not in cache:
+            cache[topic_key] = self._as_embedding_vector(
+                self._embed_memory_layer_text(topic_key)
+            )
+        return cache[topic_key]
+
+    def _canonical_topic_entries_for_entity(
+        self,
+        entity_id: int,
+        embedding_cache: Dict[str, Optional[np.ndarray]],
+    ) -> List[Dict[str, Any]]:
+        if not self._db:
+            return []
+        try:
+            bundles = self._db.get_evidence_bundles_for_entity(entity_id)
+        except Exception:
+            return []
+        entries: List[Dict[str, Any]] = []
+        for bundle in bundles:
+            topic_key = self._topic_key(bundle.get("topic_key") or "general")
+            topic_label = str(
+                bundle.get("topic_label") or topic_key
+            ).strip() or topic_key
+            metadata = self._json_dict(bundle.get("metadata", {}))
+            aliases = {
+                str(alias).strip()
+                for alias in metadata.get("topic_aliases", [])
+                if str(alias or "").strip()
+            }
+            aliases.add(topic_label)
+            embedding = self._as_embedding_vector(
+                bundle.get("canonical_topic_embedding")
+            )
+            if embedding is None:
+                embedding = self._topic_only_embedding(
+                    topic_label,
+                    embedding_cache,
+                )
+                if embedding is not None:
+                    metadata.update({
+                        "canonical_topic": topic_label,
+                        "topic_aliases": sorted(aliases),
+                        "topic_embedding_text": topic_label,
+                    })
+                    try:
+                        self._db.memory_update_evidence_bundle_topic(
+                            int(bundle["id"]),
+                            canonical_topic_embedding=embedding,
+                            metadata=metadata,
+                        )
+                    except Exception:
+                        pass
+            entries.append({
+                "bundle_id": int(bundle["id"]),
+                "topic_key": topic_key,
+                "topic_label": topic_label,
+                "embedding": embedding,
+                "aliases": aliases,
+            })
+        return entries
+
+    def _canonicalize_topics_for_entity(
+        self,
+        entity_id: int,
+        raw_topics: List[str],
+        embedding_cache: Dict[str, Optional[np.ndarray]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Resolve raw topics to stable existing or provisional canonical topics."""
+        entries = self._canonical_topic_entries_for_entity(
+            entity_id,
+            embedding_cache,
+        )
+        exact_lookup: Dict[str, Dict[str, Any]] = {}
+        for entry in entries:
+            exact_lookup.setdefault(entry["topic_key"], entry)
+            for alias in entry["aliases"]:
+                exact_lookup.setdefault(self._topic_key(alias), entry)
+
+        topic_counts = Counter(
+            self._topic_key(topic)
+            for topic in raw_topics
+            if str(topic or "").strip()
+        )
+        raw_labels: Dict[str, str] = {}
+        for topic in raw_topics:
+            raw_label = str(topic or "").strip()
+            if raw_label:
+                raw_labels.setdefault(self._topic_key(raw_label), raw_label)
+
+        resolved: Dict[str, Dict[str, Any]] = {}
+        ordered_raw_keys = sorted(
+            topic_counts,
+            key=lambda key: (
+                -topic_counts[key],
+                len(self._generalize_topic_key(key)),
+                key,
+            ),
+        )
+        for raw_key in ordered_raw_keys:
+            raw_label = raw_labels.get(raw_key, raw_key)
+            generalized_key = self._generalize_topic_key(raw_key)
+            entry = exact_lookup.get(raw_key)
+            match_reason = "exact_existing_topic"
+            if entry is None:
+                entry = exact_lookup.get(generalized_key)
+                match_reason = "generalized_exact_topic"
+
+            topic_embedding = self._topic_only_embedding(
+                generalized_key,
+                embedding_cache,
+            )
+            similarity = 1.0 if entry is not None else 0.0
+            if entry is None and topic_embedding is not None:
+                scored_entries = [
+                    (
+                        self._embedding_similarity(
+                            topic_embedding,
+                            candidate.get("embedding"),
+                        ),
+                        candidate,
+                    )
+                    for candidate in entries
+                    if candidate.get("embedding") is not None
+                    and self._topic_embedding_match_allowed(
+                        generalized_key,
+                        candidate.get("topic_key"),
+                    )
+                ]
+                scored_entries.sort(key=lambda item: item[0], reverse=True)
+                if (
+                    scored_entries
+                    and scored_entries[0][0]
+                    >= EVIDENCE_BUNDLE_TOPIC_SIMILARITY_THRESHOLD
+                ):
+                    similarity, entry = scored_entries[0]
+                    match_reason = "topic_embedding"
+
+            if entry is None:
+                canonical_key = generalized_key
+                entry = {
+                    "bundle_id": None,
+                    "topic_key": canonical_key,
+                    "topic_label": canonical_key,
+                    "embedding": topic_embedding,
+                    "aliases": set(),
+                }
+                entries.append(entry)
+                exact_lookup.setdefault(canonical_key, entry)
+                match_reason = (
+                    "weak_suffix_generalization"
+                    if canonical_key != raw_key
+                    else "new_canonical_topic"
+                )
+
+            entry["aliases"].add(raw_label)
+            exact_lookup.setdefault(raw_key, entry)
+            resolved[raw_key] = {
+                "topic_key": entry["topic_key"],
+                "topic_label": entry["topic_label"],
+                "canonical_topic_embedding": entry.get("embedding"),
+                "topic_alias": raw_label,
+                "topic_match_reason": match_reason,
+                "topic_similarity": similarity,
+            }
+        return resolved
+
     @staticmethod
     def _string_list(value: Any, *, limit: int = 5) -> List[str]:
         if isinstance(value, str):
@@ -2453,6 +2792,54 @@ class MemoryNodeManager:
         return "context"
 
     @staticmethod
+    def _observation_type_match_rule(
+        left_type: str,
+        right_type: str,
+    ) -> Tuple[str, Optional[float]]:
+        """Return the compatibility class and similarity threshold."""
+        left = str(left_type or "context").strip().lower()
+        right = str(right_type or "context").strip().lower()
+        if left == right:
+            return "exact", OBSERVATION_EXACT_TYPE_SIMILARITY_THRESHOLD
+        for compatible_types in OBSERVATION_TYPE_COMPATIBILITY_GROUPS.values():
+            if left in compatible_types and right in compatible_types:
+                return (
+                    "compatible",
+                    OBSERVATION_COMPATIBLE_TYPE_SIMILARITY_THRESHOLD,
+                )
+        return "incompatible", None
+
+    @classmethod
+    def _observation_type_for_fact_cluster(
+        cls,
+        facts: List[Dict[str, Any]],
+    ) -> str:
+        """Choose a stable claim type from all facts in a semantic cluster."""
+        candidate_types = [
+            cls._implicit_observation_type_for_fact(fact)
+            for fact in facts
+        ]
+        if not candidate_types:
+            return "context"
+        return max(
+            candidate_types,
+            key=lambda observation_type: (
+                OBSERVATION_TYPE_PRIORITY.get(observation_type, 0),
+                candidate_types.count(observation_type),
+            ),
+        )
+
+    @staticmethod
+    def _observation_type_prompt_guidance(observation_type: str) -> str:
+        normalized_type = str(
+            observation_type or "context"
+        ).strip().lower()
+        return OBSERVATION_TYPE_GUIDANCE.get(
+            normalized_type,
+            OBSERVATION_TYPE_GUIDANCE["context"],
+        )
+
+    @staticmethod
     def _observation_kind(observation_type: str) -> str:
         return {
             "task_state": "task_signal",
@@ -2558,20 +2945,32 @@ class MemoryNodeManager:
             fact_embedding = embeddings.get(node_id)
             best_cluster = None
             best_similarity = -1.0
+            best_match_rule = "incompatible"
             for cluster in clusters:
-                if cluster["observation_type"] != implicit_observation_type:
+                match_rule, threshold = self._observation_type_match_rule(
+                    implicit_observation_type,
+                    cluster["observation_type"],
+                )
+                if threshold is None:
                     continue
                 similarity = self._embedding_similarity(
                     fact_embedding,
                     cluster.get("centroid"),
                 )
-                if similarity > best_similarity:
+                if similarity < threshold:
+                    continue
+                if (
+                    similarity > best_similarity
+                    or (
+                        similarity == best_similarity
+                        and match_rule == "exact"
+                        and best_match_rule != "exact"
+                    )
+                ):
                     best_cluster = cluster
                     best_similarity = similarity
-            if (
-                best_cluster is None
-                or best_similarity < OBSERVATION_EMBEDDING_SIMILARITY_THRESHOLD
-            ):
+                    best_match_rule = match_rule
+            if best_cluster is None:
                 vector = self._as_embedding_vector(fact_embedding)
                 clusters.append({
                     "observation_type": implicit_observation_type,
@@ -2589,6 +2988,11 @@ class MemoryNodeManager:
                     axis=0,
                 )
                 best_cluster["centroid"] = self._as_embedding_vector(centroid)
+            best_cluster["observation_type"] = (
+                self._observation_type_for_fact_cluster(
+                    best_cluster["source_nodes"]
+                )
+            )
 
         observations: List[Dict[str, Any]] = []
         for cluster in clusters:
@@ -2706,6 +3110,9 @@ class MemoryNodeManager:
         if existing_observation:
             prompt = OBSERVATION_UPDATE_PROMPT.format(
                 observation_type=observation_type,
+                observation_type_definition=(
+                    self._observation_type_prompt_guidance(observation_type)
+                ),
                 existing_observation=json.dumps(
                     {
                         "observation_id": existing_observation.get("id"),
@@ -2721,6 +3128,9 @@ class MemoryNodeManager:
         else:
             prompt = OBSERVATION_CREATE_PROMPT.format(
                 requested_observation_type=observation_type,
+                observation_type_definition=(
+                    self._observation_type_prompt_guidance(observation_type)
+                ),
                 evidence_bundle_context=json.dumps(
                     {
                         "evidence_bundle_id": evidence_bundle.get("id"),
@@ -2872,6 +3282,11 @@ class MemoryNodeManager:
                 for observation in existing_observations
                 for node_id in observation.get("source_node_ids", [])
             }
+            self._db.memory_set_evidence_bundle_sources_pending_observation(
+                evidence_bundle_id,
+                sorted(assigned_fact_ids),
+                pending=False,
+            )
             new_facts = [
                 fact for fact in all_facts
                 if (
@@ -2897,13 +3312,14 @@ class MemoryNodeManager:
             for fact in new_facts:
                 fact_id = int(self._node_id(fact))
                 implicit_observation_type = self._implicit_observation_type_for_fact(fact)
-                candidates = [
-                    observation
-                    for observation in existing_observations
-                    if observation.get("observation_type") == implicit_observation_type
-                ]
                 scored = []
-                for observation in candidates:
+                for observation in existing_observations:
+                    match_rule, threshold = self._observation_type_match_rule(
+                        implicit_observation_type,
+                        str(observation.get("observation_type") or ""),
+                    )
+                    if threshold is None:
+                        continue
                     (
                         match_similarity,
                         centroid_similarity,
@@ -2918,8 +3334,17 @@ class MemoryNodeManager:
                         centroid_similarity,
                         max_source_similarity,
                         observation,
+                        match_rule,
+                        threshold,
                     ))
-                scored.sort(key=lambda item: item[0], reverse=True)
+                scored.sort(
+                    key=lambda item: (
+                        item[0] >= item[5],
+                        item[0],
+                        item[4] == "exact",
+                    ),
+                    reverse=True,
+                )
                 best_match = scored[0] if scored else None
                 self._log_info(
                     "memory_reflect",
@@ -2942,12 +3367,13 @@ class MemoryNodeManager:
                         "max_source_similarity": round(best_match[2], 4)
                         if best_match
                         else 0.0,
-                        "threshold": OBSERVATION_MATCH_SIMILARITY_THRESHOLD,
+                        "type_match": best_match[4] if best_match else "none",
+                        "threshold": best_match[5] if best_match else None,
                     },
                 )
                 if (
                     best_match
-                    and best_match[0] >= OBSERVATION_MATCH_SIMILARITY_THRESHOLD
+                    and best_match[0] >= best_match[5]
                 ):
                     matched.setdefault(int(best_match[3]["id"]), []).append(fact)
                 else:
@@ -3008,14 +3434,52 @@ class MemoryNodeManager:
                     ],
                     metadata=record["metadata"],
                 )
+                self._db.memory_set_evidence_bundle_sources_pending_observation(
+                    evidence_bundle_id,
+                    [
+                        int(self._node_id(fact))
+                        for fact in added_facts
+                        if self._node_id(fact) is not None
+                    ],
+                    pending=False,
+                )
                 touched_observation_ids.append(observation_id)
                 bundle_observation_ids.append(observation_id)
 
             for candidate in self._cluster_evidence_bundle_facts_into_observations(
                 unmatched
             ):
+                candidate_source_ids = [
+                    int(node_id)
+                    for node_id in candidate.get("source_node_ids", [])
+                    if node_id is not None
+                ]
+                if (
+                    len(candidate_source_ids)
+                    < OBSERVATION_MIN_FACTS_FOR_NEW_CLUSTER
+                ):
+                    self._db.memory_set_evidence_bundle_sources_pending_observation(
+                        evidence_bundle_id,
+                        candidate_source_ids,
+                        pending=True,
+                    )
+                    self._log_info(
+                        "memory_reflect",
+                        "observation_fact_cluster_deferred",
+                        {
+                            "evidence_bundle_id": evidence_bundle_id,
+                            "observation_type": candidate.get(
+                                "observation_type"
+                            ),
+                            "source_node_ids": candidate_source_ids,
+                            "minimum_fact_count": (
+                                OBSERVATION_MIN_FACTS_FOR_NEW_CLUSTER
+                            ),
+                        },
+                    )
+                    continue
                 candidate_facts = self._db.memory_nodes_by_ids(
-                    candidate["source_node_ids"]
+                    candidate_source_ids
                 )
                 generated = self._generate_observation_using_llm(
                     evidence_bundle=evidence_bundle,
@@ -3047,9 +3511,20 @@ class MemoryNodeManager:
                     record,
                 )
                 if observation_id is not None:
+                    self._db.memory_set_evidence_bundle_sources_pending_observation(
+                        evidence_bundle_id,
+                        candidate_source_ids,
+                        pending=False,
+                    )
                     touched_observation_ids.append(observation_id)
                     bundle_observation_ids.append(observation_id)
 
+            pending_observation_fact_ids = (
+                self._db
+                .memory_evidence_bundle_pending_observation_source_ids(
+                    evidence_bundle_id
+                )
+            )
             self._log_info(
                 "memory_reflect",
                 "evidence_bundle_observations_incrementally_updated",
@@ -3059,6 +3534,9 @@ class MemoryNodeManager:
                         int(self._node_id(fact)) for fact in new_facts
                     ],
                     "touched_observation_ids": bundle_observation_ids,
+                    "pending_observation_fact_ids": (
+                        pending_observation_fact_ids
+                    ),
                 },
             )
         return list(dict.fromkeys(touched_observation_ids))
@@ -4978,6 +5456,29 @@ class MemoryNodeManager:
             return evidence_bundle_id
 
         metadata = self._json_dict(existing_bundle.get("metadata", {}))
+        topic_aliases = {
+            str(alias).strip()
+            for alias in metadata.get("topic_aliases", [])
+            if str(alias or "").strip()
+        }
+        topic_aliases.update(
+            str(alias).strip()
+            for alias in cluster.get("topic_aliases", [])
+            if str(alias or "").strip()
+        )
+        canonical_topic = str(
+            existing_bundle.get("topic_label")
+            or existing_bundle.get("topic_key")
+            or cluster.get("topic_label")
+            or cluster.get("topic_key")
+            or "general"
+        )
+        topic_aliases.add(canonical_topic)
+        metadata.update({
+            "canonical_topic": canonical_topic,
+            "topic_aliases": sorted(topic_aliases),
+            "topic_embedding_text": canonical_topic,
+        })
         stored_source_ids = list(dict.fromkeys(existing_source_ids + pending_source_ids))
         self._db.memory_replace_evidence_bundle_group(
             keep_evidence_bundle_id=evidence_bundle_id,
@@ -4990,6 +5491,16 @@ class MemoryNodeManager:
                 for node_id in pending_source_ids
             },
         )
+        canonical_topic_embedding = (
+            existing_bundle.get("canonical_topic_embedding")
+            if existing_bundle.get("canonical_topic_embedding") is not None
+            else cluster.get("canonical_topic_embedding")
+        )
+        self._db.memory_update_evidence_bundle_topic(
+            evidence_bundle_id,
+            canonical_topic_embedding=canonical_topic_embedding,
+            metadata=metadata,
+        )
         if changed_evidence_bundle_ids is not None:
             changed_evidence_bundle_ids.append(evidence_bundle_id)
         consumed_node_ids.update(source_node_ids)
@@ -4999,6 +5510,8 @@ class MemoryNodeManager:
             "evidence_bundle_id": evidence_bundle_id,
             "entity_id": cluster.get("entity_id"),
             "topic_key": cluster.get("topic_key"),
+            "topic_aliases": sorted(topic_aliases),
+            "topic_match_reasons": cluster.get("topic_match_reasons", []),
             "source_node_ids": source_node_ids,
             "score": score,
             "reason": reason,
@@ -5016,7 +5529,9 @@ class MemoryNodeManager:
         *,
         excluded_node_ids: set[int],
     ) -> List[Dict[str, Any]]:
-        buckets: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        prepared_facts: List[Dict[str, Any]] = []
+        topics_by_entity: Dict[int, List[str]] = {}
+        embedding_cache: Dict[str, Optional[np.ndarray]] = {}
         for fact in facts:
             node_id = self._node_id(fact)
             if node_id is None or node_id in excluded_node_ids:
@@ -5039,10 +5554,46 @@ class MemoryNodeManager:
                     "",
                 )
             )
-            topic_key = self._topic_key(
+            raw_topic = str(
                 fact.get("primary_topic")
                 or next(iter(fact.get("topics", []) or []), "general")
+            ).strip() or "general"
+            prepared_facts.append({
+                "fact": fact,
+                "node_id": node_id,
+                "entity_id": entity_id,
+                "entity_name": entity_name,
+                "raw_topic": raw_topic,
+            })
+            topics_by_entity.setdefault(entity_id, []).append(raw_topic)
+
+        topic_resolutions = {
+            entity_id: self._canonicalize_topics_for_entity(
+                entity_id,
+                raw_topics,
+                embedding_cache,
             )
+            for entity_id, raw_topics in topics_by_entity.items()
+        }
+        buckets: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        for prepared in prepared_facts:
+            fact = prepared["fact"]
+            node_id = prepared["node_id"]
+            entity_id = prepared["entity_id"]
+            entity_name = prepared["entity_name"]
+            raw_topic = prepared["raw_topic"]
+            resolution = topic_resolutions[entity_id].get(
+                self._topic_key(raw_topic),
+                {
+                    "topic_key": self._topic_key(raw_topic),
+                    "topic_label": self._topic_key(raw_topic),
+                    "canonical_topic_embedding": None,
+                    "topic_alias": raw_topic,
+                    "topic_match_reason": "fallback_exact_topic",
+                    "topic_similarity": 0.0,
+                },
+            )
+            topic_key = str(resolution["topic_key"])
             key = (entity_id, topic_key)
             bucket = buckets.setdefault(
                 key,
@@ -5050,10 +5601,19 @@ class MemoryNodeManager:
                     "entity_id": entity_id,
                     "entity_name": entity_name,
                     "topic_key": topic_key,
-                    "topic_label": topic_key,
+                    "topic_label": str(resolution["topic_label"]),
+                    "canonical_topic_embedding": resolution.get(
+                        "canonical_topic_embedding"
+                    ),
+                    "topic_aliases": set(),
+                    "topic_match_reasons": set(),
                     "facts": [],
                     "node_ids": set(),
                 },
+            )
+            bucket["topic_aliases"].add(str(resolution["topic_alias"]))
+            bucket["topic_match_reasons"].add(
+                str(resolution["topic_match_reason"])
             )
             if node_id not in bucket["node_ids"]:
                 bucket["node_ids"].add(node_id)
@@ -5069,15 +5629,24 @@ class MemoryNodeManager:
                 **{
                     key: value
                     for key, value in bucket.items()
-                    if key not in {"facts", "node_ids"}
+                    if key not in {
+                        "facts",
+                        "node_ids",
+                        "topic_aliases",
+                        "topic_match_reasons",
+                    }
                 },
+                "topic_aliases": sorted(bucket["topic_aliases"]),
+                "topic_match_reasons": sorted(
+                    bucket["topic_match_reasons"]
+                ),
                 "source_nodes": facts_for_cluster,
                 "source_node_ids": [
                     self._node_id(fact)
                     for fact in facts_for_cluster
                     if self._node_id(fact) is not None
                 ],
-                "can_create_evidence_bundle": len(facts_for_cluster) >= 2,
+                "can_create_evidence_bundle": len(facts_for_cluster) >= MIN_FACTS_FOR_NEW_EVIDENCE_BUNDLE,
             })
 
         clusters.sort(
@@ -5120,16 +5689,28 @@ class MemoryNodeManager:
                 for fact in source_nodes
                 if self._node_id(fact) in remaining_node_ids
             ]
-        if len(source_node_ids) < 2:
-            return None
 
         entity_id = int(cluster["entity_id"])
         topic_key = str(cluster.get("topic_key") or "general")
-        bundle_metadata = {}
+        topic_label = str(cluster.get("topic_label") or topic_key)
+        topic_aliases = {
+            str(alias).strip()
+            for alias in cluster.get("topic_aliases", [])
+            if str(alias or "").strip()
+        }
+        topic_aliases.add(topic_label)
+        bundle_metadata = {
+            "canonical_topic": topic_label,
+            "topic_aliases": sorted(topic_aliases),
+            "topic_embedding_text": topic_label,
+        }
         evidence_bundle_id = self._db.memory_upsert_evidence_bundle(
             entity_id=entity_id,
             topic_key=topic_key,
-            topic_label=str(cluster.get("topic_label") or topic_key),
+            topic_label=topic_label,
+            canonical_topic_embedding=cluster.get(
+                "canonical_topic_embedding"
+            ),
             source_node_ids=source_node_ids,
             bundle_type="entity_topic",
             metadata=bundle_metadata,
@@ -5146,6 +5727,11 @@ class MemoryNodeManager:
                 "entity_id": entity_id,
                 "entity_name": cluster.get("entity_name"),
                 "topic_key": topic_key,
+                "topic_aliases": bundle_metadata["topic_aliases"],
+                "topic_match_reasons": cluster.get(
+                    "topic_match_reasons",
+                    [],
+                ),
                 "source_node_ids": source_node_ids,
                 "source_facts": self._reflect_fact_log_items(source_nodes),
                 "generated_evidence_bundle": {

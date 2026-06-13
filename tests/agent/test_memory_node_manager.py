@@ -1111,6 +1111,148 @@ def test_observation_evidence_score_uses_centroid_and_max_source_similarity():
     assert score == max_source_similarity
 
 
+def test_observation_type_match_rule_uses_layered_thresholds():
+    assert MemoryNodeManager._observation_type_match_rule(
+        "task_state",
+        "task_state",
+    ) == ("exact", 0.62)
+    assert MemoryNodeManager._observation_type_match_rule(
+        "task_state",
+        "task_progress",
+    ) == ("compatible", 0.72)
+    assert MemoryNodeManager._observation_type_match_rule(
+        "context",
+        "strategy",
+    ) == ("compatible", 0.72)
+    assert MemoryNodeManager._observation_type_match_rule(
+        "preference_signal",
+        "behavior_pattern",
+    ) == ("incompatible", None)
+    assert MemoryNodeManager._observation_type_match_rule(
+        "constraint",
+        "task_state",
+    ) == ("incompatible", None)
+
+
+def test_observation_prompts_explain_type_specific_synthesis(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "observation_type": "strategy",
+                "summary": "Alice uses staged rollout with rollback checks.",
+                "confidence": 0.9,
+            }),
+            json.dumps({
+                "observation_type": "task_progress",
+                "summary": "Alice completed the staged rollout.",
+                "confidence": 0.9,
+                "change_summary": "状态由执行中更新为已完成",
+            }),
+        ],
+    )
+    facts = [{
+        "id": 1,
+        "summary": "Alice proposed a staged rollout.",
+        "fact_type": "semantic",
+        "fact_kind": "recommendation",
+        "time_key": "2026-05-01 10:00:00",
+    }]
+
+    created = mgr._generate_observation_using_llm(
+        evidence_bundle={
+            "id": 7,
+            "entity_name": "Alice",
+            "topic_key": "rollout",
+        },
+        observation_type="strategy",
+        source_nodes=facts,
+    )
+    updated = mgr._generate_observation_using_llm(
+        evidence_bundle={"id": 7},
+        observation_type="task_progress",
+        source_nodes=facts,
+        existing_observation={
+            "id": 11,
+            "summary": "Alice is executing the staged rollout.",
+            "confidence": 0.8,
+        },
+    )
+
+    assert created is not None
+    assert updated is not None
+    create_prompt, update_prompt = mgr.llm_prompts
+    assert "策略：归纳为实现同一目标提出或采用的方法" in create_prompt
+    assert "不是选择一条代表性 fact，也不是逐条拼接 facts" in create_prompt
+    assert "任务进展：归纳围绕同一任务已经发生的动作" in update_prompt
+    assert "禁止把 new_facts 机械追加到旧 summary 末尾" in update_prompt
+    assert "状态由待处理更新为已完成" in update_prompt
+
+
+def test_observation_clustering_softens_only_compatible_type_gates(
+    db,
+    monkeypatch,
+):
+    request_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice requested implementation of the alert fallback.",
+        keywords=["alert-routing"],
+        fact_type="episodic",
+        fact_kind="request",
+        task_event_like=True,
+    )
+    action_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 11:00:00",
+        summary="Alice implemented the alert fallback.",
+        keywords=["alert-routing"],
+        fact_type="episodic",
+        fact_kind="action",
+        task_event_like=True,
+    )
+    preference_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 12:00:00",
+        summary="Alice prefers Slack alerts.",
+        keywords=["alert-routing"],
+        fact_type="semantic",
+        fact_kind="preference",
+    )
+    vectors = {
+        request_node: np.array([1.0, 0.0], dtype=np.float32),
+        action_node: np.array([0.8, 0.2], dtype=np.float32),
+        preference_node: np.array([1.0, 0.0], dtype=np.float32),
+    }
+    monkeypatch.setattr(
+        db,
+        "memory_node_embeddings",
+        lambda node_ids: {
+            node_id: vectors[node_id]
+            for node_id in node_ids
+            if node_id in vectors
+        },
+    )
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    clusters = mgr._cluster_evidence_bundle_facts_into_observations(
+        db.memory_nodes_by_ids(
+            [request_node, action_node, preference_node]
+        )
+    )
+
+    by_type = {cluster["observation_type"]: cluster for cluster in clusters}
+    assert set(by_type) == {"task_progress", "preference_signal"}
+    assert by_type["task_progress"]["source_node_ids"] == [
+        request_node,
+        action_node,
+    ]
+    assert by_type["preference_signal"]["source_node_ids"] == [
+        preference_node
+    ]
+
+
 def test_observation_persists_evidence_centroid_embedding(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     source_id = _add_memory_node(
@@ -1146,6 +1288,98 @@ def test_observation_persists_evidence_centroid_embedding(db):
         observation["evidence_centroid_embedding"],
         centroid,
     )
+
+
+def test_incremental_observation_update_accepts_compatible_fact_type(
+    db,
+    monkeypatch,
+):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    request_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice requested implementation of the alert fallback.",
+        keywords=["alert-routing"],
+        fact_type="episodic",
+        fact_kind="request",
+        task_event_like=True,
+    )
+    action_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 11:00:00",
+        summary="Alice implemented the alert fallback.",
+        keywords=["alert-routing"],
+        fact_type="episodic",
+        fact_kind="action",
+        task_event_like=True,
+    )
+    for node_id in (request_node, action_node):
+        db.entity_link_node(node_id, alice)
+    evidence_bundle_id = db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="alert-routing",
+        topic_label="alert routing",
+        bundle_type="entity_topic",
+        source_node_ids=[request_node],
+    )
+    observation_id = db.memory_create_observation(
+        evidence_bundle_id,
+        {
+            "observation_type": "task_state",
+            "summary": "Alice requested implementation of the alert fallback.",
+            "source_node_ids": [request_node],
+            "evidence_centroid_embedding": np.array(
+                [1.0, 0.0],
+                dtype=np.float32,
+            ),
+        },
+    )
+    db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="alert-routing",
+        topic_label="alert routing",
+        bundle_type="entity_topic",
+        source_node_ids=[request_node, action_node],
+    )
+    vectors = {
+        request_node: np.array([1.0, 0.0], dtype=np.float32),
+        action_node: np.array([0.8, 0.2], dtype=np.float32),
+    }
+    monkeypatch.setattr(
+        db,
+        "memory_node_embeddings",
+        lambda node_ids: {
+            node_id: vectors[node_id]
+            for node_id in node_ids
+            if node_id in vectors
+        },
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps({
+            "observation_type": "task_state",
+            "summary": (
+                "Alice requested and then implemented the alert fallback."
+            ),
+            "confidence": 0.9,
+        })],
+    )
+
+    touched_ids = mgr._update_observations_for_evidence_bundles(
+        [evidence_bundle_id]
+    )
+
+    assert touched_ids == [observation_id]
+    observations = db.get_observations_for_evidence_bundles(
+        [evidence_bundle_id]
+    )
+    assert len(observations) == 1
+    assert observations[0]["observation_type"] == "task_state"
+    assert observations[0]["source_node_ids"] == [
+        request_node,
+        action_node,
+    ]
 
 
 def _add_task_interpretation(
@@ -2962,11 +3196,218 @@ def test_cluster_unprocessed_facts_returns_only_structural_fields(db):
         "entity_name",
         "topic_key",
         "topic_label",
+        "canonical_topic_embedding",
+        "topic_aliases",
+        "topic_match_reasons",
         "source_nodes",
         "source_node_ids",
         "can_create_evidence_bundle",
     }
     assert clusters[0]["can_create_evidence_bundle"] is True
+
+
+def test_topic_generalization_removes_only_safe_weak_suffixes():
+    assert MemoryNodeManager._generalize_topic_key("胃部健康建议") == "胃部健康"
+    assert MemoryNodeManager._generalize_topic_key("时间管理方法") == "时间管理"
+    assert MemoryNodeManager._generalize_topic_key("健康建议") == "健康建议"
+    assert MemoryNodeManager._generalize_topic_key("教育观念冲突") == "教育观念冲突"
+
+
+def test_cluster_unprocessed_facts_uses_canonical_topic_for_weak_aliases(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    facts = []
+    for index, topic in enumerate(("胃部健康", "胃部健康建议")):
+        node_id = _add_memory_node(
+            db,
+            time_key=f"2026-05-01 10:{index:02d}:00",
+            summary=f"Alice discussed {topic}.",
+            keywords=[topic],
+        )
+        facts.append({
+            "node_id": node_id,
+            "time_key": f"2026-05-01 10:{index:02d}:00",
+            "summary": f"Alice discussed {topic}.",
+            "keywords": [topic],
+            "topics": [topic],
+            "primary_entity_id": alice,
+            "primary_entity_name": "Alice",
+            "primary_topic": topic,
+            "linked_entities": [(alice, "Alice")],
+        })
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    clusters = mgr._cluster_unprocessed_facts(
+        facts,
+        excluded_node_ids=set(),
+    )
+
+    assert len(clusters) == 1
+    assert clusters[0]["topic_key"] == "胃部健康"
+    assert clusters[0]["topic_aliases"] == ["胃部健康", "胃部健康建议"]
+    assert clusters[0]["can_create_evidence_bundle"] is True
+
+
+def test_generated_evidence_bundle_persists_canonical_topic_data(
+    db,
+    monkeypatch,
+):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    facts = []
+    for index in range(2):
+        node_id = _add_memory_node(
+            db,
+            time_key=f"2026-05-01 10:{index:02d}:00",
+            summary="Alice received stomach health advice.",
+            keywords=["胃部健康建议"],
+        )
+        facts.append({
+            "node_id": node_id,
+            "time_key": f"2026-05-01 10:{index:02d}:00",
+            "summary": "Alice received stomach health advice.",
+            "keywords": ["胃部健康建议"],
+            "topics": ["胃部健康建议"],
+            "primary_entity_id": alice,
+            "primary_entity_name": "Alice",
+            "primary_topic": "胃部健康建议",
+            "linked_entities": [(alice, "Alice")],
+        })
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    monkeypatch.setattr(
+        mgr,
+        "_embed_memory_layer_text",
+        lambda text: np.array([0.6, 0.8], dtype=np.float32),
+    )
+    cluster = mgr._cluster_unprocessed_facts(
+        facts,
+        excluded_node_ids=set(),
+    )[0]
+
+    evidence_bundle_id = (
+        mgr._generate_evidence_bundle_using_unmatched_fact_clusters(
+            cluster,
+            consumed_node_ids=set(),
+        )
+    )
+
+    bundle = db.get_evidence_bundles_by_ids([evidence_bundle_id])[0]
+    metadata = json.loads(bundle["metadata"])
+    assert bundle["topic_key"] == "胃部健康"
+    assert np.allclose(
+        bundle["canonical_topic_embedding"],
+        np.array([0.6, 0.8], dtype=np.float32),
+    )
+    assert metadata["canonical_topic"] == "胃部健康"
+    assert metadata["topic_aliases"] == ["胃部健康", "胃部健康建议"]
+    assert metadata["topic_embedding_text"] == "胃部健康"
+
+
+def test_cluster_unprocessed_facts_reuses_existing_topic_by_embedding(
+    db,
+    monkeypatch,
+):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    old_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 09:00:00",
+        summary="Alice tracks stomach health.",
+        keywords=["胃部健康"],
+    )
+    db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="胃部健康",
+        topic_label="胃部健康",
+        canonical_topic_embedding=np.array([1.0, 0.0], dtype=np.float32),
+        source_node_ids=[old_node],
+        metadata={
+            "canonical_topic": "胃部健康",
+            "topic_aliases": ["胃部健康"],
+        },
+    )
+    facts = []
+    for index in range(2):
+        node_id = _add_memory_node(
+            db,
+            time_key=f"2026-05-01 10:{index:02d}:00",
+            summary="Alice discussed stomach care.",
+            keywords=["胃部保健"],
+        )
+        facts.append({
+            "node_id": node_id,
+            "time_key": f"2026-05-01 10:{index:02d}:00",
+            "summary": "Alice discussed stomach care.",
+            "keywords": ["胃部保健"],
+            "topics": ["胃部保健"],
+            "primary_entity_id": alice,
+            "primary_entity_name": "Alice",
+            "primary_topic": "胃部保健",
+            "linked_entities": [(alice, "Alice")],
+        })
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    monkeypatch.setattr(
+        mgr,
+        "_embed_memory_layer_text",
+        lambda text: np.array([0.98, 0.02], dtype=np.float32),
+    )
+
+    clusters = mgr._cluster_unprocessed_facts(
+        facts,
+        excluded_node_ids=set(),
+    )
+
+    assert len(clusters) == 1
+    assert clusters[0]["topic_key"] == "胃部健康"
+    assert clusters[0]["topic_match_reasons"] == ["topic_embedding"]
+
+
+def test_topic_embedding_does_not_merge_different_health_domains(
+    db,
+    monkeypatch,
+):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    old_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 09:00:00",
+        summary="Alice tracks stomach health.",
+        keywords=["胃部健康"],
+    )
+    db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="胃部健康",
+        topic_label="胃部健康",
+        canonical_topic_embedding=np.array([1.0, 0.0], dtype=np.float32),
+        source_node_ids=[old_node],
+    )
+    new_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice tracks intestinal health.",
+        keywords=["肠道健康"],
+    )
+    fact = {
+        "node_id": new_node,
+        "time_key": "2026-05-01 10:00:00",
+        "summary": "Alice tracks intestinal health.",
+        "keywords": ["肠道健康"],
+        "topics": ["肠道健康"],
+        "primary_entity_id": alice,
+        "primary_entity_name": "Alice",
+        "primary_topic": "肠道健康",
+        "linked_entities": [(alice, "Alice")],
+    }
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    monkeypatch.setattr(
+        mgr,
+        "_embed_memory_layer_text",
+        lambda text: np.array([1.0, 0.0], dtype=np.float32),
+    )
+
+    clusters = mgr._cluster_unprocessed_facts(
+        [fact],
+        excluded_node_ids=set(),
+    )
+
+    assert clusters[0]["topic_key"] == "肠道健康"
+    assert clusters[0]["topic_match_reasons"] == ["new_canonical_topic"]
 
 
 def test_existing_evidence_bundle_match_reuses_cluster_sources(db, monkeypatch):
@@ -3140,22 +3581,24 @@ def test_incremental_observation_update_preserves_identity_and_rebuilds_summary(
     mgr = _NoAsyncMemoryNodeManager(
         db,
         embedding_config={},
-        llm_outputs=[
-            json.dumps({
-                "observation_type": "task_progress",
-                "summary": "Alice implemented the alert routing fallback.",
-                "confidence": 0.82,
-            }),
-        ],
+        llm_outputs=[],
     )
     embedding_client = _CapturingEmbeddingClient()
     mgr._embedding_client = embedding_client
 
-    first_ids = mgr._update_observations_for_evidence_bundles(
-        [evidence_bundle_id]
+    stable_observation_id = db.memory_create_observation(
+        evidence_bundle_id,
+        {
+            "observation_type": "task_progress",
+            "summary": "Alice implemented the alert routing fallback.",
+            "source_node_ids": [first_node],
+            "evidence_centroid_embedding": np.ones(
+                1536,
+                dtype=np.float32,
+            ),
+            "metadata": {"revision": 1},
+        },
     )
-    assert len(first_ids) == 1
-    stable_observation_id = first_ids[0]
     interpretation_id = db.memory_upsert_interpretation(
         claim="Alice is progressing the alert routing fallback.",
         entity_id=alice,
@@ -3239,6 +3682,99 @@ def test_incremental_observation_update_preserves_identity_and_rebuilds_summary(
         observations[0]["summary"]
     )
     assert embedding_client.texts[-1] == observations[0]["embedding_text"]
+
+
+def test_singleton_observation_fact_waits_for_later_cluster(
+    db,
+    monkeypatch,
+):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    first_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice started verifying the alert routing fallback.",
+        keywords=["alert-routing", "verification"],
+        fact_type="episodic",
+        fact_kind="action",
+        task_event_like=True,
+    )
+    db.entity_link_node(first_node, alice)
+    evidence_bundle_id = db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="alert-routing",
+        topic_label="alert routing",
+        bundle_type="entity_topic",
+        source_node_ids=[first_node],
+    )
+    vectors = {
+        first_node: np.ones(1536, dtype=np.float32),
+    }
+    monkeypatch.setattr(
+        db,
+        "memory_node_embeddings",
+        lambda node_ids: {
+            node_id: vectors[node_id]
+            for node_id in node_ids
+            if node_id in vectors
+        },
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps({
+            "observation_type": "task_progress",
+            "summary": (
+                "Alice started and completed verification of the alert "
+                "routing fallback."
+            ),
+            "confidence": 0.9,
+        })],
+    )
+
+    first_observation_ids = mgr._update_observations_for_evidence_bundles(
+        [evidence_bundle_id]
+    )
+
+    assert first_observation_ids == []
+    assert db.get_observations_for_evidence_bundles(
+        [evidence_bundle_id]
+    ) == []
+    assert db.memory_evidence_bundle_pending_observation_source_ids(
+        evidence_bundle_id
+    ) == [first_node]
+
+    second_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 11:00:00",
+        summary="Alice completed verification of the alert routing fallback.",
+        keywords=["alert-routing", "verification"],
+        fact_type="episodic",
+        fact_kind="action",
+        task_event_like=True,
+    )
+    db.entity_link_node(second_node, alice)
+    vectors[second_node] = np.ones(1536, dtype=np.float32)
+    db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="alert-routing",
+        topic_label="alert routing",
+        bundle_type="entity_topic",
+        source_node_ids=[second_node],
+        source_role="matched",
+    )
+
+    second_observation_ids = mgr._update_observations_for_evidence_bundles(
+        [evidence_bundle_id]
+    )
+
+    assert len(second_observation_ids) == 1
+    observations = db.get_observations_for_evidence_bundles(
+        [evidence_bundle_id]
+    )
+    assert observations[0]["source_node_ids"] == [first_node, second_node]
+    assert db.memory_evidence_bundle_pending_observation_source_ids(
+        evidence_bundle_id
+    ) == []
 
 
 def test_interpretation_generation_skips_observation_without_observations(db):
@@ -4534,41 +5070,80 @@ def test_fact_cluster_candidates_always_include_exact_entity_topic_observation(d
     assert candidates[0]["entity_name"] == "Alice"
 
 
-def test_observation_observations_preserve_fact_to_interpretation_type_mapping(db):
+def test_observation_observations_preserve_fact_to_interpretation_type_mapping(
+    db,
+    monkeypatch,
+):
     alice = db.entity_add_entity("Alice", "PERSON")
-    task_node = _add_memory_node(
+    node_groups = []
+    fact_specs = [
+        (
+            "Alice implemented the alert routing fallback.",
+            "episodic",
+            "action",
+            True,
+        ),
+        (
+            "Alice explicitly prefers Slack for urgent alerts.",
+            "semantic",
+            "preference",
+            None,
+        ),
+        (
+            "Alice instructed that urgent alerts must not use email.",
+            "semantic",
+            "instruction",
+            None,
+        ),
+    ]
+    for group_index, (
+        summary,
+        fact_type,
+        fact_kind,
+        task_event_like,
+    ) in enumerate(fact_specs):
+        group = []
+        for item_index in range(2):
+            node_id = _add_memory_node(
+                db,
+                time_key=(
+                    f"2026-05-01 10:{group_index}{item_index}:00"
+                ),
+                summary=summary,
+                keywords=["alert-routing", fact_kind],
+                fact_type=fact_type,
+                fact_kind=fact_kind,
+                task_event_like=task_event_like,
+            )
+            db.entity_link_node(node_id, alice)
+            group.append(node_id)
+        node_groups.append(group)
+    task_nodes, preference_nodes, constraint_nodes = node_groups
+    all_node_ids = [
+        *task_nodes,
+        *preference_nodes,
+        *constraint_nodes,
+    ]
+    vectors = {
+        node_id: np.eye(3, dtype=np.float32)[group_index]
+        for group_index, group in enumerate(node_groups)
+        for node_id in group
+    }
+    monkeypatch.setattr(
         db,
-        time_key="2026-05-01 10:00:00",
-        summary="Alice implemented the alert routing fallback.",
-        keywords=["alert-routing", "fallback"],
-        fact_type="episodic",
-        fact_kind="action",
-        task_event_like=True,
+        "memory_node_embeddings",
+        lambda requested_ids: {
+            node_id: vectors[node_id]
+            for node_id in requested_ids
+            if node_id in vectors
+        },
     )
-    preference_node = _add_memory_node(
-        db,
-        time_key="2026-05-01 10:10:00",
-        summary="Alice explicitly prefers Slack for urgent alerts.",
-        keywords=["Slack", "preference"],
-        fact_type="semantic",
-        fact_kind="preference",
-    )
-    constraint_node = _add_memory_node(
-        db,
-        time_key="2026-05-01 10:20:00",
-        summary="Alice instructed that urgent alerts must not use email.",
-        keywords=["email", "constraint"],
-        fact_type="semantic",
-        fact_kind="instruction",
-    )
-    for node_id in (task_node, preference_node, constraint_node):
-        db.entity_link_node(node_id, alice)
     observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",
         topic_label="alert routing",
         bundle_type="observation",
-        source_node_ids=[task_node, preference_node, constraint_node],
+        source_node_ids=all_node_ids,
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
@@ -4578,7 +5153,7 @@ def test_observation_observations_preserve_fact_to_interpretation_type_mapping(d
     observations = db.get_observations_for_evidence_bundles([observation_id])
     by_type = {item["observation_type"]: item for item in observations}
     assert set(by_type) == {"task_progress", "preference_signal", "constraint"}
-    assert by_type["task_progress"]["source_node_ids"] == [task_node]
+    assert by_type["task_progress"]["source_node_ids"] == task_nodes
     assert by_type["preference_signal"]["evidence_mode"] == "explicit"
     assert by_type["constraint"]["evidence_mode"] == "explicit"
     assert set(
@@ -4592,23 +5167,38 @@ def test_observation_observations_preserve_fact_to_interpretation_type_mapping(d
     ) == {"constraint", "explicit_instruction", "task_risk"}
 
 
-def test_observation_type_gate_rejects_incompatible_interpretation(db):
+def test_observation_type_gate_rejects_incompatible_interpretation(
+    db,
+    monkeypatch,
+):
     alice = db.entity_add_entity("Alice", "PERSON")
-    node_id = _add_memory_node(
+    node_ids = []
+    for index in range(2):
+        node_id = _add_memory_node(
+            db,
+            time_key=f"2026-05-01 10:0{index}:00",
+            summary="Alice explicitly prefers Slack for urgent alerts.",
+            keywords=["Slack", "preference"],
+            fact_type="semantic",
+            fact_kind="preference",
+        )
+        db.entity_link_node(node_id, alice)
+        node_ids.append(node_id)
+    monkeypatch.setattr(
         db,
-        time_key="2026-05-01 10:00:00",
-        summary="Alice explicitly prefers Slack for urgent alerts.",
-        keywords=["Slack", "preference"],
-        fact_type="semantic",
-        fact_kind="preference",
+        "memory_node_embeddings",
+        lambda requested_ids: {
+            node_id: np.ones(1536, dtype=np.float32)
+            for node_id in requested_ids
+            if node_id in node_ids
+        },
     )
-    db.entity_link_node(node_id, alice)
     observation_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",
         topic_label="alert routing",
         bundle_type="observation",
-        source_node_ids=[node_id],
+        source_node_ids=node_ids,
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
     mgr._update_observations_for_evidence_bundles([observation_id])
@@ -4628,7 +5218,7 @@ def test_observation_type_gate_rejects_incompatible_interpretation(db):
 
     score, reason = mgr._calculate_interpretation_candidate_score(
         observation=semantic_observation,
-        source_nodes=db.memory_nodes_by_ids([node_id]),
+        source_nodes=db.memory_nodes_by_ids(node_ids),
         interpretation=task_interpretation,
         observation_id=observation_id,
     )

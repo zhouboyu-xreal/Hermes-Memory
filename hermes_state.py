@@ -321,6 +321,7 @@ CREATE TABLE IF NOT EXISTS memory_evidence_bundles (
     entity_id INTEGER NOT NULL REFERENCES entity_nodes(id),
     topic_key TEXT NOT NULL,
     topic_label TEXT NOT NULL,
+    canonical_topic_embedding BLOB,
     bundle_type TEXT NOT NULL DEFAULT 'entity_topic',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -335,6 +336,7 @@ CREATE TABLE IF NOT EXISTS memory_evidence_bundle_sources (
     node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
     role TEXT NOT NULL DEFAULT 'initial',
     confidence REAL DEFAULT 1.0,
+    pending_observation INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (evidence_bundle_id, node_id)
 );
 
@@ -858,6 +860,20 @@ class SessionDB:
         except sqlite3.OperationalError:
             cursor.executescript(ENTITY_FTS_SQL)
         cursor.executescript(MEMORY_EVIDENCE_BUNDLES_SQL)
+        try:
+            cursor.execute(
+                "ALTER TABLE memory_evidence_bundles "
+                "ADD COLUMN canonical_topic_embedding BLOB"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute(
+                "ALTER TABLE memory_evidence_bundle_sources "
+                "ADD COLUMN pending_observation INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
         self._drop_obsolete_evidence_bundle_columns(cursor)
         self._drop_legacy_memory_entity_columns(cursor)
         cursor.executescript(MEMORY_INTERPRETATIONS_SQL)
@@ -5006,6 +5022,42 @@ class SessionDB:
         ).fetchall()
         return [int(row["node_id"]) for row in rows]
 
+    def memory_set_evidence_bundle_sources_pending_observation(
+        self,
+        evidence_bundle_id: int,
+        node_ids: List[int],
+        *,
+        pending: bool,
+    ) -> None:
+        """Mark bundle facts as waiting for a viable observation cluster."""
+        clean_ids = self._json_int_list(node_ids)
+        if not clean_ids:
+            return
+        placeholders = ",".join("?" for _ in clean_ids)
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE memory_evidence_bundle_sources "
+                "SET pending_observation = ? "
+                f"WHERE evidence_bundle_id = ? AND node_id IN ({placeholders})",
+                [1 if pending else 0, int(evidence_bundle_id), *clean_ids],
+            )
+
+        self._execute_write(_do)
+
+    def memory_evidence_bundle_pending_observation_source_ids(
+        self,
+        evidence_bundle_id: int,
+    ) -> List[int]:
+        """Return facts deferred until more evidence reaches the bundle."""
+        rows = self._conn.execute(
+            "SELECT node_id FROM memory_evidence_bundle_sources "
+            "WHERE evidence_bundle_id = ? AND pending_observation = 1 "
+            "ORDER BY node_id",
+            (int(evidence_bundle_id),),
+        ).fetchall()
+        return [int(row["node_id"]) for row in rows]
+
     def find_bundled_source_node_ids(self, node_ids: List[int]) -> List[int]:
         """Return node ids that already belong to an evidence bundle."""
         clean_ids = self._json_int_list(node_ids)
@@ -5032,8 +5084,25 @@ class SessionDB:
             f"WHERE mo.id IN ({placeholders})",
             clean_ids,
         ).fetchall()
-        by_id = {int(row["id"]): dict(row) for row in rows}
+        by_id = {
+            int(row["id"]): self._decode_evidence_bundle_row(row)
+            for row in rows
+        }
         return [by_id[bundle_id] for bundle_id in clean_ids if bundle_id in by_id]
+
+    @staticmethod
+    def _decode_evidence_bundle_row(row: Any) -> Dict[str, Any]:
+        item = dict(row)
+        stored_embedding = item.get("canonical_topic_embedding")
+        if stored_embedding is not None:
+            try:
+                item["canonical_topic_embedding"] = np.frombuffer(
+                    bytes(stored_embedding),
+                    dtype=np.float32,
+                ).copy()
+            except (TypeError, ValueError):
+                item["canonical_topic_embedding"] = None
+        return item
 
     def memory_update_evidence_bundle_metadata(
         self,
@@ -5658,6 +5727,7 @@ class SessionDB:
         topic_key: str,
         topic_label: str,
         source_node_ids: List[int],
+        canonical_topic_embedding: Optional[np.ndarray] = None,
         bundle_type: str = "entity_topic",
         metadata: Optional[Dict[str, Any]] = None,
         source_role: str = "initial",
@@ -5686,6 +5756,9 @@ class SessionDB:
         source_time_end = time_rows["end_time"] if time_rows else None
         now_text = datetime.now().astimezone().isoformat()
         metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
+        canonical_topic_embedding_blob = self._embedding_to_blob(
+            canonical_topic_embedding
+        )
 
         def _do(conn):
             existing = conn.execute(
@@ -5698,11 +5771,14 @@ class SessionDB:
                 evidence_bundle_id = existing["id"] if isinstance(existing, sqlite3.Row) else existing[0]
                 conn.execute(
                     "UPDATE memory_evidence_bundles SET "
-                    "topic_label = ?, updated_at = ?, last_supported_at = ?, "
+                    "topic_label = ?, canonical_topic_embedding = "
+                    "COALESCE(?, canonical_topic_embedding), "
+                    "updated_at = ?, last_supported_at = ?, "
                     "source_time_start = ?, source_time_end = ?, metadata = ? "
                     "WHERE id = ?",
                     (
                         topic_label,
+                        canonical_topic_embedding_blob,
                         now_text,
                         now_text,
                         source_time_start,
@@ -5714,13 +5790,15 @@ class SessionDB:
             else:
                 cursor = conn.execute(
                     "INSERT INTO memory_evidence_bundles "
-                    "(entity_id, topic_key, topic_label, bundle_type, created_at, "
-                    "updated_at, last_supported_at, source_time_start, source_time_end, metadata) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(entity_id, topic_key, topic_label, canonical_topic_embedding, "
+                    "bundle_type, created_at, updated_at, last_supported_at, "
+                    "source_time_start, source_time_end, metadata) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         entity_id,
                         topic_key,
                         topic_label,
+                        canonical_topic_embedding_blob,
                         bundle_type,
                         now_text,
                         now_text,
@@ -5812,7 +5890,58 @@ class SessionDB:
             "ORDER BY mo.updated_at DESC, mo.id DESC",
             (int(entity_id), str(topic_key)),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._decode_evidence_bundle_row(row) for row in rows]
+
+    def get_evidence_bundles_for_entity(
+        self,
+        entity_id: int,
+        *,
+        bundle_type: str = "entity_topic",
+    ) -> List[Dict[str, Any]]:
+        """Return canonical topic containers available for one entity."""
+        rows = self._conn.execute(
+            "SELECT mo.*, en.name AS entity_name "
+            "FROM memory_evidence_bundles mo "
+            "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
+            "WHERE mo.entity_id = ? AND mo.bundle_type = ? "
+            "ORDER BY mo.updated_at DESC, mo.id DESC",
+            (int(entity_id), str(bundle_type)),
+        ).fetchall()
+        return [self._decode_evidence_bundle_row(row) for row in rows]
+
+    def memory_update_evidence_bundle_topic(
+        self,
+        evidence_bundle_id: int,
+        *,
+        topic_label: Optional[str] = None,
+        canonical_topic_embedding: Optional[np.ndarray] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Update canonical topic data without changing source timestamps."""
+        assignments: List[str] = []
+        params: List[Any] = []
+        if topic_label is not None:
+            assignments.append("topic_label = ?")
+            params.append(str(topic_label))
+        embedding_blob = self._embedding_to_blob(canonical_topic_embedding)
+        if embedding_blob is not None:
+            assignments.append("canonical_topic_embedding = ?")
+            params.append(embedding_blob)
+        if metadata is not None:
+            assignments.append("metadata = ?")
+            params.append(json.dumps(metadata or {}, ensure_ascii=False))
+        if not assignments:
+            return
+        params.append(int(evidence_bundle_id))
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE memory_evidence_bundles SET "
+                f"{', '.join(assignments)} WHERE id = ?",
+                params,
+            )
+
+        self._execute_write(_do)
 
     def get_evidence_bundle_supporting_nodes(
         self,
@@ -6153,12 +6282,14 @@ class SessionDB:
             source_bundle_ids = [keep_evidence_bundle_id, *clean_remove_ids]
             source_bundle_placeholders = ",".join("?" for _ in source_bundle_ids)
             existing_source_rows = conn.execute(
-                "SELECT node_id, role FROM memory_evidence_bundle_sources "
+                "SELECT node_id, role, pending_observation "
+                "FROM memory_evidence_bundle_sources "
                 f"WHERE evidence_bundle_id IN ({source_bundle_placeholders})",
                 source_bundle_ids,
             ).fetchall()
             role_priority = {"supporting": 0, "matched": 1, "initial": 2}
             existing_source_roles: Dict[int, str] = {}
+            existing_pending_observation: Dict[int, bool] = {}
             for row in existing_source_rows:
                 node_id = int(row["node_id"])
                 role = str(row["role"] or "supporting").strip().lower()
@@ -6167,6 +6298,10 @@ class SessionDB:
                 previous = existing_source_roles.get(node_id)
                 if previous is None or role_priority[role] > role_priority[previous]:
                     existing_source_roles[node_id] = role
+                existing_pending_observation[node_id] = (
+                    existing_pending_observation.get(node_id, False)
+                    or bool(row["pending_observation"])
+                )
             conn.execute(
                 "UPDATE memory_evidence_bundles SET "
                 "bundle_type = ?, updated_at = ?, last_supported_at = ?, "
@@ -6231,8 +6366,15 @@ class SessionDB:
                 )
                 conn.execute(
                     "INSERT OR IGNORE INTO memory_evidence_bundle_sources "
-                    "(evidence_bundle_id, node_id, role, confidence) VALUES (?, ?, ?, ?)",
-                    (keep_evidence_bundle_id, node_id, role, 1.0),
+                    "(evidence_bundle_id, node_id, role, confidence, "
+                    "pending_observation) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        keep_evidence_bundle_id,
+                        node_id,
+                        role,
+                        1.0,
+                        1 if existing_pending_observation.get(node_id) else 0,
+                    ),
                 )
 
         self._execute_write(_do)
