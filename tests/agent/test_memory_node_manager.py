@@ -4546,6 +4546,57 @@ def test_interpretation_linker_respects_observation_candidate_type_gate(db):
     assert "cheap_linker" not in metadata
 
 
+def test_interpretation_clustering_allows_mixed_observation_types(db):
+    entity_id = db.entity_add_entity("Hermes Agent", "PROJECT")
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    items = [
+        {
+            "observation": {
+                "entity_id": entity_id,
+                "topic_key": "memory-interpretation",
+                "observation_type": "task_state",
+                "metadata": {
+                    "candidate_interpretation_types": ["task"],
+                },
+            },
+            "source_nodes": [
+                {
+                    "fact_kind": "request",
+                    "task_event_like": True,
+                    "task_relevance": "strong",
+                },
+            ],
+        },
+        {
+            "observation": {
+                "entity_id": entity_id,
+                "topic_key": "memory-interpretation",
+                "observation_type": "task_progress",
+                "metadata": {
+                    "candidate_interpretation_types": ["task"],
+                },
+            },
+            "source_nodes": [
+                {
+                    "fact_kind": "action",
+                    "task_event_like": True,
+                    "task_relevance": "strong",
+                },
+            ],
+        },
+    ]
+
+    clusters = mgr._cluster_observation_items_for_interpretation(items)
+
+    assert len(clusters) == 1
+    assert clusters[0]["family"] == "task"
+    assert clusters[0]["observation_types"] == [
+        "task_state",
+        "task_progress",
+    ]
+    assert clusters[0]["items"] == items
+
+
 def test_interpretation_generation_clusters_unmatched_observations(db):
     hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
     first_source = _add_memory_node(

@@ -4709,7 +4709,7 @@ class MemoryNodeManager:
             reasons.append(temporal_reason)
         return score, reasons
 
-    def _calculate_interpretation_candidate_score(
+    def _calculate_interpretation_candidate_score_for_observation(
         self,
         *,
         observation: Dict[str, Any],
@@ -4882,13 +4882,13 @@ class MemoryNodeManager:
         observation = item["observation"]
         observation_id = int(item["observation_id"])
         source_nodes = item.get("source_nodes", [])
-        candidates = self._search_interpretation_candidates_for_observation(
+        interpretation_candidates = self._search_interpretation_candidates_for_observation(
             observation,
             observation_id,
         )
-        scored_candidates: List[Tuple[float, str, Dict[str, Any]]] = []
-        for candidate in candidates:
-            score, score_reason = self._calculate_interpretation_candidate_score(
+        scored_interpretation_candidates: List[Tuple[float, str, Dict[str, Any]]] = []
+        for candidate in interpretation_candidates:
+            score, score_reason = self._calculate_interpretation_candidate_score_for_observation(
                 observation=observation,
                 source_nodes=source_nodes,
                 interpretation=candidate,
@@ -4896,21 +4896,21 @@ class MemoryNodeManager:
             )
             if score <= 0.0:
                 continue
-            scored_candidates.append((score, score_reason, candidate))
-        scored_candidates.sort(
+            scored_interpretation_candidates.append((score, score_reason, candidate))
+        scored_interpretation_candidates.sort(
             key=lambda entry: (
                 entry[0],
                 entry[2].get("updated_at") or "",
             ),
             reverse=True,
         )
-        scored_candidates = scored_candidates[:6]
+        scored_interpretation_candidates = scored_interpretation_candidates[:6]
 
         if (
-            scored_candidates
-            and scored_candidates[0][1] == "existing_observation_evidence"
+            scored_interpretation_candidates
+            and scored_interpretation_candidates[0][1] == "existing_observation_evidence"
         ):
-            score, score_reason, candidate = scored_candidates[0]
+            score, score_reason, candidate = scored_interpretation_candidates[0]
             return {
                 "decision": "evidence_only",
                 "target_interpretation_id": int(candidate["id"]),
@@ -4924,7 +4924,7 @@ class MemoryNodeManager:
 
         candidate_payloads = []
         candidate_by_id: Dict[int, Dict[str, Any]] = {}
-        for score, score_reason, candidate in scored_candidates:
+        for score, score_reason, candidate in scored_interpretation_candidates:
             candidate_id = int(candidate["id"])
             candidate_by_id[candidate_id] = candidate
             candidate_payloads.append({
@@ -4994,7 +4994,7 @@ class MemoryNodeManager:
         if decision not in {
             "update", "evidence_only", "unmatched", "defer", "ignore",
         }:
-            if scored_candidates and scored_candidates[0][0] >= 0.78:
+            if scored_interpretation_candidates and scored_interpretation_candidates[0][0] >= 0.78:
                 decision = "update"
                 relationship = "extend"
             else:
@@ -5040,7 +5040,7 @@ class MemoryNodeManager:
             "candidate_score": next(
                 (
                     score
-                    for score, _, candidate in scored_candidates
+                    for score, _, candidate in scored_interpretation_candidates
                     if int(candidate["id"]) == target_id
                 ),
                 0.0,
@@ -5469,194 +5469,11 @@ class MemoryNodeManager:
             })
         return deferred_items
 
-    def _link_observation_to_existing_interpretation(
-        self,
-        *,
-        observation: Dict[str, Any],
-        source_nodes: List[Dict[str, Any]],
-        observation_id: int,
-        source_node_ids: List[int],
-        auto_link_threshold: float = 0.78,
-        allow_content_update: bool = True,
-        return_details: bool = False,
-    ) -> Optional[Any]:
-        if not self._db or not observation_id:
-            return None
-        candidates = self._search_interpretation_candidates_for_observation(observation, int(observation_id))
-        if not candidates:
-            return None
-
-        scored: List[Tuple[float, str, Dict[str, Any]]] = []
-        for candidate in candidates:
-            score, reason = self._calculate_interpretation_candidate_score(
-                observation=observation,
-                source_nodes=source_nodes,
-                interpretation=candidate,
-                observation_id=int(observation_id),
-            )
-            scored.append((score, reason, candidate))
-        scored.sort(key=lambda item: (item[0], item[2].get("updated_at") or ""), reverse=True)
-        best_score, reason, best = scored[0]
-        if best_score < auto_link_threshold:
-            self._log_info(
-                "memory_reflect",
-                "interpretation_link_skipped", 
-                {
-                    "observation": self._reflect_observation_log_item(observation),
-                    "best_interpretation_id": best.get("id"),
-                    "best_score": best_score,
-                    "reason": reason,
-                }
-            )
-            return None
-        existing_evidence_reasons = {
-            "existing_observation_evidence",
-        }
-        if not allow_content_update and reason not in existing_evidence_reasons:
-            self._log_info(
-                "memory_reflect",
-                "interpretation_link_deferred", 
-                {
-                    "observation": self._reflect_observation_log_item(observation),
-                    "best_interpretation_id": best.get("id"),
-                    "best_score": best_score,
-                    "reason": "llm_budget_exhausted_before_update",
-                }
-            )
-            return None
-
-        evidence_node_ids = list(dict.fromkeys([
-            *best.get("evidence_node_ids", []),
-            *[int(node_id) for node_id in source_node_ids if node_id is not None],
-        ]))
-        evidence_observation_ids = list(dict.fromkeys([
-            *best.get("evidence_observation_ids", []),
-            int(observation_id),
-        ]))
-        metadata = self._json_dict(best.get("metadata", {}))
-        updated_interpretation = None
-        content_update_attempted = False
-        if allow_content_update and reason not in existing_evidence_reasons:
-            content_update_attempted = True
-            updated_interpretation = self._update_existing_interpretation_from_observation(
-                interpretation=best,
-                observation=observation,
-                source_nodes=source_nodes,
-                observation_id=int(observation_id),
-            )
-        if updated_interpretation:
-            evidence_node_ids = list(dict.fromkeys([
-                *evidence_node_ids,
-                *updated_interpretation.get("evidence_node_ids", []),
-            ]))
-            evidence_observation_ids = list(dict.fromkeys([
-                *evidence_observation_ids,
-                *updated_interpretation.get("evidence_observation_ids", []),
-            ]))
-            metadata = {
-                **metadata,
-                **(updated_interpretation.get("metadata") or {}),
-            }
-        link_metadata = self._json_dict(metadata.get("cheap_linker", {}))
-        metadata["cheap_linker"] = {
-            **link_metadata,
-            "last_match_score": round(float(best_score), 4),
-            "last_match_reason": reason,
-            "last_observation_id": int(observation_id),
-            "linker_version": 1,
-            "content_updated": bool(updated_interpretation),
-        }
-        metadata["observation_ids"] = list(dict.fromkeys([
-            *[
-                int(value)
-                for value in metadata.get("observation_ids", [])
-                if str(value).isdigit()
-            ],
-            int(observation_id),
-        ]))
-        claim = (updated_interpretation or {}).get("claim", best.get("claim", ""))
-        target_text = (updated_interpretation or {}).get("target_text", best.get("target_text", ""))
-        scope = (updated_interpretation or {}).get("scope", best.get("scope", "general"))
-        interpretation_type = (updated_interpretation or {}).get(
-            "interpretation_type",
-            best.get("interpretation_type", "behavior_pattern"),
-        )
-        resolution = (updated_interpretation or {}).get("resolution", best.get("resolution", ""))
-        action_implication = (updated_interpretation or {}).get(
-            "action_implication",
-            best.get("action_implication", ""),
-        )
-        embedding_text = self._build_interpretation_embedding_text(
-            entity_name=best.get("entity_name") or observation.get("entity_name") or "",
-            target_text=target_text,
-            scope=scope,
-            interpretation_type=interpretation_type,
-            claim=claim,
-            action_implication=action_implication,
-            resolution=resolution,
-        )
-        interpretation_id = self._db.memory_upsert_interpretation(
-            interpretation_id=int(best["id"]),
-            claim=claim,
-            entity_id=best.get("entity_id") or metadata.get("entity_id") or observation.get("entity_id"),
-            subject_text=(updated_interpretation or {}).get("subject_text", best.get("subject_text", "")),
-            target_text=target_text,
-            scope=scope,
-            interpretation_type=interpretation_type,
-            polarity=(updated_interpretation or {}).get("polarity", best.get("polarity", "neutral")),
-            strength=(updated_interpretation or {}).get("strength", best.get("strength", 0.5)),
-            confidence=(updated_interpretation or {}).get("confidence", best.get("confidence", 0.5)),
-            status=(updated_interpretation or {}).get("status", best.get("status", "current")),
-            conflict_status=(updated_interpretation or {}).get("conflict_status", best.get("conflict_status", "none")),
-            resolution=resolution,
-            action_implication=action_implication,
-            evidence_node_ids=evidence_node_ids,
-            evidence_observation_ids=evidence_observation_ids,
-            counter_evidence_node_ids=list(dict.fromkeys([
-                *best.get("counter_evidence_node_ids", []),
-                *((updated_interpretation or {}).get("counter_evidence_node_ids", [])),
-            ])),
-            counter_evidence_observation_ids=list(dict.fromkeys([
-                *best.get("counter_evidence_observation_ids", []),
-                *((updated_interpretation or {}).get("counter_evidence_observation_ids", [])),
-            ])),
-            embedding=self._embed_memory_layer_text(embedding_text),
-            embedding_text=embedding_text,
-            metadata=metadata,
-        )
-        self._db.memory_link_interpretation_observation(
-            interpretation_id,
-            int(observation_id),
-            confidence=float(best_score),
-        )
-        self._log_info(
-            "memory_reflect",
-            "interpretation_linked", 
-            {
-                "interpretation_id": interpretation_id,
-                "observation_id": observation_id,
-                "source_node_ids": source_node_ids,
-                "score": best_score,
-                "reason": reason,
-                "interpretation_type": best.get("interpretation_type"),
-                "content_updated": bool(updated_interpretation),
-            }
-        )
-        if return_details:
-            return {
-                "interpretation_id": int(interpretation_id),
-                "content_update_attempted": content_update_attempted,
-                "content_updated": bool(updated_interpretation),
-                "reason": reason,
-                "score": best_score,
-            }
-        return int(interpretation_id)
-
     def _cluster_observation_items_for_interpretation(
         self,
         items: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        buckets: Dict[Tuple[str, Any, str, str], Dict[str, Any]] = {}
+        buckets: Dict[Tuple[str, Any, str], Dict[str, Any]] = {}
         for item in items:
             observation = item["observation"]
             source_nodes = item.get("source_nodes", [])
@@ -5664,24 +5481,22 @@ class MemoryNodeManager:
             topic_key = self._topic_key(observation.get("topic_key") or observation.get("topic_label") or "general")
             cluster_topic = "task-chain" if family == "task" else (topic_key or "general")
             observation_type = str(
-                self._json_dict(observation.get("metadata", {})).get(
-                    "observation_type"
-                )
-                or "legacy_observation"
+                observation.get("observation_type") or "context"
             )
             key = (
                 family,
                 observation.get("entity_id"),
                 cluster_topic,
-                observation_type,
             )
             bucket = buckets.setdefault(key, {
                 "family": family,
                 "entity_id": observation.get("entity_id"),
                 "topic_key": cluster_topic,
-                "observation_type": observation_type,
+                "observation_types": [],
                 "items": [],
             })
+            if observation_type not in bucket["observation_types"]:
+                bucket["observation_types"].append(observation_type)
             bucket["items"].append(item)
         clusters = list(buckets.values())
         clusters.sort(key=lambda cluster: (len(cluster["items"]), cluster["family"], cluster["topic_key"]), reverse=True)
