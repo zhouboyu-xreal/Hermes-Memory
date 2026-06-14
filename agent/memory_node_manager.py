@@ -2374,7 +2374,7 @@ class MemoryNodeManager:
             if entry is None and topic_embedding is not None:
                 scored_entries = [
                     (
-                        self._embedding_similarity(
+                        self._cal_embedding_similarity(
                             topic_embedding,
                             candidate.get("embedding"),
                         ),
