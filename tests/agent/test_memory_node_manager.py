@@ -1530,7 +1530,7 @@ def _add_task_interpretation(
             topic_label=topic_label,
             bundle_type="observation",
             source_node_ids=source_node_ids,
-            metadata={"observation_kind": "timeline"},
+            metadata={"observation_type": "task_progress"},
         )
     task_metadata = {
         "task_status": "active",
@@ -2360,7 +2360,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         topic_label="alerts",
         bundle_type="entity_topic",
         source_node_ids=[first_node],
-        metadata={"observation_kind": "context"},
+        metadata={"observation_type": "context"},
     )
     second_observation = db.memory_upsert_evidence_bundle(
         entity_id=alice_spaced,
@@ -2368,7 +2368,7 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         topic_label="alerts",
         bundle_type="entity_topic",
         source_node_ids=[second_node],
-        metadata={"observation_kind": "context"},
+        metadata={"observation_type": "context"},
     )
     mgr = _NoAsyncMemoryNodeManager(
         db,
@@ -2379,14 +2379,14 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
                 "summary": "Alice consistently wants urgent and incident alerts routed through Slack.",
                 "keywords": ["Slack", "alerts", "notifications"],
                 "confidence": 0.9,
-                "metadata": {"observation_kind": "context"},
+                "metadata": {"observation_type": "context"},
             }),
             json.dumps({
                 "category": "observation",
                 "summary": "Alice consistently wants urgent and incident alerts routed through Slack.",
                 "keywords": ["Slack", "alerts", "notifications"],
                 "confidence": 0.9,
-                "metadata": {"observation_kind": "context"},
+                "metadata": {"observation_type": "context"},
             }),
             json.dumps({"should_create": False}),
         ],
@@ -2957,7 +2957,7 @@ def test_store_turn_consolidates_observation_for_entity_topic_bucket(db):
     assert bundle["entity_name"] == "Alice"
     assert bundle["topic_key"] == "slack-alerts"
     assert observation["observation_type"] == "context"
-    assert json.loads(observation["metadata"])["observation_kind"] == "context"
+    assert "observation_kind" not in json.loads(observation["metadata"])
     assert observation["summary"] == "Alice's urgent alert workflow is Slack-centered."
     sources = db._conn.execute("SELECT node_id FROM memory_evidence_bundle_sources").fetchall()
     assert len(sources) == 3
@@ -4378,7 +4378,7 @@ def test_interpretation_linker_reuses_existing_observation_evidence_without_llm(
         topic_label="Slack alerts",
         bundle_type="observation",
         source_node_ids=[first, second],
-        metadata={"observation_kind": "context"},
+        metadata={"observation_type": "context"},
     )
     interpretation_id = db.memory_upsert_interpretation(
         claim="Agent 当前解释为 Alice 的紧急告警协作应优先使用 Slack。",
@@ -4427,7 +4427,7 @@ def test_interpretation_linker_matches_preference_by_entity_topic_without_llm(db
         topic_label="architecture planning",
         bundle_type="observation",
         source_node_ids=[source],
-        metadata={"observation_kind": "event_pattern"},
+        metadata={"observation_type": "behavior_pattern"},
     )
     interpretation_id = db.memory_upsert_interpretation(
         claim="Alice prefers architecture discussion before implementation on complex coding work.",
@@ -4508,7 +4508,7 @@ def test_interpretation_linker_respects_observation_candidate_type_gate(db):
         bundle_type="observation",
         source_node_ids=[source],
         metadata={
-            "observation_kind": "task_signal",
+            "observation_type": "task_state",
             "candidate_interpretation_types": ["task"],
         },
     )
@@ -4577,7 +4577,7 @@ def test_interpretation_generation_clusters_unmatched_observations(db):
         bundle_type="observation",
         source_node_ids=[first_source],
         metadata={
-            "observation_kind": "task_signal",
+            "observation_type": "task_state",
             "evidence_shape": "single_event",
             "temporal_scope": "recent",
             "candidate_interpretation_types": ["task"],
@@ -4590,7 +4590,7 @@ def test_interpretation_generation_clusters_unmatched_observations(db):
         bundle_type="observation",
         source_node_ids=[second_source],
         metadata={
-            "observation_kind": "state_change",
+            "observation_type": "task_progress",
             "evidence_shape": "progression",
             "temporal_scope": "recent",
             "candidate_interpretation_types": ["task"],
@@ -4662,7 +4662,7 @@ def test_interpretation_generation_defers_weak_single_observation(db):
         bundle_type="observation",
         source_node_ids=[source],
         metadata={
-            "observation_kind": "context",
+            "observation_type": "context",
             "evidence_shape": "single_event",
             "temporal_scope": "recent",
             "candidate_interpretation_types": ["insight"],
@@ -4702,7 +4702,7 @@ def test_interpretation_generation_defers_single_fact_insight_before_llm(db):
         bundle_type="observation",
         source_node_ids=[source],
         metadata={
-            "observation_kind": "state_change",
+            "observation_type": "task_progress",
             "evidence_shape": "progression",
             "temporal_scope": "recent",
             "candidate_interpretation_types": ["insight"],
@@ -4767,7 +4767,7 @@ def test_interpretation_generation_does_not_use_global_batch_threshold_for_weak_
                 bundle_type="observation",
                 source_node_ids=[source],
                 metadata={
-                    "observation_kind": "context",
+                    "observation_type": "context",
                     "evidence_shape": "single_event",
                     "temporal_scope": "recent",
                     "candidate_interpretation_types": ["insight"],
@@ -4807,7 +4807,7 @@ def test_interpretation_generation_skips_final_observation_when_basis_unchanged(
         bundle_type="observation",
         source_node_ids=[source],
         metadata={
-            "observation_kind": "preference_signal",
+            "observation_type": "preference_signal",
             "evidence_shape": "single_event",
             "temporal_scope": "ongoing",
             "candidate_interpretation_types": ["preference"],
@@ -4866,7 +4866,7 @@ def test_interpretation_generation_reuses_deferred_observation_in_new_cluster(db
         bundle_type="observation",
         source_node_ids=[first_source],
         metadata={
-            "observation_kind": "context",
+            "observation_type": "context",
             "evidence_shape": "single_event",
             "temporal_scope": "recent",
             "candidate_interpretation_types": ["insight"],
@@ -4882,7 +4882,7 @@ def test_interpretation_generation_reuses_deferred_observation_in_new_cluster(db
         bundle_type="observation_followup",
         source_node_ids=[second_source],
         metadata={
-            "observation_kind": "context",
+            "observation_type": "context",
             "evidence_shape": "single_event",
             "temporal_scope": "recent",
             "candidate_interpretation_types": ["insight"],
@@ -4969,7 +4969,7 @@ def test_store_turn_can_consolidate_task_observation(db):
                 "keywords": ["Hermes Agent", "memory", "recall", "observation"],
                 "confidence": 0.82,
                 "metadata": {
-                    "observation_kind": "timeline",
+                    "observation_type": "task_progress",
                     "has_conflict": False,
                 },
             }),
@@ -5023,7 +5023,7 @@ def test_store_turn_can_consolidate_task_observation(db):
     metadata = json.loads(observation["metadata"])
     assert observation["observation_type"] == "observation"
     assert "正在迭代 Hermes Agent" in observation["summary"]
-    assert metadata["observation_kind"] == "event_cluster"
+    assert "observation_kind" not in metadata
     assert metadata["evidence_shape"] == "progression"
     assert metadata["temporal_scope"] == "recent"
     assert metadata["candidate_interpretation_types"] == ["insight", "task"]
@@ -5081,7 +5081,7 @@ def test_reflect_updates_observation_by_entity_and_topic(db):
                 "keywords": ["Hermes Agent", "reflect"],
                 "confidence": 0.9,
                 "metadata": {
-                    "observation_kind": "timeline",
+                    "observation_type": "task_progress",
                     "has_conflict": False,
                 },
             })
@@ -5150,7 +5150,7 @@ def test_reflect_excludes_non_task_fact_kind_from_existing_task_match(db):
                 "summary": "用户偏好讨论 reflect 调度机制，但这不是 task 进展。",
                 "keywords": ["memory-reflect", "preference"],
                 "confidence": 0.78,
-                "metadata": {"observation_kind": "context"},
+                "metadata": {"observation_type": "context"},
             }),
             json.dumps({"should_create": False}),
         ],
@@ -5202,7 +5202,7 @@ def test_reflect_no_longer_matches_observation_by_high_task_embedding_similarity
                 "keywords": ["memory", "reflect", "task matching"],
                 "confidence": 0.88,
                 "metadata": {
-                    "observation_kind": "timeline",
+                    "observation_type": "task_progress",
                     "has_conflict": False,
                 },
             })
@@ -5254,7 +5254,7 @@ def test_reflect_no_longer_matches_fact_to_single_recent_active_task(db):
                 "keywords": ["memory", "prompt"],
                 "confidence": 0.78,
                 "metadata": {
-                    "observation_kind": "timeline",
+                    "observation_type": "task_progress",
                     "has_conflict": False,
                 },
             })
@@ -5322,7 +5322,7 @@ def test_reflect_updates_existing_observation_by_entity_topic(db):
         topic_label="alert-routing",
         bundle_type="observation",
         source_node_ids=[old_node],
-        metadata={"observation_kind": "timeline"},
+        metadata={"observation_type": "task_progress"},
     )
     new_matching_node = _add_memory_node(
         db,
@@ -5355,7 +5355,7 @@ def test_reflect_updates_existing_observation_by_entity_topic(db):
                 "summary": "Alice has continued refining alert routing over time.",
                 "keywords": ["alert-routing", "Slack"],
                 "confidence": 0.88,
-                "metadata": {"observation_kind": "timeline"},
+                "metadata": {"observation_type": "task_progress"},
             }),
             json.dumps({"should_create": False}),
         ],
@@ -5400,7 +5400,7 @@ def test_reflect_clusters_facts_before_updating_existing_observation(db):
         topic_label="alert-routing",
         bundle_type="observation",
         source_node_ids=[old_node],
-        metadata={"observation_kind": "event_cluster"},
+        metadata={"observation_type": "context"},
     )
     new_nodes = []
     for index, summary in enumerate(
@@ -5428,7 +5428,7 @@ def test_reflect_clusters_facts_before_updating_existing_observation(db):
                 "keywords": ["alert-routing", "Slack", "fallback"],
                 "confidence": 0.9,
                 "metadata": {
-                    "observation_kind": "event_cluster",
+                    "observation_type": "context",
                     "evidence_shape": "progression",
                 },
             }),
@@ -5712,11 +5712,12 @@ def test_behavioral_preference_observation_only_allows_inferred_preference(
     assert observation["metadata"]["allowed_interpretation_types"] == [
         "inferred_preference"
     ]
+    assert "observation_kind" not in observation["metadata"]
 
 
 def test_observation_metadata_tracks_fact_type_mixture():
     metadata = MemoryNodeManager._normalize_observation_metadata(
-        {"observation_kind": "context"},
+        {"observation_type": "context"},
         [
             {"fact_type": "semantic", "fact_kind": "context"},
             {"fact_type": "episodic", "fact_kind": "action"},

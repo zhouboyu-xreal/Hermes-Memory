@@ -342,7 +342,7 @@ SCREEN_OBSERVATION_LLM_SYSTEM_PROMPT = """你是屏幕记忆 observation consoli
 
 输出 JSON 必须严格使用以下格式和字段名：
 {
-  "observation_kind": "period_work|event_cluster|state_change|outcome|conflict|context|task_signal|constraint|goal_signal|other",
+  "observation_type": "task_state|task_progress|decision|preference_signal|constraint|problem|strategy|behavior_pattern|context",
   "title": "中文短标题",
   "summary_text": "中文 1-3 句话，描述这组 facts 共同说明发生了什么",
   "progress_text": "中文 1-3 句话，面向周报进展表达；没有明确进展时可与 summary_text 接近",
@@ -358,7 +358,6 @@ SCREEN_OBSERVATION_LLM_SYSTEM_PROMPT = """你是屏幕记忆 observation consoli
   "artifacts": ["材料或产物，0-15 个"],
   "confidence": 0.0,
   "metadata": {
-    "observation_kind": "period_work|event_cluster|state_change|outcome|conflict|context|task_signal|constraint|goal_signal|other",
     "evidence_shape": "single_event|repeated_pattern|contrast|progression|correction|confirmation",
     "temporal_scope": "momentary|recent|ongoing|historical|recurring",
     "source_note": "可选，简短说明证据性质"
@@ -2406,7 +2405,7 @@ class ScreenMemoryCleaner:
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS screen_observations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            observation_kind TEXT NOT NULL DEFAULT 'period_work',
+            observation_type TEXT NOT NULL DEFAULT 'context',
             scope_type TEXT NOT NULL DEFAULT 'window_workstream',
             scope_id INTEGER,
             cluster_key TEXT,
@@ -2442,6 +2441,34 @@ class ScreenMemoryCleaner:
             updated_at TEXT
         );
         """)
+        screen_observation_columns = {
+            row[1]
+            for row in cursor.execute(
+                "PRAGMA table_info(screen_observations)"
+            ).fetchall()
+        }
+        if (
+            "observation_kind" in screen_observation_columns
+            and "observation_type" not in screen_observation_columns
+        ):
+            cursor.execute(
+                "ALTER TABLE screen_observations "
+                "RENAME COLUMN observation_kind TO observation_type"
+            )
+            cursor.execute(
+                """
+                UPDATE screen_observations
+                SET observation_type = CASE observation_type
+                    WHEN 'state_change' THEN 'task_progress'
+                    WHEN 'outcome' THEN 'task_progress'
+                    WHEN 'conflict' THEN 'problem'
+                    WHEN 'task_signal' THEN 'task_state'
+                    WHEN 'goal_signal' THEN 'task_state'
+                    WHEN 'constraint' THEN 'constraint'
+                    ELSE 'context'
+                END
+                """
+            )
 
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS screen_observation_facts (
@@ -4459,7 +4486,9 @@ class ScreenMemoryCleaner:
 
     def normalize_screen_observation_llm_result(self, llm_result):
         normalized = {
-            "observation_kind": str(llm_result.get("observation_kind") or "period_work"),
+            "observation_type": str(
+                llm_result.get("observation_type") or "context"
+            ).strip().lower(),
             "title": str(llm_result.get("title") or ""),
             "summary_text": str(llm_result.get("summary_text") or llm_result.get("summary") or ""),
             "progress_text": str(llm_result.get("progress_text") or ""),
@@ -4476,26 +4505,27 @@ class ScreenMemoryCleaner:
             "confidence": llm_result.get("confidence", 0.0),
             "metadata": llm_result.get("metadata") or {},
         }
-        allowed_kinds = {
-            "period_work",
-            "event_cluster",
-            "state_change",
-            "outcome",
-            "conflict",
-            "context",
-            "task_signal",
+        allowed_types = {
+            "task_state",
+            "task_progress",
+            "decision",
+            "preference_signal",
             "constraint",
-            "goal_signal",
-            "other",
+            "problem",
+            "strategy",
+            "behavior_pattern",
+            "context",
         }
-        if normalized["observation_kind"] not in allowed_kinds:
-            normalized["observation_kind"] = "period_work"
+        if normalized["observation_type"] not in allowed_types:
+            normalized["observation_type"] = "context"
         for key in ["key_points", "decisions", "blockers", "next_actions", "entities", "artifacts"]:
             if not isinstance(normalized[key], list):
                 normalized[key] = [str(normalized[key])]
             normalized[key] = [str(item).strip() for item in normalized[key] if str(item).strip()][:20]
         if not isinstance(normalized["metadata"], dict):
             normalized["metadata"] = {}
+        normalized["metadata"].pop("observation_kind", None)
+        normalized["metadata"].pop("observation_type", None)
         try:
             normalized["confidence"] = round(float(normalized["confidence"]), 3)
         except (TypeError, ValueError):
@@ -4517,7 +4547,7 @@ class ScreenMemoryCleaner:
         title = self.clean_task_window_label(window_context.get("title")) or window_context.get("title") or "屏幕工作观察"
         summary_text = "；".join(fact_texts[:3]) if fact_texts else f"该窗口工作流下出现了 {len(facts)} 条相关屏幕事实。"
         return {
-            "observation_kind": "period_work",
+            "observation_type": "context",
             "title": title[:120],
             "summary_text": summary_text[:1200],
             "progress_text": summary_text[:1200],
@@ -4533,7 +4563,6 @@ class ScreenMemoryCleaner:
             "artifacts": artifacts[:30],
             "confidence": round(sum(fact.get("confidence") or 0.0 for fact in facts) / max(1, len(facts)), 3),
             "metadata": {
-                "observation_kind": "period_work",
                 "evidence_shape": "single_event" if len(facts) <= 1 else "progression",
                 "temporal_scope": "recent",
                 "source_note": "local_fallback_from_screen_facts",
@@ -4604,7 +4633,7 @@ class ScreenMemoryCleaner:
         })
         return {
             "observation_id": cluster.get("observation_id"),
-            "observation_kind": observation.get("observation_kind") or "period_work",
+            "observation_type": observation.get("observation_type") or "context",
             "scope_type": "window_workstream",
             "scope_id": window_workstream_id,
             "cluster_key": cluster_hash,
@@ -4657,7 +4686,7 @@ class ScreenMemoryCleaner:
             cursor.execute(
                 """
                 UPDATE screen_observations
-                SET observation_kind = ?, scope_type = ?, scope_id = ?, cluster_key = ?, period_key = ?,
+                SET observation_type = ?, scope_type = ?, scope_id = ?, cluster_key = ?, period_key = ?,
                     period_start = ?, period_end = ?, title = ?, summary_text = ?,
                     progress_text = ?, project_key = ?, objective_key = ?, work_type = ?,
                     category = ?, key_points_json = ?, decisions_json = ?, blockers_json = ?,
@@ -4670,7 +4699,7 @@ class ScreenMemoryCleaner:
                 WHERE id = ?
                 """,
                 (
-                    entry["observation_kind"],
+                    entry["observation_type"],
                     entry["scope_type"],
                     entry["scope_id"],
                     entry["cluster_key"],
@@ -4710,7 +4739,7 @@ class ScreenMemoryCleaner:
             cursor.execute(
                 """
                 INSERT INTO screen_observations
-                (observation_kind, scope_type, scope_id, cluster_key, period_key,
+                (observation_type, scope_type, scope_id, cluster_key, period_key,
                  period_start, period_end, title, summary_text, progress_text,
                  project_key, objective_key, work_type, category, key_points_json,
                  decisions_json, blockers_json, next_actions_json, entities_json,
@@ -4721,7 +4750,7 @@ class ScreenMemoryCleaner:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    entry["observation_kind"],
+                    entry["observation_type"],
                     entry["scope_type"],
                     entry["scope_id"],
                     entry["cluster_key"],

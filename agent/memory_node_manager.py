@@ -3000,20 +3000,6 @@ class MemoryNodeManager:
         )
 
     @staticmethod
-    def _observation_kind(observation_type: str) -> str:
-        return {
-            "task_state": "task_signal",
-            "task_progress": "state_change",
-            "decision": "state_change",
-            "preference_signal": "preference_signal",
-            "constraint": "constraint",
-            "problem": "conflict",
-            "strategy": "context",
-            "behavior_pattern": "pattern",
-            "context": "context",
-        }.get(str(observation_type or ""), "context")
-
-    @staticmethod
     def _observation_candidate_families(observation_type: str) -> List[str]:
         allowed = OBSERVATION_INTERPRETATION_TYPES.get(
             str(observation_type or "context"),
@@ -4417,7 +4403,9 @@ class MemoryNodeManager:
         interpretation_family: str,
     ) -> Tuple[bool, str]:
         metadata = cls._json_dict(observation.get("metadata", {}))
-        observation_kind = str(metadata.get("observation_kind") or "context").strip().lower()
+        observation_type = str(
+            observation.get("observation_type") or "context"
+        ).strip().lower()
         evidence_shape = str(metadata.get("evidence_shape") or "single_event").strip().lower()
         temporal_scope = str(metadata.get("temporal_scope") or "recent").strip().lower()
         dominant_fact_type = str(metadata.get("dominant_fact_type") or "unknown").strip().lower()
@@ -4429,8 +4417,8 @@ class MemoryNodeManager:
         source_count = cls._unique_source_node_count(source_nodes)
 
         if interpretation_family == "task":
-            if observation_kind in {"task_signal", "goal_signal", "state_change", "outcome", "event_cluster"}:
-                return True, "task_observation_kind"
+            if observation_type in {"task_state", "task_progress", "decision"}:
+                return True, "task_observation_type"
             if any(cls._is_task_event_like_fact(node) for node in source_nodes):
                 return True, "task_event_evidence"
             if source_kinds & {"request", "action", "decision", "error", "recommendation"}:
@@ -4442,7 +4430,11 @@ class MemoryNodeManager:
         if interpretation_family == "preference":
             if source_kinds & {"instruction"}:
                 return True, "explicit_instruction"
-            if source_kinds & {"preference"} and observation_kind in {"preference_signal", "constraint", "pattern"}:
+            if source_kinds & {"preference"} and observation_type in {
+                "preference_signal",
+                "constraint",
+                "behavior_pattern",
+            }:
                 return True, "explicit_preference_signal"
             if source_count >= 2 and evidence_shape in {"repeated_pattern", "confirmation"} and source_kinds & {"preference"}:
                 return True, "repeated_preference_evidence"
@@ -4460,8 +4452,13 @@ class MemoryNodeManager:
             return False, "single_fact_insight_signal"
         if evidence_shape in {"repeated_pattern", "contrast", "progression", "correction", "confirmation"}:
             return True, "structured_insight_evidence"
-        if observation_kind in {"conflict", "state_change", "outcome", "pattern"} and temporal_scope != "momentary":
-            return True, "material_insight_observation_kind"
+        if observation_type in {
+            "problem",
+            "task_progress",
+            "decision",
+            "behavior_pattern",
+        } and temporal_scope != "momentary":
+            return True, "material_insight_observation_type"
         if evidence_mixture in {"semantic_dominant", "episodic_dominant", "balanced_mixed"}:
             return True, "mixed_fact_type_insight"
         return False, "weak_insight_signal"
@@ -4475,16 +4472,16 @@ class MemoryNodeManager:
         metadata = cls._json_dict(observation.get("metadata", {}))
         families = cls._metadata_candidate_types(metadata.get("candidate_interpretation_types"))
         if not families:
-            families = cls._candidate_interpretation_types_for_observation_kind(
-                str(metadata.get("observation_kind") or "context"),
-                source_nodes,
+            families = cls._observation_candidate_families(
+                str(observation.get("observation_type") or "context"),
             )
         return [family for family in ("insight", "task", "preference") if family in set(families)]
 
     @classmethod
-    def _observation_family(cls, observation: Dict[str, Any], source_nodes: List[Dict[str, Any]]) -> str:
-        metadata = cls._json_dict(observation.get("metadata", {}))
-        observation_kind = str(metadata.get("observation_kind") or "").strip().lower()
+    def _observation_cluster_interpretation_family(cls, observation: Dict[str, Any], source_nodes: List[Dict[str, Any]]) -> str:
+        observation_type = str(
+            observation.get("observation_type") or "context"
+        ).strip().lower()
         candidate_families = cls._candidate_interpretation_families(observation, source_nodes)
         source_kinds = {
             str(node.get("fact_kind") or "").strip().lower()
@@ -4492,15 +4489,23 @@ class MemoryNodeManager:
         }
         if "task" in candidate_families and (
             any(cls._is_task_event_like_fact(node) for node in source_nodes)
-            or observation_kind in {"task_signal", "goal_signal", "state_change", "outcome", "event_cluster"}
+            or observation_type in {"task_state", "task_progress", "decision"}
         ):
             return "task"
         if "preference" in candidate_families and (
             source_kinds & {"preference", "instruction"}
-            or observation_kind in {"preference_signal", "constraint", "pattern"}
+            or observation_type in {
+                "preference_signal",
+                "constraint",
+                "behavior_pattern",
+            }
         ):
             return "preference"
-        if "task" in candidate_families and observation_kind in {"timeline", "state_change", "outcome"} and source_kinds & {
+        if "task" in candidate_families and observation_type in {
+            "task_state",
+            "task_progress",
+            "decision",
+        } and source_kinds & {
             "request", "action", "decision", "error",
         }:
             return "task"
@@ -4606,7 +4611,9 @@ class MemoryNodeManager:
     ) -> Tuple[float, List[str]]:
         score = 0.0
         reasons: List[str] = []
-        observation_kind = str(observation_metadata.get("observation_kind") or "").strip().lower()
+        observation_type = str(
+            observation.get("observation_type") or "context"
+        ).strip().lower()
         evidence_shape = str(observation_metadata.get("evidence_shape") or "").strip().lower()
         dominant_fact_type = str(observation_metadata.get("dominant_fact_type") or "").strip().lower()
         evidence_mixture = str(observation_metadata.get("evidence_mixture") or "").strip().lower()
@@ -4620,9 +4627,13 @@ class MemoryNodeManager:
         }
 
         if interpretation_family == "preference":
-            if observation_kind in {"preference_signal", "constraint", "pattern"}:
+            if observation_type in {
+                "preference_signal",
+                "constraint",
+                "behavior_pattern",
+            }:
                 score += 0.08
-                reasons.append("preference_kind")
+                reasons.append("preference_type")
             if source_kinds & {"preference", "instruction"}:
                 score += 0.10
                 reasons.append("preference_evidence")
@@ -4642,9 +4653,9 @@ class MemoryNodeManager:
                 reasons.append("preference_target")
 
         elif interpretation_family == "task":
-            if observation_kind in {"task_signal", "goal_signal", "state_change", "outcome", "event_cluster"}:
+            if observation_type in {"task_state", "task_progress", "decision"}:
                 score += 0.08
-                reasons.append("task_kind")
+                reasons.append("task_type")
             if any(cls._is_task_event_like_fact(node) for node in source_nodes) or source_kinds & {
                 "request", "action", "decision", "error", "recommendation",
             }:
@@ -4664,9 +4675,16 @@ class MemoryNodeManager:
                 reasons.append("task_goal")
 
         else:
-            if observation_kind in {"pattern", "event_cluster", "state_change", "outcome", "conflict", "context"}:
+            if observation_type in {
+                "behavior_pattern",
+                "task_progress",
+                "decision",
+                "problem",
+                "strategy",
+                "context",
+            }:
                 score += 0.06
-                reasons.append("insight_kind")
+                reasons.append("insight_type")
             if evidence_shape in {"repeated_pattern", "contrast", "progression", "correction", "confirmation"}:
                 score += 0.08
                 reasons.append("insight_shape")
@@ -4735,7 +4753,7 @@ class MemoryNodeManager:
         ):
             return 0.0, "observation_type_gate"
         candidate_families = self._candidate_interpretation_families(observation, source_nodes)
-        observation_family = self._observation_family(observation, source_nodes)
+        observation_family = self._observation_cluster_interpretation_family(observation, source_nodes)
         interpretation_family = self._interpretation_family(interpretation.get("interpretation_type"))
         if candidate_families and interpretation_family not in candidate_families:
             return 0.0, "candidate_type_gate"
@@ -4856,7 +4874,7 @@ class MemoryNodeManager:
             seen.add(item_id)
         return candidates
 
-    def _judge_observation_interpretation_value(
+    def _judge_observation_value_for_interpretation(
         self,
         item: Dict[str, Any],
     ) -> Dict[str, Any]:
@@ -5238,7 +5256,6 @@ class MemoryNodeManager:
             "topic_label": observation.get("topic_label"),
             "observation_type": observation.get("observation_type", "observation"),
             "metadata": {
-                "observation_kind": normalized_metadata.get("observation_kind"),
                 "evidence_shape": normalized_metadata.get("evidence_shape"),
                 "temporal_scope": normalized_metadata.get("temporal_scope"),
                 "candidate_interpretation_types": normalized_metadata.get("candidate_interpretation_types", []),
@@ -5330,7 +5347,9 @@ class MemoryNodeManager:
         family: str,
     ) -> Tuple[str, str]:
         metadata = cls._json_dict(observation.get("metadata", {}))
-        observation_kind = str(metadata.get("observation_kind") or "context")
+        observation_type = str(
+            observation.get("observation_type") or "context"
+        ).strip().lower()
         evidence_shape = str(metadata.get("evidence_shape") or "single_event")
         temporal_scope = str(metadata.get("temporal_scope") or "recent")
         dominant_fact_type = str(metadata.get("dominant_fact_type") or "unknown")
@@ -5342,7 +5361,7 @@ class MemoryNodeManager:
         if family == "preference":
             if source_kinds & {"instruction"}:
                 return "high", "explicit_instruction"
-            if observation_kind in {"preference_signal", "constraint"}:
+            if observation_type in {"preference_signal", "constraint"}:
                 return "high", "preference_signal"
             if evidence_shape in {"repeated_pattern", "confirmation"} or temporal_scope in {"ongoing", "recurring"}:
                 return "high", "stable_preference_signal"
@@ -5350,14 +5369,14 @@ class MemoryNodeManager:
                 return "medium", "mixed_preference_evidence"
             return "medium", "weak_preference_signal"
         if family == "task":
-            if observation_kind in {"task_signal", "goal_signal", "state_change", "outcome"}:
+            if observation_type in {"task_state", "task_progress", "decision"}:
                 return "high", "task_state_signal"
             if any(cls._is_task_event_like_fact(node) for node in source_nodes):
                 return "high", "task_event_evidence"
             if dominant_fact_type == "episodic" or evidence_mixture in {"episodic_only", "episodic_dominant"}:
                 return "medium", "episodic_task_context"
             return "medium", "weak_task_signal"
-        if observation_kind in {"conflict", "state_change", "outcome"}:
+        if observation_type in {"problem", "task_progress", "decision"}:
             return "high", "material_insight_change"
         if evidence_shape in {"repeated_pattern", "contrast", "progression", "correction", "confirmation"}:
             return "medium", "structured_insight_evidence"
@@ -5397,7 +5416,7 @@ class MemoryNodeManager:
             source_nodes = self._db.memory_nodes_by_ids(
                 candidate.get("source_node_ids", [])
             )
-            family = self._observation_interpretation_cluster_family(
+            family = self._observation_cluster_interpretation_family(
                 candidate_semantic_observation,
                 source_nodes,
             )
@@ -5633,13 +5652,6 @@ class MemoryNodeManager:
             }
         return int(interpretation_id)
 
-    def _observation_interpretation_cluster_family(
-        self,
-        observation: Dict[str, Any],
-        source_nodes: List[Dict[str, Any]],
-    ) -> str:
-        return self._observation_family(observation, source_nodes)
-
     def _cluster_observation_items_for_interpretation(
         self,
         items: List[Dict[str, Any]],
@@ -5648,7 +5660,7 @@ class MemoryNodeManager:
         for item in items:
             observation = item["observation"]
             source_nodes = item.get("source_nodes", [])
-            family = self._observation_interpretation_cluster_family(observation, source_nodes)
+            family = self._observation_cluster_interpretation_family(observation, source_nodes)
             topic_key = self._topic_key(observation.get("topic_key") or observation.get("topic_label") or "general")
             cluster_topic = "task-chain" if family == "task" else (topic_key or "general")
             observation_type = str(
@@ -5913,9 +5925,6 @@ class MemoryNodeManager:
                 "observation_id": int(observation["id"]),
                 "observation_type": observation_type,
                 "evidence_mode": evidence_mode,
-                "observation_kind": self._observation_kind(
-                    observation_type
-                ),
                 "evidence_shape": evidence_shape,
                 "temporal_scope": temporal_scope,
                 "candidate_interpretation_types": (
@@ -5995,7 +6004,7 @@ class MemoryNodeManager:
                 )
                 continue
             semantic_observation["metadata"] = metadata
-            family = self._observation_interpretation_cluster_family(
+            family = self._observation_cluster_interpretation_family(
                 semantic_observation,
                 source_nodes,
             )
@@ -6025,7 +6034,7 @@ class MemoryNodeManager:
         assignments_by_interpretation: Dict[int, Dict[str, Any]] = {}
         remaining_items: List[Dict[str, Any]] = []
         for item in candidate_items:
-            judgement = self._judge_observation_interpretation_value(item)
+            judgement = self._judge_observation_value_for_interpretation(item)
             decision = str(judgement.get("decision") or "unmatched")
             judgement_extra = {
                 "interpretation_value_decision": decision,
@@ -7922,16 +7931,34 @@ class MemoryNodeManager:
                 return -0.2
         if layer == "observation":
             metadata = cls._json_dict(item.get("metadata", {}))
-            observation_kind = str(metadata.get("observation_kind") or item.get("observation_type") or "").lower()
+            observation_type = str(item.get("observation_type") or "context").lower()
             temporal_scope = str(metadata.get("temporal_scope") or "").lower()
-            if intent == "action" and observation_kind in {"task_signal", "goal_signal", "preference_signal", "constraint"}:
+            if intent == "action" and observation_type in {
+                "task_state",
+                "task_progress",
+                "decision",
+                "preference_signal",
+                "constraint",
+            }:
                 return 0.35
             if intent == "state" and (
-                observation_kind in {"state_change", "pattern", "timeline", "event_cluster", "outcome"}
+                observation_type in {
+                    "task_state",
+                    "task_progress",
+                    "decision",
+                    "problem",
+                    "behavior_pattern",
+                    "context",
+                }
                 or temporal_scope in {"ongoing", "recurring", "recent"}
             ):
                 return 0.35
-            if intent == "evidence" and observation_kind in {"timeline", "event_cluster"}:
+            if intent == "evidence" and observation_type in {
+                "task_progress",
+                "decision",
+                "problem",
+                "context",
+            }:
                 return 0.25
         if layer == "fact":
             fact_type = str(item.get("fact_type") or "").lower()

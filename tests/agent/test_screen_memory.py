@@ -478,6 +478,18 @@ def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
     observation_id = cluster_row[1]
     assert observation_id is not None
     assert cluster_row[2] == 5
+    observation_columns = {
+        row[1]
+        for row in cursor.execute(
+            "PRAGMA table_info(screen_observations)"
+        ).fetchall()
+    }
+    assert "observation_type" in observation_columns
+    assert "observation_kind" not in observation_columns
+    assert cursor.execute(
+        "SELECT observation_type FROM screen_observations WHERE id = ?",
+        (observation_id,),
+    ).fetchone()[0] == "context"
 
     for index in range(6, 11):
         _add_fact(
