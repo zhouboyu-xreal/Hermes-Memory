@@ -730,6 +730,53 @@ supporting facts:
   "metadata": {{"source": "interpretation_generation"}}
 }}"""
 
+INTERPRETATION_OBSERVATION_VALUE_PROMPT = """你是 observation 到已有 interpretation 的价值判断模块。
+
+你需要独立判断一条新 observation 是否与候选 interpretation 相关，以及它是否值得改变已有 interpretation。
+这一步同时负责匹配确认、信息价值判断和冲突识别，但不直接生成或改写 interpretation。
+
+observation:
+{observation}
+
+supporting facts:
+{source_facts}
+
+candidate interpretations:
+{candidate_interpretations}
+
+决策定义：
+- update：observation 带来进展、修正、范围变化、状态变化或冲突，已有 interpretation 的内容需要更新。
+- evidence_only：observation 只是支持或确认已有 interpretation，只需增加证据，不需要改写内容。
+- unmatched：与候选 interpretation 均不匹配，但可能与其他 observation 组合生成新的 interpretation。
+- defer：当前独立价值不足，但未来或与其他 observation 组合后可能有价值。
+- ignore：琐碎、重复、无行动意义，并且没有继续组合分析的价值。
+
+relationship 定义：
+- support：支持或确认已有解释。
+- extend：增加新的进展、条件、范围或行动含义。
+- revise：已有解释需要被修正。
+- contradict：明确反驳、削弱或使已有解释产生冲突。
+- unrelated：与候选解释无关。
+
+判断要求：
+- update 或 evidence_only 时，target_interpretation_id 必须来自候选列表。
+- contradict 通常应选择 update，不能仅因语义方向相反而判为 unrelated。
+- 候选为空时，只能选择 unmatched、defer 或 ignore。
+- 单条 observation 独立价值低，不代表应该 ignore；若可能形成重复模式、时间进展或组合证据，应选择 unmatched 或 defer。
+- 不要仅凭 entity/topic 相同认定匹配，必须判断命题、对象、范围和时间状态是否相关。
+- conflict_level 只能是 none、partial、strong。
+- intrinsic_value 只能是 low、medium、high。
+
+只返回合法 JSON，不要 markdown，不要额外解释：
+{{
+  "decision": "update | evidence_only | unmatched | defer | ignore",
+  "target_interpretation_id": 1,
+  "relationship": "support | extend | revise | contradict | unrelated",
+  "conflict_level": "none | partial | strong",
+  "intrinsic_value": "low | medium | high",
+  "reason": "简洁说明判断依据"
+}}"""
+
 INTERPRETATION_UPDATE_PROMPT = """你是长期记忆 interpretation 更新模块。
 
 你需要根据新的 observation 和 supporting facts，更新一条已经存在的 interpretation。
@@ -812,6 +859,59 @@ supporting facts:
   "counter_evidence_node_ids": [],
   "counter_evidence_observation_ids": [],
   "metadata": {{"source": "interpretation_update"}}
+}}"""
+
+INTERPRETATION_BATCH_UPDATE_PROMPT = """你是长期记忆 interpretation 批量更新模块。
+
+你需要使用一组已经确认匹配的 observations，一次性更新已有 interpretation。
+这些 observations 可能分别提供支持、进展、修正或冲突。请形成统一的 current best interpretation，不要按输入顺序机械追加。
+
+已有 interpretation：
+{interpretation}
+
+matched observations:
+{observations}
+
+supporting facts:
+{source_facts}
+
+更新要求：
+- 综合全部 observations 后再更新 claim、状态、范围、置信度和行动含义。
+- support 可以增强证据；extend 应吸收新进展或条件；revise 应修正原解释；contradict 应体现冲突或明确的新结论。
+- 明确支持当前解释的 observation id 放入 evidence_observation_ids。
+- 明确反驳、削弱或限制当前解释的 observation id 放入 counter_evidence_observation_ids。
+- 对应的底层 fact id 分别放入 evidence_node_ids 或 counter_evidence_node_ids。
+- 如果 interpretation_type=task，metadata 中填写 task_status、task_source、goal、evidence、steps；task_source 固定为 inferred_from_interpretation。
+- 不要编造输入中没有的目标、偏好、风险或结论。
+- 如果综合后内容不需要改变，只输出 {{"should_update": false}}。
+
+字段约束：
+- interpretation_type 只能是 insight、task、explicit_preference、explicit_instruction、inferred_preference、behavior_pattern、project_state、task_risk、constraint、conflict_resolution、strategy、other。
+- status 只能是 current、conflicted。
+- conflict_status 只能是 none、resolved、unresolved。
+- polarity 只能是 positive、negative、mixed、neutral。
+- strength/confidence 必须是 0.0-1.0。
+- evidence_* 和 counter_evidence_* 只能引用输入中的 id。
+
+只返回合法 JSON，不要 markdown，不要额外解释：
+{{
+  "should_update": true,
+  "claim": "更新后的 Agent 当前解释",
+  "target_text": "解释对象",
+  "scope": "适用范围",
+  "interpretation_type": "insight | task | explicit_preference | explicit_instruction | inferred_preference | behavior_pattern | project_state | task_risk | constraint | conflict_resolution | strategy | other",
+  "polarity": "positive | negative | mixed | neutral",
+  "strength": 0.0,
+  "confidence": 0.0,
+  "status": "current | conflicted",
+  "conflict_status": "none | resolved | unresolved",
+  "resolution": "可选，冲突如何被解决",
+  "action_implication": "未来 Agent 应如何使用这个解释",
+  "evidence_node_ids": [1, 2],
+  "evidence_observation_ids": [3],
+  "counter_evidence_node_ids": [],
+  "counter_evidence_observation_ids": [],
+  "metadata": {{"source": "interpretation_batch_update"}}
 }}"""
 
 # ── Reflect prompt template ───────────────────────────────────────────────
@@ -1133,8 +1233,6 @@ class MemoryNodeManager:
         if llm_api_key is not None:
             self._llm_api_key = str(llm_api_key)
 
-    # ── Lazy init ─────────────────────────────────────────────────────────
-
     def _ensure_embedding_client(self, *, optional: bool = False) -> bool:
         if self._embedding_client is not None:
             return True
@@ -1165,7 +1263,7 @@ class MemoryNodeManager:
             return None
 
     @staticmethod
-    def _interpretation_embedding_text(
+    def _build_interpretation_embedding_text(
         *,
         entity_name: str = "",
         target_text: str = "",
@@ -1291,10 +1389,8 @@ class MemoryNodeManager:
             timeout=self._llm_timeout,
         )
 
-    # ── Summarisation ────────────────────────────────────────────────────
-
     @staticmethod
-    def _dialogue_batch_for_prompt(
+    def _build_dialogue_batch_for_prompt(
         source_turns: List[Dict[str, Any]],
         fallback_timestamp: Optional[Any] = None,
     ) -> str:
@@ -1330,7 +1426,7 @@ class MemoryNodeManager:
         """
         if not source_turns:
             return None
-        dialogue_batch = self._dialogue_batch_for_prompt(source_turns)
+        dialogue_batch = self._build_dialogue_batch_for_prompt(source_turns)
         prompt = SUMMARY_SYSTEM_PROMPT.format(
             dialogue_batch=dialogue_batch,
         )
@@ -1506,7 +1602,7 @@ class MemoryNodeManager:
                     logger.debug("Recall query analysis attempt %d returned empty, retrying...", attempt)
                     continue
                 return None
-            data = self._json_object_from_llm_text(result)
+            data = self._parse_json_object_from_llm_text(result)
             if data is None:
                 if attempt == 0:
                     logger.debug("Recall query analysis JSON parse failed on attempt %d, retrying...", attempt)
@@ -1552,7 +1648,7 @@ class MemoryNodeManager:
         return {"decision": "analyze", "reason": "semantic_judgment_required"}
 
     @staticmethod
-    def _json_object_from_llm_text(text: str) -> Optional[Dict[str, Any]]:
+    def _parse_json_object_from_llm_text(text: str) -> Optional[Dict[str, Any]]:
         """Parse a JSON object from an LLM response, tolerating code fences."""
         raw = (text or "").strip()
         if not raw:
@@ -1719,7 +1815,7 @@ class MemoryNodeManager:
         else:
             turn_timestamp_text = str(turn_timestamp)
 
-        dialogue_batch = self._dialogue_batch_for_prompt(
+        dialogue_batch = self._build_dialogue_batch_for_prompt(
             source_turns,
             fallback_timestamp=turn_timestamp_text,
         )
@@ -1730,7 +1826,7 @@ class MemoryNodeManager:
         data: Optional[Dict[str, Any]] = None
         for attempt in range(2):
             result = self._call_llm(prompt)
-            data = self._json_object_from_llm_text(result or "")
+            data = self._parse_json_object_from_llm_text(result or "")
             if data is not None:
                 break
             if attempt == 0:
@@ -2608,7 +2704,7 @@ class MemoryNodeManager:
         return arr / norm
 
     @classmethod
-    def _embedding_similarity(cls, left: Any, right: Any) -> float:
+    def _cal_embedding_similarity(cls, left: Any, right: Any) -> float:
         left_vec = cls._as_embedding_vector(left)
         right_vec = cls._as_embedding_vector(right)
         if left_vec is None or right_vec is None:
@@ -2693,12 +2789,12 @@ class MemoryNodeManager:
             normalized_cluster_centroid = cls._embedding_centroid(
                 cluster_embeddings
             )
-        centroid_similarity = cls._embedding_similarity(
+        centroid_similarity = cls._cal_embedding_similarity(
             normalized_cluster_centroid,
             observation_centroid,
         )
         cross_source_similarities = [
-            cls._embedding_similarity(
+            cls._cal_embedding_similarity(
                 cluster_embedding,
                 observation_source_embedding,
             )
@@ -2711,13 +2807,13 @@ class MemoryNodeManager:
         )
         fact_coverage_similarities = [
             max(
-                cls._embedding_similarity(
+                cls._cal_embedding_similarity(
                     cluster_embedding,
                     observation_centroid,
                 ),
                 max(
                     (
-                        cls._embedding_similarity(
+                        cls._cal_embedding_similarity(
                             cluster_embedding,
                             observation_source_embedding,
                         )
@@ -3017,7 +3113,7 @@ class MemoryNodeManager:
                 )
                 if threshold is None:
                     continue
-                similarity = self._embedding_similarity(
+                similarity = self._cal_embedding_similarity(
                     fact_embedding,
                     cluster.get("centroid"),
                 )
@@ -3065,7 +3161,7 @@ class MemoryNodeManager:
             representative = max(
                 cluster_facts,
                 key=lambda fact: (
-                    self._embedding_similarity(
+                    self._cal_embedding_similarity(
                         embeddings.get(int(self._node_id(fact))),
                         centroid,
                     ),
@@ -3089,7 +3185,7 @@ class MemoryNodeManager:
                     fact_kind_distribution.get(fact_kind, 0) + 1
                 )
             pair_similarities = [
-                self._embedding_similarity(
+                self._cal_embedding_similarity(
                     embeddings.get(int(self._node_id(left))),
                     embeddings.get(int(self._node_id(right))),
                 )
@@ -3207,7 +3303,7 @@ class MemoryNodeManager:
                 ),
                 source_facts=self._observation_fact_payload(source_nodes),
             )
-        data = self._json_object_from_llm_text(self._call_llm(prompt) or "")
+        data = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "")
         if not data:
             return None
         returned_type = str(
@@ -3763,7 +3859,7 @@ class MemoryNodeManager:
             source_facts="\n".join(fact_lines),
         )
         result = self._call_llm(prompt)
-        data = self._json_object_from_llm_text(result or "")
+        data = self._parse_json_object_from_llm_text(result or "")
         if not data or not bool(data.get("should_create")):
             return None
 
@@ -3955,7 +4051,7 @@ class MemoryNodeManager:
             source_facts="\n".join(fact_lines),
         )
         result = self._call_llm(prompt)
-        data = self._json_object_from_llm_text(result or "")
+        data = self._parse_json_object_from_llm_text(result or "")
         if not data or not bool(data.get("should_update")):
             return None
 
@@ -4051,6 +4147,235 @@ class MemoryNodeManager:
                 data.get("evidence_observation_ids", [observation_id]),
                 allowed_observation_ids,
             ) or [int(observation_id)],
+            "counter_evidence_node_ids": self._filter_int_ids(
+                data.get("counter_evidence_node_ids", []),
+                allowed_node_ids,
+            ),
+            "counter_evidence_observation_ids": self._filter_int_ids(
+                data.get("counter_evidence_observation_ids", []),
+                allowed_observation_ids,
+            ),
+            "metadata": metadata_out,
+        }
+
+    def _update_existing_interpretation_from_observations(
+        self,
+        *,
+        interpretation: Dict[str, Any],
+        assignments: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Update one interpretation from all matched observations at once."""
+        if not assignments:
+            return None
+
+        observation_payloads: List[Dict[str, Any]] = []
+        source_nodes = self._dedupe_source_nodes([
+            node
+            for assignment in assignments
+            for node in assignment.get("item", {}).get("source_nodes", [])
+        ])
+        allowed_node_ids = {
+            int(node["id"])
+            for node in source_nodes
+            if node.get("id") is not None
+        }
+        allowed_observation_ids = {
+            int(assignment["item"]["observation_id"])
+            for assignment in assignments
+        }
+        for assignment in assignments:
+            item = assignment["item"]
+            observation = item["observation"]
+            observation_payloads.append({
+                "id": int(item["observation_id"]),
+                "observation_type": observation.get("observation_type"),
+                "summary": observation.get("summary"),
+                "metadata": self._json_dict(observation.get("metadata", {})),
+                "relationship": assignment.get("relationship", "extend"),
+                "conflict_level": assignment.get("conflict_level", "none"),
+                "intrinsic_value": assignment.get("intrinsic_value", "medium"),
+                "reason": assignment.get("reason", ""),
+            })
+
+        fact_lines = []
+        for index, node in enumerate(source_nodes[:24], 1):
+            node_id = int(node["id"])
+            summary = str(node.get("summary") or "").strip()
+            if not summary:
+                continue
+            fact_lines.append(
+                f"{index}. id={node_id} "
+                f"[{node.get('fact_type', 'semantic')}/"
+                f"{node.get('fact_subject', 'other')}/"
+                f"{node.get('fact_kind', 'other')}] {summary}"
+            )
+        if not fact_lines:
+            return None
+
+        interpretation_payload = {
+            key: interpretation.get(key)
+            for key in (
+                "id", "claim", "target_text", "scope", "interpretation_type",
+                "polarity", "strength", "confidence", "status",
+                "conflict_status", "resolution", "action_implication",
+                "evidence_node_ids", "evidence_observation_ids",
+                "counter_evidence_node_ids",
+                "counter_evidence_observation_ids", "metadata",
+            )
+        }
+        prompt = INTERPRETATION_BATCH_UPDATE_PROMPT.format(
+            interpretation=json.dumps(
+                interpretation_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+            observations=json.dumps(
+                observation_payloads,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+            source_facts="\n".join(fact_lines),
+        )
+        data = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "")
+        if not data or not bool(data.get("should_update")):
+            return None
+
+        allowed_types = {
+            "insight", "task",
+            "explicit_preference", "explicit_instruction", "inferred_preference",
+            "behavior_pattern", "project_state", "task_risk", "constraint",
+            "conflict_resolution", "strategy", "other",
+        }
+        existing_type = str(
+            interpretation.get("interpretation_type") or "insight"
+        ).strip().lower()
+        interpretation_type = str(
+            data.get("interpretation_type") or existing_type
+        ).strip().lower().replace("-", "_").replace(" ", "_")
+        if interpretation_type not in allowed_types:
+            interpretation_type = (
+                existing_type if existing_type in allowed_types else "insight"
+            )
+
+        for assignment in assignments:
+            allowed_for_observation = {
+                str(value).strip().lower()
+                for value in self._json_dict(
+                    assignment["item"]["observation"].get("metadata", {})
+                ).get("allowed_interpretation_types", [])
+                if str(value or "").strip()
+            }
+            if (
+                allowed_for_observation
+                and interpretation_type not in allowed_for_observation
+            ):
+                return None
+
+        claim = str(
+            data.get("claim") or interpretation.get("claim") or ""
+        ).strip()
+        action_implication = str(
+            data.get("action_implication")
+            or interpretation.get("action_implication")
+            or ""
+        ).strip()
+        if not claim or not action_implication:
+            return None
+
+        status = str(
+            data.get("status") or interpretation.get("status") or "current"
+        ).strip().lower()
+        if status not in {"current", "conflicted"}:
+            status = "current"
+        conflict_status = str(
+            data.get("conflict_status")
+            or interpretation.get("conflict_status")
+            or "none"
+        ).strip().lower()
+        if conflict_status not in {"none", "resolved", "unresolved"}:
+            conflict_status = "none"
+        polarity = str(
+            data.get("polarity")
+            or interpretation.get("polarity")
+            or "neutral"
+        ).strip().lower()
+        if polarity not in {"positive", "negative", "mixed", "neutral"}:
+            polarity = "neutral"
+        try:
+            strength = float(
+                data.get("strength", interpretation.get("strength", 0.5))
+                or 0.5
+            )
+        except (TypeError, ValueError):
+            strength = float(interpretation.get("strength") or 0.5)
+        try:
+            confidence = float(
+                data.get("confidence", interpretation.get("confidence", 0.5))
+                or 0.5
+            )
+        except (TypeError, ValueError):
+            confidence = float(interpretation.get("confidence") or 0.5)
+
+        metadata_out = data.get("metadata", {})
+        if not isinstance(metadata_out, dict):
+            metadata_out = {}
+        if interpretation_type == "task":
+            metadata_out = self._normalize_task_metadata(
+                metadata_out,
+                allow_stale=True,
+            )
+            metadata_out["task_source"] = "inferred_from_interpretation"
+        else:
+            metadata_out = {
+                key: value
+                for key, value in metadata_out.items()
+                if key not in {
+                    "task_status", "task_source", "goal", "steps",
+                    "next_action",
+                }
+            }
+        metadata_out = {
+            "source": "interpretation_batch_update",
+            **metadata_out,
+        }
+        return {
+            "claim": claim,
+            "subject_text": str(
+                interpretation.get("subject_text") or "agent"
+            ).strip() or "agent",
+            "target_text": str(
+                data.get("target_text")
+                or interpretation.get("target_text")
+                or ""
+            ).strip(),
+            "scope": str(
+                data.get("scope") or interpretation.get("scope") or "general"
+            ).strip() or "general",
+            "interpretation_type": interpretation_type,
+            "polarity": polarity,
+            "strength": max(0.0, min(1.0, strength)),
+            "confidence": max(0.0, min(1.0, confidence)),
+            "status": status,
+            "conflict_status": conflict_status,
+            "resolution": str(
+                data.get("resolution")
+                or interpretation.get("resolution")
+                or ""
+            ).strip(),
+            "action_implication": action_implication,
+            "evidence_node_ids": self._filter_int_ids(
+                data.get("evidence_node_ids", sorted(allowed_node_ids)),
+                allowed_node_ids,
+            ),
+            "evidence_observation_ids": self._filter_int_ids(
+                data.get(
+                    "evidence_observation_ids",
+                    sorted(allowed_observation_ids),
+                ),
+                allowed_observation_ids,
+            ),
             "counter_evidence_node_ids": self._filter_int_ids(
                 data.get("counter_evidence_node_ids", []),
                 allowed_node_ids,
@@ -4531,6 +4856,365 @@ class MemoryNodeManager:
             seen.add(item_id)
         return candidates
 
+    def _judge_observation_interpretation_value(
+        self,
+        item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Judge one observation against existing interpretations."""
+        observation = item["observation"]
+        observation_id = int(item["observation_id"])
+        source_nodes = item.get("source_nodes", [])
+        candidates = self._search_interpretation_candidates_for_observation(
+            observation,
+            observation_id,
+        )
+        scored_candidates: List[Tuple[float, str, Dict[str, Any]]] = []
+        for candidate in candidates:
+            score, score_reason = self._calculate_interpretation_candidate_score(
+                observation=observation,
+                source_nodes=source_nodes,
+                interpretation=candidate,
+                observation_id=observation_id,
+            )
+            if score <= 0.0:
+                continue
+            scored_candidates.append((score, score_reason, candidate))
+        scored_candidates.sort(
+            key=lambda entry: (
+                entry[0],
+                entry[2].get("updated_at") or "",
+            ),
+            reverse=True,
+        )
+        scored_candidates = scored_candidates[:6]
+
+        if (
+            scored_candidates
+            and scored_candidates[0][1] == "existing_observation_evidence"
+        ):
+            score, score_reason, candidate = scored_candidates[0]
+            return {
+                "decision": "evidence_only",
+                "target_interpretation_id": int(candidate["id"]),
+                "target_interpretation": candidate,
+                "relationship": "support",
+                "conflict_level": "none",
+                "intrinsic_value": "medium",
+                "reason": score_reason,
+                "candidate_score": score,
+            }
+
+        candidate_payloads = []
+        candidate_by_id: Dict[int, Dict[str, Any]] = {}
+        for score, score_reason, candidate in scored_candidates:
+            candidate_id = int(candidate["id"])
+            candidate_by_id[candidate_id] = candidate
+            candidate_payloads.append({
+                "id": candidate_id,
+                "claim": candidate.get("claim"),
+                "target_text": candidate.get("target_text"),
+                "scope": candidate.get("scope"),
+                "interpretation_type": candidate.get("interpretation_type"),
+                "status": candidate.get("status"),
+                "conflict_status": candidate.get("conflict_status"),
+                "action_implication": candidate.get("action_implication"),
+                "retrieval_score": round(float(score), 4),
+                "retrieval_reason": score_reason,
+            })
+
+        fact_lines = []
+        for index, node in enumerate(source_nodes[:12], 1):
+            node_id = node.get("id", node.get("node_id"))
+            summary = str(node.get("summary") or "").strip()
+            if node_id is None or not summary:
+                continue
+            fact_lines.append(
+                f"{index}. id={int(node_id)} "
+                f"[{node.get('fact_type', 'semantic')}/"
+                f"{node.get('fact_subject', 'other')}/"
+                f"{node.get('fact_kind', 'other')}] {summary}"
+            )
+        observation_payload = {
+            "id": observation_id,
+            "entity_id": observation.get("entity_id"),
+            "entity_name": observation.get("entity_name"),
+            "topic_key": observation.get("topic_key"),
+            "topic_label": observation.get("topic_label"),
+            "observation_type": observation.get("observation_type"),
+            "summary": observation.get("summary"),
+            "metadata": self._json_dict(observation.get("metadata", {})),
+        }
+        prompt = INTERPRETATION_OBSERVATION_VALUE_PROMPT.format(
+            observation=json.dumps(
+                observation_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+            source_facts="\n".join(fact_lines) or "(none)",
+            candidate_interpretations=json.dumps(
+                candidate_payloads,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )
+        data = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "")
+        decision = str(data.get("decision") or "").strip().lower() if data else ""
+        relationship = (
+            str(data.get("relationship") or "unrelated").strip().lower()
+            if data else "unrelated"
+        )
+        conflict_level = (
+            str(data.get("conflict_level") or "none").strip().lower()
+            if data else "none"
+        )
+        intrinsic_value = (
+            str(data.get("intrinsic_value") or "medium").strip().lower()
+            if data else "medium"
+        )
+        if decision not in {
+            "update", "evidence_only", "unmatched", "defer", "ignore",
+        }:
+            if scored_candidates and scored_candidates[0][0] >= 0.78:
+                decision = "update"
+                relationship = "extend"
+            else:
+                decision = "unmatched"
+                relationship = "unrelated"
+        if relationship not in {
+            "support", "extend", "revise", "contradict", "unrelated",
+        }:
+            relationship = "unrelated"
+        if conflict_level not in {"none", "partial", "strong"}:
+            conflict_level = "none"
+        if intrinsic_value not in {"low", "medium", "high"}:
+            intrinsic_value = "medium"
+
+        try:
+            target_id = int(data.get("target_interpretation_id")) if data else None
+        except (TypeError, ValueError):
+            target_id = None
+        if decision in {"update", "evidence_only"}:
+            if target_id not in candidate_by_id:
+                decision = "unmatched"
+                target_id = None
+                relationship = "unrelated"
+                conflict_level = "none"
+            elif relationship == "unrelated":
+                decision = "unmatched"
+                target_id = None
+        else:
+            target_id = None
+        if relationship == "contradict" and decision == "evidence_only":
+            decision = "update"
+
+        result = {
+            "decision": decision,
+            "target_interpretation_id": target_id,
+            "target_interpretation": (
+                candidate_by_id.get(target_id) if target_id is not None else None
+            ),
+            "relationship": relationship,
+            "conflict_level": conflict_level,
+            "intrinsic_value": intrinsic_value,
+            "reason": str(data.get("reason") or "")[:512] if data else "",
+            "candidate_score": next(
+                (
+                    score
+                    for score, _, candidate in scored_candidates
+                    if int(candidate["id"]) == target_id
+                ),
+                0.0,
+            ),
+        }
+        self._log_info(
+            "memory_reflect",
+            "observation_interpretation_value_judged",
+            {
+                "observation_id": observation_id,
+                "candidate_interpretation_ids": [
+                    payload["id"] for payload in candidate_payloads
+                ],
+                **{
+                    key: value
+                    for key, value in result.items()
+                    if key != "target_interpretation"
+                },
+            },
+        )
+        return result
+
+    def _persist_interpretation_assignments(
+        self,
+        *,
+        interpretation: Dict[str, Any],
+        assignments: List[Dict[str, Any]],
+        updated_interpretation: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Persist links and optional content update for matched observations."""
+        support_node_ids: List[int] = []
+        support_observation_ids: List[int] = []
+        counter_node_ids: List[int] = []
+        counter_observation_ids: List[int] = []
+        for assignment in assignments:
+            item = assignment["item"]
+            observation_id = int(item["observation_id"])
+            source_node_ids = [
+                int(node_id)
+                for node_id in item.get("source_node_ids", [])
+                if node_id is not None
+            ]
+            if assignment.get("relationship") == "contradict":
+                counter_node_ids.extend(source_node_ids)
+                counter_observation_ids.append(observation_id)
+            else:
+                support_node_ids.extend(source_node_ids)
+                support_observation_ids.append(observation_id)
+
+        updated = updated_interpretation or {}
+        evidence_node_ids = list(dict.fromkeys([
+            *interpretation.get("evidence_node_ids", []),
+            *support_node_ids,
+            *updated.get("evidence_node_ids", []),
+        ]))
+        evidence_observation_ids = list(dict.fromkeys([
+            *interpretation.get("evidence_observation_ids", []),
+            *support_observation_ids,
+            *updated.get("evidence_observation_ids", []),
+        ]))
+        counter_evidence_node_ids = list(dict.fromkeys([
+            *interpretation.get("counter_evidence_node_ids", []),
+            *counter_node_ids,
+            *updated.get("counter_evidence_node_ids", []),
+        ]))
+        counter_evidence_observation_ids = list(dict.fromkeys([
+            *interpretation.get("counter_evidence_observation_ids", []),
+            *counter_observation_ids,
+            *updated.get("counter_evidence_observation_ids", []),
+        ]))
+        metadata = {
+            **self._json_dict(interpretation.get("metadata", {})),
+            **self._json_dict(updated.get("metadata", {})),
+        }
+        metadata["observation_ids"] = list(dict.fromkeys([
+            *[
+                int(value)
+                for value in metadata.get("observation_ids", [])
+                if str(value).isdigit()
+            ],
+            *[
+                int(assignment["item"]["observation_id"])
+                for assignment in assignments
+            ],
+        ]))
+        metadata["value_judgement"] = {
+            "last_observation_ids": [
+                int(assignment["item"]["observation_id"])
+                for assignment in assignments
+            ],
+            "relationships": {
+                str(assignment["item"]["observation_id"]): assignment.get(
+                    "relationship",
+                    "support",
+                )
+                for assignment in assignments
+            },
+            "content_updated": bool(updated_interpretation),
+        }
+
+        claim = updated.get("claim", interpretation.get("claim", ""))
+        target_text = updated.get(
+            "target_text",
+            interpretation.get("target_text", ""),
+        )
+        scope = updated.get("scope", interpretation.get("scope", "general"))
+        interpretation_type = updated.get(
+            "interpretation_type",
+            interpretation.get("interpretation_type", "insight"),
+        )
+        action_implication = updated.get(
+            "action_implication",
+            interpretation.get("action_implication", ""),
+        )
+        resolution = updated.get(
+            "resolution",
+            interpretation.get("resolution", ""),
+        )
+        embedding_text = self._build_interpretation_embedding_text(
+            entity_name=(
+                interpretation.get("entity_name")
+                or metadata.get("entity_name")
+                or assignments[0]["item"]["observation"].get("entity_name")
+                or ""
+            ),
+            target_text=target_text,
+            scope=scope,
+            interpretation_type=interpretation_type,
+            claim=claim,
+            action_implication=action_implication,
+            resolution=resolution,
+        )
+        interpretation_id = self._db.memory_upsert_interpretation(
+            interpretation_id=int(interpretation["id"]),
+            claim=claim,
+            entity_id=(
+                interpretation.get("entity_id")
+                or metadata.get("entity_id")
+                or assignments[0]["item"]["observation"].get("entity_id")
+            ),
+            subject_text=updated.get(
+                "subject_text",
+                interpretation.get("subject_text", ""),
+            ),
+            target_text=target_text,
+            scope=scope,
+            interpretation_type=interpretation_type,
+            polarity=updated.get(
+                "polarity",
+                interpretation.get("polarity", "neutral"),
+            ),
+            strength=updated.get(
+                "strength",
+                interpretation.get("strength", 0.5),
+            ),
+            confidence=updated.get(
+                "confidence",
+                interpretation.get("confidence", 0.5),
+            ),
+            status=updated.get(
+                "status",
+                interpretation.get("status", "current"),
+            ),
+            conflict_status=updated.get(
+                "conflict_status",
+                interpretation.get("conflict_status", "none"),
+            ),
+            resolution=resolution,
+            action_implication=action_implication,
+            evidence_node_ids=evidence_node_ids,
+            evidence_observation_ids=evidence_observation_ids,
+            counter_evidence_node_ids=counter_evidence_node_ids,
+            counter_evidence_observation_ids=counter_evidence_observation_ids,
+            embedding=self._embed_memory_layer_text(embedding_text),
+            embedding_text=embedding_text,
+            metadata=metadata,
+        )
+        for assignment in assignments:
+            relationship = assignment.get("relationship", "support")
+            relation = (
+                "contradict"
+                if relationship == "contradict"
+                else ("refine" if relationship in {"extend", "revise"} else "support")
+            )
+            self._db.memory_link_interpretation_observation(
+                interpretation_id,
+                int(assignment["item"]["observation_id"]),
+                relation=relation,
+                confidence=float(assignment.get("candidate_score") or 0.75),
+            )
+        return int(interpretation_id)
+
     @classmethod
     def _interpretation_basis_hash(
         cls,
@@ -4723,7 +5407,7 @@ class MemoryNodeManager:
                 semantic_observation.get("observation_type") or ""
             ):
                 continue
-            similarity = self._embedding_similarity(
+            similarity = self._cal_embedding_similarity(
                 semantic_observation.get("embedding"),
                 candidate_semantic_observation.get("embedding"),
             )
@@ -4883,7 +5567,7 @@ class MemoryNodeManager:
             "action_implication",
             best.get("action_implication", ""),
         )
-        embedding_text = self._interpretation_embedding_text(
+        embedding_text = self._build_interpretation_embedding_text(
             entity_name=best.get("entity_name") or observation.get("entity_name") or "",
             target_text=target_text,
             scope=scope,
@@ -4948,19 +5632,6 @@ class MemoryNodeManager:
                 "score": best_score,
             }
         return int(interpretation_id)
-
-    @classmethod
-    def _should_generate_interpretation_for_observation(
-        cls,
-        observation: Dict[str, Any],
-        source_nodes: List[Dict[str, Any]],
-        family: str,
-    ) -> Tuple[bool, str]:
-        return cls._single_observation_generation_allowed(
-            observation=observation,
-            source_nodes=source_nodes,
-            interpretation_family=family,
-        )
 
     def _observation_interpretation_cluster_family(
         self,
@@ -5044,22 +5715,6 @@ class MemoryNodeManager:
 
         if len(items) == 1:
             observation = items[0]["observation"]
-            should_generate, reason = self._should_generate_interpretation_for_observation(
-                observation,
-                all_source_nodes,
-                family,
-            )
-            if not should_generate:
-                self._log_info(
-                    "memory_reflect",
-                    "interpretation_generation_deferred", 
-                    {
-                        "observation_id": observation_ids[0],
-                        "family": family,
-                        "reason": reason,
-                    }
-                )
-                return None
             interpretation = self._generate_interpretation(
                 observation=observation,
                 source_nodes=all_source_nodes,
@@ -5105,7 +5760,7 @@ class MemoryNodeManager:
             "observation_type": representative.get("observation_type", "observation"),
             "interpretation_cluster_family": family,
         }
-        embedding_text = self._interpretation_embedding_text(
+        embedding_text = self._build_interpretation_embedding_text(
             entity_name=representative.get("entity_name") or "",
             target_text=interpretation["target_text"],
             scope=interpretation["scope"],
@@ -5324,6 +5979,21 @@ class MemoryNodeManager:
                     },
                 )
                 continue
+            if (
+                self._interpretation_state(metadata) == "deferred"
+                and str(metadata.get("interpretation_basis_hash") or "")
+                == basis_hash
+            ):
+                self._log_info(
+                    "memory_reflect",
+                    "interpretation_semantic_unit_skipped",
+                    {
+                        "observation_id": observation_id,
+                        "status": "deferred",
+                        "reason": "unchanged_deferred_context",
+                    },
+                )
+                continue
             semantic_observation["metadata"] = metadata
             family = self._observation_interpretation_cluster_family(
                 semantic_observation,
@@ -5351,32 +6021,155 @@ class MemoryNodeManager:
         if not candidate_items:
             return 0
 
+        llm_calls_used = 0
+        assignments_by_interpretation: Dict[int, Dict[str, Any]] = {}
+        remaining_items: List[Dict[str, Any]] = []
+        for item in candidate_items:
+            judgement = self._judge_observation_interpretation_value(item)
+            decision = str(judgement.get("decision") or "unmatched")
+            judgement_extra = {
+                "interpretation_value_decision": decision,
+                "interpretation_value_relationship": judgement.get(
+                    "relationship",
+                ),
+                "interpretation_value_conflict_level": judgement.get(
+                    "conflict_level",
+                ),
+                "interpretation_value_intrinsic": judgement.get(
+                    "intrinsic_value",
+                ),
+                "interpretation_value_reason": judgement.get("reason"),
+            }
+            if decision in {"update", "evidence_only"}:
+                target = judgement.get("target_interpretation")
+                target_id = judgement.get("target_interpretation_id")
+                if target is None or target_id is None:
+                    remaining_items.append(item)
+                    continue
+                group = assignments_by_interpretation.setdefault(
+                    int(target_id),
+                    {
+                        "interpretation": target,
+                        "assignments": [],
+                        "needs_update": False,
+                    },
+                )
+                group["assignments"].append({
+                    **judgement,
+                    "item": item,
+                    "state_extra": judgement_extra,
+                })
+                if decision == "update":
+                    group["needs_update"] = True
+                continue
+            if decision == "ignore":
+                self._update_observation_interpretation_state(
+                    item["observation"],
+                    status="ignored",
+                    basis_hash=item["basis_hash"],
+                    reason=str(judgement.get("reason") or "value_judgement_ignore"),
+                    extra=judgement_extra,
+                )
+                continue
+            remaining_items.append({
+                **item,
+                "value_judgement": judgement,
+            })
+
+        for target_id, group in assignments_by_interpretation.items():
+            assignments = group["assignments"]
+            updated_interpretation = None
+            if group["needs_update"]:
+                if llm_calls_used >= INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT:
+                    for assignment in assignments:
+                        item = assignment["item"]
+                        self._update_observation_interpretation_state(
+                            item["observation"],
+                            status="deferred",
+                            basis_hash=item["basis_hash"],
+                            reason="llm_budget_exhausted_before_batch_update",
+                            extra=assignment["state_extra"],
+                        )
+                    continue
+                updated_interpretation = (
+                    self._update_existing_interpretation_from_observations(
+                        interpretation=group["interpretation"],
+                        assignments=assignments,
+                    )
+                )
+                llm_calls_used += 1
+                if updated_interpretation is None:
+                    for assignment in assignments:
+                        item = assignment["item"]
+                        self._update_observation_interpretation_state(
+                            item["observation"],
+                            status="deferred",
+                            basis_hash=item["basis_hash"],
+                            reason="batch_update_not_applied",
+                            extra=assignment["state_extra"],
+                        )
+                    continue
+
+            interpretation_id = self._persist_interpretation_assignments(
+                interpretation=group["interpretation"],
+                assignments=assignments,
+                updated_interpretation=updated_interpretation,
+            )
+            for assignment in assignments:
+                item = assignment["item"]
+                self._update_observation_interpretation_state(
+                    item["observation"],
+                    status="linked",
+                    basis_hash=item["basis_hash"],
+                    reason=(
+                        "value_judgement_batch_update"
+                        if updated_interpretation
+                        else "value_judgement_evidence_only"
+                    ),
+                    interpretation_id=interpretation_id,
+                    extra=assignment["state_extra"],
+                )
+            generated += len(assignments)
+            self._log_info(
+                "memory_reflect",
+                "interpretation_assignments_applied",
+                {
+                    "interpretation_id": target_id,
+                    "observation_ids": [
+                        int(assignment["item"]["observation_id"])
+                        for assignment in assignments
+                    ],
+                    "content_updated": bool(updated_interpretation),
+                },
+            )
+
+        if not remaining_items:
+            return generated
+
         seen_observation_ids = {
             int(item["observation_id"]) for item in candidate_items
         }
-        cluster_context_items = list(candidate_items)
-        for item in list(candidate_items):
-            deferred_items = self._get_similar_deferred_observations(
-                item,
-                seen_observation_ids,
+        cluster_context_items = list(remaining_items)
+        for item in list(remaining_items):
+            cluster_context_items.extend(
+                self._get_similar_deferred_observations(
+                    item,
+                    seen_observation_ids,
+                )
             )
-            cluster_context_items.extend(deferred_items)
 
-        llm_calls_used = 0
-        for cluster in self._cluster_observation_items_for_interpretation(cluster_context_items):
+        for cluster in self._cluster_observation_items_for_interpretation(
+            cluster_context_items
+        ):
             should_run, reason = self._judge_observation_clustering_should_run(cluster)
             changed_items = [
                 item
                 for item in cluster.get("items") or []
                 if not item.get("is_deferred_context")
             ]
-            deferred_context_items = [
-                item
-                for item in cluster.get("items") or []
-                if item.get("is_deferred_context")
-            ]
             if not should_run:
                 for item in changed_items:
+                    judgement = item.get("value_judgement") or {}
                     self._update_observation_interpretation_state(
                         item["observation"],
                         status="deferred",
@@ -5385,64 +6178,35 @@ class MemoryNodeManager:
                         extra={
                             "interpretation_priority": item.get("priority"),
                             "interpretation_priority_reason": item.get("priority_reason"),
+                            "interpretation_value_decision": judgement.get("decision"),
+                            "interpretation_value_relationship": judgement.get("relationship"),
+                            "interpretation_value_reason": judgement.get("reason"),
                         },
                     )
-                continue
-
-            unmatched_items: List[Dict[str, Any]] = []
-            for item in changed_items:
-                observation_id = int(item["observation_id"])
-                allow_content_update = llm_calls_used < INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT
-                link_result = self._link_observation_to_existing_interpretation(
-                    observation=item["observation"],
-                    source_nodes=item["source_nodes"],
-                    observation_id=observation_id,
-                    source_node_ids=item["source_node_ids"],
-                    allow_content_update=allow_content_update,
-                    return_details=True,
-                )
-                if link_result is not None:
-                    linked_id = int(link_result["interpretation_id"])
-                    if link_result.get("content_update_attempted"):
-                        llm_calls_used += 1
-                    self._update_observation_interpretation_state(
-                        item["observation"],
-                        status="linked",
-                        basis_hash=item["basis_hash"],
-                        reason=str(link_result.get("reason") or "linked_existing_interpretation"),
-                        interpretation_id=linked_id,
-                        extra={
-                            "interpretation_priority": item.get("priority"),
-                            "interpretation_priority_reason": item.get("priority_reason"),
-                        },
-                    )
-                    generated += 1
-                    continue
-                unmatched_items.append(item)
-
-            if not unmatched_items:
                 continue
 
             if llm_calls_used >= INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT:
-                for item in unmatched_items:
+                for item in changed_items:
+                    judgement = item.get("value_judgement") or {}
                     self._update_observation_interpretation_state(
                         item["observation"],
                         status="deferred",
                         basis_hash=item["basis_hash"],
                         reason="llm_budget_exhausted",
+                        extra={
+                            "interpretation_value_decision": judgement.get("decision"),
+                            "interpretation_value_relationship": judgement.get("relationship"),
+                            "interpretation_value_reason": judgement.get("reason"),
+                        },
                     )
                 continue
-
-            generation_items = unmatched_items + deferred_context_items
-            generation_cluster = {
-                **cluster,
-                "items": generation_items,
-            }
-            interpretation_id = self._generate_interpretation_from_observation_cluster(generation_cluster)
+            
+            interpretation_id = self._generate_interpretation_from_observation_cluster(cluster)
             llm_calls_used += 1
             if interpretation_id is not None:
                 generated += 1
-                for item in generation_items:
+                for item in cluster.get("items") or []:
+                    judgement = item.get("value_judgement") or {}
                     self._update_observation_interpretation_state(
                         item["observation"],
                         status="generated",
@@ -5452,10 +6216,14 @@ class MemoryNodeManager:
                         extra={
                             "interpretation_cluster_family": cluster.get("family"),
                             "interpretation_cluster_topic": cluster.get("topic_key"),
+                            "interpretation_value_decision": judgement.get("decision"),
+                            "interpretation_value_relationship": judgement.get("relationship"),
+                            "interpretation_value_reason": judgement.get("reason"),
                         },
                     )
             else:
-                for item in unmatched_items:
+                for item in changed_items:
+                    judgement = item.get("value_judgement") or {}
                     self._update_observation_interpretation_state(
                         item["observation"],
                         status="deferred",
@@ -5464,6 +6232,9 @@ class MemoryNodeManager:
                         extra={
                             "interpretation_cluster_family": cluster.get("family"),
                             "interpretation_cluster_topic": cluster.get("topic_key"),
+                            "interpretation_value_decision": judgement.get("decision"),
+                            "interpretation_value_relationship": judgement.get("relationship"),
+                            "interpretation_value_reason": judgement.get("reason"),
                         },
                     )
         return generated

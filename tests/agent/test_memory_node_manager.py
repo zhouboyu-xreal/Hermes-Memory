@@ -4039,6 +4039,321 @@ def test_deferred_interpretation_context_is_loaded_from_observations(db):
     )
 
 
+def test_interpretation_value_judgement_batches_updates_and_tracks_conflict(
+    db,
+    monkeypatch,
+):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    support_node = _add_memory_node(
+        db,
+        time_key="2026-05-03 10:00:00",
+        summary="Alice still prefers Slack for urgent alerts.",
+        keywords=["Slack", "urgent alerts"],
+        fact_kind="preference",
+    )
+    conflict_node = _add_memory_node(
+        db,
+        time_key="2026-05-04 10:00:00",
+        summary="Alice asked to use email instead of Slack for urgent alerts.",
+        keywords=["email", "urgent alerts"],
+        fact_kind="instruction",
+    )
+    db.entity_link_node(support_node, alice)
+    db.entity_link_node(conflict_node, alice)
+    evidence_bundle_id = db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="urgent-alert-routing",
+        topic_label="urgent alert routing",
+        bundle_type="entity_topic",
+        source_node_ids=[support_node, conflict_node],
+    )
+    support_observation = db.memory_create_observation(
+        evidence_bundle_id,
+        {
+            "observation_type": "preference_signal",
+            "summary": "Alice continues to prefer Slack for urgent alerts.",
+            "evidence_mode": "semantic",
+            "source_node_ids": [support_node],
+            "metadata": {
+                "allowed_interpretation_types": ["explicit_preference"],
+                "candidate_interpretation_types": ["preference"],
+                "source_count": 1,
+            },
+        },
+    )
+    conflict_observation = db.memory_create_observation(
+        evidence_bundle_id,
+        {
+            "observation_type": "preference_signal",
+            "summary": "Alice now requests email instead of Slack for urgent alerts.",
+            "evidence_mode": "explicit",
+            "source_node_ids": [conflict_node],
+            "metadata": {
+                "allowed_interpretation_types": ["explicit_preference"],
+                "candidate_interpretation_types": ["preference"],
+                "source_count": 1,
+            },
+        },
+    )
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="Alice prefers Slack for urgent alerts.",
+        entity_id=alice,
+        subject_text="agent",
+        target_text="urgent alert routing",
+        scope="urgent-alert-routing",
+        interpretation_type="explicit_preference",
+        confidence=0.82,
+        action_implication="Use Slack for Alice's urgent alerts.",
+        metadata={
+            "entity_id": alice,
+            "entity_name": "Alice",
+            "topic_key": "urgent-alert-routing",
+        },
+    )
+    candidate = {
+        "id": interpretation_id,
+        "claim": "Alice prefers Slack for urgent alerts.",
+        "entity_id": alice,
+        "entity_name": "Alice",
+        "subject_text": "agent",
+        "target_text": "urgent alert routing",
+        "scope": "urgent-alert-routing",
+        "interpretation_type": "explicit_preference",
+        "polarity": "positive",
+        "strength": 0.8,
+        "confidence": 0.82,
+        "status": "current",
+        "conflict_status": "none",
+        "resolution": "",
+        "action_implication": "Use Slack for Alice's urgent alerts.",
+        "evidence_node_ids": [],
+        "evidence_observation_ids": [],
+        "counter_evidence_node_ids": [],
+        "counter_evidence_observation_ids": [],
+        "metadata": {
+            "entity_id": alice,
+            "entity_name": "Alice",
+            "topic_key": "urgent-alert-routing",
+        },
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "decision": "evidence_only",
+                "target_interpretation_id": interpretation_id,
+                "relationship": "support",
+                "conflict_level": "none",
+                "intrinsic_value": "medium",
+                "reason": "Confirms the current preference.",
+            }),
+            json.dumps({
+                "decision": "update",
+                "target_interpretation_id": interpretation_id,
+                "relationship": "contradict",
+                "conflict_level": "strong",
+                "intrinsic_value": "high",
+                "reason": "The explicit instruction reverses the channel.",
+            }),
+            json.dumps({
+                "should_update": True,
+                "claim": "Alice's urgent alert channel preference is conflicted.",
+                "target_text": "urgent alert routing",
+                "scope": "urgent-alert-routing",
+                "interpretation_type": "explicit_preference",
+                "polarity": "mixed",
+                "strength": 0.78,
+                "confidence": 0.74,
+                "status": "conflicted",
+                "conflict_status": "unresolved",
+                "resolution": "Clarify whether email replaces Slack.",
+                "action_implication": "Ask for clarification before routing urgent alerts.",
+                "evidence_node_ids": [support_node],
+                "evidence_observation_ids": [support_observation],
+                "counter_evidence_node_ids": [conflict_node],
+                "counter_evidence_observation_ids": [conflict_observation],
+                "metadata": {},
+            }),
+        ],
+    )
+    monkeypatch.setattr(
+        mgr,
+        "_search_interpretation_candidates_for_observation",
+        lambda observation, observation_id: [candidate],
+    )
+
+    processed = mgr._reflect_generate_interpretations_using_observations(
+        [evidence_bundle_id]
+    )
+
+    assert processed == 2
+    assert len([
+        prompt
+        for prompt in mgr.llm_prompts
+        if "价值判断模块" in prompt
+    ]) == 2
+    assert len([
+        prompt
+        for prompt in mgr.llm_prompts
+        if "批量更新模块" in prompt
+    ]) == 1
+    row = db._conn.execute(
+        "SELECT claim, status, conflict_status, evidence_node_ids, "
+        "evidence_observation_ids, counter_evidence_node_ids, "
+        "counter_evidence_observation_ids "
+        "FROM memory_interpretations WHERE id = ?",
+        (interpretation_id,),
+    ).fetchone()
+    assert row["status"] == "conflicted"
+    assert row["conflict_status"] == "unresolved"
+    assert json.loads(row["evidence_node_ids"]) == [support_node]
+    assert json.loads(row["evidence_observation_ids"]) == [
+        support_observation
+    ]
+    assert json.loads(row["counter_evidence_node_ids"]) == [conflict_node]
+    assert json.loads(row["counter_evidence_observation_ids"]) == [
+        conflict_observation
+    ]
+    relations = {
+        row["observation_id"]: row["relation"]
+        for row in db._conn.execute(
+            "SELECT observation_id, relation "
+            "FROM memory_interpretation_observations "
+            "WHERE interpretation_id = ?",
+            (interpretation_id,),
+        ).fetchall()
+    }
+    assert relations == {
+        support_observation: "support",
+        conflict_observation: "contradict",
+    }
+
+
+def test_unmatched_observations_are_clustered_after_individual_judgement(
+    db,
+    monkeypatch,
+):
+    hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
+    source_ids = []
+    for index, (summary, fact_kind) in enumerate(
+        [
+            ("用户要求实现 interpretation value gate。", "request"),
+            ("助手开始实现 interpretation value gate。", "action"),
+        ],
+        1,
+    ):
+        node_id = _add_memory_node(
+            db,
+            time_key=f"2026-05-05 1{index}:00:00",
+            summary=summary,
+            keywords=["interpretation", "value gate"],
+            fact_kind=fact_kind,
+            task_event_like=True,
+            task_event_subject="user" if index == 1 else "assistant",
+            task_relevance="strong",
+        )
+        db.entity_link_node(node_id, hermes)
+        source_ids.append(node_id)
+    evidence_bundle_id = db.memory_upsert_evidence_bundle(
+        entity_id=hermes,
+        topic_key="interpretation-value-gate",
+        topic_label="interpretation value gate",
+        bundle_type="entity_topic",
+        source_node_ids=source_ids,
+    )
+    observation_ids = [
+        db.memory_create_observation(
+            evidence_bundle_id,
+            {
+                "observation_type": "task_progress",
+                "summary": summary,
+                "source_node_ids": [node_id],
+                "metadata": {
+                    "allowed_interpretation_types": ["task"],
+                    "candidate_interpretation_types": ["task"],
+                    "source_count": 1,
+                },
+            },
+        )
+        for node_id, summary in zip(
+            source_ids,
+            [
+                "The user requested an interpretation value gate.",
+                "Implementation of the interpretation value gate started.",
+            ],
+        )
+    ]
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "decision": "unmatched",
+                "target_interpretation_id": None,
+                "relationship": "unrelated",
+                "conflict_level": "none",
+                "intrinsic_value": "medium",
+                "reason": "No existing interpretation matches.",
+            }),
+            json.dumps({
+                "decision": "defer",
+                "target_interpretation_id": None,
+                "relationship": "unrelated",
+                "conflict_level": "none",
+                "intrinsic_value": "medium",
+                "reason": "Useful when combined with task context.",
+            }),
+            json.dumps({
+                "should_create": True,
+                "claim": "The interpretation value gate is being implemented.",
+                "target_text": "interpretation value gate",
+                "scope": "memory-interpretation",
+                "interpretation_type": "task",
+                "polarity": "neutral",
+                "strength": 0.8,
+                "confidence": 0.84,
+                "status": "current",
+                "conflict_status": "none",
+                "resolution": "",
+                "action_implication": "Preserve the implementation state.",
+                "evidence_node_ids": source_ids,
+                "evidence_observation_ids": observation_ids,
+                "counter_evidence_node_ids": [],
+                "counter_evidence_observation_ids": [],
+                "metadata": {
+                    "task_status": "active",
+                    "goal": "Implement the interpretation value gate.",
+                    "steps": [],
+                },
+            }),
+        ],
+    )
+    monkeypatch.setattr(
+        mgr,
+        "_search_interpretation_candidates_for_observation",
+        lambda observation, observation_id: [],
+    )
+
+    generated = mgr._reflect_generate_interpretations_using_observations(
+        [evidence_bundle_id]
+    )
+
+    assert generated == 1
+    generation_prompt = next(
+        prompt
+        for prompt in mgr.llm_prompts
+        if "interpretation 生成模块" in prompt
+    )
+    assert "Clustered observations" in generation_prompt
+    for observation_id in observation_ids:
+        assert f"id={observation_id}" in generation_prompt
+    row = db._conn.execute(
+        "SELECT evidence_observation_ids FROM memory_interpretations"
+    ).fetchone()
+    assert json.loads(row["evidence_observation_ids"]) == observation_ids
+
+
 def test_interpretation_linker_reuses_existing_observation_evidence_without_llm(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     first = _add_memory_node(
