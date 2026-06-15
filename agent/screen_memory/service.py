@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from agent.screen_memory.cleaner import ScreenMemoryCleaner
+from agent.screen_memory.manager import ScreenMemoryManager
 from agent.screen_memory.config import load_screen_memory_config
 from hermes_constants import get_hermes_home
 
@@ -99,7 +99,7 @@ def _configured_model(config: Dict[str, Any]) -> str:
 
 
 def _inject_runtime_config(
-    cleaner_config: Dict[str, Any],
+    manager_config: Dict[str, Any],
     hermes_config: Dict[str, Any],
 ) -> Any:
     model = _configured_model(hermes_config)
@@ -117,7 +117,7 @@ def _inject_runtime_config(
         "window_workstream_generation",
         "screen_memory_generation",
     ):
-        section = cleaner_config.get(section_name)
+        section = manager_config.get(section_name)
         if not isinstance(section, dict):
             continue
         section["llm_model"] = model
@@ -149,40 +149,38 @@ def _validate_sources(config: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _run_ingest(
-    cleaner: ScreenMemoryCleaner,
+def _run_fact_extraction(
+    manager: ScreenMemoryManager,
     state: Dict[str, Any],
     now: datetime,
 ) -> Optional[Dict[str, Any]]:
     now = _as_utc(now)
-    schedule = cleaner.config.get("schedule", {})
-    previous = _parse_state_time(state.get("last_ingest_at"))
+    schedule = manager.config.get("schedule", {})
+    previous = _parse_state_time(state.get("last_fact_extraction_at"))
     if previous is None:
         previous = now - timedelta(
             minutes=max(1, int(schedule.get("initial_lookback_minutes", 30)))
         )
-    stats = cleaner.clean(
+    stats = manager.clean(
         start_time_str=_format_utc_time(previous),
         end_time_str=_format_utc_time(now),
         incremental=True,
-        generate_screen_facts=True,
-        update_window_workstreams=True,
     )
     if stats is not None:
-        state["last_ingest_at"] = _format_utc_time(now)
-        state["last_ingest_stats"] = stats
+        state["last_fact_extraction_at"] = _format_utc_time(now)
+        state["last_fact_extraction_stats"] = stats
     return stats
 
 
 def _run_fact_clustering(
-    cleaner: ScreenMemoryCleaner,
+    manager: ScreenMemoryManager,
     state: Dict[str, Any],
     now: datetime,
 ) -> Dict[str, Any]:
     now = _as_utc(now)
-    connection = cleaner.ensure_cleaned_db()
+    connection = manager.ensure_cleaned_db()
     try:
-        stats = cleaner.update_screen_fact_cluster_tables(connection)
+        stats = manager.update_screen_fact_cluster_tables(connection)
     finally:
         connection.close()
     state["last_fact_clustering_at"] = _format_utc_time(now)
@@ -191,17 +189,17 @@ def _run_fact_clustering(
 
 
 def _run_observations(
-    cleaner: ScreenMemoryCleaner,
+    manager: ScreenMemoryManager,
     state: Dict[str, Any],
     now: datetime,
 ) -> Dict[str, Any]:
     now = _as_utc(now)
-    connection = cleaner.ensure_cleaned_db()
+    connection = manager.ensure_cleaned_db()
     try:
         # A daily observation run first catches any facts left unclustered by
         # a missed clustering tick.
-        cluster_stats = cleaner.update_screen_fact_cluster_tables(connection)
-        observation_stats = cleaner.update_screen_observation_tables(connection, None)
+        cluster_stats = manager.update_screen_fact_cluster_tables(connection)
+        observation_stats = manager.update_screen_observation_tables(connection, None)
     finally:
         connection.close()
     stats = {
@@ -221,10 +219,10 @@ def run_screen_memory_due_work(
     from hermes_cli.config import load_config
 
     hermes_config = load_config() or {}
-    cleaner_config = load_screen_memory_config(hermes_config)
-    if not cleaner_config.get("enabled"):
+    manager_config = load_screen_memory_config(hermes_config)
+    if not manager_config.get("enabled"):
         return {"status": "disabled"}
-    source_error = _validate_sources(cleaner_config)
+    source_error = _validate_sources(manager_config)
     if source_error:
         logger.warning("Screen memory skipped: %s", source_error)
         return {"status": "skipped", "reason": source_error}
@@ -245,14 +243,14 @@ def run_screen_memory_due_work(
 
         state = _load_state()
         current = _as_utc(now or _utc_now())
-        schedule = cleaner_config.get("schedule", {})
+        schedule = manager_config.get("schedule", {})
 
         ingest_due = force_phase == "ingest" or (
             force_phase is None
             and _is_due(
-                state.get("last_ingest_at"),
+                state.get("last_fact_extraction_at"),
                 current,
-                timedelta(minutes=max(1, int(schedule["ingest_interval_minutes"]))),
+                timedelta(minutes=max(1, int(schedule["fact_extraction_interval_minutes"]))),
             )
         )
         cluster_due = force_phase == "cluster" or (
@@ -275,40 +273,40 @@ def run_screen_memory_due_work(
             return {
                 "status": "ok",
                 "phases": {},
-                "output_db": cleaner_config["database"]["cleaned_db"],
+                "output_db": manager_config["database"]["cleaned_db"],
             }
 
-        llm_client = _inject_runtime_config(cleaner_config, hermes_config)
-        cleaner = ScreenMemoryCleaner(
-            cleaner_config,
+        llm_client = _inject_runtime_config(manager_config, hermes_config)
+        manager = ScreenMemoryManager(
+            manager_config,
             llm_client=llm_client,
             quiet=True,
         )
         phases: Dict[str, Any] = {}
         if ingest_due:
-            phases["ingest"] = _run_ingest(cleaner, state, current)
+            phases["ingest"] = _run_fact_extraction(manager, state, current)
             _save_state(state)
         if cluster_due:
             phases["fact_clustering"] = _run_fact_clustering(
-                cleaner,
+                manager,
                 state,
                 current,
             )
             _save_state(state)
         if observation_due:
-            phases["observations"] = _run_observations(cleaner, state, current)
+            phases["observations"] = _run_observations(manager, state, current)
             _save_state(state)
 
         if phases:
             logger.info(
                 "Screen memory phases completed: %s (output=%s)",
                 ", ".join(phases),
-                cleaner.cleaned_db,
+                manager.cleaned_db,
             )
         return {
             "status": "ok",
             "phases": phases,
-            "output_db": cleaner.cleaned_db,
+            "output_db": manager.cleaned_db,
         }
     except Exception:
         logger.exception("Screen memory pipeline failed")

@@ -1871,7 +1871,7 @@ def time_proximity_score(view_start, topic_start, topic_end, max_gap_days=30):
     return 0.0
 
 
-class ScreenMemoryCleaner:
+class ScreenMemoryManager:
     def __init__(self, config=None, llm_client=None, *, quiet=False):
         self.config = config or load_screen_memory_config()
         self.quiet = bool(quiet)
@@ -3208,23 +3208,9 @@ class ScreenMemoryCleaner:
         oc_events,
         output_conn,
         min_quality=None,
-        segment_gap_minutes=None,
-        max_segment_minutes=None,
-        focus_switch_split_minutes=None,
-        segment_config=None,
-        view_config=None,
         discarded_oc_events=None,
-        generate_screen_facts=True,
-        update_window_workstreams=True,
     ):
         self._print("Running scheduling simulation & deduplication...")
-        segment_gap_minutes = self.segment_gap_minutes if segment_gap_minutes is None else segment_gap_minutes
-        max_segment_minutes = self.max_segment_minutes if max_segment_minutes is None else max_segment_minutes
-        focus_switch_split_minutes = (
-            self.focus_switch_split_minutes
-            if focus_switch_split_minutes is None
-            else focus_switch_split_minutes
-        )
 
         kept_records, stats = self.select_records_to_keep(
             sp_rows,
@@ -3283,19 +3269,19 @@ class ScreenMemoryCleaner:
         stats["record_ax_event_links"] = record_ax_event_links
         stats["record_ax_context_updates"] = self.count_record_ax_context_records(inserted_records)
 
-        segment_llm_budget = segment_config.get("llm_budget", 0) if segment_config else 0
-        if view_config:
-            view_gap_minutes = view_config.get("gap_minutes") or segment_gap_minutes
-            view_max_minutes = view_config.get("max_minutes") or max_segment_minutes
+        segment_llm_budget = self.segment_cfg.get("llm_budget", 0) if self.segment_cfg else 0
+        if self.view_cfg:
+            view_gap_minutes = self.view_cfg.get("gap_minutes") or self.segment_gap_minutes
+            view_max_minutes = self.view_cfg.get("max_minutes") or self.max_segment_minutes
         else:
-            view_gap_minutes = segment_gap_minutes
-            view_max_minutes = max_segment_minutes
+            view_gap_minutes = self.segment_gap_minutes
+            view_max_minutes = self.max_segment_minutes
 
         segment_record_entries = self.generate_segment_record_entries(
             inserted_records,
-            segment_gap_minutes,
-            max_segment_minutes=max_segment_minutes,
-            focus_switch_split_minutes=focus_switch_split_minutes,
+            self.segment_gap_minutes,
+            max_segment_minutes=self.max_segment_minutes,
+            focus_switch_split_minutes=self.focus_switch_split_minutes,
         )
         record_segment_key_by_id = self.map_record_ids_to_segment_keys(segment_record_entries)
 
@@ -3309,7 +3295,7 @@ class ScreenMemoryCleaner:
         segment_entries, segment_llm_stats = self.generate_segment_entries(
             segment_record_entries,
             view_entries,
-            segment_config=segment_config,
+            segment_config=self.segment_cfg,
             llm_budget=segment_llm_budget,
         )
 
@@ -3324,18 +3310,15 @@ class ScreenMemoryCleaner:
         )
         screen_fact_stats = (
             self.generate_screen_facts_for_views(output_conn, view_entries)
-            if generate_screen_facts
-            else {}
         )
-        if update_window_workstreams:
-            touched_window_workstream_ids, window_stream_stats = (
-                self.update_window_workstream_tables(output_conn, view_entries)
-            )
-            workstream_stats = self.get_workstream_stats(output_conn)
-            workstream_stats.update(window_stream_stats)
-            workstream_stats["touched_window_workstream_ids"] = touched_window_workstream_ids
-        else:
-            workstream_stats = {}
+        
+        touched_window_workstream_ids, window_stream_stats = (
+            self.update_window_workstream_tables(output_conn, view_entries)
+        )
+        workstream_stats = self.get_workstream_stats(output_conn)
+        workstream_stats.update(window_stream_stats)
+        workstream_stats["touched_window_workstream_ids"] = touched_window_workstream_ids
+
         stats["segments"] = len(segment_entries)
         stats["views"] = view_count
         stats.update(screen_fact_stats)
@@ -8823,11 +8806,6 @@ class ScreenMemoryCleaner:
         incremental=True,
         output_path=None,
         min_quality=None,
-        segment_gap_minutes=None,
-        max_segment_minutes=None,
-        focus_switch_split_minutes=None,
-        generate_screen_facts=True,
-        update_window_workstreams=True,
     ):
         """
         Clean and merge screen data from Screenpipe and OpenChronicle.
@@ -8864,24 +8842,24 @@ class ScreenMemoryCleaner:
 
         schedule = self.config.get("schedule", {})
         try:
-            ingest_interval_minutes = max(
+            fact_extraction_interval_minutes = max(
                 1,
-                int(schedule.get("ingest_interval_minutes", 30)),
+                int(schedule.get("fact_extraction_interval_minutes", 30)),
             )
         except (TypeError, ValueError):
-            ingest_interval_minutes = 30
+            fact_extraction_interval_minutes = 30
 
         try:
             start_time = (
                 parse_user_time_to_utc(start_time_str)
                 if start_time_str
-                else end_time - timedelta(minutes=ingest_interval_minutes)
+                else end_time - timedelta(minutes=fact_extraction_interval_minutes)
             )
         except (TypeError, ValueError):
-            start_time = end_time - timedelta(minutes=ingest_interval_minutes)
+            start_time = end_time - timedelta(minutes=fact_extraction_interval_minutes)
             self._print(
                 f"Invalid start_time_str {start_time_str!r}; using the previous "
-                f"{ingest_interval_minutes} minutes."
+                f"{fact_extraction_interval_minutes} minutes."
             )
             
         # Create or open output DB
@@ -8917,14 +8895,7 @@ class ScreenMemoryCleaner:
             oc_events,
             output_conn,
             min_quality=min_quality,
-            segment_gap_minutes=segment_gap_minutes,
-            max_segment_minutes=max_segment_minutes,
-            focus_switch_split_minutes=focus_switch_split_minutes,
-            segment_config=self.segment_cfg,
-            view_config=self.view_cfg,
             discarded_oc_events=discarded_oc_events,
-            generate_screen_facts=generate_screen_facts,
-            update_window_workstreams=update_window_workstreams,
         )
         output_conn.close()
         
@@ -8978,7 +8949,3 @@ class ScreenMemoryCleaner:
             end_time_str=now.isoformat(),
             incremental=True
         )
-
-
-# Compatibility for PME-side callers that imported the original class name.
-PMECleaner = ScreenMemoryCleaner

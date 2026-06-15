@@ -1063,7 +1063,7 @@ DEFAULT_CONFIG = {
         "openchronicle_db": "~/.openchronicle/index.db",
         # Empty uses <HERMES_HOME>/screen_memory/memory.db.
         "output_db": "",
-        "ingest_interval_minutes": 10,
+        "fact_extraction_interval_minutes": 10,
         "fact_clustering_interval_hours": 1,
         "observation_interval_hours": 24,
         "initial_lookback_minutes": 30,

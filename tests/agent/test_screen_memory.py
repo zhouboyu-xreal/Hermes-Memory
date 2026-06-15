@@ -3,7 +3,7 @@ import sys
 import threading
 from datetime import datetime, timedelta, timezone
 
-from agent.screen_memory.cleaner import ScreenMemoryCleaner
+from agent.screen_memory.manager import ScreenMemoryManager
 from agent.screen_memory.config import load_screen_memory_config
 from agent.screen_memory import service
 
@@ -25,7 +25,7 @@ def _cleaner(tmp_path):
         },
         "embedding": {"enabled": False},
     })
-    return ScreenMemoryCleaner(config)
+    return ScreenMemoryManager(config)
 
 
 def _seed_workstream(cursor):
@@ -76,7 +76,7 @@ def _add_fact(cursor, view_id, fact_hash, text, timestamp):
          start_timestamp, end_timestamp, confidence, created_at, updated_at)
         VALUES (?, ?, ?, 'episodic', 'work_event', 'implementation',
                 'hermes-agent', 'screen-memory', '["screen memory"]',
-                '["ScreenMemoryCleaner"]', '["memory.py"]', ?, '[]', 'Code',
+                '["ScreenMemoryManager"]', '["memory.py"]', ?, '[]', 'Code',
                 'memory.py', ?, ?, 0.9, ?, ?)
         """,
         (
@@ -106,7 +106,7 @@ def test_screen_memory_defaults_use_profile_output_path(tmp_path, monkeypatch):
     assert config["database"]["cleaned_db"] == str(
         tmp_path / "profile" / "screen_memory" / "memory.db"
     )
-    assert config["schedule"]["ingest_interval_minutes"] == 30
+    assert config["schedule"]["fact_extraction_interval_minutes"] == 30
     assert config["schedule"]["fact_clustering_interval_hours"] == 2
     assert config["schedule"]["observation_interval_hours"] == 24
 
@@ -284,7 +284,7 @@ def test_run_ingest_normalizes_window_and_state_to_utc():
 
     assert captured["start_time_str"] == "2026-06-01T09:30:00Z"
     assert captured["end_time_str"] == "2026-06-01T10:00:00Z"
-    assert state["last_ingest_at"] == "2026-06-01T10:00:00Z"
+    assert state["last_fact_extraction_at"] == "2026-06-01T10:00:00Z"
 
 
 def test_screen_memory_state_times_are_normalized_to_utc():
@@ -335,7 +335,7 @@ def test_screenpipe_window_compares_timestamp_values_across_offsets(tmp_path):
 
 def test_clean_invalid_start_uses_ingest_interval(tmp_path, monkeypatch):
     cleaner = _cleaner(tmp_path)
-    cleaner.config["schedule"]["ingest_interval_minutes"] = 45
+    cleaner.config["schedule"]["fact_extraction_interval_minutes"] = 45
     captured = {}
 
     monkeypatch.setattr(
@@ -364,7 +364,7 @@ def test_clean_invalid_start_uses_ingest_interval(tmp_path, monkeypatch):
 
 def test_clean_missing_start_uses_ingest_interval(tmp_path, monkeypatch):
     cleaner = _cleaner(tmp_path)
-    cleaner.config["schedule"]["ingest_interval_minutes"] = 20
+    cleaner.config["schedule"]["fact_extraction_interval_minutes"] = 20
     captured = {}
 
     monkeypatch.setattr(
@@ -388,7 +388,7 @@ def test_clean_missing_start_uses_ingest_interval(tmp_path, monkeypatch):
 
 
 def test_quiet_cleaner_suppresses_console_output(tmp_path, capsys):
-    cleaner = ScreenMemoryCleaner(_cleaner(tmp_path).config, quiet=True)
+    cleaner = ScreenMemoryManager(_cleaner(tmp_path).config, quiet=True)
 
     cleaner._print("hidden", "output")
 
@@ -540,7 +540,7 @@ def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "_screen_memory_dir", lambda: tmp_path / "state")
     monkeypatch.setattr(service, "load_screen_memory_config", lambda _cfg: config)
     monkeypatch.setattr(service, "_inject_runtime_config", lambda *_args: None)
-    monkeypatch.setattr(service, "ScreenMemoryCleaner", _FakeCleaner)
+    monkeypatch.setattr(service, "ScreenMemoryManager", _FakeCleaner)
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {"screen_memory": {"enabled": True}},
@@ -550,7 +550,7 @@ def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
 
     def _ingest(_cleaner, state, now):
         calls.append("ingest")
-        state["last_ingest_at"] = now.isoformat()
+        state["last_fact_extraction_at"] = now.isoformat()
         return {}
 
     def _cluster(_cleaner, state, now):
@@ -613,10 +613,10 @@ def test_incremental_clean_merges_screenpipe_and_openchronicle_into_workstream(t
         INSERT INTO frames VALUES (2, '2026-06-01T10:00:03Z');
         INSERT INTO ocr_text
         VALUES (1, 1, 'Code', 'memory.py', 1,
-                'Implement ScreenMemoryCleaner records views and workstream pipeline');
+                'Implement ScreenMemoryManager records views and workstream pipeline');
         INSERT INTO ocr_text
         VALUES (2, 2, 'Code', 'memory.py', 1,
-                'Implement ScreenMemoryCleaner records views workstream and AXTree pipeline');
+                'Implement ScreenMemoryManager records views workstream and AXTree pipeline');
         """
     )
     connection.commit()
@@ -639,7 +639,7 @@ def test_incremental_clean_merges_screenpipe_and_openchronicle_into_workstream(t
         INSERT INTO captures
         VALUES ('capture-1', '2026-06-01T10:00:02Z', 'Code',
                 'com.microsoft.VSCode', 'memory.py', 'AXTextArea',
-                'editor', 'ScreenMemoryCleaner AXTree structured content', '');
+                'editor', 'ScreenMemoryManager AXTree structured content', '');
         """
     )
     connection.commit()
