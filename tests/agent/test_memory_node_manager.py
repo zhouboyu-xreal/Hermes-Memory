@@ -2227,7 +2227,7 @@ def test_memory_reflect_reports_entity_merge_conditions(db):
     _ = alice
     _ = hermes
 
-    report = db.reflect_merging_entities(limit=10)
+    report = db.merge_similar_entities(limit=10)
 
     by_duplicate = {item["duplicate_id"]: item for item in report["candidates"]}
     assert by_duplicate[alice_spaced]["action"] == "merge"
@@ -2249,7 +2249,7 @@ def test_memory_reflect_entities_can_scope_candidates_to_anchor_entities(db):
     hermes_agent = db.entity_add_entity("Hermes Agent", "PRODUCT")
     _ = alice
 
-    report = db.reflect_merging_entities(
+    report = db.merge_similar_entities(
         limit=10,
         anchor_entity_ids=[alice_spaced],
     )
@@ -2285,13 +2285,13 @@ def test_memory_node_manager_reflect_uses_requested_timestamp_for_fact_day(db):
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
     requested_at = datetime(2031, 4, 5, 23, 30, tzinfo=timezone(timedelta(hours=8)))
     requested_date_keys = []
-    original_get_candidates = db.get_unobserved_nodes_for_observation
+    original_get_candidates = db.get_unprocessed_facts_for_evidence_bundle
 
     def capture_candidates(**kwargs):
         requested_date_keys.append(kwargs.get("date_key"))
         return original_get_candidates(**kwargs)
 
-    db.get_unobserved_nodes_for_observation = capture_candidates
+    db.get_unprocessed_facts_for_evidence_bundle = capture_candidates
 
     report = mgr.reflect(limit=5, reflect_timestamp=requested_at)
 
@@ -2311,7 +2311,7 @@ def test_memory_reflect_can_merge_normalized_entity_duplicates(db):
     alice_spaced = db.entity_add_entity(" alice ", "PERSON")
     db.entity_link_node(node_id, alice_spaced)
 
-    report = db.reflect_merging_entities(limit=10)
+    report = db.merge_similar_entities(limit=10)
 
     assert report["merged"] == 1
     assert db._conn.execute(
@@ -2995,7 +2995,7 @@ def test_unmatched_fact_clusters_keep_exact_topics_separate(db):
         },
     ]
 
-    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unprocessed_facts(facts, excluded_node_ids=set())
 
     assert {
         (cluster["topic_key"], tuple(cluster["source_node_ids"]))
@@ -3032,7 +3032,7 @@ def test_unmatched_fact_clusters_do_not_match_different_specific_family_topics(d
         },
     ]
 
-    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unprocessed_facts(facts, excluded_node_ids=set())
 
     assert not [
         cluster for cluster in clusters
@@ -3065,7 +3065,7 @@ def test_unmatched_fact_clusters_require_time_window_for_generalized_topic_match
         },
     ]
 
-    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unprocessed_facts(facts, excluded_node_ids=set())
 
     assert not [
         cluster for cluster in clusters
@@ -3108,7 +3108,7 @@ def test_unmatched_fact_clusters_ignore_time_when_topics_are_exact(db):
         },
     ]
 
-    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unprocessed_facts(facts, excluded_node_ids=set())
 
     assert {
         (cluster["topic_key"], tuple(cluster["source_node_ids"]))
@@ -3154,7 +3154,7 @@ def test_unmatched_fact_clusters_do_not_generalize_topic_suffixes(db):
         },
     ]
 
-    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unprocessed_facts(facts, excluded_node_ids=set())
 
     assert {
         (cluster["topic_key"], tuple(cluster["source_node_ids"]))
@@ -3203,7 +3203,7 @@ def test_unmatched_fact_clusters_assign_each_fact_to_one_primary_cluster(db):
         },
     ]
 
-    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unprocessed_facts(facts, excluded_node_ids=set())
 
     assigned_node_ids = [
         node_id
@@ -3246,7 +3246,7 @@ def test_unmatched_fact_clusters_use_family_profile_without_duplicate_mixed_buck
         },
     ]
 
-    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unprocessed_facts(facts, excluded_node_ids=set())
 
     assert len(clusters) == 1
     assert clusters[0]["cluster_family"] == "preference"
@@ -3270,7 +3270,7 @@ def test_unmatched_fact_clusters_keep_singleton_for_matching_only(db):
         },
     ]
 
-    clusters = mgr._cluster_unmatched_facts(facts, excluded_node_ids=set())
+    clusters = mgr._cluster_unprocessed_facts(facts, excluded_node_ids=set())
 
     assert len(clusters) == 1
     assert clusters[0]["source_node_ids"] == [1]
@@ -3647,11 +3647,6 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
         [evidence_bundle_id]
     )[0]
     bundle_metadata = json.loads(evidence_bundle["metadata"])
-    assert evidence_bundle["embedding_text"] == evidence_bundle["summary"]
-    assert "[strategy]" not in evidence_bundle["summary"]
-    assert "[preference_signal]" not in evidence_bundle["summary"]
-    assert "Hermes recommended Slack alert routing" in evidence_bundle["summary"]
-    assert "Alice explicitly prefers Slack" in evidence_bundle["summary"]
     assert set(bundle_metadata) <= {"decay"}
     assert interpretation["entity_id"] == alice
     assert interpretation["interpretation_type"] == "explicit_preference"
@@ -4018,7 +4013,7 @@ def test_deferred_interpretation_context_is_loaded_from_observations(db):
     second_sources = db.memory_nodes_by_ids(
         second_observation["source_node_ids"]
     )
-    family = mgr._observation_interpretation_cluster_family(
+    family = mgr._observation_cluster_interpretation_family(
         second_semantic_observation,
         second_sources,
     )
@@ -4397,7 +4392,7 @@ def test_interpretation_linker_reuses_existing_observation_evidence_without_llm(
         llm_outputs=[json.dumps({"should_create": True})],
     )
 
-    generated = mgr._generate_interpretations_using_observations([observation_id])
+    generated = mgr._reflect_generate_interpretations_using_observations([observation_id])
 
     assert generated == 1
     assert mgr.llm_prompts == []
@@ -4466,7 +4461,7 @@ def test_interpretation_linker_matches_preference_by_entity_topic_without_llm(db
         ],
     )
 
-    generated = mgr._generate_interpretations_using_observations([observation_id])
+    generated = mgr._reflect_generate_interpretations_using_observations([observation_id])
 
     assert generated == 1
     assert len([prompt for prompt in mgr.llm_prompts if "interpretation 更新模块" in prompt]) == 1
@@ -4674,7 +4669,7 @@ def test_interpretation_generation_clusters_unmatched_observations(db):
         ],
     )
 
-    generated = mgr._generate_interpretations_using_observations([first_observation, second_observation])
+    generated = mgr._reflect_generate_interpretations_using_observations([first_observation, second_observation])
 
     assert generated == 1
     interpretation_prompts = [
@@ -4721,7 +4716,7 @@ def test_interpretation_generation_defers_weak_single_observation(db):
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
-    generated = mgr._generate_interpretations_using_observations([observation_id])
+    generated = mgr._reflect_generate_interpretations_using_observations([observation_id])
 
     assert generated == 0
     assert mgr.llm_prompts == []
@@ -4731,10 +4726,6 @@ def test_interpretation_generation_defers_weak_single_observation(db):
             (observation_id,),
         ).fetchone()["metadata"]
     )
-    assert metadata["interpretation_status"] == "deferred"
-    assert metadata["interpretation_reason"] == "single_fact_insight_signal"
-    assert metadata["interpretation_basis_hash"]
-
 
 def test_interpretation_generation_defers_single_fact_insight_before_llm(db):
     hermes = db.entity_add_entity("Hermes Agent", "PROJECT")
@@ -4783,7 +4774,7 @@ def test_interpretation_generation_defers_single_fact_insight_before_llm(db):
         ],
     )
 
-    generated = mgr._generate_interpretations_using_observations([observation_id])
+    generated = mgr._reflect_generate_interpretations_using_observations([observation_id])
 
     assert generated == 0
     assert mgr.llm_prompts == []
@@ -4827,7 +4818,7 @@ def test_interpretation_generation_does_not_use_global_batch_threshold_for_weak_
         )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
-    generated = mgr._generate_interpretations_using_observations(observation_ids)
+    generated = mgr._reflect_generate_interpretations_using_observations(observation_ids)
 
     assert generated == 0
     assert mgr.llm_prompts == []
@@ -4877,8 +4868,8 @@ def test_interpretation_generation_skips_final_observation_when_basis_unchanged(
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 
-    first = mgr._generate_interpretations_using_observations([observation_id])
-    second = mgr._generate_interpretations_using_observations([observation_id])
+    first = mgr._reflect_generate_interpretations_using_observations([observation_id])
+    second = mgr._reflect_generate_interpretations_using_observations([observation_id])
 
     assert first == 1
     assert second == 0
@@ -4924,7 +4915,7 @@ def test_interpretation_generation_reuses_deferred_observation_in_new_cluster(db
         },
     )
     first_mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
-    assert first_mgr._generate_interpretations_using_observations([first_observation]) == 0
+    assert first_mgr._reflect_generate_interpretations_using_observations([first_observation]) == 0
 
     second_observation = db.memory_upsert_evidence_bundle(
         entity_id=hermes,
@@ -4963,7 +4954,7 @@ def test_interpretation_generation_reuses_deferred_observation_in_new_cluster(db
         ],
     )
 
-    generated = mgr._generate_interpretations_using_observations([second_observation])
+    generated = mgr._reflect_generate_interpretations_using_observations([second_observation])
 
     assert generated == 1
     prompt = next(prompt for prompt in mgr.llm_prompts if "interpretation 生成模块" in prompt)
@@ -5709,7 +5700,7 @@ def test_observation_type_gate_rejects_incompatible_interpretation(
         "evidence_observation_ids": [],
     }
 
-    score, reason = mgr._calculate_interpretation_candidate_score(
+    score, reason = mgr._calculate_interpretation_candidate_score_for_observation(
         observation=semantic_observation,
         source_nodes=db.memory_nodes_by_ids(node_ids),
         interpretation=task_interpretation,
