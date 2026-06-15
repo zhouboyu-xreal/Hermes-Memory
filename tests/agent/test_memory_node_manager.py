@@ -1238,6 +1238,11 @@ def test_observation_clustering_softens_only_compatible_type_gates(
 
     by_type = {cluster["observation_type"]: cluster for cluster in clusters}
     assert set(by_type) == {"task_progress", "preference_signal"}
+    assert set(by_type["task_progress"]) == {
+        "observation_type",
+        "source_node_ids",
+        "evidence_centroid_embedding",
+    }
     assert by_type["task_progress"]["source_node_ids"] == [
         request_node,
         action_node,
@@ -1245,6 +1250,46 @@ def test_observation_clustering_softens_only_compatible_type_gates(
     assert by_type["preference_signal"]["source_node_ids"] == [
         preference_node
     ]
+
+
+def test_fact_clustering_rejects_low_semantic_cohesion(db, monkeypatch):
+    fact_ids = [
+        _add_memory_node(
+            db,
+            time_key=f"2026-05-01 1{index}:00:00",
+            summary=f"Alice discussed alert routing detail {index}.",
+            keywords=["alert-routing"],
+            fact_type="semantic",
+            fact_kind="context",
+        )
+        for index in range(3)
+    ]
+    angles = np.deg2rad([0.0, 50.0, 76.0])
+    vectors = {
+        node_id: np.array(
+            [np.cos(angle), np.sin(angle)],
+            dtype=np.float32,
+        )
+        for node_id, angle in zip(fact_ids, angles)
+    }
+    monkeypatch.setattr(
+        db,
+        "memory_node_embeddings",
+        lambda node_ids: {
+            node_id: vectors[node_id]
+            for node_id in node_ids
+            if node_id in vectors
+        },
+    )
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    clusters = mgr._cluster_evidence_bundle_facts_into_observations(
+        db.memory_nodes_by_ids(fact_ids)
+    )
+
+    assert [
+        cluster["source_node_ids"] for cluster in clusters
+    ] == [fact_ids[:2], fact_ids[2:]]
 
 
 def test_observation_persists_evidence_centroid_embedding(db):
@@ -4590,6 +4635,56 @@ def test_interpretation_clustering_allows_mixed_observation_types(db):
         "task_progress",
     ]
     assert clusters[0]["items"] == items
+
+
+def test_interpretation_clustering_keeps_task_topics_separate(db):
+    entity_id = db.entity_add_entity("Hermes Agent", "PROJECT")
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    items = [
+        {
+            "observation": {
+                "entity_id": entity_id,
+                "topic_key": "memory-interpretation",
+                "observation_type": "task_state",
+                "metadata": {
+                    "candidate_interpretation_types": ["task"],
+                },
+            },
+            "source_nodes": [
+                {
+                    "fact_kind": "request",
+                    "task_event_like": True,
+                    "task_relevance": "strong",
+                },
+            ],
+        },
+        {
+            "observation": {
+                "entity_id": entity_id,
+                "topic_key": "memory-implementation",
+                "observation_type": "task_progress",
+                "metadata": {
+                    "candidate_interpretation_types": ["task"],
+                },
+            },
+            "source_nodes": [
+                {
+                    "fact_kind": "action",
+                    "task_event_like": True,
+                    "task_relevance": "strong",
+                },
+            ],
+        },
+    ]
+
+    clusters = mgr._cluster_observation_items_for_interpretation(items)
+
+    assert len(clusters) == 2
+    assert {cluster["family"] for cluster in clusters} == {"task"}
+    assert {cluster["topic_key"] for cluster in clusters} == {
+        "memory-interpretation",
+        "memory-implementation",
+    }
 
 
 def test_interpretation_generation_clusters_unmatched_observations(db):

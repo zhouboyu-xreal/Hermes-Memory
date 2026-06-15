@@ -75,6 +75,7 @@ OBSERVATION_EMBEDDING_SIMILARITY_THRESHOLD = 0.72
 OBSERVATION_EXACT_TYPE_SIMILARITY_THRESHOLD = 0.62
 OBSERVATION_COMPATIBLE_TYPE_SIMILARITY_THRESHOLD = 0.72
 OBSERVATION_MIN_FACTS_FOR_NEW_CLUSTER = 2
+OBSERVATION_CLUSTER_MIN_SEMANTIC_COHESION = 0.5
 OBSERVATION_CLUSTER_CENTROID_WEIGHT = 0.55
 OBSERVATION_CLUSTER_MAX_SOURCE_WEIGHT = 0.25
 OBSERVATION_CLUSTER_COVERAGE_WEIGHT = 0.20
@@ -3088,10 +3089,12 @@ class MemoryNodeManager:
         for fact in facts:
             node_id = int(self._node_id(fact))
             implicit_observation_type = self._implicit_observation_type_for_fact(fact)
-            fact_embedding = embeddings.get(node_id)
+            fact_embedding_vector = self._as_embedding_vector(embeddings.get(node_id))
             best_cluster = None
             best_similarity = -1.0
             best_match_rule = "incompatible"
+            best_pair_similarity_sum = 0.0
+            best_pair_count = 0
             for cluster in clusters:
                 match_rule, threshold = self._observation_type_match_rule(
                     implicit_observation_type,
@@ -3100,10 +3103,31 @@ class MemoryNodeManager:
                 if threshold is None:
                     continue
                 similarity = self._cal_embedding_similarity(
-                    fact_embedding,
+                    fact_embedding_vector,
                     cluster.get("centroid"),
                 )
                 if similarity < threshold:
+                    continue
+                new_pair_similarities = [
+                    self._cal_embedding_similarity(fact_embedding_vector, existing_vector)
+                    for existing_vector in cluster["vectors"]
+                ] if fact_embedding_vector is not None else []
+                projected_pair_similarity_sum = (
+                    cluster["pair_similarity_sum"]
+                    + sum(new_pair_similarities)
+                )
+                projected_pair_count = (
+                    cluster["pair_count"] + len(new_pair_similarities)
+                )
+                semantic_cohesion = (
+                    projected_pair_similarity_sum / projected_pair_count
+                    if projected_pair_count
+                    else 1.0
+                )
+                if (
+                    semantic_cohesion
+                    < OBSERVATION_CLUSTER_MIN_SEMANTIC_COHESION
+                ):
                     continue
                 if (
                     similarity > best_similarity
@@ -3116,19 +3140,23 @@ class MemoryNodeManager:
                     best_cluster = cluster
                     best_similarity = similarity
                     best_match_rule = match_rule
+                    best_pair_similarity_sum = projected_pair_similarity_sum
+                    best_pair_count = projected_pair_count
             if best_cluster is None:
-                vector = self._as_embedding_vector(fact_embedding)
                 clusters.append({
                     "observation_type": implicit_observation_type,
                     "source_nodes": [fact],
-                    "vectors": [vector] if vector is not None else [],
-                    "centroid": vector,
+                    "vectors": [fact_embedding_vector] if fact_embedding_vector is not None else [],
+                    "centroid": fact_embedding_vector,
+                    "pair_similarity_sum": 0.0,
+                    "pair_count": 0,
                 })
                 continue
             best_cluster["source_nodes"].append(fact)
-            vector = self._as_embedding_vector(fact_embedding)
-            if vector is not None:
-                best_cluster["vectors"].append(vector)
+            best_cluster["pair_similarity_sum"] = best_pair_similarity_sum
+            best_cluster["pair_count"] = best_pair_count
+            if fact_embedding_vector is not None:
+                best_cluster["vectors"].append(fact_embedding_vector)
                 centroid = np.mean(
                     np.stack(best_cluster["vectors"]),
                     axis=0,
@@ -3140,89 +3168,18 @@ class MemoryNodeManager:
                 )
             )
 
-        observations: List[Dict[str, Any]] = []
+        candidate_fact_clusters: List[Dict[str, Any]] = []
         for cluster in clusters:
             cluster_facts = cluster["source_nodes"]
             centroid = cluster.get("centroid")
-            representative = max(
-                cluster_facts,
-                key=lambda fact: (
-                    self._cal_embedding_similarity(
-                        embeddings.get(int(self._node_id(fact))),
-                        centroid,
-                    ),
-                    len(str(fact.get("summary") or "")),
-                ),
-            )
-            observation_type = cluster["observation_type"]
-            evidence_mode = self._observation_evidence_mode(
-                observation_type,
-                cluster_facts,
-            )
-            fact_type_distribution = self._fact_type_distribution_from_facts(
-                cluster_facts
-            )
-            fact_kind_distribution: Dict[str, int] = {}
-            for fact in cluster_facts:
-                fact_kind = str(
-                    fact.get("fact_kind") or "other"
-                ).strip().lower()
-                fact_kind_distribution[fact_kind] = (
-                    fact_kind_distribution.get(fact_kind, 0) + 1
-                )
-            pair_similarities = [
-                self._cal_embedding_similarity(
-                    embeddings.get(int(self._node_id(left))),
-                    embeddings.get(int(self._node_id(right))),
-                )
-                for index, left in enumerate(cluster_facts)
-                for right in cluster_facts[index + 1:]
-            ]
-            semantic_cohesion = (
-                sum(pair_similarities) / len(pair_similarities)
-                if pair_similarities
-                else 1.0
-            )
-            confidence = min(
-                0.95,
-                0.55
-                + min(0.20, 0.06 * len(cluster_facts))
-                + max(0.0, semantic_cohesion) * 0.15,
-            )
-            allowed_interpretation_types = (
-                self._observation_allowed_interpretation_types(
-                    observation_type,
-                    evidence_mode,
-                )
-            )
-            summary = str(representative.get("summary") or "").strip()
-            observations.append({
-                "observation_type": observation_type,
-                "summary": summary,
-                "evidence_mode": evidence_mode,
-                "confidence": confidence,
+            candidate_fact_clusters.append({
+                "observation_type": cluster["observation_type"],
                 "source_node_ids": [
                     int(self._node_id(fact)) for fact in cluster_facts
                 ],
-                "embedding": centroid,
-                "embedding_text": "\n".join([
-                    f"Observation type: {observation_type}",
-                    f"Summary text: {summary}",
-                ]),
                 "evidence_centroid_embedding": centroid,
-                "metadata": {
-                    "source": "evidence_bundle_fact_clustering",
-                    "allowed_interpretation_types": allowed_interpretation_types,
-                    "candidate_interpretation_types": (
-                        self._observation_candidate_families(observation_type)
-                    ),
-                    "fact_type_distribution": fact_type_distribution,
-                    "fact_kind_distribution": fact_kind_distribution,
-                    "semantic_cohesion": round(semantic_cohesion, 4),
-                    "source_count": len(cluster_facts),
-                },
             })
-        return observations
+        return candidate_fact_clusters
 
     @staticmethod
     def _observation_fact_payload(source_nodes: List[Dict[str, Any]]) -> str:
@@ -5479,7 +5436,7 @@ class MemoryNodeManager:
             source_nodes = item.get("source_nodes", [])
             family = self._observation_cluster_interpretation_family(observation, source_nodes)
             topic_key = self._topic_key(observation.get("topic_key") or observation.get("topic_label") or "general")
-            cluster_topic = "task-chain" if family == "task" else (topic_key or "general")
+            cluster_topic = topic_key or "general"
             observation_type = str(
                 observation.get("observation_type") or "context"
             )
