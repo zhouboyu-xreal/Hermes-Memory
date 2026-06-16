@@ -3,7 +3,7 @@
 
 Two modes are supported:
 
-* once: ingest the complete source time range, then run fact clustering and
+* once: fact_extraction the complete source time range, then run fact clustering and
   observation generation once.
 * timeline: start at the earliest source timestamp and simulate the production
   schedule in chronological order.
@@ -72,7 +72,7 @@ COUNT_TABLES = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run screen-memory ingest, fact clustering, and observation "
+            "Run screen-memory fact_extraction, fact clustering, and observation "
             "generation against Screenpipe and OpenChronicle databases."
         )
     )
@@ -107,7 +107,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH)
     parser.add_argument(
         "--fact-extraction-interval-minutes",
-        "--ingest-interval-minutes",
         dest="fact_extraction_interval_minutes",
         type=int,
         help="Override screen_memory.fact_extraction_interval_minutes.",
@@ -282,7 +281,7 @@ def run_once(
         "last_fact_extraction_at": _format_utc_time(start),
     }
     events = [
-        _phase_result("ingest", end, _run_fact_extraction(manager, state, end)),
+        _phase_result("fact_extraction", end, _run_fact_extraction(manager, state, end)),
         _phase_result(
             "fact_clustering",
             end,
@@ -302,29 +301,29 @@ def run_timeline(
     start: datetime,
     end: datetime,
     *,
-    ingest_interval: timedelta,
+    fact_extraction_interval: timedelta,
     fact_clustering_interval: timedelta,
     observation_interval: timedelta,
     finalize: bool,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     state: Dict[str, Any] = {}
     events: List[Dict[str, Any]] = []
-    next_ingest = start
+    next_fact_extraction = start
     next_clustering = start
     next_observation = start
 
-    while min(next_ingest, next_clustering, next_observation) <= end:
-        now = min(next_ingest, next_clustering, next_observation)
+    while min(next_fact_extraction, next_clustering, next_observation) <= end:
+        now = min(next_fact_extraction, next_clustering, next_observation)
         logging.info("timeline tick=%s", _format_utc_time(now))
-        if next_ingest == now:
+        if next_fact_extraction == now:
             events.append(
                 _phase_result(
-                    "ingest",
+                    "fact_extraction",
                     now,
                     _run_fact_extraction(manager, state, now),
                 )
             )
-            next_ingest += ingest_interval
+            next_fact_extraction += fact_extraction_interval
         if next_clustering == now:
             events.append(
                 _phase_result(
@@ -344,12 +343,12 @@ def run_timeline(
             )
             next_observation += observation_interval
 
-    last_ingest = state.get("last_fact_extraction_at")
-    if finalize and last_ingest != _format_utc_time(end):
+    last_fact_extraction = state.get("last_fact_extraction_at")
+    if finalize and last_fact_extraction != _format_utc_time(end):
         logging.info("timeline finalization tick=%s", _format_utc_time(end))
         events.extend([
             _phase_result(
-                "ingest",
+                "fact_extraction",
                 end,
                 _run_fact_extraction(manager, state, end),
             ),
@@ -507,7 +506,7 @@ def main() -> int:
                 manager,
                 start,
                 end,
-                ingest_interval=timedelta(
+                fact_extraction_interval=timedelta(
                     minutes=max(1, int(schedule["fact_extraction_interval_minutes"]))
                 ),
                 fact_clustering_interval=timedelta(

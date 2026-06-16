@@ -242,7 +242,7 @@ def run_screen_memory_due_work(
         current = _as_utc(now or _utc_now())
         schedule = manager_config.get("schedule", {})
 
-        fact_extraction_due = force_phase == "ingest" or (
+        fact_extraction_due = force_phase == "fact_extraction" or (
             force_phase is None
             and _is_due(
                 state.get("last_fact_extraction_at"),
@@ -286,7 +286,7 @@ def run_screen_memory_due_work(
         )
         phases: Dict[str, Any] = {}
         if fact_extraction_due:
-            phases["ingest"] = _run_fact_extraction(manager, state, current)
+            phases["fact_extraction"] = _run_fact_extraction(manager, state, current)
             _save_state(state)
         if cluster_due:
             phases["fact_clustering"] = _run_fact_clustering(
