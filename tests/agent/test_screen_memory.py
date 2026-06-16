@@ -458,7 +458,7 @@ def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
     )
     connection.commit()
 
-    cluster_stats = cleaner.update_screen_fact_cluster_tables(connection)
+    cluster_stats = cleaner.update_screen_fact_cluster_tables()
 
     assert cluster_stats["screen_facts_clustered"] == 0
     assert cursor.execute(
@@ -474,7 +474,7 @@ def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
     )
     connection.commit()
 
-    cluster_stats = cleaner.update_screen_fact_cluster_tables(connection)
+    cluster_stats = cleaner.update_screen_fact_cluster_tables()
 
     assert cluster_stats["screen_facts_clustered"] == 5
     cluster_row = cursor.execute(
@@ -492,7 +492,7 @@ def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
         (cluster_row[0],),
     ).fetchone()[0] == 5
 
-    observation_stats = cleaner.update_screen_observation_tables(connection, None)
+    observation_stats = cleaner.update_screen_observation_tables()
 
     assert observation_stats["screen_observations_generated"] == 1
     cluster_row = cursor.execute(
@@ -528,8 +528,8 @@ def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
             f"2026-06-01 10:{index + 25:02d}:00",
         )
     connection.commit()
-    cleaner.update_screen_fact_cluster_tables(connection)
-    cleaner.update_screen_observation_tables(connection, None)
+    cleaner.update_screen_fact_cluster_tables()
+    cleaner.update_screen_observation_tables()
 
     updated_cluster = cursor.execute(
         """

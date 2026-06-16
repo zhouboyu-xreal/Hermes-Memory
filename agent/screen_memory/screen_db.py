@@ -1887,6 +1887,7 @@ class ScreenMemoryDB:
                     now,
                 ),
             )
+        self._conn.commit()
         return window_workstream_id
 
     def update_window_workstream(self, workstream_entry):
@@ -1958,13 +1959,16 @@ class ScreenMemoryDB:
                     now,
                 ),
             )
+        self._conn.commit()
 
     def save_or_update_window_workstream(self, workstream_entry):
-        
         if workstream_entry.get("id") is None:
-            return self.save_window_workstream(workstream_entry)
-        self.update_window_workstream(workstream_entry)
-        return workstream_entry["id"]
+            window_workstream_id = self.save_window_workstream(workstream_entry)
+        else:
+            self.update_window_workstream(workstream_entry)
+            window_workstream_id = workstream_entry["id"]
+        
+        return window_workstream_id
     
     def write_record_table(self, kept_records):
         inserted_records = []
