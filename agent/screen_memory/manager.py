@@ -2269,114 +2269,6 @@ class ScreenMemoryManager:
 
         return kept_records, stats
 
-    def process_cleaning(
-        self,
-        sp_rows,
-        oc_events,
-        min_quality=None,
-        discarded_oc_events=None,
-    ):
-        self._print("Running scheduling simulation & deduplication...")
-
-        kept_records, stats = self.select_records_to_keep(
-            sp_rows,
-            oc_events,
-            discarded_oc_events=discarded_oc_events,
-            min_quality=min_quality,
-        )
-        stats.update({
-            "segments": 0,
-            "views": 0,
-            "window_workstream": 0,
-            "window_workstream_members": 0,
-            "task_workstream": 0,
-            "task_workstream_members": 0,
-            "report_blocks": 0,
-            "segment_llm_generation_count": 0,
-            "segment_llm_failed_count": 0,
-            "view_llm_generation_count": 0,
-            "view_llm_failed_count": 0,
-            "window_workstream_llm_generation_count": 0,
-            "window_workstream_llm_failed_count": 0,
-            "task_workstream_llm_generation_count": 0,
-            "task_workstream_llm_failed_count": 0,
-            "report_block_llm_generation_count": 0,
-            "report_block_llm_failed_count": 0,
-            "screen_facts": 0,
-            "screen_fact_embedding_ready_count": 0,
-            "screen_observations": 0,
-            "screen_fact_llm_generation_count": 0,
-            "screen_fact_llm_failed_count": 0,
-            "screen_observation_llm_generation_count": 0,
-            "screen_observation_llm_failed_count": 0,
-            "openchronicle_events": 0,
-            "record_ax_event_links": 0,
-            "record_ax_context_updates": 0,
-        })
-        if not kept_records:
-            stats.update(self.get_workstream_stats())
-            return stats
-
-        events_by_record_key, matched_oc_events = self.select_openchronicle_events_for_records(
-            kept_records,
-            oc_events,
-        )
-
-        event_id_by_source = self.screen_db.write_openchronicle_event_table(
-            matched_oc_events
-        )
-        self.apply_openchronicle_event_ids(events_by_record_key, event_id_by_source)
-        self.attach_openchronicle_events_to_records(kept_records, events_by_record_key)
-        inserted_records = self.screen_db.write_record_table(kept_records)
-        events_by_record_id = self.map_record_ax_events_by_inserted_id(inserted_records)
-        record_ax_event_links = self.screen_db.write_record_ax_event_links(
-            events_by_record_id,
-            event_id_by_source,
-        )
-        stats["openchronicle_events"] = len(matched_oc_events)
-        stats["record_ax_event_links"] = record_ax_event_links
-        stats["record_ax_context_updates"] = self.count_record_ax_context_records(inserted_records)
-
-        segment_record_entries = self.generate_segment_record_entries(
-            inserted_records,
-            self.segment_gap_minutes,
-            max_segment_minutes=self.max_segment_minutes,
-            focus_switch_split_minutes=self.focus_switch_split_minutes,
-        )
-        record_segment_key_by_id = self.map_record_ids_to_segment_keys(segment_record_entries)
-
-        view_entries, view_llm_stats = self.generate_view_entries(
-            inserted_records,
-            record_segment_key_by_id=record_segment_key_by_id,
-        )
-
-        segment_entries, segment_llm_stats = self.generate_segment_entries(
-            segment_record_entries,
-            view_entries,
-            segment_config=self.segment_cfg,
-        )
-
-        segment_id_by_key = self.screen_db.write_segment_table(segment_entries)
-        view_count = self.screen_db.write_view_table(
-            view_entries,
-            segment_id_by_key,
-        )
-        screen_fact_stats = self.generate_screen_facts_for_views(view_entries)
-        
-        touched_window_workstream_ids, window_stream_stats = self.update_window_workstream_tables(view_entries)
-
-        workstream_stats = self.screen_db.get_workstream_stats()
-        workstream_stats.update(window_stream_stats)
-        workstream_stats["touched_window_workstream_ids"] = touched_window_workstream_ids
-
-        stats["segments"] = len(segment_entries)
-        stats["views"] = view_count
-        stats.update(screen_fact_stats)
-        stats.update(workstream_stats)
-        stats.update(segment_llm_stats)
-        stats.update(view_llm_stats)
-        return stats
-
     def build_llm_segment_payload(self, segment_summary, view_infos=None):
         view_infos = view_infos or []
         view_overlaps = []
@@ -6811,7 +6703,7 @@ class ScreenMemoryManager:
             "openchronicle_coverage_ratio": round(coverage_ratio, 3),
         }
 
-    def _load_raw_data(self, start_time, end_time):
+    def _load_raw_data(self, start_time, end_time, min_quality):
         try:
             sp_rows = self.load_screenpipe_data(start_time, end_time)
         except Exception as e:
@@ -6829,10 +6721,47 @@ class ScreenMemoryManager:
             oc_events = []
             discarded_oc_events = []
 
+        self._print("Running scheduling simulation & deduplication...")
+
+        kept_records, stats = self.select_records_to_keep(
+            sp_rows,
+            oc_events,
+            discarded_oc_events=discarded_oc_events,
+            min_quality=min_quality,
+        )
+        stats.update({
+            "openchronicle_events": 0,
+            "record_ax_event_links": 0,
+            "record_ax_context_updates": 0,
+        })
+        if not kept_records:
+            stats.update(self.get_workstream_stats())
+            return stats
+
+        events_by_record_key, matched_oc_events = self.select_openchronicle_events_for_records(
+            kept_records,
+            oc_events,
+        )
+
+        event_id_by_source = self.screen_db.write_openchronicle_event_table(
+            matched_oc_events
+        )
+        self.apply_openchronicle_event_ids(events_by_record_key, event_id_by_source)
+        self.attach_openchronicle_events_to_records(kept_records, events_by_record_key)
+        inserted_records = self.screen_db.write_record_table(kept_records)
+        events_by_record_id = self.map_record_ax_events_by_inserted_id(inserted_records)
+        record_ax_event_links = self.screen_db.write_record_ax_event_links(
+            events_by_record_id,
+            event_id_by_source,
+        )
+        stats["openchronicle_events"] = len(matched_oc_events)
+        stats["record_ax_event_links"] = record_ax_event_links
+        stats["record_ax_context_updates"] = self.count_record_ax_context_records(inserted_records)
+
         # inspect matching
         # coverage_stats = self.inspect_openchronicle_coverage(sp_rows, oc_events, start_time)
 
-        return sp_rows, oc_events, discarded_oc_events
+        return inserted_records, stats
 
     def update_screen_facts_table(
         self,
@@ -6891,18 +6820,81 @@ class ScreenMemoryManager:
                 f"Invalid start_time_str {start_time_str!r}; using the previous "
                 f"{fact_extraction_interval_minutes} minutes."
             )
-        raw_data = self._load_raw_data(start_time, end_time)
+        raw_data = self._load_raw_data(start_time, end_time, min_quality)
         if raw_data is None:
             return None
-        sp_rows, oc_events, discarded_oc_events = raw_data
+        if isinstance(raw_data, dict):
+            raw_data["output_path"] = self.cleaned_db
+            return raw_data
+        inserted_records, stats = raw_data
 
         # Clean
-        stats = self.process_cleaning(
-            sp_rows,
-            oc_events,
-            min_quality=min_quality,
-            discarded_oc_events=discarded_oc_events,
+        stats.update({
+            "segments": 0,
+            "views": 0,
+            "window_workstream": 0,
+            "window_workstream_members": 0,
+            "task_workstream": 0,
+            "task_workstream_members": 0,
+            "report_blocks": 0,
+            "segment_llm_generation_count": 0,
+            "segment_llm_failed_count": 0,
+            "view_llm_generation_count": 0,
+            "view_llm_failed_count": 0,
+            "window_workstream_llm_generation_count": 0,
+            "window_workstream_llm_failed_count": 0,
+            "task_workstream_llm_generation_count": 0,
+            "task_workstream_llm_failed_count": 0,
+            "report_block_llm_generation_count": 0,
+            "report_block_llm_failed_count": 0,
+            "screen_facts": 0,
+            "screen_fact_embedding_ready_count": 0,
+            "screen_observations": 0,
+            "screen_fact_llm_generation_count": 0,
+            "screen_fact_llm_failed_count": 0,
+            "screen_observation_llm_generation_count": 0,
+            "screen_observation_llm_failed_count": 0,
+        })
+
+        segment_record_entries = self.generate_segment_record_entries(
+            inserted_records,
+            self.segment_gap_minutes,
+            max_segment_minutes=self.max_segment_minutes,
+            focus_switch_split_minutes=self.focus_switch_split_minutes,
         )
+        record_segment_key_by_id = self.map_record_ids_to_segment_keys(segment_record_entries)
+
+        view_entries, view_llm_stats = self.generate_view_entries(
+            inserted_records,
+            record_segment_key_by_id=record_segment_key_by_id,
+        )
+
+        segment_entries, segment_llm_stats = self.generate_segment_entries(
+            segment_record_entries,
+            view_entries,
+            segment_config=self.segment_cfg,
+        )
+
+        segment_id_by_key = self.screen_db.write_segment_table(segment_entries)
+        view_count = self.screen_db.write_view_table(
+            view_entries,
+            segment_id_by_key,
+        )
+        screen_fact_stats = self.generate_screen_facts_for_views(view_entries)
+
+        touched_window_workstream_ids, window_stream_stats = self.update_window_workstream_tables(view_entries)
+
+        workstream_stats = self.screen_db.get_workstream_stats()
+        workstream_stats.update(window_stream_stats)
+        workstream_stats["touched_window_workstream_ids"] = touched_window_workstream_ids
+
+        stats["segments"] = len(segment_entries)
+        stats["views"] = view_count
+        stats.update(screen_fact_stats)
+        stats.update(workstream_stats)
+        stats.update(segment_llm_stats)
+        stats.update(view_llm_stats)
+
         # Record the actual output path used
         stats["output_path"] = self.cleaned_db
 
