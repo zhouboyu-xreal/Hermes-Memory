@@ -2575,18 +2575,6 @@ class ScreenMemoryManager:
             vectors = [self.normalize_embedding_vector(vector) for vector in vectors]
         return vectors
 
-    def build_screen_fact_embedding_text(self, fact):
-        parts = [
-            f"fact: {fact.get('fact_text') or ''}",
-            f"evidence: {fact.get('evidence_text') or ''}",
-            f"topics: {', '.join(fact.get('topics') or [])}",
-            f"entities: {', '.join(fact.get('entities') or [])}",
-            f"artifacts: {', '.join(fact.get('artifacts') or [])}",
-            f"app: {fact.get('app_name') or ''}",
-            f"window: {fact.get('window_title') or ''}",
-        ]
-        return "\n".join(part for part in parts if part.split(":", 1)[-1].strip())[:4000]
-
     def screen_fact_embedding_hash(self, embedding_text, config):
         payload = {
             "model": config.get("model"),
@@ -2594,51 +2582,6 @@ class ScreenMemoryManager:
             "text": embedding_text,
         }
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-
-    def prepare_screen_fact_embeddings(self, facts):
-        config = self.get_embedding_config()
-        if not config.get("enabled", False):
-            return False
-        if not facts:
-            return False
-        batch_size = int(config.get("batch_size", 32) or 32)
-        pending = []
-        for fact in facts:
-            embedding_text = self.build_screen_fact_embedding_text(fact)
-            if not embedding_text:
-                continue
-            embedding_hash = self.screen_fact_embedding_hash(embedding_text, config)
-            fact["embedding_text"] = embedding_text
-            fact["embedding_hash"] = embedding_hash
-            stored_hash = fact.get("embedding_hash_from_db")
-            stored_model = fact.get("embedding_model")
-            stored_vector = fact.get("embedding_vector")
-            if stored_vector and stored_hash == embedding_hash and stored_model == config.get("model"):
-                fact["embedding_vector"] = stored_vector
-                continue
-            pending.append((fact, embedding_text, embedding_hash))
-        for start in range(0, len(pending), batch_size):
-            batch = pending[start:start + batch_size]
-            texts = [item[1] for item in batch]
-            try:
-                vectors = self.call_embedding_model(texts, config)
-            except Exception as exc:
-                for fact, embedding_text, embedding_hash in batch:
-                    self.screen_db.update_screen_fact_embedding_row(
-                        fact,
-                        None,
-                        embedding_text,
-                        embedding_hash,
-                        config,
-                        status="error",
-                        error=str(exc),
-                    )
-                self._print(f"Screen fact embedding failed: {exc}")
-                continue
-            for (fact, embedding_text, embedding_hash), vector in zip(batch, vectors):
-                fact["embedding_vector"] = vector
-                self.screen_db.update_screen_fact_embedding_row(fact, vector, embedding_text, embedding_hash, config)
-        return any(fact.get("embedding_vector") for fact in facts)
 
     def build_screen_fact_faiss_similarity_index(self, facts):
         config = self.get_embedding_config()
@@ -3004,6 +2947,26 @@ class ScreenMemoryManager:
                 "llm_updated_at": now,
             }, False, str(e)
 
+    def _build_screen_fact_embedding_text(self,
+        fact_text: str = "",
+        evidence_text: str = "",
+        topics_str: str = "",
+        entities_str: str = "",
+        artifacts_str: str = "",
+        app_name: str = "",
+        window_name: str = ""
+        ):
+        parts = [
+            f"fact: {fact_text}" if fact_text else "",
+            f"evidence: {evidence_text}" if evidence_text else "",
+            f"topics: {topics_str}" if topics_str else "",
+            f"entities: {entities_str}" if entities_str else "",
+            f"artifacts: {artifacts_str}" if artifacts_str else "",
+            f"app: {app_name}" if app_name else "",
+            f"window: {window_name}" if window_name else "",
+        ]
+        return "\n".join(part for part in parts if part.split(":", 1)[-1].strip())[:4000]
+
     def build_screen_fact_entry(self, view_entry, fact, llm_fields=None):
         info = view_entry.get("info") or {}
         llm_fields = llm_fields or {}
@@ -3016,6 +2979,44 @@ class ScreenMemoryManager:
         fact_hash = hashlib.sha256(
             json.dumps(fact_hash_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
+
+        embedding_text = self._build_screen_fact_embedding_text(
+            fact_text=fact.get("fact_text") or "",
+            evidence_text=fact.get("evidence_text") or "",
+            topics_str=", ".join(fact.get("topics") or []),
+            entities_str=", ".join(fact.get("entities") or []),
+            artifacts_str=", ".join(fact.get("artifacts") or []),
+            app_name=info.get("app_name") or "",
+            window_name=info.get("window_title") or "",
+        )
+        embedding_config = self.get_embedding_config()
+        embedding_vector = None
+        embedding_hash = None
+        embedding_provider = None
+        embedding_model = None
+        embedding_dimensions = None
+        embedding_status = None
+        embedding_error = None
+        embedding_updated_at = None
+        if embedding_text and embedding_config.get("enabled", False):
+            embedding_hash = self.screen_fact_embedding_hash(embedding_text, embedding_config)
+            embedding_provider = embedding_config.get("provider") or "openai"
+            embedding_model = embedding_config.get("model")
+            embedding_updated_at = now_db_timestamp()
+            try:
+                vectors = self.call_embedding_model([embedding_text], embedding_config)
+                if vectors:
+                    embedding_vector = vectors[0]
+                    embedding_dimensions = len(embedding_vector or [])
+                    embedding_status = "ok"
+                else:
+                    embedding_status = "error"
+                    embedding_error = "Embedding API returned no vectors"
+            except Exception as exc:
+                embedding_status = "error"
+                embedding_error = str(exc)[:1000]
+                self._print(f"Screen fact embedding failed: {exc}")
+
         return {
             "view_id": view_entry.get("view_id"),
             "fact_hash": fact_hash,
@@ -3032,6 +3033,15 @@ class ScreenMemoryManager:
             "evidence_record_ids_json": dump_json_list(evidence_record_ids),
             "app_name": info.get("app_name") or "",
             "window_title": info.get("window_title") or "",
+            "embedding_text": embedding_text,
+            "embedding_hash": embedding_hash,
+            "embedding_provider": embedding_provider,
+            "embedding_model": embedding_model,
+            "embedding_dimensions": embedding_dimensions,
+            "embedding_vector": embedding_vector,
+            "embedding_status": embedding_status,
+            "embedding_error": embedding_error,
+            "embedding_updated_at": embedding_updated_at,
             "start_timestamp": format_db_timestamp(info.get("start_timestamp")),
             "end_timestamp": format_db_timestamp(info.get("end_timestamp")),
             "confidence": fact.get("confidence") or 0.0,
@@ -3079,9 +3089,7 @@ class ScreenMemoryManager:
                     inserted_count += 1
                     generated_fact_ids.append(fact_id)
         generated_facts = self.screen_db.load_screen_facts_by_ids(generated_fact_ids)
-        embedding_ready_count = 0
-        if self.prepare_screen_fact_embeddings(generated_facts):
-            embedding_ready_count = sum(1 for fact in generated_facts if fact.get("embedding_vector"))
+        embedding_ready_count = sum(1 for fact in generated_facts if fact.get("embedding_vector"))
         return {
             "screen_facts": inserted_count,
             "screen_fact_embedding_ready_count": embedding_ready_count,
@@ -3580,8 +3588,7 @@ class ScreenMemoryManager:
             all_facts = list(new_facts)
             for existing_cluster in existing_clusters:
                 all_facts.extend(existing_cluster.get("facts") or [])
-            if self.prepare_screen_fact_embeddings(all_facts):
-                self.build_screen_fact_faiss_similarity_index(all_facts)
+            self.build_screen_fact_faiss_similarity_index(all_facts)
             for cluster in self.cluster_screen_facts_for_observation(new_facts):
                 matched_cluster, match = self.find_matching_screen_fact_cluster(
                     cluster,

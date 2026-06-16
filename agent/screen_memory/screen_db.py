@@ -861,8 +861,11 @@ class ScreenMemoryDB:
              project_key, objective_key, topics_json, entities_json, artifacts_json,
              evidence_text, evidence_record_ids_json, app_name, window_title,
              start_timestamp, end_timestamp, confidence, llm_summary_json, llm_model,
-             llm_status, llm_error, llm_hash, llm_updated_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             llm_status, llm_error, llm_hash, llm_updated_at, embedding_text,
+             embedding_hash, embedding_provider, embedding_model, embedding_dimensions,
+             embedding_vector, embedding_status, embedding_error, embedding_updated_at,
+             created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fact_entry["view_id"],
@@ -889,6 +892,17 @@ class ScreenMemoryDB:
                 fact_entry.get("llm_error"),
                 fact_entry.get("llm_hash"),
                 fact_entry.get("llm_updated_at"),
+                fact_entry.get("embedding_text"),
+                fact_entry.get("embedding_hash"),
+                fact_entry.get("embedding_provider"),
+                fact_entry.get("embedding_model"),
+                fact_entry.get("embedding_dimensions"),
+                self.encode_embedding_vector(fact_entry.get("embedding_vector"))
+                if fact_entry.get("embedding_vector")
+                else None,
+                fact_entry.get("embedding_status"),
+                fact_entry.get("embedding_error"),
+                fact_entry.get("embedding_updated_at"),
                 now,
                 now,
             ),
