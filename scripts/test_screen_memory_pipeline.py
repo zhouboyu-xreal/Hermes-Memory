@@ -500,6 +500,7 @@ def main() -> int:
     )
     try:
         if args.mode == "once":
+            start = _format_utc_time(datetime(2026, 5, 9, 0, 0, tzinfo=timezone.utc))
             state, events = run_once(manager, start, end)
         else:
             state, events = run_timeline(
@@ -536,7 +537,7 @@ def main() -> int:
             },
             "source_edges": source_edges,
             "source_range": {
-                "start": _format_utc_time(start),
+                "start": _format_utc_time(effective_start),
                 "end": _format_utc_time(end),
             },
             "schedule": schedule,

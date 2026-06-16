@@ -163,8 +163,7 @@ def _run_fact_extraction(
         previous = now - timedelta(
             minutes=max(1, int(schedule.get("initial_lookback_minutes", 30)))
         )
-    fact_extraction = getattr(manager, "update_screen_facts_table", None)
-    stats = fact_extraction(
+    stats = manager.update_screen_facts_table(
         start_time_str=_format_utc_time(previous),
         end_time_str=_format_utc_time(now),
         incremental=True,
@@ -196,7 +195,7 @@ def _run_observations(
     # A daily observation run first catches any facts left unclustered by
     # a missed clustering tick.
     cluster_stats = manager.update_screen_fact_cluster_tables()
-    observation_stats = manager.update_screen_observation_tables(None)
+    observation_stats = manager.update_screen_observation_tables()
     stats = {
         "fact_clustering": cluster_stats,
         "observations": observation_stats,

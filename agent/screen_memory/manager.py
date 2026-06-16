@@ -2449,14 +2449,6 @@ class ScreenMemoryManager:
             vectors = [self.normalize_embedding_vector(vector) for vector in vectors]
         return vectors
 
-    def screen_fact_embedding_hash(self, embedding_text, config):
-        payload = {
-            "model": config.get("model"),
-            "dimensions": int(config.get("dimensions") or 0),
-            "text": embedding_text,
-        }
-        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-
     def build_screen_fact_faiss_similarity_index(self, facts):
         config = self.get_embedding_config()
         if not config.get("enabled", False):
@@ -2845,14 +2837,6 @@ class ScreenMemoryManager:
         info = view_entry.get("info") or {}
         llm_fields = llm_fields or {}
         evidence_record_ids = parse_json_list(info.get("evidence_ids_json"))
-        fact_hash_payload = {
-            "view_id": view_entry.get("view_id"),
-            "fact_text": fact.get("fact_text") or "",
-            "evidence_record_ids": evidence_record_ids,
-        }
-        fact_hash = hashlib.sha256(
-            json.dumps(fact_hash_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()
 
         embedding_text = self._build_screen_fact_embedding_text(
             fact_text=fact.get("fact_text") or "",
@@ -2865,18 +2849,14 @@ class ScreenMemoryManager:
         )
         embedding_config = self.get_embedding_config()
         embedding_vector = None
-        embedding_hash = None
         embedding_provider = None
         embedding_model = None
         embedding_dimensions = None
         embedding_status = None
         embedding_error = None
-        embedding_updated_at = None
         if embedding_text and embedding_config.get("enabled", False):
-            embedding_hash = self.screen_fact_embedding_hash(embedding_text, embedding_config)
             embedding_provider = embedding_config.get("provider") or "openai"
             embedding_model = embedding_config.get("model")
-            embedding_updated_at = now_db_timestamp()
             try:
                 vectors = self.call_embedding_model([embedding_text], embedding_config)
                 if vectors:
@@ -2893,7 +2873,6 @@ class ScreenMemoryManager:
 
         return {
             "view_id": view_entry.get("view_id"),
-            "fact_hash": fact_hash,
             "fact_text": fact.get("fact_text") or "",
             "fact_type": self.normalize_screen_fact_type(fact.get("fact_type")),
             "fact_kind": self.normalize_screen_fact_kind(fact.get("fact_kind")),
@@ -2908,14 +2887,12 @@ class ScreenMemoryManager:
             "app_name": info.get("app_name") or "",
             "window_title": info.get("window_title") or "",
             "embedding_text": embedding_text,
-            "embedding_hash": embedding_hash,
             "embedding_provider": embedding_provider,
             "embedding_model": embedding_model,
             "embedding_dimensions": embedding_dimensions,
             "embedding_vector": embedding_vector,
             "embedding_status": embedding_status,
             "embedding_error": embedding_error,
-            "embedding_updated_at": embedding_updated_at,
             "start_timestamp": format_db_timestamp(info.get("start_timestamp")),
             "end_timestamp": format_db_timestamp(info.get("end_timestamp")),
             "confidence": fact.get("confidence") or 0.0,
@@ -2970,63 +2947,6 @@ class ScreenMemoryManager:
             "screen_fact_llm_generation_count": llm_generation_count,
             "screen_fact_llm_failed_count": llm_failed_count,
         }
-
-    # def load_screen_fact_clusters_for_window_workstream(self, cursor, window_workstream_id):
-    #     cursor.execute(
-    #         """
-    #         SELECT
-    #             so.id AS observation_id,
-    #             so.cluster_key AS observation_cluster_key,
-    #             so.title AS observation_title,
-    #             so.summary_text AS observation_summary_text,
-    #             so.project_key AS observation_project_key,
-    #             so.objective_key AS observation_objective_key,
-    #             so.work_type AS observation_work_type,
-    #             so.metadata_json AS observation_metadata_json,
-    #             sf.id, sf.view_id, sf.fact_text, sf.fact_type, sf.fact_kind,
-    #             sf.work_type, sf.project_key, sf.objective_key, sf.topics_json,
-    #             sf.entities_json, sf.artifacts_json, sf.evidence_text,
-    #             sf.evidence_record_ids_json, sf.app_name, sf.window_title,
-    #             sf.start_timestamp, sf.end_timestamp, sf.confidence,
-    #             sf.embedding_text, sf.embedding_hash, sf.embedding_model,
-    #             sf.embedding_dimensions, sf.embedding_vector
-    #         FROM screen_observations so
-    #         JOIN screen_observation_facts sof ON sof.observation_id = so.id
-    #         JOIN screen_facts sf ON sf.id = sof.fact_id
-    #         WHERE so.scope_type = 'window_workstream'
-    #           AND so.scope_id = ?
-    #         ORDER BY so.updated_at DESC, so.id DESC, sf.start_timestamp ASC, sf.id ASC
-    #         """,
-    #         (window_workstream_id,),
-    #     )
-    #     columns = [column[0] for column in cursor.description]
-    #     clusters_by_id = {}
-    #     ordered_ids = []
-    #     for row in cursor.fetchall():
-    #         item = dict(zip(columns, row))
-    #         observation_id = item["observation_id"]
-    #         if observation_id not in clusters_by_id:
-    #             metadata = {}
-    #             try:
-    #                 parsed_metadata = json.loads(item.get("observation_metadata_json") or "{}")
-    #                 if isinstance(parsed_metadata, dict):
-    #                     metadata = parsed_metadata
-    #             except (TypeError, json.JSONDecodeError):
-    #                 metadata = {}
-    #             clusters_by_id[observation_id] = {
-    #                 "observation_id": observation_id,
-    #                 "observation_cluster_key": item.get("observation_cluster_key"),
-    #                 "observation_title": item.get("observation_title") or "",
-    #                 "observation_summary_text": item.get("observation_summary_text") or "",
-    #                 "observation_project_key": item.get("observation_project_key") or "unknown",
-    #                 "observation_objective_key": item.get("observation_objective_key") or "general",
-    #                 "observation_work_type": item.get("observation_work_type") or "other",
-    #                 "observation_metadata": metadata,
-    #                 "facts": [],
-    #             }
-    #             ordered_ids.append(observation_id)
-    #         clusters_by_id[observation_id]["facts"].append(self.build_screen_fact_item_from_row(item))
-    #     return [clusters_by_id[observation_id] for observation_id in ordered_ids]
 
     def load_window_workstream_context_for_observation(self, window_workstream_id):
         rows = self.screen_db.load_window_workstream_signatures_for_task_generation(
@@ -3442,12 +3362,8 @@ class ScreenMemoryManager:
         ).hexdigest()
 
     def update_screen_fact_cluster_tables(self, window_workstream_ids=None):
-        if isinstance(window_workstream_ids, sqlite3.Connection):
-            window_workstream_ids = None
         if window_workstream_ids is None:
-            window_workstream_ids = (
-                self.screen_db.load_window_workstream_ids_with_unclustered_facts()
-            )
+            window_workstream_ids = self.screen_db.load_window_workstream_ids_with_unclustered_facts()
         clustered_fact_count = 0
         touched_cluster_ids = []
         for window_workstream_id in window_workstream_ids or []:
@@ -3456,7 +3372,7 @@ class ScreenMemoryManager:
             )
             if len(new_facts) < MIN_NEW_FACTS_FOR_CLUSTERING:
                 continue
-            existing_clusters = self.screen_db.load_persisted_screen_fact_clusters(
+            existing_clusters = self.screen_db.load_persisted_screen_fact_clusters_for_window_workstream(
                 window_workstream_id,
             )
             all_facts = list(new_facts)
@@ -3506,9 +3422,8 @@ class ScreenMemoryManager:
             "touched_screen_fact_cluster_ids": sorted(set(touched_cluster_ids)),
         }
 
-    def update_screen_observation_tables(self, window_workstream_ids=None, *_legacy_args):
-        if isinstance(window_workstream_ids, sqlite3.Connection):
-            window_workstream_ids = None
+    def update_screen_observation_tables(self, window_workstream_ids=None):
+        
         screen_observation_cfg = self.screen_observation_cfg or {}
         if not screen_observation_cfg.get("enabled", False) or not screen_observation_cfg.get("enable_observation_generation", True):
             return {
@@ -3527,15 +3442,16 @@ class ScreenMemoryManager:
         )
         for window_workstream_id, dirty_cluster_ids in dirty_by_workstream.items():
             window_context = self.load_window_workstream_context_for_observation(window_workstream_id)
-            persisted_clusters = self.screen_db.load_persisted_screen_fact_clusters(
+            persisted_clusters = self.screen_db.load_persisted_screen_fact_clusters_for_window_workstream(
                 window_workstream_id,
             )
             for cluster in persisted_clusters:
                 if cluster.get("fact_cluster_id") not in dirty_cluster_ids:
                     continue
                 fact_count = len(cluster.get("facts") or [])
-                use_llm = fact_count > 1 and llm_enabled and llm_generation_count + llm_failed_count < llm_budget
-                if use_llm:
+                if fact_count < screen_observation_cfg.get("observation_min_fact_count", False):
+                    continue
+                if llm_enabled and llm_generation_count + llm_failed_count < llm_budget:
                     self._print(
                         f"Summarizing Screen_Observation with LLM "
                             f"({llm_generation_count + llm_failed_count + 1}/{llm_budget})..."
@@ -3557,7 +3473,7 @@ class ScreenMemoryManager:
                             continue
                         observation = self.fallback_screen_observation_for_cluster(window_context, cluster)
                 else:
-                    if fact_count > 1 and not fallback_enabled:
+                    if not fallback_enabled:
                         continue
                     self._print("Summarizing Screen_Observation with fallback ")
                     observation = self.fallback_screen_observation_for_cluster(window_context, cluster)
@@ -4050,25 +3966,25 @@ class ScreenMemoryManager:
             return False
         return True
 
-    def exact_app_window_key_for_view(self, view):
+    def get_app_window_key_for_view(self, view):
         app_key = view.get("app_key")
         title_key = view.get("title_key")
         if not self.is_exact_app_window_title_eligible(app_key, title_key, view.get("window_title")):
             return None
         return app_key, title_key
 
-    def exact_app_window_keys_for_view_cluster(self, cluster):
+    def get_all_app_window_keys_for_view_cluster(self, cluster):
         keys = set()
         for view in cluster.get("views") or []:
-            key = self.exact_app_window_key_for_view(view)
+            key = self.get_app_window_key_for_view(view)
             if key:
                 keys.add(key)
         return keys
 
-    def exact_app_window_keys_for_workstream(self, workstream):
+    def get_all_app_window_keys_for_workstream(self, workstream):
         keys = set()
         for view in workstream.get("member_views") or []:
-            key = self.exact_app_window_key_for_view(view)
+            key = self.get_app_window_key_for_view(view)
             if key:
                 keys.add(key)
         if keys:
@@ -4088,15 +4004,15 @@ class ScreenMemoryManager:
 
     def has_exact_app_window_match(self, view, workstream):
         key = self.exact_app_window_key_for_view(view)
-        return bool(key and key in self.exact_app_window_keys_for_workstream(workstream))
+        return bool(key and key in self.get_all_app_window_keys_for_workstream(workstream))
 
     def has_exact_app_window_cluster_match(self, left_cluster, right_cluster):
-        left_keys = self.exact_app_window_keys_for_view_cluster(left_cluster)
-        return bool(left_keys and left_keys.intersection(self.exact_app_window_keys_for_view_cluster(right_cluster)))
+        left_keys = self.get_all_app_window_keys_for_view_cluster(left_cluster)
+        return bool(left_keys and left_keys.intersection(self.get_all_app_window_keys_for_view_cluster(right_cluster)))
 
     def has_exact_app_window_workstream_match(self, cluster, workstream):
-        cluster_keys = self.exact_app_window_keys_for_view_cluster(cluster)
-        return bool(cluster_keys and cluster_keys.intersection(self.exact_app_window_keys_for_workstream(workstream)))
+        cluster_keys = self.get_all_app_window_keys_for_view_cluster(cluster)
+        return bool(cluster_keys and cluster_keys.intersection(self.get_all_app_window_keys_for_workstream(workstream)))
 
     def score_view_pair(self, view, member_view):
         max_gap_days = self.window_workstream_cfg.get("max_time_gap_days", 30)
@@ -4199,7 +4115,7 @@ class ScreenMemoryManager:
         if not cluster_views:
             return 0.0, "empty_cluster"
 
-        if self.exact_app_window_key_for_view(view) in self.exact_app_window_keys_for_view_cluster(cluster):
+        if self.get_app_window_key_for_view(view) in self.get_all_app_window_keys_for_view_cluster(cluster):
             return 1.0, "exact_app_window_batch_cluster"
 
         cluster_app_keys = {item.get("app_key") for item in cluster_views if item.get("app_key")}
@@ -4510,134 +4426,7 @@ class ScreenMemoryManager:
             if key in llm_fields:
                 workstream_entry[key] = llm_fields[key]
         return workstream_entry
-
-    def save_window_workstream(self, cursor, workstream_entry):
-        now = now_db_timestamp()
-        cursor.execute(
-            """
-            INSERT INTO window_workstream
-            (title, summary, category, start_timestamp, end_timestamp,
-             topics_json, entities_json, artifacts_json, app_names_json, window_titles_json,
-             view_count, segment_count, confidence, llm_summary_json, llm_model, llm_status,
-             llm_error, llm_hash, llm_updated_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                workstream_entry["title"],
-                workstream_entry["summary"],
-                workstream_entry["category"],
-                format_db_timestamp(workstream_entry["start_timestamp"]),
-                format_db_timestamp(workstream_entry["end_timestamp"]),
-                workstream_entry["topics_json"],
-                workstream_entry["entities_json"],
-                workstream_entry["artifacts_json"],
-                workstream_entry["app_names_json"],
-                workstream_entry["window_titles_json"],
-                workstream_entry["view_count"],
-                workstream_entry["segment_count"],
-                workstream_entry["confidence"],
-                workstream_entry.get("llm_summary_json"),
-                workstream_entry.get("llm_model"),
-                workstream_entry.get("llm_status"),
-                workstream_entry.get("llm_error"),
-                workstream_entry.get("llm_hash"),
-                workstream_entry.get("llm_updated_at"),
-                now,
-                now,
-            ),
-        )
-        window_workstream_id = cursor.lastrowid
-        for member in workstream_entry["members"]:
-            cursor.execute(
-                """
-                INSERT INTO window_workstream_members
-                (window_workstream_id, view_id, relevance, reason, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    window_workstream_id,
-                    member["view_id"],
-                    member["relevance"],
-                    member["reason"],
-                    now,
-                ),
-            )
-        return window_workstream_id
-
-    def update_window_workstream(self, cursor, workstream_entry):
-        now = now_db_timestamp()
-        window_workstream_id = workstream_entry["id"]
-        cursor.execute(
-            """
-            UPDATE window_workstream
-            SET title = ?,
-                summary = ?,
-                category = ?,
-                start_timestamp = ?,
-                end_timestamp = ?,
-                topics_json = ?,
-                entities_json = ?,
-                artifacts_json = ?,
-                app_names_json = ?,
-                window_titles_json = ?,
-                view_count = ?,
-                segment_count = ?,
-                confidence = ?,
-                llm_summary_json = ?,
-                llm_model = ?,
-                llm_status = ?,
-                llm_error = ?,
-                llm_hash = ?,
-                llm_updated_at = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                workstream_entry["title"],
-                workstream_entry["summary"],
-                workstream_entry["category"],
-                format_db_timestamp(workstream_entry["start_timestamp"]),
-                format_db_timestamp(workstream_entry["end_timestamp"]),
-                workstream_entry["topics_json"],
-                workstream_entry["entities_json"],
-                workstream_entry["artifacts_json"],
-                workstream_entry["app_names_json"],
-                workstream_entry["window_titles_json"],
-                workstream_entry["view_count"],
-                workstream_entry["segment_count"],
-                workstream_entry["confidence"],
-                workstream_entry.get("llm_summary_json"),
-                workstream_entry.get("llm_model"),
-                workstream_entry.get("llm_status"),
-                workstream_entry.get("llm_error"),
-                workstream_entry.get("llm_hash"),
-                workstream_entry.get("llm_updated_at"),
-                now,
-                window_workstream_id,
-            ),
-        )
-        for member in workstream_entry["members"]:
-            cursor.execute(
-                """
-                INSERT INTO window_workstream_members
-                (window_workstream_id, view_id, relevance, reason, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    window_workstream_id,
-                    member["view_id"],
-                    member["relevance"],
-                    member["reason"],
-                    now,
-                ),
-            )
-
-    def save_or_update_window_workstream(self, cursor, workstream_entry):
-        if workstream_entry.get("id") is None:
-            return self.save_window_workstream(cursor, workstream_entry)
-        self.update_window_workstream(cursor, workstream_entry)
-        return workstream_entry["id"]
-
+    
     def task_business_title_labels(self, item):
         labels = self.extract_task_window_label(item)
         if labels:
@@ -6631,35 +6420,16 @@ class ScreenMemoryManager:
             workstream_entries.append(workstream_entry)
 
         touched_window_workstream_ids = []
-        cursor = self.screen_db.connection.cursor()
         for workstream_entry in workstream_entries:
             touched_window_workstream_ids.append(
-                self.save_or_update_window_workstream(cursor, workstream_entry)
+                self.screen_db.save_or_update_window_workstream(workstream_entry)
             )
-        self.screen_db.connection.commit()
 
         return touched_window_workstream_ids, {
             "window_workstream_llm_generation_count": llm_generation_count,
             "window_workstream_llm_failed_count": llm_failed_count,
         }
-
-    def update_workstream_tables(self, output_conn, view_entries):
-        touched_window_workstream_ids, window_stream_stats = self.update_window_workstream_tables(output_conn, view_entries)
-        stats = self.screen_db.get_workstream_stats()
-        stats.update({
-            "task_workstream_llm_generation_count": 0,
-            "task_workstream_llm_failed_count": 0,
-            "touched_task_workstream_ids": [],
-            "touched_window_workstream_ids": touched_window_workstream_ids,
-        })
-        report_block_stats = self.get_report_block_stats(
-            output_conn,
-            skipped_reason="scheduled_separately",
-        )
-        stats.update(window_stream_stats)
-        stats.update(report_block_stats)
-        return stats
-
+    
     def inspect_openchronicle_coverage(self, sp_rows, oc_events, start_time, bucket_minutes=10):
         oc_buckets = set()
         for event in oc_events or []:

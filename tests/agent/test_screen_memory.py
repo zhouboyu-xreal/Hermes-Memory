@@ -67,22 +67,21 @@ def _seed_workstream(cursor):
     return workstream_id, view_id
 
 
-def _add_fact(cursor, view_id, fact_hash, text, timestamp):
+def _add_fact(cursor, view_id, _fact_key, text, timestamp):
     cursor.execute(
         """
         INSERT INTO screen_facts
-        (view_id, fact_hash, fact_text, fact_type, fact_kind, work_type,
+        (view_id, fact_text, fact_type, fact_kind, work_type,
          project_key, objective_key, topics_json, entities_json, artifacts_json,
          evidence_text, evidence_record_ids_json, app_name, window_title,
          start_timestamp, end_timestamp, confidence, created_at, updated_at)
-        VALUES (?, ?, ?, 'episodic', 'work_event', 'implementation',
+        VALUES (?, ?, 'episodic', 'work_event', 'implementation',
                 'hermes-agent', 'screen-memory', '["screen memory"]',
                 '["ScreenMemoryManager"]', '["memory.py"]', ?, '[]', 'Code',
                 'memory.py', ?, ?, 0.9, ?, ?)
         """,
         (
             view_id,
-            fact_hash,
             text,
             text,
             timestamp,

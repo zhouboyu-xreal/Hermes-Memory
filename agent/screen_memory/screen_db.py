@@ -548,7 +548,6 @@ class ScreenMemoryDB:
         CREATE TABLE IF NOT EXISTS screen_facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             view_id INTEGER NOT NULL,
-            fact_hash TEXT UNIQUE,
             fact_text TEXT NOT NULL,
             fact_type TEXT NOT NULL DEFAULT 'episodic',
             fact_kind TEXT NOT NULL DEFAULT 'other',
@@ -582,14 +581,12 @@ class ScreenMemoryDB:
         }
         for column_name, column_type in [
             ("embedding_text", "TEXT"),
-            ("embedding_hash", "TEXT"),
             ("embedding_provider", "TEXT"),
             ("embedding_model", "TEXT"),
             ("embedding_dimensions", "INTEGER"),
             ("embedding_vector", "BLOB"),
             ("embedding_status", "TEXT"),
             ("embedding_error", "TEXT"),
-            ("embedding_updated_at", "TEXT"),
         ]:
             if column_name not in existing_screen_fact_columns:
                 cursor.execute(f"ALTER TABLE screen_facts ADD COLUMN {column_name} {column_type}")
@@ -811,26 +808,24 @@ class ScreenMemoryDB:
 
         self._conn.commit()
 
-    def update_screen_fact_embedding_row(self, fact, vector, embedding_text, embedding_hash, config, status="ok", error=None):
+    def update_screen_fact_embedding_row(self, fact, vector, embedding_text, config, status="ok", error=None):
         cursor = self._conn.cursor()
         cursor.execute(
             """
             UPDATE screen_facts
-            SET embedding_text = ?, embedding_hash = ?, embedding_provider = ?,
+            SET embedding_text = ?, embedding_provider = ?,
                 embedding_model = ?, embedding_dimensions = ?, embedding_vector = ?,
-                embedding_status = ?, embedding_error = ?, embedding_updated_at = ?
+                embedding_status = ?, embedding_error = ?,
             WHERE id = ?
             """,
             (
                 embedding_text,
-                embedding_hash,
                 config.get("provider") or "openai",
                 config.get("model"),
                 len(vector or []),
                 self.encode_embedding_vector(vector) if vector else None,
                 status,
                 (error or "")[:1000] if error else None,
-                now_db_timestamp(),
                 fact.get("id"),
             ),
         )
@@ -857,19 +852,18 @@ class ScreenMemoryDB:
         cursor.execute(
             """
             INSERT OR IGNORE INTO screen_facts
-            (view_id, fact_hash, fact_text, fact_type, fact_kind, work_type,
+            (view_id, fact_text, fact_type, fact_kind, work_type,
              project_key, objective_key, topics_json, entities_json, artifacts_json,
              evidence_text, evidence_record_ids_json, app_name, window_title,
              start_timestamp, end_timestamp, confidence, llm_summary_json, llm_model,
              llm_status, llm_error, llm_hash, llm_updated_at, embedding_text,
-             embedding_hash, embedding_provider, embedding_model, embedding_dimensions,
-             embedding_vector, embedding_status, embedding_error, embedding_updated_at,
+             embedding_provider, embedding_model, embedding_dimensions,
+             embedding_vector, embedding_status, embedding_error,
              created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fact_entry["view_id"],
-                fact_entry["fact_hash"],
                 fact_entry["fact_text"],
                 fact_entry["fact_type"],
                 fact_entry["fact_kind"],
@@ -893,7 +887,6 @@ class ScreenMemoryDB:
                 fact_entry.get("llm_hash"),
                 fact_entry.get("llm_updated_at"),
                 fact_entry.get("embedding_text"),
-                fact_entry.get("embedding_hash"),
                 fact_entry.get("embedding_provider"),
                 fact_entry.get("embedding_model"),
                 fact_entry.get("embedding_dimensions"),
@@ -902,18 +895,13 @@ class ScreenMemoryDB:
                 else None,
                 fact_entry.get("embedding_status"),
                 fact_entry.get("embedding_error"),
-                fact_entry.get("embedding_updated_at"),
                 now,
                 now,
             ),
         )
         if cursor.rowcount:
             return cursor.lastrowid
-        row = cursor.execute(
-            "SELECT id FROM screen_facts WHERE fact_hash = ? LIMIT 1",
-            (fact_entry["fact_hash"],),
-        ).fetchone()
-        return row[0] if row else None
+        return None
 
     def load_screen_facts_by_ids(self, fact_ids):
 
@@ -930,7 +918,7 @@ class ScreenMemoryDB:
                 sf.entities_json, sf.artifacts_json, sf.evidence_text,
                 sf.evidence_record_ids_json, sf.app_name, sf.window_title,
                 sf.start_timestamp, sf.end_timestamp, sf.confidence,
-                sf.embedding_text, sf.embedding_hash, sf.embedding_model,
+                sf.embedding_text, sf.embedding_model,
                 sf.embedding_dimensions, sf.embedding_vector
             FROM screen_facts sf
             WHERE sf.id IN ({placeholders})
@@ -1206,7 +1194,7 @@ class ScreenMemoryDB:
                 sf.entities_json, sf.artifacts_json, sf.evidence_text,
                 sf.evidence_record_ids_json, sf.app_name, sf.window_title,
                 sf.start_timestamp, sf.end_timestamp, sf.confidence,
-                sf.embedding_text, sf.embedding_hash, sf.embedding_model,
+                sf.embedding_text, sf.embedding_model,
                 sf.embedding_dimensions, sf.embedding_vector
             FROM screen_facts sf
             JOIN window_workstream_members wm ON wm.view_id = sf.view_id
@@ -1233,7 +1221,7 @@ class ScreenMemoryDB:
                 sf.entities_json, sf.artifacts_json, sf.evidence_text,
                 sf.evidence_record_ids_json, sf.app_name, sf.window_title,
                 sf.start_timestamp, sf.end_timestamp, sf.confidence,
-                sf.embedding_text, sf.embedding_hash, sf.embedding_model,
+                sf.embedding_text, sf.embedding_model,
                 sf.embedding_dimensions, sf.embedding_vector
             FROM screen_facts sf
             JOIN window_workstream_members wm ON wm.view_id = sf.view_id
@@ -1251,7 +1239,7 @@ class ScreenMemoryDB:
             facts.append(self.build_screen_fact_item_from_row(item))
         return facts
 
-    def load_persisted_screen_fact_clusters(self, window_workstream_id):
+    def load_persisted_screen_fact_clusters_for_window_workstream(self, window_workstream_id):
         cursor = self._conn.cursor()
         cursor.execute(
             """
@@ -1267,7 +1255,7 @@ class ScreenMemoryDB:
                 sf.entities_json, sf.artifacts_json, sf.evidence_text,
                 sf.evidence_record_ids_json, sf.app_name, sf.window_title,
                 sf.start_timestamp, sf.end_timestamp, sf.confidence,
-                sf.embedding_text, sf.embedding_hash, sf.embedding_model,
+                sf.embedding_text, sf.embedding_model,
                 sf.embedding_dimensions, sf.embedding_vector
             FROM screen_fact_clusters fc
             JOIN screen_fact_cluster_members cm ON cm.cluster_id = fc.id
@@ -1332,7 +1320,6 @@ class ScreenMemoryDB:
             "confidence": item.get("confidence") or 0.0,
             "tokens": tokenize_signature_text(signature_text),
             "embedding_text": item.get("embedding_text") or "",
-            "embedding_hash_from_db": item.get("embedding_hash"),
             "embedding_model": item.get("embedding_model"),
             "embedding_dimensions": item.get("embedding_dimensions"),
             "embedding_vector": self.decode_embedding_vector(
@@ -1847,7 +1834,138 @@ class ScreenMemoryDB:
             "screen_facts": total_screen_fact_count,
             "screen_observations": total_screen_observation_count,
         }
+    def save_window_workstream(self, workstream_entry):
 
+        cursor = self._conn.cursor()
+        now = now_db_timestamp()
+        cursor.execute(
+            """
+            INSERT INTO window_workstream
+            (title, summary, category, start_timestamp, end_timestamp,
+             topics_json, entities_json, artifacts_json, app_names_json, window_titles_json,
+             view_count, segment_count, confidence, llm_summary_json, llm_model, llm_status,
+             llm_error, llm_hash, llm_updated_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                workstream_entry["title"],
+                workstream_entry["summary"],
+                workstream_entry["category"],
+                format_db_timestamp(workstream_entry["start_timestamp"]),
+                format_db_timestamp(workstream_entry["end_timestamp"]),
+                workstream_entry["topics_json"],
+                workstream_entry["entities_json"],
+                workstream_entry["artifacts_json"],
+                workstream_entry["app_names_json"],
+                workstream_entry["window_titles_json"],
+                workstream_entry["view_count"],
+                workstream_entry["segment_count"],
+                workstream_entry["confidence"],
+                workstream_entry.get("llm_summary_json"),
+                workstream_entry.get("llm_model"),
+                workstream_entry.get("llm_status"),
+                workstream_entry.get("llm_error"),
+                workstream_entry.get("llm_hash"),
+                workstream_entry.get("llm_updated_at"),
+                now,
+                now,
+            ),
+        )
+        window_workstream_id = cursor.lastrowid
+        for member in workstream_entry["members"]:
+            cursor.execute(
+                """
+                INSERT INTO window_workstream_members
+                (window_workstream_id, view_id, relevance, reason, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    window_workstream_id,
+                    member["view_id"],
+                    member["relevance"],
+                    member["reason"],
+                    now,
+                ),
+            )
+        return window_workstream_id
+
+    def update_window_workstream(self, workstream_entry):
+    
+        cursor = self._conn.cursor()
+        now = now_db_timestamp()
+        window_workstream_id = workstream_entry["id"]
+        cursor.execute(
+            """
+            UPDATE window_workstream
+            SET title = ?,
+                summary = ?,
+                category = ?,
+                start_timestamp = ?,
+                end_timestamp = ?,
+                topics_json = ?,
+                entities_json = ?,
+                artifacts_json = ?,
+                app_names_json = ?,
+                window_titles_json = ?,
+                view_count = ?,
+                segment_count = ?,
+                confidence = ?,
+                llm_summary_json = ?,
+                llm_model = ?,
+                llm_status = ?,
+                llm_error = ?,
+                llm_hash = ?,
+                llm_updated_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                workstream_entry["title"],
+                workstream_entry["summary"],
+                workstream_entry["category"],
+                format_db_timestamp(workstream_entry["start_timestamp"]),
+                format_db_timestamp(workstream_entry["end_timestamp"]),
+                workstream_entry["topics_json"],
+                workstream_entry["entities_json"],
+                workstream_entry["artifacts_json"],
+                workstream_entry["app_names_json"],
+                workstream_entry["window_titles_json"],
+                workstream_entry["view_count"],
+                workstream_entry["segment_count"],
+                workstream_entry["confidence"],
+                workstream_entry.get("llm_summary_json"),
+                workstream_entry.get("llm_model"),
+                workstream_entry.get("llm_status"),
+                workstream_entry.get("llm_error"),
+                workstream_entry.get("llm_hash"),
+                workstream_entry.get("llm_updated_at"),
+                now,
+                window_workstream_id,
+            ),
+        )
+        for member in workstream_entry["members"]:
+            cursor.execute(
+                """
+                INSERT INTO window_workstream_members
+                (window_workstream_id, view_id, relevance, reason, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    window_workstream_id,
+                    member["view_id"],
+                    member["relevance"],
+                    member["reason"],
+                    now,
+                ),
+            )
+
+    def save_or_update_window_workstream(self, workstream_entry):
+        
+        if workstream_entry.get("id") is None:
+            return self.save_window_workstream(workstream_entry)
+        self.update_window_workstream(workstream_entry)
+        return workstream_entry["id"]
+    
     def write_record_table(self, kept_records):
         inserted_records = []
 
