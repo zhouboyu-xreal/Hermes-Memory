@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from agent.screen_memory.manager import ScreenMemoryManager
 from agent.screen_memory.config import load_screen_memory_config
+from agent.screen_memory.screen_db import ScreenMemoryDB
 from agent.screen_memory import service
 
 
@@ -175,7 +176,7 @@ def test_screen_memory_embedding_resolves_dedicated_env_key(
         return _Response()
 
     monkeypatch.setattr(
-        "agent.screen_memory.cleaner.urllib.request.urlopen",
+        "agent.screen_memory.manager.urllib.request.urlopen",
         _urlopen,
     )
 
@@ -251,14 +252,14 @@ def test_background_ingest_does_not_redirect_process_stdout(tmp_path):
             assert sys.stdout is expected_stdout
             return {}
 
-    service._run_ingest(
+    service._run_fact_extraction(
         _FakeCleaner(),
         {},
         datetime(2026, 6, 1, tzinfo=timezone.utc),
     )
 
 
-def test_run_ingest_normalizes_window_and_state_to_utc():
+def test_run_fact_extraction_normalizes_window_and_state_to_utc():
     captured = {}
 
     class _FakeCleaner:
@@ -269,7 +270,7 @@ def test_run_ingest_normalizes_window_and_state_to_utc():
             return {"cleaned_records": 1}
 
     state = {}
-    service._run_ingest(
+    service._run_fact_extraction(
         _FakeCleaner(),
         state,
         datetime(
@@ -338,12 +339,6 @@ def test_clean_invalid_start_uses_ingest_interval(tmp_path, monkeypatch):
     cleaner.config["schedule"]["fact_extraction_interval_minutes"] = 45
     captured = {}
 
-    monkeypatch.setattr(
-        cleaner,
-        "ensure_cleaned_db",
-        lambda: sqlite3.connect(":memory:"),
-    )
-
     def _capture_window(start_time, end_time):
         captured["start"] = start_time
         captured["end"] = end_time
@@ -367,12 +362,6 @@ def test_clean_missing_start_uses_ingest_interval(tmp_path, monkeypatch):
     cleaner.config["schedule"]["fact_extraction_interval_minutes"] = 20
     captured = {}
 
-    monkeypatch.setattr(
-        cleaner,
-        "ensure_cleaned_db",
-        lambda: sqlite3.connect(":memory:"),
-    )
-
     def _capture_window(start_time, end_time):
         captured["start"] = start_time
         captured["end"] = end_time
@@ -395,9 +384,49 @@ def test_quiet_cleaner_suppresses_console_output(tmp_path, capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_screen_db_ensure_reuses_open_database_and_reopens_closed_database(tmp_path):
+    output_path = tmp_path / "screen-memory.db"
+    screen_db = ScreenMemoryDB.ensure_cleaned_db(None, output_path)
+
+    assert ScreenMemoryDB.ensure_cleaned_db(screen_db, output_path) is screen_db
+
+    screen_db.close()
+    reopened = ScreenMemoryDB.ensure_cleaned_db(screen_db, output_path)
+
+    assert reopened is not screen_db
+    assert reopened.connection is not None
+    reopened.close()
+
+
+def test_screen_db_init_replaces_database_with_full_reset(tmp_path):
+    output_path = tmp_path / "screen-memory.db"
+    screen_db = ScreenMemoryDB.ensure_cleaned_db(None, output_path)
+    screen_db.connection.execute(
+        """
+        INSERT INTO records (timestamp, app_name)
+        VALUES ('2026-06-01T10:00:00+08:00', 'Code')
+        """
+    )
+    screen_db.connection.commit()
+
+    reset_db = ScreenMemoryDB.init_cleaned_db(screen_db, output_path)
+
+    record_count = reset_db.connection.execute(
+        "SELECT COUNT(*) FROM records"
+    ).fetchone()[0]
+    assert reset_db is not screen_db
+    assert screen_db.connection is None
+    assert record_count == 0
+    reset_db.close()
+
+
 def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
     cleaner = _cleaner(tmp_path)
-    connection = cleaner.ensure_cleaned_db()
+    cleaner.screen_db = ScreenMemoryDB.ensure_cleaned_db(
+        cleaner.screen_db,
+        cleaner.cleaned_db,
+    )
+    connection = cleaner.screen_db.connection
     cursor = connection.cursor()
     workstream_id, view_id = _seed_workstream(cursor)
     _add_fact(
@@ -533,14 +562,28 @@ def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
     config["database"]["openchronicle_db"] = str(openchronicle_db)
 
     class _FakeCleaner:
-        def __init__(self, cleaner_config, llm_client=None, quiet=False):
+        def __init__(
+            self,
+            cleaner_config,
+            llm_client=None,
+            quiet=False,
+            screen_db=None,
+        ):
             self.config = cleaner_config
-            self.cleaned_db = cleaner_config["database"]["cleaned_db"]
+            self.screen_db = screen_db
+
+        def close(self):
+            return None
+
+    class _FakeScreenDB:
+        def __init__(self, output_path, incremental_mode=False):
+            self.output_path = str(output_path)
 
     monkeypatch.setattr(service, "_screen_memory_dir", lambda: tmp_path / "state")
     monkeypatch.setattr(service, "load_screen_memory_config", lambda _cfg: config)
     monkeypatch.setattr(service, "_inject_runtime_config", lambda *_args: None)
     monkeypatch.setattr(service, "ScreenMemoryManager", _FakeCleaner)
+    monkeypatch.setattr(service, "ScreenMemoryDB", _FakeScreenDB)
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {"screen_memory": {"enabled": True}},
@@ -563,7 +606,7 @@ def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
         state["last_observation_at"] = now.isoformat()
         return {}
 
-    monkeypatch.setattr(service, "_run_ingest", _ingest)
+    monkeypatch.setattr(service, "_run_fact_extraction", _ingest)
     monkeypatch.setattr(service, "_run_fact_clustering", _cluster)
     monkeypatch.setattr(service, "_run_observations", _observe)
 

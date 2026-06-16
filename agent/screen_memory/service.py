@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 
 from agent.screen_memory.manager import ScreenMemoryManager
 from agent.screen_memory.config import load_screen_memory_config
+from agent.screen_memory.screen_db import ScreenMemoryDB
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,8 @@ def _inject_runtime_config(
     for section_name in (
         "segment_generation",
         "window_workstream_generation",
-        "screen_memory_generation",
+        "screen_fact_generation",
+        "screen_observation_generation",
     ):
         section = manager_config.get(section_name)
         if not isinstance(section, dict):
@@ -161,7 +163,10 @@ def _run_fact_extraction(
         previous = now - timedelta(
             minutes=max(1, int(schedule.get("initial_lookback_minutes", 30)))
         )
-    stats = manager.clean(
+    fact_extraction = getattr(manager, "update_screen_facts_table", None)
+    if not callable(fact_extraction):
+        fact_extraction = manager.clean
+    stats = fact_extraction(
         start_time_str=_format_utc_time(previous),
         end_time_str=_format_utc_time(now),
         incremental=True,
@@ -178,11 +183,7 @@ def _run_fact_clustering(
     now: datetime,
 ) -> Dict[str, Any]:
     now = _as_utc(now)
-    connection = manager.ensure_cleaned_db()
-    try:
-        stats = manager.update_screen_fact_cluster_tables(connection)
-    finally:
-        connection.close()
+    stats = manager.update_screen_fact_cluster_tables()
     state["last_fact_clustering_at"] = _format_utc_time(now)
     state["last_fact_clustering_stats"] = stats
     return stats
@@ -194,14 +195,10 @@ def _run_observations(
     now: datetime,
 ) -> Dict[str, Any]:
     now = _as_utc(now)
-    connection = manager.ensure_cleaned_db()
-    try:
-        # A daily observation run first catches any facts left unclustered by
-        # a missed clustering tick.
-        cluster_stats = manager.update_screen_fact_cluster_tables(connection)
-        observation_stats = manager.update_screen_observation_tables(connection, None)
-    finally:
-        connection.close()
+    # A daily observation run first catches any facts left unclustered by
+    # a missed clustering tick.
+    cluster_stats = manager.update_screen_fact_cluster_tables()
+    observation_stats = manager.update_screen_observation_tables(None)
     stats = {
         "fact_clustering": cluster_stats,
         "observations": observation_stats,
@@ -231,6 +228,8 @@ def run_screen_memory_due_work(
     directory.mkdir(parents=True, exist_ok=True)
     lock_handle = open(_lock_path(), "a+")
     llm_client = None
+    screen_db = None
+    manager = None
     try:
         try:
             import fcntl
@@ -245,7 +244,7 @@ def run_screen_memory_due_work(
         current = _as_utc(now or _utc_now())
         schedule = manager_config.get("schedule", {})
 
-        ingest_due = force_phase == "ingest" or (
+        fact_extraction_due = force_phase == "ingest" or (
             force_phase is None
             and _is_due(
                 state.get("last_fact_extraction_at"),
@@ -269,7 +268,7 @@ def run_screen_memory_due_work(
                 timedelta(hours=max(1, int(schedule["observation_interval_hours"]))),
             )
         )
-        if not any((ingest_due, cluster_due, observation_due)):
+        if not any((fact_extraction_due, cluster_due, observation_due)):
             return {
                 "status": "ok",
                 "phases": {},
@@ -277,13 +276,18 @@ def run_screen_memory_due_work(
             }
 
         llm_client = _inject_runtime_config(manager_config, hermes_config)
+        screen_db = ScreenMemoryDB(
+            manager_config["database"]["cleaned_db"],
+            incremental_mode=True,
+        )
         manager = ScreenMemoryManager(
             manager_config,
             llm_client=llm_client,
             quiet=True,
+            screen_db=screen_db,
         )
         phases: Dict[str, Any] = {}
-        if ingest_due:
+        if fact_extraction_due:
             phases["ingest"] = _run_fact_extraction(manager, state, current)
             _save_state(state)
         if cluster_due:
@@ -301,17 +305,21 @@ def run_screen_memory_due_work(
             logger.info(
                 "Screen memory phases completed: %s (output=%s)",
                 ", ".join(phases),
-                manager.cleaned_db,
+                manager.screen_db.output_path,
             )
         return {
             "status": "ok",
             "phases": phases,
-            "output_db": manager.cleaned_db,
+            "output_db": manager.screen_db.output_path,
         }
     except Exception:
         logger.exception("Screen memory pipeline failed")
         return {"status": "error"}
     finally:
+        if manager is not None:
+            manager.close()
+        elif screen_db is not None:
+            screen_db.close()
         close_client = getattr(llm_client, "close", None)
         if callable(close_client):
             try:

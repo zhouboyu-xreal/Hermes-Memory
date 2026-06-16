@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from agent.screen_memory.manager import ScreenMemoryManager, parse_timestamp_to_utc
 from agent.screen_memory.config import load_screen_memory_config
+from agent.screen_memory.screen_db import ScreenMemoryDB
 from agent.screen_memory.service import (
     _format_utc_time,
     _inject_runtime_config,
@@ -105,7 +106,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH)
     parser.add_argument(
+        "--fact-extraction-interval-minutes",
         "--ingest-interval-minutes",
+        dest="fact_extraction_interval_minutes",
         type=int,
         help="Override screen_memory.fact_extraction_interval_minutes.",
     )
@@ -486,10 +489,15 @@ def main() -> int:
         if args.disable_llm
         else _inject_runtime_config(manager_config, hermes_config)
     )
+    screen_db = ScreenMemoryDB(
+        output_db,
+        incremental_mode=True,
+    )
     manager = ScreenMemoryManager(
         manager_config,
         llm_client=llm_client,
         quiet=True,
+        screen_db=screen_db,
     )
     try:
         if args.mode == "once":
@@ -572,6 +580,7 @@ def main() -> int:
         }, ensure_ascii=False, indent=2))
         return 0
     finally:
+        manager.close()
         close_client = getattr(llm_client, "close", None)
         if callable(close_client):
             close_client()
