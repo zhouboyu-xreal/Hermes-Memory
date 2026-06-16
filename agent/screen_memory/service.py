@@ -174,32 +174,13 @@ def _run_fact_extraction(
     return stats
 
 
-def _run_fact_clustering(
-    manager: ScreenMemoryManager,
-    state: Dict[str, Any],
-    now: datetime,
-) -> Dict[str, Any]:
-    now = _as_utc(now)
-    stats = manager.update_screen_fact_cluster_tables()
-    state["last_fact_clustering_at"] = _format_utc_time(now)
-    state["last_fact_clustering_stats"] = stats
-    return stats
-
-
 def _run_observations(
     manager: ScreenMemoryManager,
     state: Dict[str, Any],
     now: datetime,
 ) -> Dict[str, Any]:
     now = _as_utc(now)
-    # A daily observation run first catches any facts left unclustered by
-    # a missed clustering tick.
-    cluster_stats = manager.update_screen_fact_cluster_tables()
-    observation_stats = manager.update_screen_observation_tables()
-    stats = {
-        "fact_clustering": cluster_stats,
-        "observations": observation_stats,
-    }
+    stats = manager.update_screen_observation_tables()
     state["last_observation_at"] = _format_utc_time(now)
     state["last_observation_stats"] = stats
     return stats
@@ -249,14 +230,6 @@ def run_screen_memory_due_work(
                 timedelta(minutes=max(1, int(schedule["fact_extraction_interval_minutes"]))),
             )
         )
-        cluster_due = force_phase == "cluster" or (
-            force_phase is None
-            and _is_due(
-                state.get("last_fact_clustering_at"),
-                current,
-                timedelta(hours=max(1, int(schedule["fact_clustering_interval_hours"]))),
-            )
-        )
         observation_due = force_phase == "observation" or (
             force_phase is None
             and _is_due(
@@ -265,7 +238,7 @@ def run_screen_memory_due_work(
                 timedelta(hours=max(1, int(schedule["observation_interval_hours"]))),
             )
         )
-        if not any((fact_extraction_due, cluster_due, observation_due)):
+        if not any((fact_extraction_due, observation_due)):
             return {
                 "status": "ok",
                 "phases": {},
@@ -286,13 +259,6 @@ def run_screen_memory_due_work(
         phases: Dict[str, Any] = {}
         if fact_extraction_due:
             phases["fact_extraction"] = _run_fact_extraction(manager, state, current)
-            _save_state(state)
-        if cluster_due:
-            phases["fact_clustering"] = _run_fact_clustering(
-                manager,
-                state,
-                current,
-            )
             _save_state(state)
         if observation_due:
             phases["observations"] = _run_observations(manager, state, current)

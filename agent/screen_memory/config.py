@@ -14,8 +14,7 @@ SCREEN_MEMORY_DEFAULTS: Dict[str, Any] = {
     "openchronicle_db": "~/.openchronicle/index.db",
     "output_db": "",
     "fact_extraction_interval_minutes": 30,
-    "fact_clustering_interval_hours": 2,
-    "observation_interval_hours": 24,
+    "observation_interval_hours": 2,
     "initial_lookback_minutes": 30,
     "openchronicle": {
         "record_link_window_seconds": 6,

@@ -3361,7 +3361,7 @@ class ScreenMemoryManager:
             json.dumps(payload, sort_keys=True).encode("utf-8")
         ).hexdigest()
 
-    def update_screen_fact_cluster_tables(self, window_workstream_ids=None):
+    def _cluster_screen_facts_for_observation(self, window_workstream_ids=None):
         if window_workstream_ids is None:
             window_workstream_ids = self.screen_db.load_window_workstream_ids_with_unclustered_facts()
         clustered_fact_count = 0
@@ -3437,6 +3437,9 @@ class ScreenMemoryManager:
         llm_generation_count = 0
         llm_failed_count = 0
         observation_count = 0
+        cluster_stats = self._cluster_screen_facts_for_observation(
+            window_workstream_ids=window_workstream_ids,
+        )
         dirty_by_workstream = self.screen_db.load_dirty_persisted_screen_fact_clusters(
             window_workstream_ids=window_workstream_ids,
         )
@@ -3492,6 +3495,7 @@ class ScreenMemoryManager:
                 )
                 observation_count += 1
         return {
+            **cluster_stats,
             "screen_observations": self.screen_db.get_screen_observation_count(),
             "screen_observations_generated": observation_count,
             "screen_observation_llm_generation_count": llm_generation_count,

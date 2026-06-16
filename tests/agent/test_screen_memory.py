@@ -458,9 +458,9 @@ def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
     )
     connection.commit()
 
-    cluster_stats = cleaner.update_screen_fact_cluster_tables()
+    observation_stats = cleaner.update_screen_observation_tables()
 
-    assert cluster_stats["screen_facts_clustered"] == 0
+    assert observation_stats["screen_facts_clustered"] == 0
     assert cursor.execute(
         "SELECT count(*) FROM screen_fact_cluster_members"
     ).fetchone()[0] == 0
@@ -474,9 +474,9 @@ def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
     )
     connection.commit()
 
-    cluster_stats = cleaner.update_screen_fact_cluster_tables()
+    observation_stats = cleaner.update_screen_observation_tables()
 
-    assert cluster_stats["screen_facts_clustered"] == 5
+    assert observation_stats["screen_facts_clustered"] == 5
     cluster_row = cursor.execute(
         """
         SELECT id, observation_id, observed_fact_count
@@ -485,14 +485,12 @@ def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
         """,
         (workstream_id,),
     ).fetchone()
-    assert cluster_row[1] is None
-    assert cluster_row[2] == 0
+    assert cluster_row[1] is not None
+    assert cluster_row[2] == 5
     assert cursor.execute(
         "SELECT count(*) FROM screen_fact_cluster_members WHERE cluster_id = ?",
         (cluster_row[0],),
     ).fetchone()[0] == 5
-
-    observation_stats = cleaner.update_screen_observation_tables()
 
     assert observation_stats["screen_observations_generated"] == 1
     cluster_row = cursor.execute(
@@ -528,7 +526,6 @@ def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
             f"2026-06-01 10:{index + 25:02d}:00",
         )
     connection.commit()
-    cleaner.update_screen_fact_cluster_tables()
     cleaner.update_screen_observation_tables()
 
     updated_cluster = cursor.execute(
@@ -595,23 +592,17 @@ def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
         state["last_fact_extraction_at"] = now.isoformat()
         return {}
 
-    def _cluster(_cleaner, state, now):
-        calls.append("cluster")
-        state["last_fact_clustering_at"] = now.isoformat()
-        return {}
-
     def _observe(_cleaner, state, now):
         calls.append("observation")
         state["last_observation_at"] = now.isoformat()
         return {}
 
     monkeypatch.setattr(service, "_run_fact_extraction", _ingest)
-    monkeypatch.setattr(service, "_run_fact_clustering", _cluster)
     monkeypatch.setattr(service, "_run_observations", _observe)
 
     start = datetime(2026, 6, 1, tzinfo=timezone.utc)
     service.run_screen_memory_due_work(now=start)
-    assert calls == ["ingest", "cluster", "observation"]
+    assert calls == ["ingest", "observation"]
 
     calls.clear()
     service.run_screen_memory_due_work(
@@ -623,13 +614,13 @@ def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
     service.run_screen_memory_due_work(
         now=datetime(2026, 6, 1, 6, tzinfo=timezone.utc)
     )
-    assert calls == ["ingest", "cluster"]
+    assert calls == ["ingest"]
 
     calls.clear()
     service.run_screen_memory_due_work(
         now=datetime(2026, 6, 2, tzinfo=timezone.utc)
     )
-    assert calls == ["ingest", "cluster", "observation"]
+    assert calls == ["ingest", "observation"]
 
 
 def test_incremental_update_screen_facts_table_merges_screenpipe_and_openchronicle_into_workstream(tmp_path):

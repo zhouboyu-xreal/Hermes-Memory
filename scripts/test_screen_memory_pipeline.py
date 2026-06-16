@@ -35,7 +35,6 @@ from agent.screen_memory.screen_db import ScreenMemoryDB
 from agent.screen_memory.service import (
     _format_utc_time,
     _inject_runtime_config,
-    _run_fact_clustering,
     _run_fact_extraction,
     _run_observations,
 )
@@ -283,11 +282,6 @@ def run_once(
     events = [
         _phase_result("fact_extraction", end, _run_fact_extraction(manager, state, end)),
         _phase_result(
-            "fact_clustering",
-            end,
-            _run_fact_clustering(manager, state, end),
-        ),
-        _phase_result(
             "observations",
             end,
             _run_observations(manager, state, end),
@@ -302,18 +296,16 @@ def run_timeline(
     end: datetime,
     *,
     fact_extraction_interval: timedelta,
-    fact_clustering_interval: timedelta,
     observation_interval: timedelta,
     finalize: bool,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     state: Dict[str, Any] = {}
     events: List[Dict[str, Any]] = []
     next_fact_extraction = start
-    next_clustering = start
     next_observation = start
 
-    while min(next_fact_extraction, next_clustering, next_observation) <= end:
-        now = min(next_fact_extraction, next_clustering, next_observation)
+    while min(next_fact_extraction, next_observation) <= end:
+        now = min(next_fact_extraction, next_observation)
         logging.info("timeline tick=%s", _format_utc_time(now))
         if next_fact_extraction == now:
             events.append(
@@ -324,15 +316,6 @@ def run_timeline(
                 )
             )
             next_fact_extraction += fact_extraction_interval
-        if next_clustering == now:
-            events.append(
-                _phase_result(
-                    "fact_clustering",
-                    now,
-                    _run_fact_clustering(manager, state, now),
-                )
-            )
-            next_clustering += fact_clustering_interval
         if next_observation == now:
             events.append(
                 _phase_result(
@@ -351,11 +334,6 @@ def run_timeline(
                 "fact_extraction",
                 end,
                 _run_fact_extraction(manager, state, end),
-            ),
-            _phase_result(
-                "fact_clustering",
-                end,
-                _run_fact_clustering(manager, state, end),
             ),
             _phase_result(
                 "observations",
@@ -498,23 +476,17 @@ def main() -> int:
         quiet=True,
         screen_db=screen_db,
     )
+    effective_start = datetime(2026, 5, 9, 0, 0, tzinfo=timezone.utc) if args.mode == "once" else start
     try:
         if args.mode == "once":
-            start = _format_utc_time(datetime(2026, 5, 9, 0, 0, tzinfo=timezone.utc))
-            state, events = run_once(manager, start, end)
+            state, events = run_once(manager, effective_start, end)
         else:
             state, events = run_timeline(
                 manager,
-                start,
+                effective_start,
                 end,
                 fact_extraction_interval=timedelta(
                     minutes=max(1, int(schedule["fact_extraction_interval_minutes"]))
-                ),
-                fact_clustering_interval=timedelta(
-                    hours=max(
-                        0.001,
-                        float(schedule["fact_clustering_interval_hours"]),
-                    )
                 ),
                 observation_interval=timedelta(
                     hours=max(
