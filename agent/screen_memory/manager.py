@@ -2275,8 +2275,6 @@ class ScreenMemoryManager:
         oc_events,
         min_quality=None,
         discarded_oc_events=None,
-        generate_screen_facts=True,
-        update_window_workstreams=True,
     ):
         self._print("Running scheduling simulation & deduplication...")
 
@@ -2363,25 +2361,9 @@ class ScreenMemoryManager:
             view_entries,
             segment_id_by_key,
         )
-        if generate_screen_facts:
-            screen_fact_stats = self.generate_screen_facts_for_views(view_entries)
-        else:
-            current_stats = self.screen_db.get_workstream_stats()
-            screen_fact_stats = {
-                "screen_facts": current_stats.get("screen_facts", 0),
-                "screen_fact_embedding_ready_count": 0,
-                "screen_fact_llm_generation_count": 0,
-                "screen_fact_llm_failed_count": 0,
-            }
-
-        if update_window_workstreams:
-            touched_window_workstream_ids, window_stream_stats = self.update_window_workstream_tables(view_entries)
-        else:
-            touched_window_workstream_ids = []
-            window_stream_stats = {
-                "window_workstream_llm_generation_count": 0,
-                "window_workstream_llm_failed_count": 0,
-            }
+        screen_fact_stats = self.generate_screen_facts_for_views(view_entries)
+        
+        touched_window_workstream_ids, window_stream_stats = self.update_window_workstream_tables(view_entries)
 
         workstream_stats = self.screen_db.get_workstream_stats()
         workstream_stats.update(window_stream_stats)
@@ -6858,8 +6840,6 @@ class ScreenMemoryManager:
         end_time_str=None,
         incremental=True,
         min_quality=None,
-        generate_screen_facts=True,
-        update_window_workstreams=True,
     ):
         """
         Clean and merge screen data from Screenpipe and OpenChronicle.
@@ -6922,8 +6902,6 @@ class ScreenMemoryManager:
             oc_events,
             min_quality=min_quality,
             discarded_oc_events=discarded_oc_events,
-            generate_screen_facts=generate_screen_facts,
-            update_window_workstreams=update_window_workstreams,
         )
         # Record the actual output path used
         stats["output_path"] = self.cleaned_db
@@ -6960,35 +6938,3 @@ class ScreenMemoryManager:
         self._print(f"Compression Ratio: {stats.get('raw_records', 0) / max(1, stats.get('cleaned_records', 0)):.2f}x")
         self._print("="*50)
         return stats
-
-    def clean(
-        self,
-        start_time_str=None,
-        end_time_str=None,
-        incremental=True,
-        output_path=None,
-        min_quality=None,
-        generate_screen_facts=True,
-        update_window_workstreams=True,
-    ):
-        original_cleaned_db = self.cleaned_db
-        original_screen_db = self.screen_db
-        if output_path:
-            self.cleaned_db = str(Path(output_path).expanduser())
-            if not incremental:
-                self.screen_db = None
-        try:
-            return self.update_screen_facts_table(
-                start_time_str=start_time_str,
-                end_time_str=end_time_str,
-                incremental=incremental,
-                min_quality=min_quality,
-                generate_screen_facts=generate_screen_facts,
-                update_window_workstreams=update_window_workstreams,
-            )
-        finally:
-            if output_path and not incremental:
-                if self.screen_db is not None:
-                    self.screen_db.close()
-                self.cleaned_db = original_cleaned_db
-                self.screen_db = original_screen_db

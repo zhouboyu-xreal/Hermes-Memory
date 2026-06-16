@@ -248,7 +248,7 @@ def test_background_ingest_does_not_redirect_process_stdout(tmp_path):
     class _FakeCleaner:
         config = {"schedule": {"initial_lookback_minutes": 30}}
 
-        def clean(self, **_kwargs):
+        def update_screen_facts_table(self, **_kwargs):
             assert sys.stdout is expected_stdout
             return {}
 
@@ -265,7 +265,7 @@ def test_run_fact_extraction_normalizes_window_and_state_to_utc():
     class _FakeCleaner:
         config = {"schedule": {"initial_lookback_minutes": 30}}
 
-        def clean(self, **kwargs):
+        def update_screen_facts_table(self, **kwargs):
             captured.update(kwargs)
             return {"cleaned_records": 1}
 
@@ -334,7 +334,7 @@ def test_screenpipe_window_compares_timestamp_values_across_offsets(tmp_path):
     assert [row[5] for row in rows] == [2, 3]
 
 
-def test_clean_invalid_start_uses_ingest_interval(tmp_path, monkeypatch):
+def test_update_screen_facts_table_invalid_start_uses_ingest_interval(tmp_path, monkeypatch):
     cleaner = _cleaner(tmp_path)
     cleaner.config["schedule"]["fact_extraction_interval_minutes"] = 45
     captured = {}
@@ -346,7 +346,7 @@ def test_clean_invalid_start_uses_ingest_interval(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cleaner, "load_screenpipe_data", _capture_window)
 
-    assert cleaner.clean(
+    assert cleaner.update_screen_facts_table(
         start_time_str="not-a-timestamp",
         end_time_str="2026-06-01T10:00:00Z",
         incremental=True,
@@ -357,7 +357,7 @@ def test_clean_invalid_start_uses_ingest_interval(tmp_path, monkeypatch):
     assert captured["end"] - captured["start"] == timedelta(minutes=45)
 
 
-def test_clean_missing_start_uses_ingest_interval(tmp_path, monkeypatch):
+def test_update_screen_facts_table_missing_start_uses_ingest_interval(tmp_path, monkeypatch):
     cleaner = _cleaner(tmp_path)
     cleaner.config["schedule"]["fact_extraction_interval_minutes"] = 20
     captured = {}
@@ -369,7 +369,7 @@ def test_clean_missing_start_uses_ingest_interval(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cleaner, "load_screenpipe_data", _capture_window)
 
-    assert cleaner.clean(
+    assert cleaner.update_screen_facts_table(
         end_time_str="2026-06-01T10:00:00Z",
         incremental=True,
     ) is None
@@ -633,7 +633,7 @@ def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
     assert calls == ["ingest", "cluster", "observation"]
 
 
-def test_incremental_clean_merges_screenpipe_and_openchronicle_into_workstream(tmp_path):
+def test_incremental_update_screen_facts_table_merges_screenpipe_and_openchronicle_into_workstream(tmp_path):
     cleaner = _cleaner(tmp_path)
     screenpipe_db = tmp_path / "screenpipe.db"
     openchronicle_db = tmp_path / "openchronicle.db"
@@ -688,12 +688,10 @@ def test_incremental_clean_merges_screenpipe_and_openchronicle_into_workstream(t
     connection.commit()
     connection.close()
 
-    stats = cleaner.clean(
+    stats = cleaner.update_screen_facts_table(
         start_time_str="2026-06-01T09:59:00Z",
         end_time_str="2026-06-01T10:01:00Z",
         incremental=True,
-        generate_screen_facts=False,
-        update_window_workstreams=True,
     )
 
     assert stats["cleaned_records"] == 2

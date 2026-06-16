@@ -164,8 +164,6 @@ def _run_fact_extraction(
             minutes=max(1, int(schedule.get("initial_lookback_minutes", 30)))
         )
     fact_extraction = getattr(manager, "update_screen_facts_table", None)
-    if not callable(fact_extraction):
-        fact_extraction = manager.clean
     stats = fact_extraction(
         start_time_str=_format_utc_time(previous),
         end_time_str=_format_utc_time(now),
