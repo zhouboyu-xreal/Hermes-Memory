@@ -14,7 +14,7 @@ SCREEN_MEMORY_DEFAULTS: Dict[str, Any] = {
     "openchronicle_db": "~/.openchronicle/index.db",
     "output_db": "",
     "fact_extraction_interval_minutes": 30,
-    "observation_interval_hours": 2,
+    "observation_interval_hours": 24,
     "initial_lookback_minutes": 30,
     "openchronicle": {
         "record_link_window_seconds": 6,
@@ -144,7 +144,6 @@ def load_screen_memory_config(config: Dict[str, Any] | None = None) -> Dict[str,
         "enabled": bool(settings.get("enabled")),
         "schedule": {
             "fact_extraction_interval_minutes": settings["fact_extraction_interval_minutes"],
-            "fact_clustering_interval_hours": settings["fact_clustering_interval_hours"],
             "observation_interval_hours": settings["observation_interval_hours"],
             "initial_lookback_minutes": settings["initial_lookback_minutes"],
         },

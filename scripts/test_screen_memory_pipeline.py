@@ -111,11 +111,6 @@ def parse_args() -> argparse.Namespace:
         help="Override screen_memory.fact_extraction_interval_minutes.",
     )
     parser.add_argument(
-        "--fact-clustering-interval-hours",
-        type=float,
-        help="Override screen_memory.fact_clustering_interval_hours.",
-    )
-    parser.add_argument(
         "--observation-interval-hours",
         type=float,
         help="Override screen_memory.observation_interval_hours.",
@@ -424,11 +419,6 @@ def main() -> int:
         schedule["fact_extraction_interval_minutes"] = max(
             1,
             int(args.fact_extraction_interval_minutes),
-        )
-    if args.fact_clustering_interval_hours is not None:
-        schedule["fact_clustering_interval_hours"] = max(
-            0.001,
-            float(args.fact_clustering_interval_hours),
         )
     if args.observation_interval_hours is not None:
         schedule["observation_interval_hours"] = max(

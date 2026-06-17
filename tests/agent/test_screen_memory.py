@@ -3,7 +3,11 @@ import sys
 import threading
 from datetime import datetime, timedelta, timezone
 
-from agent.screen_memory.manager import ScreenMemoryManager
+from agent.screen_memory.manager import (
+    ScreenMemoryManager,
+    build_view_representative_text,
+    normalize_openchronicle_capture,
+)
 from agent.screen_memory.config import load_screen_memory_config
 from agent.screen_memory.screen_db import ScreenMemoryDB
 from agent.screen_memory import service
@@ -107,7 +111,6 @@ def test_screen_memory_defaults_use_profile_output_path(tmp_path, monkeypatch):
         tmp_path / "profile" / "screen_memory" / "memory.db"
     )
     assert config["schedule"]["fact_extraction_interval_minutes"] == 30
-    assert config["schedule"]["fact_clustering_interval_hours"] == 2
     assert config["schedule"]["observation_interval_hours"] == 24
 
 
@@ -754,3 +757,185 @@ def test_openchronicle_read_uses_immutable_connection(
     assert connection_uris == [
         openchronicle_db.resolve().as_uri() + "?immutable=1"
     ]
+
+
+def test_select_openchronicle_events_matches_app_aliases(tmp_path):
+    cleaner = _cleaner(tmp_path)
+    record_time = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+    records = [
+        {
+            "id": 1,
+            "app": "Safari浏览器",
+            "timestamp_dt": record_time,
+        },
+        {
+            "id": 2,
+            "app": "终端",
+            "timestamp_dt": record_time + timedelta(seconds=2),
+        },
+    ]
+    oc_events = [
+        {
+            "source_capture_id": "capture-safari",
+            "timestamp_dt": record_time + timedelta(seconds=1),
+            "timestamp_epoch": int((record_time + timedelta(seconds=1)).timestamp()),
+            "app_name": "Safari",
+            "bundle_id": "com.apple.Safari",
+            "visible_text": "",
+            "app_context": None,
+        },
+        {
+            "source_capture_id": "capture-terminal",
+            "timestamp_dt": record_time + timedelta(seconds=2),
+            "timestamp_epoch": int((record_time + timedelta(seconds=2)).timestamp()),
+            "app_name": "Terminal",
+            "bundle_id": "com.apple.Terminal",
+            "visible_text": "",
+            "app_context": None,
+        },
+    ]
+
+    events_by_record_key, matched = cleaner.select_openchronicle_events_for_records(
+        records,
+        oc_events,
+    )
+
+    assert [event["source_capture_id"] for event in events_by_record_key[1]] == [
+        "capture-safari"
+    ]
+    assert [event["source_capture_id"] for event in events_by_record_key[2]] == [
+        "capture-terminal"
+    ]
+    assert {event["source_capture_id"] for event in matched} == {
+        "capture-safari",
+        "capture-terminal",
+    }
+
+
+def test_normalize_openchronicle_capture_extracts_safari_context():
+    event = normalize_openchronicle_capture(
+        {
+            "id": "capture-safari-1",
+            "timestamp": "2026-05-12T18:09:46+08:00",
+            "app_name": "Safari",
+            "bundle_id": "com.apple.Safari",
+            "window_title": "Agent API Key Validation Issue — Hermes",
+            "focused_role": "",
+            "focused_value": "",
+            "visible_text": "\n".join(
+                [
+                    "## Safari浏览器 [active]",
+                    "_com.apple.Safari_",
+                    "### Agent API Key Validation Issue — Hermes",
+                    "    - [WebArea] Agent API Key Validation Issue — Hermes",
+                    "        - Agent API Key Validation Issue",
+                    "        - 23 条消息",
+                    "        - [Button] Chat",
+                    "        - [Button] Tasks",
+                    "        - [Button] Skills",
+                    "        - [Button] Memory",
+                    "        - [Button] Settings",
+                    "        - [Button] New conversation",
+                    "        - Hermes 版本查询",
+                    "        - PVE 主机死机排查",
+                    "        - AI 智能体长效记忆架构与 MemoryLake 演进",
+                ]
+            ),
+            "url": "",
+        }
+    )
+
+    assert event["normalized"]["has_browser_tab"] is True
+    assert event["normalized"]["app_context_route"] == "safari_browser_tab"
+    assert event["app_context"]["surface"] == "browser-tab"
+    assert event["app_context"]["route"] == "safari_browser_tab"
+    assert event["app_context"]["page_title"] == "Agent API Key Validation Issue — Hermes"
+    assert "Hermes 版本查询" in event["app_context"]["content_snippets"]
+    assert "AI 智能体长效记忆架构与 MemoryLake 演进" in event["app_context"]["content_snippets"]
+    assert event["app_context"]["structure_summary"].startswith("Safari标签页")
+
+
+def test_attach_openchronicle_events_populates_browser_ax_visible_text(tmp_path):
+    cleaner = _cleaner(tmp_path)
+    record_time = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+    record = {
+        "id": 1,
+        "app": "Safari浏览器",
+        "window": "Hermes 版本查询 — Hermes",
+        "text": "Hermes 页面 OCR 文本",
+        "cleaned_text": "Hermes 页面 OCR 文本",
+        "timestamp_dt": record_time,
+    }
+    event = normalize_openchronicle_capture(
+        {
+            "id": "capture-safari-1",
+            "timestamp": "2026-05-12T18:09:46+08:00",
+            "app_name": "Safari",
+            "bundle_id": "com.apple.Safari",
+            "window_title": "Hermes 版本查询 — Hermes",
+            "focused_role": "",
+            "focused_value": "",
+            "visible_text": "\n".join(
+                [
+                    "## Safari浏览器 [active]",
+                    "_com.apple.Safari_",
+                    "### Hermes 版本查询 — Hermes",
+                    "    - [WebArea] Hermes 版本查询 — Hermes",
+                    "        - Hermes 版本查询",
+                    "        - [Button] Chat",
+                    "        - [Button] Tasks",
+                    "        - AI 智能体长效记忆架构与 MemoryLake 演进",
+                ]
+            ),
+            "url": "",
+        }
+    )
+    event["delta_seconds"] = 1.0
+    event["match_reason"] = "same_app_nearby"
+
+    cleaner.attach_openchronicle_events_to_records(
+        [record],
+        {1: [event]},
+    )
+
+    assert record["ax_window_title"] == "Hermes 版本查询 — Hermes"
+    assert record["text_source"] == "ocr+axtree"
+    assert "AI 智能体长效记忆架构与 MemoryLake 演进" in record["ax_visible_text"]
+    assert "Safari标签页" in record["ax_visible_text"]
+
+
+def test_build_view_representative_text_prefers_ax_chat_text():
+    representative_text = build_view_representative_text(
+        [
+            {
+                "timestamp_dt": datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
+                "ax_chat_text": "这是聊天增强文本",
+                "ax_visible_text": "这是浏览器增强文本",
+                "cleaned_text": "这是 OCR 文本",
+                "text": "原始 OCR 文本",
+            }
+        ]
+    )
+
+    assert "[source=ax_chat_text]" in representative_text
+    assert "这是聊天增强文本" in representative_text
+    assert "这是浏览器增强文本" not in representative_text
+    assert "这是 OCR 文本" not in representative_text
+
+
+def test_build_view_representative_text_combines_ax_visible_text_and_cleaned_text():
+    representative_text = build_view_representative_text(
+        [
+            {
+                "timestamp_dt": datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
+                "ax_chat_text": "",
+                "ax_visible_text": "这是浏览器增强文本",
+                "cleaned_text": "这是 OCR 文本",
+                "text": "原始 OCR 文本",
+            }
+        ]
+    )
+
+    assert "[source=ax_visible_text+cleaned_text]" in representative_text
+    assert "这是浏览器增强文本" in representative_text
+    assert "这是 OCR 文本" in representative_text

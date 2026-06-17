@@ -858,9 +858,8 @@ class ScreenMemoryDB:
              start_timestamp, end_timestamp, confidence, llm_summary_json, llm_model,
              llm_status, llm_error, llm_hash, llm_updated_at, embedding_text,
              embedding_provider, embedding_model, embedding_dimensions,
-             embedding_vector, embedding_status, embedding_error,
-             created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             embedding_vector, embedding_status, embedding_error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fact_entry["view_id"],

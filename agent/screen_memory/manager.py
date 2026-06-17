@@ -776,8 +776,9 @@ def build_view_representative_text(
     previous_blocks = []
 
     for record in sorted(records, key=lambda item: item["timestamp_dt"]):
+        source_label, representative_source_text = get_record_text_for_representative(record)
         novel_blocks = []
-        for block in split_representative_text_blocks(get_record_text_for_view(record)):
+        for block in split_representative_text_blocks(representative_source_text):
             normalized = normalize_signature_text(block)
             if not normalized or normalized in seen_blocks:
                 continue
@@ -800,7 +801,7 @@ def build_view_representative_text(
         timestamp = record.get("timestamp_dt")
         time_label = timestamp.strftime("%H:%M:%S") if timestamp else "unknown"
         candidates.extend(
-            f"[{time_label}] {snippet}"
+            f"[{time_label}][source={source_label}] {snippet}"
             for snippet in pack_representative_text_blocks(
                 novel_blocks,
                 per_record_char_limit,
@@ -851,6 +852,67 @@ def normalize_app_key(value):
     return normalize_signature_text(value)
 
 
+def app_alias_keys(app_name, bundle_id=None, visible_text=None):
+    app_keys = set()
+    visible_text = visible_text or ""
+    bundle_id = bundle_id or ""
+    app_key = normalize_app_key(app_name)
+    bundle_key = normalize_app_key(bundle_id)
+
+    def _add_alias(*values):
+        for value in values:
+            alias_key = normalize_app_key(value)
+            if alias_key:
+                app_keys.add(alias_key)
+
+    _add_alias(app_name)
+
+    if is_feishu_app(app_name, bundle_id, visible_text):
+        _add_alias("Feishu", "飞书")
+    if is_wechat_app(app_name, bundle_id, visible_text):
+        _add_alias("WeChat", "微信")
+    if is_edge_app(app_name, bundle_id, visible_text):
+        _add_alias("Microsoft Edge", "Edge")
+
+    if is_safari_app(app_name, bundle_id, visible_text):
+        _add_alias("Safari", "Safari浏览器")
+
+    if (
+        "terminal" in app_key
+        or "终端" in (app_name or "")
+        or "terminal" in bundle_key
+        or "com.apple.Terminal" in bundle_id
+        or "_com.apple.Terminal_" in visible_text
+        or "## Terminal" in visible_text
+    ):
+        _add_alias("Terminal", "终端")
+
+    if (
+        "finder" in app_key
+        or "访达" in (app_name or "")
+        or "finder" in bundle_key
+        or "com.apple.finder" in bundle_id.lower()
+        or "_com.apple.finder_" in visible_text.lower()
+        or "## Finder" in visible_text
+    ):
+        _add_alias("Finder", "访达")
+
+    if "doubao" in app_key or "豆包" in (app_name or ""):
+        _add_alias("Doubao", "豆包")
+
+    if (
+        "system settings" in app_key
+        or "系统设置" in (app_name or "")
+        or "systemsettings" in bundle_key
+        or "com.apple.systemsettings" in bundle_id.lower()
+        or "_com.apple.systemsettings_" in visible_text.lower()
+        or "## System Settings" in visible_text
+    ):
+        _add_alias("System Settings", "系统设置")
+
+    return app_keys
+
+
 def is_feishu_app(app_name, bundle_id=None, visible_text=None):
     app_key = normalize_app_key(app_name)
     bundle_key = normalize_app_key(bundle_id)
@@ -890,6 +952,23 @@ def is_edge_app(app_name, bundle_id=None, visible_text=None):
         or "com.microsoft.edgemac" in (bundle_id or "")
         or "_com.microsoft.edgemac_" in visible_text
         or "## Microsoft Edge" in visible_text
+    )
+
+
+def is_safari_app(app_name, bundle_id=None, visible_text=None):
+    app_key = normalize_app_key(app_name)
+    bundle_id = bundle_id or ""
+    bundle_key = normalize_app_key(bundle_id)
+    bundle_id_lower = bundle_id.lower()
+    visible_text = visible_text or ""
+    return (
+        app_key == "safari"
+        or "safari浏览器" in (app_name or "")
+        or "safari" in bundle_key
+        or "com.apple.safari" in bundle_id_lower
+        or "_com.apple.Safari_" in visible_text
+        or "## Safari" in visible_text
+        or "## Safari浏览器" in visible_text
     )
 
 
@@ -971,6 +1050,90 @@ def browser_title_from_url(url):
     return parsed.netloc
 
 
+def append_browser_title_candidates(title_candidates, visible_text):
+    for line in (visible_text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("### "):
+            append_unique(
+                title_candidates,
+                [normalize_browser_title(stripped[4:])],
+                limit=8,
+            )
+            continue
+        if "[WebArea]" in stripped:
+            append_unique(
+                title_candidates,
+                [normalize_browser_title(clean_ax_tree_line(stripped))],
+                limit=8,
+            )
+
+
+SAFARI_BROWSER_NOISE_KEYS = {
+    normalize_signature_text(value)
+    for value in [
+        "Chat",
+        "Tasks",
+        "Skills",
+        "Memory",
+        "Spaces",
+        "Agent profiles",
+        "Todos",
+        "Settings",
+        "New chat",
+        "Search",
+        "Main menu",
+        "My Stuff",
+        "Notebooks",
+        "Gems",
+        "Today",
+        "今天",
+        "聊天",
+        "All",
+        "Agent",
+        "Show 1 from other profiles",
+        "Conversation actions",
+        "Open notebook actions menu",
+        "Settings & help",
+        "New notebook",
+        "Google Account",
+        "Share conversation",
+        "Preview or open",
+    ]
+}
+
+
+def normalize_safari_browser_value(value):
+    value = normalize_browser_title(value)
+    value = re.sub(r"^(Preview or open)\s+", "", value, flags=re.IGNORECASE).strip()
+    value = re.sub(
+        r'^More options for\s+"?(.+?)"?$',
+        r"\1",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
+    return value.strip(" \"")
+
+
+def is_low_value_safari_browser_value(value):
+    value = normalize_safari_browser_value(value)
+    if not value:
+        return True
+    key = normalize_signature_text(value)
+    if key in SAFARI_BROWSER_NOISE_KEYS:
+        return True
+    if key.startswith("google account"):
+        return True
+    if "open menu" in key or "actions menu" in key:
+        return True
+    if re.fullmatch(r"\d+\s*(条消息|分|小时|天)?", value):
+        return True
+    if re.fullmatch(r"[+★▾]+", value):
+        return True
+    if len(value) <= 1:
+        return True
+    return False
+
+
 def app_context_title(context):
     if not context:
         return ""
@@ -1000,6 +1163,24 @@ def app_context_chat_text(context, limit_chars=4000):
     return text[:limit_chars]
 
 
+def app_context_browser_text(context, limit_chars=4000):
+    if not context or context.get("surface") != "browser-tab":
+        return ""
+    parts = []
+    page_title = normalize_browser_title(context.get("page_title"))
+    if page_title:
+        append_unique(parts, [page_title], limit=20)
+    append_unique(parts, context.get("content_snippets") or [], limit=20)
+    structure_summary = str(context.get("structure_summary") or "").strip()
+    if structure_summary:
+        append_unique(parts, [structure_summary], limit=20)
+    normalized_url = normalize_browser_url(context.get("url"))
+    if normalized_url:
+        append_unique(parts, [normalized_url], limit=20)
+    text = "\n".join(part.strip() for part in parts if str(part).strip()).strip()
+    return text[:limit_chars]
+
+
 def get_record_text_for_view(record):
     chat_text = (record.get("ax_chat_text") or "").strip()
     if chat_text:
@@ -1013,8 +1194,20 @@ def get_record_text_for_view(record):
     return f"{base_text}\n{ax_visible_text}".strip()
 
 
-def get_record_text_for_entity(record):
-    return get_record_text_for_view(record)
+def get_record_text_for_representative(record):
+    chat_text = (record.get("ax_chat_text") or "").strip()
+    if chat_text:
+        return "ax_chat_text", chat_text
+
+    base_text = (record.get("cleaned_text") or record.get("text") or "").strip()
+    ax_visible_text = (record.get("ax_visible_text") or "").strip()
+    if ax_visible_text:
+        parts = [ax_visible_text]
+        if base_text:
+            append_unique(parts, [base_text], limit=4)
+        return "ax_visible_text+cleaned_text", "\n".join(parts).strip()
+
+    return "cleaned_text", base_text
 
 
 def is_low_value_wechat_line(value):
@@ -1203,13 +1396,7 @@ def extract_edge_browser_context(visible_text, window_title=None, focused_value=
         if title and not title.startswith(("http://", "https://")):
             append_unique(title_candidates, [title], limit=8)
 
-    for line in visible_text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("### "):
-            append_unique(title_candidates, [normalize_browser_title(stripped[4:])], limit=8)
-            continue
-        if "[WebArea]" in stripped:
-            append_unique(title_candidates, [normalize_browser_title(stripped)], limit=8)
+    append_browser_title_candidates(title_candidates, visible_text)
 
     page_title = ""
     for title in title_candidates:
@@ -1237,6 +1424,63 @@ def extract_edge_browser_context(visible_text, window_title=None, focused_value=
     }
 
 
+def extract_safari_browser_context(visible_text, window_title=None, focused_value=None, url=None):
+    visible_text = visible_text or ""
+    normalized_url = normalize_browser_url(url)
+    title_candidates = []
+    for value in [window_title, focused_value]:
+        title = normalize_browser_title(value)
+        if title and not title.startswith(("http://", "https://")):
+            append_unique(title_candidates, [title], limit=8)
+    append_browser_title_candidates(title_candidates, visible_text)
+
+    page_title = ""
+    for title in title_candidates:
+        if not is_low_value_browser_title(title):
+            page_title = title
+            break
+    if not page_title and normalized_url:
+        page_title = browser_title_from_url(normalized_url)
+    if not page_title:
+        return None
+
+    content_snippets = []
+    page_title_key = normalize_signature_text(page_title)
+    for line in visible_text.splitlines():
+        stripped = line.strip()
+        if (
+            not stripped
+            or stripped.startswith("## Safari")
+            or stripped.startswith("## Safari浏览器")
+            or stripped == "_com.apple.Safari_"
+            or stripped.startswith("### ")
+        ):
+            continue
+        value = normalize_safari_browser_value(clean_ax_tree_line(stripped))
+        if not value or normalize_signature_text(value) == page_title_key:
+            continue
+        if is_low_value_safari_browser_value(value):
+            continue
+        append_unique(content_snippets, [value], limit=10)
+
+    summary_parts = [f"Safari标签页「{page_title}」"]
+    if normalized_url:
+        summary_parts.append(f"URL：{normalized_url}")
+    if content_snippets:
+        summary_parts.append("可见内容：" + " / ".join(content_snippets[:5])[:600])
+
+    return {
+        "source_app": "Safari",
+        "surface": "browser-tab",
+        "route": "safari_browser_tab",
+        "page_title": page_title,
+        "url": normalized_url,
+        "title_candidates": title_candidates[:8],
+        "content_snippets": content_snippets[:10],
+        "structure_summary": "，".join(summary_parts) + "。",
+    }
+
+
 def normalize_openchronicle_capture(row):
     source_id = str(row.get("id") or "")
     timestamp_dt = parse_timestamp_to_utc(row.get("timestamp"))
@@ -1247,6 +1491,14 @@ def normalize_openchronicle_capture(row):
     wechat_context = None
     if is_wechat_app(row.get("app_name"), row.get("bundle_id"), visible_text):
         wechat_context = extract_wechat_chat_context(visible_text)
+    safari_context = None
+    if is_safari_app(row.get("app_name"), row.get("bundle_id"), visible_text):
+        safari_context = extract_safari_browser_context(
+            visible_text,
+            window_title=row.get("window_title"),
+            focused_value=row.get("focused_value"),
+            url=row.get("url"),
+        )
     edge_context = None
     if is_edge_app(row.get("app_name"), row.get("bundle_id"), visible_text):
         edge_context = extract_edge_browser_context(
@@ -1255,7 +1507,7 @@ def normalize_openchronicle_capture(row):
             focused_value=row.get("focused_value"),
             url=row.get("url"),
         )
-    app_context = feishu_context or wechat_context or edge_context
+    app_context = feishu_context or wechat_context or safari_context or edge_context
 
     normalized = {
         "event_type": "axtree_capture",
@@ -1267,7 +1519,7 @@ def normalize_openchronicle_capture(row):
         "url": row.get("url") or "",
         "has_messenger_chat": bool(feishu_context),
         "has_wechat_chat": bool(wechat_context),
-        "has_browser_tab": bool(edge_context),
+        "has_browser_tab": bool(safari_context or edge_context),
         "app_context_route": (app_context or {}).get("route") or (app_context or {}).get("surface") or "",
     }
     return {
@@ -1287,6 +1539,7 @@ def normalize_openchronicle_capture(row):
         "app_context": app_context,
         "feishu_context": feishu_context,
         "wechat_context": wechat_context,
+        "safari_context": safari_context,
         "edge_context": edge_context,
         "raw": {
             "id": source_id,
@@ -1303,49 +1556,21 @@ def normalize_openchronicle_capture(row):
     }
 
 def openchronicle_event_app_keys(event):
-    app_keys = set()
-    app_key = normalize_app_key(event.get("app_name"))
-    if app_key:
-        app_keys.add(app_key)
-    if is_feishu_app(event.get("app_name"), event.get("bundle_id"), event.get("visible_text")):
-        app_keys.add(normalize_app_key("Feishu"))
-    if is_wechat_app(event.get("app_name"), event.get("bundle_id"), event.get("visible_text")):
-        app_keys.add(normalize_app_key("WeChat"))
-        app_keys.add(normalize_app_key("微信"))
-    if is_edge_app(event.get("app_name"), event.get("bundle_id"), event.get("visible_text")):
-        app_keys.add(normalize_app_key("Microsoft Edge"))
-        app_keys.add(normalize_app_key("Edge"))
-    return app_keys
+    return app_alias_keys(
+        event.get("app_name"),
+        event.get("bundle_id"),
+        event.get("visible_text"),
+    )
 
 
 def record_app_keys(app_name):
-    app_keys = set()
-    app_key = normalize_app_key(app_name)
-    if app_key:
-        app_keys.add(app_key)
-    if is_feishu_app(app_name):
-        app_keys.add(normalize_app_key("Feishu"))
-    if is_wechat_app(app_name):
-        app_keys.add(normalize_app_key("WeChat"))
-        app_keys.add(normalize_app_key("微信"))
-    if is_edge_app(app_name):
-        app_keys.add(normalize_app_key("Microsoft Edge"))
-        app_keys.add(normalize_app_key("Edge"))
-    return app_keys
+    return app_alias_keys(app_name)
 
 
 def openchronicle_event_matches_record(event, record):
-    record_app = record.get("app") or ""
-    event_app = event.get("app_name") or ""
-    if normalize_app_key(record_app) and normalize_app_key(record_app) == normalize_app_key(event_app):
-        return True
-    if is_feishu_app(record_app) and is_feishu_app(event_app, event.get("bundle_id"), event.get("visible_text")):
-        return True
-    if is_wechat_app(record_app) and is_wechat_app(event_app, event.get("bundle_id"), event.get("visible_text")):
-        return True
-    if is_edge_app(record_app) and is_edge_app(event_app, event.get("bundle_id"), event.get("visible_text")):
-        return True
-    return False
+    record_keys = record_app_keys(record.get("app") or "")
+    event_keys = openchronicle_event_app_keys(event)
+    return bool(record_keys and event_keys and (record_keys & event_keys))
 
 
 def select_app_context_event_for_records(records):
@@ -2058,8 +2283,9 @@ class ScreenMemoryManager:
                         "match_reason": (app_context_event or {}).get("match_reason"),
                     }
                     record["ax_window_title"] = context_title
+                    record["ax_visible_text"] = app_context_browser_text(app_context)
                     record["ax_context_json"] = json.dumps(context_json, ensure_ascii=False)
-                    record["text_source"] = "ocr"
+                    record["text_source"] = "ocr+axtree" if record.get("ax_visible_text") else "ocr"
                     record["edge_context"] = app_context
             elif record["ax_events"]:
                 event = record["ax_events"][0]
@@ -4007,7 +4233,7 @@ class ScreenMemoryManager:
         return keys
 
     def has_exact_app_window_match(self, view, workstream):
-        key = self.exact_app_window_key_for_view(view)
+        key = self.get_app_window_key_for_view(view)
         return bool(key and key in self.get_all_app_window_keys_for_workstream(workstream))
 
     def has_exact_app_window_cluster_match(self, left_cluster, right_cluster):
