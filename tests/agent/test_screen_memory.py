@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import sys
 import threading
@@ -6,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from agent.screen_memory.manager import (
     ScreenMemoryManager,
     build_view_representative_text,
+    select_app_context_event_for_records,
+    summarize_view,
     normalize_openchronicle_capture,
 )
 from agent.screen_memory.config import load_screen_memory_config
@@ -855,7 +858,7 @@ def test_normalize_openchronicle_capture_extracts_safari_context():
     assert event["app_context"]["structure_summary"].startswith("Safari标签页")
 
 
-def test_attach_openchronicle_events_populates_browser_ax_visible_text(tmp_path):
+def test_attach_openchronicle_events_populates_browser_ax_context_json(tmp_path):
     cleaner = _cleaner(tmp_path)
     record_time = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
     record = {
@@ -899,43 +902,229 @@ def test_attach_openchronicle_events_populates_browser_ax_visible_text(tmp_path)
     )
 
     assert record["ax_window_title"] == "Hermes 版本查询 — Hermes"
-    assert record["text_source"] == "ocr+axtree"
-    assert "AI 智能体长效记忆架构与 MemoryLake 演进" in record["ax_visible_text"]
-    assert "Safari标签页" in record["ax_visible_text"]
+    assert record["text_source"] == "ocr+ax_context"
+    assert "AI 智能体长效记忆架构与 MemoryLake 演进" in record["ax_context_json"]
+    assert "Safari标签页" in record["ax_context_json"]
 
 
-def test_build_view_representative_text_prefers_ax_chat_text():
+def test_select_app_context_event_for_records_returns_per_record_primary_context():
+    record_time = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+    safari_event = normalize_openchronicle_capture(
+        {
+            "id": "capture-safari-1",
+            "timestamp": "2026-06-01T10:00:01Z",
+            "app_name": "Safari",
+            "bundle_id": "com.apple.Safari",
+            "window_title": "Hermes 版本查询 — Hermes",
+            "focused_role": "",
+            "focused_value": "",
+            "visible_text": "\n".join(
+                [
+                    "## Safari浏览器 [active]",
+                    "_com.apple.Safari_",
+                    "### Hermes 版本查询 — Hermes",
+                    "    - [WebArea] Hermes 版本查询 — Hermes",
+                    "        - AI 智能体长效记忆架构与 MemoryLake 演进",
+                ]
+            ),
+            "url": "",
+        }
+    )
+    safari_event["delta_seconds"] = 2.0
+    closer_safari_event = normalize_openchronicle_capture(
+        {
+            "id": "capture-safari-2",
+            "timestamp": "2026-06-01T10:00:00Z",
+            "app_name": "Safari",
+            "bundle_id": "com.apple.Safari",
+            "window_title": "Agent API Key Validation Issue — Hermes",
+            "focused_role": "",
+            "focused_value": "",
+            "visible_text": "\n".join(
+                [
+                    "## Safari浏览器 [active]",
+                    "_com.apple.Safari_",
+                    "### Agent API Key Validation Issue — Hermes",
+                    "    - [WebArea] Agent API Key Validation Issue — Hermes",
+                ]
+            ),
+            "url": "",
+        }
+    )
+    closer_safari_event["delta_seconds"] = 0.5
+    second_browser_event = normalize_openchronicle_capture(
+        {
+            "id": "capture-safari-3",
+            "timestamp": "2026-06-01T10:00:03Z",
+            "app_name": "Safari",
+            "bundle_id": "com.apple.Safari",
+            "window_title": "AI Response Error — Hermes",
+            "focused_role": "",
+            "focused_value": "",
+            "visible_text": "\n".join(
+                [
+                    "## Safari浏览器 [active]",
+                    "_com.apple.Safari_",
+                    "### AI Response Error — Hermes",
+                    "    - [WebArea] AI Response Error — Hermes",
+                ]
+            ),
+            "url": "",
+        }
+    )
+    second_browser_event["delta_seconds"] = 1.0
+
+    selected = select_app_context_event_for_records(
+        [
+            {
+                "id": 1,
+                "timestamp_dt": record_time,
+                "ax_events": [safari_event, closer_safari_event],
+            },
+            {
+                "id": 2,
+                "timestamp_dt": record_time + timedelta(seconds=1),
+                "ax_events": [second_browser_event],
+            },
+        ]
+    )
+
+    assert selected[1]["event"]["source_capture_id"] == "capture-safari-2"
+    assert selected[1]["context"]["route"] == "merged_app_context"
+    assert selected[1]["context"]["primary_context"]["page_title"] == "Agent API Key Validation Issue — Hermes"
+    assert len(selected[1]["context"]["contexts"]) == 2
+    assert selected[2]["event"]["source_capture_id"] == "capture-safari-3"
+    assert selected[2]["context"]["route"] == "safari_browser_tab"
+
+
+def test_summarize_view_uses_saved_record_app_context_without_ax_events():
+    browser_context = {
+        "source_app": "Safari",
+        "surface": "browser-tab",
+        "route": "safari_browser_tab",
+        "page_title": "Hermes 版本查询 — Hermes",
+        "url": "",
+        "content_snippets": ["AI 智能体长效记忆架构与 MemoryLake 演进"],
+        "structure_summary": "Safari标签页「Hermes 版本查询 — Hermes」，可见内容：AI 智能体长效记忆架构与 MemoryLake 演进。",
+    }
+    summary = summarize_view(
+        [
+            {
+                "id": 1,
+                "timestamp_dt": datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
+                "timestamp": "2026-06-01T18:00:00+08:00",
+                "app": "Safari浏览器",
+                "window": "Hermes 版本查询 — Hermes",
+                "view_window": "Hermes 版本查询 — Hermes",
+                "focused": 1,
+                "text": "Hermes OCR",
+                "cleaned_text": "Hermes OCR",
+                "ax_context_json": json.dumps(browser_context, ensure_ascii=False),
+                "app_context": browser_context,
+                "ocr_quality_score": 0.9,
+                "content_kind": "other",
+                "trigger": "test",
+                "frame_id": 1,
+            }
+        ]
+    )
+
+    assert summary["window_title"] == "Hermes 版本查询 — Hermes"
+    assert summary["content_kind"] == "browsing"
+
+
+def test_build_view_representative_text_prefers_chat_app_context():
+    chat_context = {
+        "surface": "wechat-chat",
+        "conversation_title": "张三",
+        "message_lines": ["这是聊天增强文本"],
+        "chat_text": "这是聊天增强文本",
+    }
     representative_text = build_view_representative_text(
         [
             {
                 "timestamp_dt": datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
-                "ax_chat_text": "这是聊天增强文本",
-                "ax_visible_text": "这是浏览器增强文本",
+                "ax_context_json": json.dumps(chat_context, ensure_ascii=False),
                 "cleaned_text": "这是 OCR 文本",
                 "text": "原始 OCR 文本",
             }
         ]
     )
 
-    assert "[source=ax_chat_text]" in representative_text
+    assert "[source=ax_context_json(chat)]" in representative_text
     assert "这是聊天增强文本" in representative_text
-    assert "这是浏览器增强文本" not in representative_text
     assert "这是 OCR 文本" not in representative_text
 
 
-def test_build_view_representative_text_combines_ax_visible_text_and_cleaned_text():
+def test_build_view_representative_text_combines_ax_context_and_cleaned_text():
+    browser_context = {
+        "surface": "browser-tab",
+        "page_title": "页面标题",
+        "content_snippets": ["这是浏览器增强文本"],
+        "structure_summary": "Safari标签页「页面标题」，可见内容：这是浏览器增强文本。",
+        "url": "",
+    }
     representative_text = build_view_representative_text(
         [
             {
                 "timestamp_dt": datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
-                "ax_chat_text": "",
-                "ax_visible_text": "这是浏览器增强文本",
+                "ax_context_json": json.dumps(browser_context, ensure_ascii=False),
                 "cleaned_text": "这是 OCR 文本",
                 "text": "原始 OCR 文本",
             }
         ]
     )
 
-    assert "[source=ax_visible_text+cleaned_text]" in representative_text
+    assert "[source=ax_context_json+cleaned_text]" in representative_text
     assert "这是浏览器增强文本" in representative_text
+    assert "这是 OCR 文本" in representative_text
+
+
+def test_build_view_representative_text_includes_all_record_app_contexts():
+    merged_browser_context = {
+        "surface": "merged-app-context",
+        "route": "merged_app_context",
+        "page_title": "Agent API Key Validation Issue — Hermes",
+        "primary_context": {
+            "surface": "browser-tab",
+            "route": "safari_browser_tab",
+            "page_title": "Agent API Key Validation Issue — Hermes",
+            "content_snippets": ["第一段页面信息"],
+            "structure_summary": "Safari标签页「Agent API Key Validation Issue — Hermes」，可见内容：第一段页面信息。",
+            "url": "",
+        },
+        "contexts": [
+            {
+                "surface": "browser-tab",
+                "route": "safari_browser_tab",
+                "page_title": "Agent API Key Validation Issue — Hermes",
+                "content_snippets": ["第一段页面信息"],
+                "structure_summary": "Safari标签页「Agent API Key Validation Issue — Hermes」，可见内容：第一段页面信息。",
+                "url": "",
+            },
+            {
+                "surface": "browser-tab",
+                "route": "safari_browser_tab",
+                "page_title": "Hermes 版本查询 — Hermes",
+                "content_snippets": ["第二段页面信息"],
+                "structure_summary": "Safari标签页「Hermes 版本查询 — Hermes」，可见内容：第二段页面信息。",
+                "url": "",
+            },
+        ],
+        "context_count": 2,
+    }
+    representative_text = build_view_representative_text(
+        [
+            {
+                "timestamp_dt": datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
+                "ax_context_json": json.dumps(merged_browser_context, ensure_ascii=False),
+                "cleaned_text": "这是 OCR 文本",
+                "text": "原始 OCR 文本",
+            }
+        ]
+    )
+
+    assert "[source=ax_context_json+cleaned_text]" in representative_text
+    assert "第一段页面信息" in representative_text
+    assert "第二段页面信息" in representative_text
     assert "这是 OCR 文本" in representative_text

@@ -138,8 +138,6 @@ class ScreenMemoryDB:
             ocr_text TEXT,
             cleaned_text TEXT,
             ax_window_title TEXT,
-            ax_chat_text TEXT,
-            ax_visible_text TEXT,
             ax_context_json TEXT,
             text_source TEXT,
             ocr_quality_score REAL,
@@ -155,8 +153,6 @@ class ScreenMemoryDB:
         for column_name, column_type in [
             ("cleaned_text", "TEXT"),
             ("ax_window_title", "TEXT"),
-            ("ax_chat_text", "TEXT"),
-            ("ax_visible_text", "TEXT"),
             ("ax_context_json", "TEXT"),
             ("text_source", "TEXT"),
             ("ocr_quality_score", "REAL"),
@@ -1978,10 +1974,10 @@ class ScreenMemoryDB:
                 """
                 INSERT OR IGNORE INTO records
                 (timestamp, app_name, window_title, focused, ocr_text, cleaned_text,
-                 ax_window_title, ax_chat_text, ax_visible_text, ax_context_json,
+                 ax_window_title, ax_context_json,
                  text_source, ocr_quality_score, content_kind, trigger_reason,
                  raw_frame_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _format_db_timestamp(record["timestamp"]),
@@ -1991,8 +1987,6 @@ class ScreenMemoryDB:
                     record["text"],
                     record["cleaned_text"],
                     record.get("ax_window_title"),
-                    record.get("ax_chat_text"),
-                    record.get("ax_visible_text"),
                     record.get("ax_context_json"),
                     record.get("text_source") or "ocr",
                     record["ocr_quality_score"],
@@ -2014,8 +2008,6 @@ class ScreenMemoryDB:
                 "text": record["text"],
                 "cleaned_text": record["cleaned_text"],
                 "ax_window_title": record.get("ax_window_title"),
-                "ax_chat_text": record.get("ax_chat_text"),
-                "ax_visible_text": record.get("ax_visible_text"),
                 "ax_context_json": record.get("ax_context_json"),
                 "text_source": record.get("text_source") or "ocr",
                 "ocr_quality_score": record["ocr_quality_score"],
@@ -2024,8 +2016,6 @@ class ScreenMemoryDB:
                 "_record_key": record.get("_record_key"),
                 "view_window": record.get("view_window"),
                 "app_context": record.get("app_context"),
-                "feishu_context": record.get("feishu_context"),
-                "wechat_context": record.get("wechat_context"),
                 "edge_context": record.get("edge_context"),
                 "ax_events": record.get("ax_events") or [],
             })

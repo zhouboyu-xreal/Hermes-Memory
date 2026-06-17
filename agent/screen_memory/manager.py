@@ -669,7 +669,7 @@ def extract_entities(window, text):
     return entities
 
 
-def extract_local_topics(app, window, content_kind, text, artifacts, entities):
+def extract_local_topics(content_kind, artifacts, entities):
     topics = []
     kind_topic = {
         "coding": "代码实现与调试",
@@ -1137,6 +1137,16 @@ def is_low_value_safari_browser_value(value):
 def app_context_title(context):
     if not context:
         return ""
+    primary_context = context.get("primary_context")
+    if isinstance(primary_context, dict):
+        primary_title = app_context_title(primary_context)
+        if primary_title:
+            return primary_title
+    for candidate in context.get("contexts") or []:
+        if isinstance(candidate, dict):
+            candidate_title = app_context_title(candidate)
+            if candidate_title:
+                return candidate_title
     if context.get("conversation_title"):
         return normalize_conversation_title(context.get("conversation_title"))
     if context.get("page_title"):
@@ -1145,7 +1155,29 @@ def app_context_title(context):
 
 
 def is_chat_app_context(context):
-    return bool(context and context.get("surface") in {"messenger-chat", "wechat-chat"})
+    if not context:
+        return False
+    primary_context = context.get("primary_context")
+    if isinstance(primary_context, dict):
+        return is_chat_app_context(primary_context)
+    return bool(context.get("surface") in {"messenger-chat", "wechat-chat"})
+
+
+def app_context_surface(context):
+    if not context:
+        return ""
+    primary_context = context.get("primary_context")
+    if isinstance(primary_context, dict):
+        return app_context_surface(primary_context)
+    surface = str(context.get("surface") or "").strip()
+    if surface:
+        return surface
+    for candidate in context.get("contexts") or []:
+        if isinstance(candidate, dict):
+            surface = app_context_surface(candidate)
+            if surface:
+                return surface
+    return ""
 
 
 def app_context_chat_text(context, limit_chars=4000):
@@ -1181,31 +1213,103 @@ def app_context_browser_text(context, limit_chars=4000):
     return text[:limit_chars]
 
 
+def parse_record_ax_context(record):
+    context = record.get("app_context")
+    if isinstance(context, dict):
+        return context
+    raw = record.get("ax_context_json")
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def app_context_generic_text(context, limit_chars=4000):
+    if not context:
+        return ""
+    parts = []
+    window_title = normalize_browser_title(context.get("window_title"))
+    if window_title:
+        append_unique(parts, [window_title], limit=20)
+    visible_text = str(context.get("visible_text") or "").strip()
+    if visible_text:
+        append_unique(parts, visible_text.splitlines(), limit=40)
+    text = "\n".join(part.strip() for part in parts if str(part).strip()).strip()
+    return text[:limit_chars]
+
+
+def iter_app_contexts(context):
+    if not context:
+        return []
+    nested_contexts = [
+        candidate
+        for candidate in (context.get("contexts") or [])
+        if isinstance(candidate, dict)
+    ]
+    if nested_contexts:
+        ordered = []
+        primary_context = context.get("primary_context")
+        if isinstance(primary_context, dict):
+            ordered.append(primary_context)
+        ordered.extend(nested_contexts)
+        deduped = []
+        seen = set()
+        for candidate in ordered:
+            signature = json.dumps(candidate, ensure_ascii=False, sort_keys=True)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            deduped.append(candidate)
+        return deduped
+    return [context]
+
+
+def render_app_context_text(context, limit_chars=4000):
+    if not context:
+        return ""
+    contexts = iter_app_contexts(context)
+    if len(contexts) > 1:
+        parts = []
+        for candidate in contexts:
+            candidate_text = render_app_context_text(candidate, limit_chars=limit_chars).strip()
+            if candidate_text:
+                append_unique(parts, [candidate_text], limit=40)
+        text = "\n".join(part.strip() for part in parts if str(part).strip()).strip()
+        return text[:limit_chars]
+    context = contexts[0]
+    if is_chat_app_context(context):
+        return app_context_chat_text(context, limit_chars=limit_chars)
+    if app_context_surface(context) == "browser-tab":
+        return app_context_browser_text(context, limit_chars=limit_chars)
+    return app_context_generic_text(context, limit_chars=limit_chars)
+
+
 def get_record_text_for_view(record):
-    chat_text = (record.get("ax_chat_text") or "").strip()
-    if chat_text:
-        return chat_text
+    context_text = render_app_context_text(parse_record_ax_context(record)).strip()
     base_text = (record.get("cleaned_text") or record.get("text") or "").strip()
-    ax_visible_text = (record.get("ax_visible_text") or "").strip()
-    if not ax_visible_text or ax_visible_text in base_text:
+    if not context_text or context_text in base_text:
         return base_text
     if not base_text:
-        return ax_visible_text
-    return f"{base_text}\n{ax_visible_text}".strip()
+        return context_text
+    return f"{base_text}\n{context_text}".strip()
 
 
 def get_record_text_for_representative(record):
-    chat_text = (record.get("ax_chat_text") or "").strip()
-    if chat_text:
-        return "ax_chat_text", chat_text
-
+    context = parse_record_ax_context(record)
+    context_text = render_app_context_text(context).strip()
     base_text = (record.get("cleaned_text") or record.get("text") or "").strip()
-    ax_visible_text = (record.get("ax_visible_text") or "").strip()
-    if ax_visible_text:
-        parts = [ax_visible_text]
+    if is_chat_app_context(context) and context_text:
+        return "ax_context_json(chat)", context_text
+    if context_text:
+        parts = [context_text]
         if base_text:
             append_unique(parts, [base_text], limit=4)
-        return "ax_visible_text+cleaned_text", "\n".join(parts).strip()
+        return "ax_context_json+cleaned_text", "\n".join(parts).strip()
 
     return "cleaned_text", base_text
 
@@ -1574,26 +1678,96 @@ def openchronicle_event_matches_record(event, record):
 
 
 def select_app_context_event_for_records(records):
-    candidates = []
+    selected = {}
     for record in records:
-        for event in record.get("ax_events") or []:
-            context = (
-                event.get("app_context")
-                or event.get("feishu_context")
-                or event.get("wechat_context")
-                or event.get("edge_context")
+        record_key = record.get("id")
+        if record_key is None:
+            record_key = record.get("_record_key")
+        if record_key is None:
+            continue
+        candidates = []
+        for event_index, event in enumerate(record.get("ax_events") or []):
+            context = event.get("app_context")
+            if context and (app_context_title(context) or render_app_context_text(context)):
+                delta_seconds = event.get("delta_seconds")
+                try:
+                    delta_seconds = float(delta_seconds)
+                except (TypeError, ValueError):
+                    delta_seconds = float("inf")
+                timestamp_epoch = event.get("timestamp_epoch") or 0
+                candidates.append((delta_seconds, -timestamp_epoch, event_index, event, context))
+        if not candidates:
+            selected[record_key] = {
+                "event": None,
+                "context": None,
+            }
+            continue
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        _delta_seconds, _neg_timestamp_epoch, _event_index, event, context = candidates[0]
+        merged_contexts = []
+        merged_visible_people = []
+        seen_context_signatures = set()
+        for candidate_delta_seconds, _candidate_neg_timestamp_epoch, _candidate_event_index, candidate_event, candidate_context in candidates:
+            annotated_context = {
+                **candidate_context,
+                "source_capture_id": candidate_event.get("source_capture_id"),
+                "openchronicle_event_id": candidate_event.get("id"),
+                "delta_seconds": candidate_event.get("delta_seconds"),
+                "match_reason": candidate_event.get("match_reason"),
+            }
+            signature = json.dumps(annotated_context, ensure_ascii=False, sort_keys=True)
+            if signature in seen_context_signatures:
+                continue
+            seen_context_signatures.add(signature)
+            merged_contexts.append(annotated_context)
+            append_unique(
+                merged_visible_people,
+                [
+                    value
+                    for value in annotated_context.get("visible_people") or []
+                    if is_valid_context_person_candidate(value)
+                ],
+                limit=30,
             )
-            if context and app_context_title(context):
-                candidates.append((record.get("timestamp_dt"), event, context))
-    if not candidates:
-        return None, None
-    candidates.sort(key=lambda item: item[0] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-    return candidates[0][1], candidates[0][2]
+        primary_context = merged_contexts[0]
+        merged_context = primary_context
+        if len(merged_contexts) > 1:
+            merged_context = {
+                "surface": "merged-app-context",
+                "route": "merged_app_context",
+                "primary_context": primary_context,
+                "contexts": merged_contexts,
+                "context_count": len(merged_contexts),
+                "visible_people": merged_visible_people,
+                "conversation_title": primary_context.get("conversation_title") or "",
+                "page_title": primary_context.get("page_title") or "",
+                "url": primary_context.get("url") or "",
+            }
+        selected[record_key] = {
+            "event": event,
+            "context": merged_context,
+            "primary_context": primary_context,
+            "contexts": merged_contexts,
+        }
+    return selected
 
 
 def select_app_context_for_records(records):
-    _event, context = select_app_context_event_for_records(records)
-    return context
+    candidates = []
+    for record in records:
+        context = record.get("app_context")
+        if context and app_context_title(context):
+            candidates.append(
+                (
+                    record.get("timestamp_dt")
+                    or datetime.min.replace(tzinfo=timezone.utc),
+                    context,
+                )
+            )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 def _last_non_system_record(records):
     for record in reversed(records):
@@ -1743,7 +1917,12 @@ def summarize_segment(records, view_infos=None):
 def summarize_view(records):
     sorted_records = sorted(records, key=lambda item: item["timestamp_dt"])
     app = sorted_records[0].get("app")
-    app_context = select_app_context_for_records(sorted_records)
+    app_context = None
+    for record in reversed(sorted_records):
+        context = record.get("app_context")
+        if context and app_context_title(context):
+            app_context = context
+            break
     context_title = app_context_title(app_context)
     window = (
         sorted_records[0].get("view_window")
@@ -1754,7 +1933,7 @@ def summarize_view(records):
     content_kind = kind_counts.most_common(1)[0][0] if kind_counts else "other"
     if is_chat_app_context(app_context):
         content_kind = "chat"
-    elif app_context and app_context.get("surface") == "browser-tab":
+    elif app_context_surface(app_context) == "browser-tab":
         content_kind = "browsing"
 
     artifacts = []
@@ -1763,7 +1942,7 @@ def summarize_view(records):
         for artifact in extract_artifacts(record["window"], view_text):
             if artifact not in artifacts:
                 artifacts.append(artifact)
-    if app_context and app_context.get("surface") == "browser-tab":
+    if app_context_surface(app_context) == "browser-tab":
         append_unique(artifacts, [app_context.get("url")], limit=20)
     entities = []
     if app_context:
@@ -1781,18 +1960,15 @@ def summarize_view(records):
     representative_text = build_view_representative_text(sorted_records)
 
     topics = extract_local_topics(
-        app,
-        window,
         content_kind,
-        "\n".join(get_record_text_for_view(record) for record in sorted_records),
         artifacts,
         entities,
     )
-    if app_context and app_context.get("surface") == "messenger-chat":
+    if app_context_surface(app_context) == "messenger-chat":
         append_unique(topics, ["飞书聊天", "会话消息查看"], limit=20)
-    elif app_context and app_context.get("surface") == "wechat-chat":
+    elif app_context_surface(app_context) == "wechat-chat":
         append_unique(topics, ["微信聊天", "会话消息查看"], limit=20)
-    elif app_context and app_context.get("surface") == "browser-tab":
+    elif app_context_surface(app_context) == "browser-tab":
         append_unique(topics, ["浏览器标签页"], limit=20)
 
     confidence = sum(record["ocr_quality_score"] for record in sorted_records) / max(1, len(sorted_records))
@@ -2253,10 +2429,19 @@ class ScreenMemoryManager:
             if record_key is None:
                 record_key = record.get("_record_key")
             record["ax_events"] = events_by_record_key.get(record_key, [])
-            app_context_event, app_context = select_app_context_event_for_records([record])
+        selected_contexts_by_record = select_app_context_event_for_records(records)
+        for record in records:
+            record_key = record.get("id")
+            if record_key is None:
+                record_key = record.get("_record_key")
+            selected = selected_contexts_by_record.get(record_key) or {}
+            app_context_event = selected.get("event")
+            app_context = selected.get("context")
             context_title = app_context_title(app_context)
-            if app_context and context_title:
-                record["view_window"] = context_title
+            rendered_context_text = render_app_context_text(app_context) if app_context else ""
+            if app_context and (context_title or rendered_context_text):
+                if context_title:
+                    record["view_window"] = context_title
                 record["app_context"] = app_context
                 if is_chat_app_context(app_context):
                     context_json = {
@@ -2266,15 +2451,10 @@ class ScreenMemoryManager:
                         "delta_seconds": (app_context_event or {}).get("delta_seconds"),
                         "match_reason": (app_context_event or {}).get("match_reason"),
                     }
-                    record["ax_window_title"] = context_title
-                    record["ax_chat_text"] = app_context_chat_text(app_context)
+                    record["ax_window_title"] = context_title or record.get("window") or ""
                     record["ax_context_json"] = json.dumps(context_json, ensure_ascii=False)
-                    record["text_source"] = "ax_chat" if record["ax_chat_text"] else "ocr"
-                    if app_context.get("surface") == "messenger-chat":
-                        record["feishu_context"] = app_context
-                    elif app_context.get("surface") == "wechat-chat":
-                        record["wechat_context"] = app_context
-                elif app_context.get("surface") == "browser-tab":
+                    record["text_source"] = "ax_context" if rendered_context_text else "ocr"
+                elif app_context_surface(app_context) == "browser-tab":
                     context_json = {
                         **app_context,
                         "source_capture_id": (app_context_event or {}).get("source_capture_id"),
@@ -2282,10 +2462,9 @@ class ScreenMemoryManager:
                         "delta_seconds": (app_context_event or {}).get("delta_seconds"),
                         "match_reason": (app_context_event or {}).get("match_reason"),
                     }
-                    record["ax_window_title"] = context_title
-                    record["ax_visible_text"] = app_context_browser_text(app_context)
+                    record["ax_window_title"] = context_title or record.get("window") or ""
                     record["ax_context_json"] = json.dumps(context_json, ensure_ascii=False)
-                    record["text_source"] = "ocr+axtree" if record.get("ax_visible_text") else "ocr"
+                    record["text_source"] = "ocr+ax_context" if rendered_context_text else "ocr"
                     record["edge_context"] = app_context
             elif record["ax_events"]:
                 event = record["ax_events"][0]
@@ -2312,12 +2491,11 @@ class ScreenMemoryManager:
                     record["ax_window_title"] = (
                         event.get("window_title") or record.get("window")
                     )
-                    record["ax_visible_text"] = visible_text
                     record["ax_context_json"] = json.dumps(
                         context_json,
                         ensure_ascii=False,
                     )
-                    record["text_source"] = "ocr+axtree"
+                    record["text_source"] = "ocr+ax_context"
         return records
 
     def apply_openchronicle_event_ids(self, events_by_record_key, event_id_by_source):
@@ -2339,7 +2517,7 @@ class ScreenMemoryManager:
         return sum(
             1
             for record in records
-            if record.get("ax_window_title") or record.get("ax_chat_text") or record.get("ax_context_json")
+            if record.get("ax_window_title") or record.get("ax_context_json")
         )
 
     def select_records_to_keep(self, sp_rows, oc_events, discarded_oc_events=None, min_quality=None):
