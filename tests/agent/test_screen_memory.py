@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from agent.screen_memory.manager import (
     ScreenMemoryManager,
     build_view_representative_text,
+    infer_openchronicle_event_user_actions,
     select_app_context_event_for_records,
     summarize_view,
     normalize_openchronicle_capture,
@@ -554,6 +555,64 @@ def test_fact_clusters_persist_and_daily_observation_updates(tmp_path):
     connection.close()
 
 
+def test_low_fact_screen_cluster_uses_fallback_observation(tmp_path):
+    cleaner = _cleaner(tmp_path)
+    cleaner.screen_observation_cfg["observation_min_fact_count"] = 2
+    cleaner.screen_db = ScreenMemoryDB.ensure_cleaned_db(
+        cleaner.screen_db,
+        cleaner.cleaned_db,
+    )
+    connection = cleaner.screen_db.connection
+    cursor = connection.cursor()
+    workstream_id, view_id = _seed_workstream(cursor)
+    _add_fact(
+        cursor,
+        view_id,
+        "fact-1",
+        "Reviewed a single screen event that is still worth preserving.",
+        "2026-06-01 10:05:00",
+    )
+    connection.commit()
+    facts = cleaner.screen_db.load_unclustered_screen_facts_for_window_workstream(
+        workstream_id,
+    )
+    cluster_id = cleaner.screen_db.save_persisted_screen_fact_cluster(
+        workstream_id,
+        {
+            "facts": facts,
+            "cluster_score": 0.5,
+            "cluster_reason": "single_fact_regression_fixture",
+        },
+    )
+    connection.commit()
+
+    observation_stats = cleaner.update_screen_observation_tables(
+        window_workstream_ids=[workstream_id],
+    )
+
+    cluster_row = cursor.execute(
+        """
+        SELECT observation_id, observed_fact_count
+        FROM screen_fact_clusters
+        WHERE id = ?
+        """,
+        (cluster_id,),
+    ).fetchone()
+    assert observation_stats["screen_observations_generated"] == 1
+    assert observation_stats["screen_observation_low_fact_fallback_count"] == 1
+    assert cluster_row[0] is not None
+    assert cluster_row[1] == 1
+    assert cursor.execute(
+        "SELECT summary_text FROM screen_observations WHERE id = ?",
+        (cluster_row[0],),
+    ).fetchone()[0] == "Reviewed a single screen event that is still worth preserving."
+    assert cursor.execute(
+        "SELECT count(*) FROM screen_observation_facts WHERE observation_id = ?",
+        (cluster_row[0],),
+    ).fetchone()[0] == 1
+    connection.close()
+
+
 def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
     config = _cleaner(tmp_path).config
     screenpipe_db = tmp_path / "screenpipe.db"
@@ -997,6 +1056,59 @@ def test_select_app_context_event_for_records_returns_per_record_primary_context
     assert selected[2]["context"]["route"] == "safari_browser_tab"
 
 
+def test_infer_openchronicle_browser_actions_distinguishes_feishu_doc_reading_and_editing():
+    reading_event = normalize_openchronicle_capture(
+        {
+            "id": "capture-edge-doc-read",
+            "timestamp": "2026-06-01T10:00:00Z",
+            "app_name": "Microsoft Edge",
+            "bundle_id": "com.microsoft.edgemac",
+            "window_title": "Aura 配件深度调研 - 飞书云文档 - Microsoft Edge",
+            "focused_role": "AXWebArea",
+            "focused_value": "",
+            "visible_text": "\n".join(
+                [
+                    "## Microsoft Edge [active]",
+                    "_com.microsoft.edgemac_",
+                    "### Aura 配件深度调研 - 飞书云文档 - Microsoft Edge",
+                    "    - [WebArea] Aura 配件深度调研",
+                    "        - [Heading] 用户场景",
+                    "        - 用户正在阅读 XREAL 配件相关的调研内容",
+                ]
+            ),
+            "url": "",
+        }
+    )
+    editing_event = normalize_openchronicle_capture(
+        {
+            "id": "capture-edge-doc-edit",
+            "timestamp": "2026-06-01T10:00:20Z",
+            "app_name": "Microsoft Edge",
+            "bundle_id": "com.microsoft.edgemac",
+            "window_title": "Aura 配件深度调研 - 飞书云文档 - Microsoft Edge",
+            "focused_role": "AXTextArea",
+            "focused_value": "新增一条关于镜腿配件的需求说明",
+            "visible_text": "\n".join(
+                [
+                    "## Microsoft Edge [active]",
+                    "_com.microsoft.edgemac_",
+                    "### Aura 配件深度调研 - 飞书云文档 - Microsoft Edge",
+                    "    - [WebArea] Aura 配件深度调研",
+                    "        - [TextArea] 新增一条关于镜腿配件的需求说明",
+                ]
+            ),
+            "url": "",
+        }
+    )
+
+    infer_openchronicle_event_user_actions([reading_event, editing_event])
+
+    reading_actions = {action["action_type"] for action in reading_event["user_actions"]}
+    editing_actions = {action["action_type"] for action in editing_event["user_actions"]}
+    assert "browser_document_reading" in reading_actions
+    assert "browser_document_editing" in editing_actions
+
+
 def test_summarize_view_uses_saved_record_app_context_without_ax_events():
     browser_context = {
         "source_app": "Safari",
@@ -1127,4 +1239,31 @@ def test_build_view_representative_text_includes_all_record_app_contexts():
     assert "[source=ax_context_json+cleaned_text]" in representative_text
     assert "第一段页面信息" in representative_text
     assert "第二段页面信息" in representative_text
+    assert "这是 OCR 文本" in representative_text
+
+
+def test_build_view_representative_text_includes_user_action_priors():
+    representative_text = build_view_representative_text(
+        [
+            {
+                "timestamp_dt": datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc),
+                "cleaned_text": "这是 OCR 文本",
+                "text": "原始 OCR 文本",
+                "user_actions_json": json.dumps(
+                    [
+                        {
+                            "action_type": "browser_document_reading",
+                            "confidence": 0.8,
+                            "summary": "浏览器停留在飞书文档页面，推测用户正在阅读文档内容。",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+            }
+        ]
+    )
+
+    assert "[source=user_actions+cleaned_text]" in representative_text
+    assert "动作先验" in representative_text
+    assert "browser_document_reading" in representative_text
     assert "这是 OCR 文本" in representative_text

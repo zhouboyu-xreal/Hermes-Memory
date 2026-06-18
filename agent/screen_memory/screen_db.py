@@ -139,6 +139,7 @@ class ScreenMemoryDB:
             cleaned_text TEXT,
             ax_window_title TEXT,
             ax_context_json TEXT,
+            user_actions_json TEXT,
             text_source TEXT,
             ocr_quality_score REAL,
             content_kind TEXT,
@@ -154,6 +155,7 @@ class ScreenMemoryDB:
             ("cleaned_text", "TEXT"),
             ("ax_window_title", "TEXT"),
             ("ax_context_json", "TEXT"),
+            ("user_actions_json", "TEXT"),
             ("text_source", "TEXT"),
             ("ocr_quality_score", "REAL"),
             ("content_kind", "TEXT"),
@@ -257,6 +259,7 @@ class ScreenMemoryDB:
             normalized_json TEXT,
             app_context_json TEXT,
             feishu_context_json TEXT,
+            user_actions_json TEXT,
             raw_json TEXT
         );
         """)
@@ -266,6 +269,7 @@ class ScreenMemoryDB:
         }
         for column_name, column_type in [
             ("app_context_json", "TEXT"),
+            ("user_actions_json", "TEXT"),
         ]:
             if column_name not in existing_oc_columns:
                 cursor.execute(f"ALTER TABLE openchronicle_events ADD COLUMN {column_name} {column_type}")
@@ -1974,10 +1978,10 @@ class ScreenMemoryDB:
                 """
                 INSERT OR IGNORE INTO records
                 (timestamp, app_name, window_title, focused, ocr_text, cleaned_text,
-                 ax_window_title, ax_context_json,
+                 ax_window_title, ax_context_json, user_actions_json,
                  text_source, ocr_quality_score, content_kind, trigger_reason,
                  raw_frame_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _format_db_timestamp(record["timestamp"]),
@@ -1988,6 +1992,7 @@ class ScreenMemoryDB:
                     record["cleaned_text"],
                     record.get("ax_window_title"),
                     record.get("ax_context_json"),
+                    record.get("user_actions_json"),
                     record.get("text_source") or "ocr",
                     record["ocr_quality_score"],
                     record["content_kind"],
@@ -2009,6 +2014,8 @@ class ScreenMemoryDB:
                 "cleaned_text": record["cleaned_text"],
                 "ax_window_title": record.get("ax_window_title"),
                 "ax_context_json": record.get("ax_context_json"),
+                "user_actions_json": record.get("user_actions_json"),
+                "user_actions": record.get("user_actions") or [],
                 "text_source": record.get("text_source") or "ocr",
                 "ocr_quality_score": record["ocr_quality_score"],
                 "content_kind": record["content_kind"],
@@ -2067,11 +2074,27 @@ class ScreenMemoryDB:
             source_ids.append(source_id)
             cursor.execute(
                 """
-                INSERT OR IGNORE INTO openchronicle_events
+                INSERT INTO openchronicle_events
                 (source_capture_id, timestamp, timestamp_epoch, app_name, bundle_id, window_title,
                  event_type, focused_role, focused_value, visible_text, url,
-                 normalized_json, app_context_json, feishu_context_json, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 normalized_json, app_context_json, feishu_context_json, user_actions_json, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_capture_id) DO UPDATE SET
+                    timestamp = excluded.timestamp,
+                    timestamp_epoch = excluded.timestamp_epoch,
+                    app_name = excluded.app_name,
+                    bundle_id = excluded.bundle_id,
+                    window_title = excluded.window_title,
+                    event_type = excluded.event_type,
+                    focused_role = excluded.focused_role,
+                    focused_value = excluded.focused_value,
+                    visible_text = excluded.visible_text,
+                    url = excluded.url,
+                    normalized_json = excluded.normalized_json,
+                    app_context_json = excluded.app_context_json,
+                    feishu_context_json = excluded.feishu_context_json,
+                    user_actions_json = excluded.user_actions_json,
+                    raw_json = excluded.raw_json
                 """,
                 (
                     source_id,
@@ -2088,6 +2111,7 @@ class ScreenMemoryDB:
                     json.dumps(event.get("normalized") or {}, ensure_ascii=False),
                     json.dumps(event.get("app_context"), ensure_ascii=False) if event.get("app_context") else None,
                     json.dumps(event.get("feishu_context"), ensure_ascii=False) if event.get("feishu_context") else None,
+                    json.dumps(event.get("user_actions") or [], ensure_ascii=False) if event.get("user_actions") else None,
                     json.dumps(event.get("raw") or {}, ensure_ascii=False),
                 ),
             )

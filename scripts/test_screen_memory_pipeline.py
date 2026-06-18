@@ -369,7 +369,7 @@ def collect_database_report(
                 continue
             query = f"SELECT * FROM {table} ORDER BY rowid"
             parameters: Tuple[Any, ...] = ()
-            if row_limit > 0:
+            if row_limit >= 0:
                 query += " LIMIT ?"
                 parameters = (row_limit,)
             details[table] = [

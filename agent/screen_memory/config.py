@@ -81,7 +81,7 @@ SCREEN_MEMORY_DEFAULTS: Dict[str, Any] = {
         "enable_LLM_observation_generation": True,
         "fallback_observation_when_llm_fails": True,
         "fact_cluster_min_score": 0.42,
-        "observation_min_fact_count": 2,
+        "observation_min_fact_count": 1,
         "observation_merge_fact_min_score": 0.42,
         "observation_merge_min_score": 0.48,
         "observation_merge_support_ratio": 0.5,

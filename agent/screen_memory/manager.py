@@ -1302,16 +1302,64 @@ def get_record_text_for_view(record):
 def get_record_text_for_representative(record):
     context = parse_record_ax_context(record)
     context_text = render_app_context_text(context).strip()
+    user_actions_text = render_record_user_actions_text(record).strip()
     base_text = (record.get("cleaned_text") or record.get("text") or "").strip()
     if is_chat_app_context(context) and context_text:
-        return "ax_context_json(chat)", context_text
+        parts = [context_text]
+        if user_actions_text:
+            append_unique(parts, [user_actions_text], limit=4)
+        return "ax_context_json(chat)", "\n".join(parts).strip()
     if context_text:
         parts = [context_text]
+        if user_actions_text:
+            append_unique(parts, [user_actions_text], limit=4)
         if base_text:
             append_unique(parts, [base_text], limit=4)
         return "ax_context_json+cleaned_text", "\n".join(parts).strip()
 
+    if user_actions_text:
+        parts = [user_actions_text]
+        if base_text:
+            append_unique(parts, [base_text], limit=4)
+        return "user_actions+cleaned_text", "\n".join(parts).strip()
+
     return "cleaned_text", base_text
+
+
+def parse_record_user_actions(record):
+    raw = record.get("user_actions")
+    if isinstance(raw, list):
+        return raw
+    raw = record.get("user_actions_json")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def render_record_user_actions_text(record, limit=6):
+    actions = parse_record_user_actions(record)
+    if not actions:
+        return ""
+    lines = []
+    for action in actions[:limit]:
+        if not isinstance(action, dict):
+            continue
+        action_type = str(action.get("action_type") or "").strip()
+        summary = str(action.get("summary") or action.get("reason") or "").strip()
+        confidence = action.get("confidence")
+        if not action_type and not summary:
+            continue
+        if isinstance(confidence, (int, float)):
+            lines.append(f"- {action_type}({confidence:.2f}): {summary}".strip())
+        else:
+            lines.append(f"- {action_type}: {summary}".strip())
+    if not lines:
+        return ""
+    return "动作先验:\n" + "\n".join(lines)
 
 
 def is_low_value_wechat_line(value):
@@ -1659,6 +1707,247 @@ def normalize_openchronicle_capture(row):
         },
     }
 
+
+def is_browser_openchronicle_event(event):
+    if not event:
+        return False
+    keys = openchronicle_event_app_keys(event)
+    return bool(keys & {"safari", "microsoft edge", "edge"})
+
+
+def openchronicle_event_page_title(event):
+    context_title = app_context_title(event.get("app_context"))
+    if context_title:
+        return context_title
+    window_title = normalize_browser_title(event.get("window_title"))
+    if window_title and not is_low_value_browser_title(window_title):
+        return window_title
+    return ""
+
+
+def openchronicle_event_action_text(event):
+    context_text = render_app_context_text(event.get("app_context")).strip()
+    if context_text:
+        return context_text
+    return str(event.get("visible_text") or "").strip()
+
+
+def is_feishu_document_browser_event(event):
+    page_title = openchronicle_event_page_title(event)
+    text = " ".join(
+        [
+            event.get("app_name") or "",
+            event.get("bundle_id") or "",
+            event.get("window_title") or "",
+            event.get("url") or "",
+            page_title or "",
+            openchronicle_event_action_text(event)[:4000],
+        ]
+    )
+    normalized = normalize_signature_text(text)
+    has_feishu = any(
+        token in normalized
+        for token in [
+            "飞书",
+            "lark",
+            "feishu",
+            "larksuite",
+            "open.feishu.cn",
+        ]
+    )
+    has_doc_signal = any(
+        token in normalized
+        for token in [
+            "飞书云文档",
+            "云文档",
+            "docx",
+            "wiki",
+            "docs",
+            "文档",
+            "表格",
+            "多维表格",
+            "知识库",
+        ]
+    )
+    return has_feishu and has_doc_signal
+
+
+def browser_event_has_document_editing_signal(event):
+    focused_role = normalize_signature_text(event.get("focused_role"))
+    focused_value = str(event.get("focused_value") or "").strip()
+    focused_value_key = normalize_signature_text(focused_value)
+    if focused_role in {"axtextarea", "axtextfield", "axcombobox"}:
+        if focused_value and not normalize_browser_url(focused_value):
+            return True
+    text = str(event.get("visible_text") or "")
+    normalized = normalize_signature_text(text[:6000])
+    edit_markers = [
+        "[TextArea]",
+        "正在编辑",
+        "编辑中",
+        "退出编辑",
+        "保存并关闭",
+        "编辑权限",
+        "当前正在编辑",
+    ]
+    if edit_markers[0] in text:
+        return True
+    if focused_value_key and focused_value_key in normalized and len(focused_value_key) >= 8:
+        return True
+    return any(normalize_signature_text(marker) in normalized for marker in edit_markers[1:])
+
+
+def meaningful_event_line_keys(text, limit=240):
+    keys = []
+    seen = set()
+    for line in str(text or "").splitlines():
+        value = clean_ax_tree_line(line)
+        if not value:
+            continue
+        value = normalize_safari_browser_value(value)
+        if not value or is_low_value_safari_browser_value(value):
+            continue
+        key = normalize_signature_text(value)
+        if len(key) < 3 or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+        if len(keys) >= limit:
+            break
+    return keys
+
+
+def event_text_overlap(previous_event, current_event):
+    previous_keys = set(meaningful_event_line_keys(openchronicle_event_action_text(previous_event)))
+    current_keys = set(meaningful_event_line_keys(openchronicle_event_action_text(current_event)))
+    if not previous_keys or not current_keys:
+        return 0.0, 0
+    overlap = previous_keys & current_keys
+    novel_count = len(current_keys - previous_keys)
+    return len(overlap) / max(1, min(len(previous_keys), len(current_keys))), novel_count
+
+
+def make_openchronicle_user_action(action_type, confidence, summary, event, previous_event=None):
+    action = {
+        "action_type": action_type,
+        "confidence": round(max(0.0, min(1.0, float(confidence))), 3),
+        "summary": summary,
+        "app_name": event.get("app_name") or "",
+        "window_title": event.get("window_title") or "",
+        "page_title": openchronicle_event_page_title(event),
+        "source_capture_id": event.get("source_capture_id"),
+    }
+    if previous_event:
+        action["previous_source_capture_id"] = previous_event.get("source_capture_id")
+    return action
+
+
+def infer_openchronicle_event_user_actions(oc_events, max_gap_seconds=180):
+    """Annotate browser AXTree events with conservative user action hypotheses."""
+    if not oc_events:
+        return oc_events
+
+    previous_browser_event_by_app = {}
+    previous_browser_event_by_page = {}
+    sorted_events = sorted(
+        oc_events,
+        key=lambda item: item.get("timestamp_epoch") or 0,
+    )
+    for event in sorted_events:
+        event["user_actions"] = []
+        if not is_browser_openchronicle_event(event):
+            continue
+
+        event_app_keys = openchronicle_event_app_keys(event)
+        if "safari" in event_app_keys:
+            app_key = "safari"
+        else:
+            app_key = "microsoft edge"
+        page_title = openchronicle_event_page_title(event)
+        page_key = make_stable_key(page_title, fallback="browser-page", max_tokens=8)
+        page_state_key = (app_key, page_key)
+        previous_page_event = previous_browser_event_by_page.get(page_state_key)
+        previous_app_event = previous_browser_event_by_app.get(app_key)
+
+        def nearby(previous_event):
+            if not previous_event:
+                return False
+            gap = (event.get("timestamp_epoch") or 0) - (previous_event.get("timestamp_epoch") or 0)
+            return 0 < gap <= max_gap_seconds
+
+        actions = []
+        is_feishu_doc = is_feishu_document_browser_event(event)
+        is_editing = is_feishu_doc and browser_event_has_document_editing_signal(event)
+        if is_editing:
+            actions.append(
+                make_openchronicle_user_action(
+                    "browser_document_editing",
+                    0.86,
+                    "浏览器中的飞书文档出现编辑控件或输入焦点，推测用户正在修改文档。",
+                    event,
+                    previous_page_event if nearby(previous_page_event) else None,
+                )
+            )
+        elif is_feishu_doc:
+            confidence = 0.7
+            if nearby(previous_page_event):
+                overlap, novel_count = event_text_overlap(previous_page_event, event)
+                if overlap >= 0.35 and novel_count > 0:
+                    confidence = 0.8
+            actions.append(
+                make_openchronicle_user_action(
+                    "browser_document_reading",
+                    confidence,
+                    "浏览器停留在飞书文档页面且没有明显编辑焦点，推测用户正在阅读文档内容。",
+                    event,
+                    previous_page_event if nearby(previous_page_event) else None,
+                )
+            )
+
+        if nearby(previous_page_event):
+            overlap, novel_count = event_text_overlap(previous_page_event, event)
+            if overlap >= 0.35 and novel_count >= 3:
+                actions.append(
+                    make_openchronicle_user_action(
+                        "browser_same_page_reading",
+                        0.72,
+                        "同一浏览器页面标题保持稳定，但可见内容出现新增片段，推测用户在同页滚动阅读。",
+                        event,
+                        previous_page_event,
+                    )
+                )
+
+        if nearby(previous_app_event):
+            previous_title = openchronicle_event_page_title(previous_app_event)
+            if previous_title and page_title and make_stable_key(previous_title, max_tokens=8) != page_key:
+                actions.append(
+                    make_openchronicle_user_action(
+                        "browser_page_switching",
+                        0.68,
+                        "浏览器应用连续事件之间页面标题发生变化，推测用户切换了页面或标签页。",
+                        event,
+                        previous_app_event,
+                    )
+                )
+
+        deduped_actions = []
+        seen_action_types = set()
+        for action in sorted(actions, key=lambda item: item.get("confidence", 0), reverse=True):
+            action_type = action.get("action_type")
+            if action_type in seen_action_types:
+                continue
+            seen_action_types.add(action_type)
+            deduped_actions.append(action)
+        event["user_actions"] = deduped_actions[:4]
+        if event.get("user_actions"):
+            event.setdefault("normalized", {})["user_actions"] = event["user_actions"]
+
+        previous_browser_event_by_app[app_key] = event
+        previous_browser_event_by_page[page_state_key] = event
+
+    return oc_events
+
+
 def openchronicle_event_app_keys(event):
     return app_alias_keys(
         event.get("app_name"),
@@ -1768,6 +2057,27 @@ def select_app_context_for_records(records):
         return None
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0][1]
+
+
+def collect_user_actions_from_ax_events(ax_events, limit=8):
+    actions = []
+    seen = set()
+    for event in ax_events or []:
+        for action in event.get("user_actions") or []:
+            if not isinstance(action, dict):
+                continue
+            signature = (
+                action.get("action_type"),
+                action.get("source_capture_id") or event.get("source_capture_id"),
+                action.get("previous_source_capture_id"),
+            )
+            if signature in seen:
+                continue
+            seen.add(signature)
+            actions.append(action)
+    actions.sort(key=lambda item: item.get("confidence", 0), reverse=True)
+    return actions[:limit]
+
 
 def _last_non_system_record(records):
     for record in reversed(records):
@@ -2429,6 +2739,10 @@ class ScreenMemoryManager:
             if record_key is None:
                 record_key = record.get("_record_key")
             record["ax_events"] = events_by_record_key.get(record_key, [])
+            record_actions = collect_user_actions_from_ax_events(record["ax_events"])
+            if record_actions:
+                record["user_actions"] = record_actions
+                record["user_actions_json"] = json.dumps(record_actions, ensure_ascii=False)
         selected_contexts_by_record = select_app_context_event_for_records(records)
         for record in records:
             record_key = record.get("id")
@@ -3838,8 +4152,13 @@ class ScreenMemoryManager:
         llm_enabled = bool(screen_observation_cfg.get("enable_LLM_observation_generation",  False))
         llm_budget = screen_observation_cfg.get("observation_llm_budget", 0)
         fallback_enabled = bool(screen_observation_cfg.get("fallback_observation_when_llm_fails", True))
+        try:
+            min_fact_count = int(screen_observation_cfg.get("observation_min_fact_count") or 0)
+        except (TypeError, ValueError):
+            min_fact_count = 0
         llm_generation_count = 0
         llm_failed_count = 0
+        low_fact_fallback_count = 0
         observation_count = 0
         cluster_stats = self._cluster_screen_facts_for_observation(
             window_workstream_ids=window_workstream_ids,
@@ -3856,9 +4175,14 @@ class ScreenMemoryManager:
                 if cluster.get("fact_cluster_id") not in dirty_cluster_ids:
                     continue
                 fact_count = len(cluster.get("facts") or [])
-                if fact_count < screen_observation_cfg.get("observation_min_fact_count", False):
-                    continue
-                if llm_enabled and llm_generation_count + llm_failed_count < llm_budget:
+                use_low_fact_fallback = bool(min_fact_count and fact_count <= min_fact_count)
+                if use_low_fact_fallback:
+                    if not fallback_enabled:
+                        continue
+                    low_fact_fallback_count += 1
+                    self._print("Summarizing low-evidence Screen_Observation with fallback ")
+                    observation = self.fallback_screen_observation_for_cluster(window_context, cluster)
+                elif llm_enabled and llm_generation_count + llm_failed_count < llm_budget:
                     self._print(
                         f"Summarizing Screen_Observation with LLM "
                             f"({llm_generation_count + llm_failed_count + 1}/{llm_budget})..."
@@ -3902,6 +4226,7 @@ class ScreenMemoryManager:
             **cluster_stats,
             "screen_observations": self.screen_db.get_screen_observation_count(),
             "screen_observations_generated": observation_count,
+            "screen_observation_low_fact_fallback_count": low_fact_fallback_count,
             "screen_observation_llm_generation_count": llm_generation_count,
             "screen_observation_llm_failed_count": llm_failed_count,
         }
@@ -6898,6 +7223,7 @@ class ScreenMemoryManager:
             self._print(f"Error reading OpenChronicle: {e}")
             oc_events = []
             discarded_oc_events = []
+        infer_openchronicle_event_user_actions(oc_events)
 
         self._print("Running scheduling simulation & deduplication...")
 
@@ -6909,9 +7235,14 @@ class ScreenMemoryManager:
         )
         stats.update({
             "openchronicle_events": 0,
+            "openchronicle_events_stored": 0,
+            "openchronicle_user_action_events": sum(1 for event in oc_events if event.get("user_actions")),
             "record_ax_event_links": 0,
             "record_ax_context_updates": 0,
+            "record_user_action_updates": 0,
         })
+        event_id_by_source = self.screen_db.write_openchronicle_event_table(oc_events)
+        stats["openchronicle_events_stored"] = len(event_id_by_source)
         if not kept_records:
             stats.update(self.get_workstream_stats())
             return stats
@@ -6921,9 +7252,6 @@ class ScreenMemoryManager:
             oc_events,
         )
 
-        event_id_by_source = self.screen_db.write_openchronicle_event_table(
-            matched_oc_events
-        )
         self.apply_openchronicle_event_ids(events_by_record_key, event_id_by_source)
         self.attach_openchronicle_events_to_records(kept_records, events_by_record_key)
         inserted_records = self.screen_db.write_record_table(kept_records)
@@ -6935,6 +7263,7 @@ class ScreenMemoryManager:
         stats["openchronicle_events"] = len(matched_oc_events)
         stats["record_ax_event_links"] = record_ax_event_links
         stats["record_ax_context_updates"] = self.count_record_ax_context_records(inserted_records)
+        stats["record_user_action_updates"] = sum(1 for record in inserted_records if record.get("user_actions"))
 
         # inspect matching
         # coverage_stats = self.inspect_openchronicle_coverage(sp_rows, oc_events, start_time)
