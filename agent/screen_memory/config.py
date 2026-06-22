@@ -14,7 +14,7 @@ SCREEN_MEMORY_DEFAULTS: Dict[str, Any] = {
     "openchronicle_db": "~/.openchronicle/index.db",
     "output_db": "",
     "fact_extraction_interval_minutes": 30,
-    "observation_interval_hours": 24,
+    "observation_interval_hours": 2,
     "initial_lookback_minutes": 30,
     "openchronicle": {
         "record_link_window_seconds": 6,
@@ -85,7 +85,7 @@ SCREEN_MEMORY_DEFAULTS: Dict[str, Any] = {
         "observation_merge_fact_min_score": 0.42,
         "observation_merge_min_score": 0.48,
         "observation_merge_support_ratio": 0.5,
-        "observation_llm_budget": 300,
+        "observation_llm_budget": 10,
         "llm_timeout": 120,
     },
     "task_workstream_generation": {

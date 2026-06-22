@@ -571,10 +571,14 @@ PROJECT_ACTION_PREFIXES = (
 )
 
 CONTEXT_PERSON_NOISE_WORDS = {
+    "Pin",
+    "部门",
     "是的",
     "省事",
     "已编辑",
     "便宜大碗",
+    "新消息",
+    "正在加载",
     "发送给",
     "消息",
     "文件",
@@ -1425,6 +1429,157 @@ def extract_indented_subtree(text, marker, max_lines=120):
     return []
 
 
+def parse_feishu_chat_subtree_items(subtree):
+    items = []
+    for line_number, raw_line in enumerate(subtree, start=1):
+        value = clean_ax_tree_line(raw_line)
+        if not value:
+            continue
+        items.append({
+            "line": line_number,
+            "indent": ax_line_indent(raw_line),
+            "text": value,
+        })
+    return items
+
+
+def is_feishu_chat_speaker_item(item):
+    value = str((item or {}).get("text") or "").strip()
+    if not value:
+        return False
+    if int((item or {}).get("indent") or 0) > 72:
+        return False
+    return bool(re.fullmatch(r"[\u4e00-\u9fff]{2,4}", value))
+
+
+def is_feishu_chat_control_text(value):
+    value = str(value or "").strip()
+    if not value:
+        return True
+    if value in {"消息", "云文档", "文件", "收起", "展开", ":", "："}:
+        return True
+    if value.startswith("[Button]"):
+        return True
+    if re.fullmatch(r"\d+", value):
+        return True
+    return False
+
+
+def format_feishu_chat_message_text(message):
+    content = " ".join(
+        str(part).strip()
+        for part in message.get("content") or []
+        if str(part).strip()
+    ).strip()
+    return content
+
+
+def extract_feishu_chat_messages_from_subtree(subtree):
+    raw_items = parse_feishu_chat_subtree_items(subtree)
+    if not raw_items:
+        return [], []
+
+    items = [
+        item
+        for item in raw_items
+        if not is_feishu_chat_control_text(item.get("text"))
+    ]
+    messages = []
+    current = None
+    quote_mode = False
+    quote_indent = None
+    pending_reply_author = None
+
+    def flush_current():
+        nonlocal current, quote_mode, quote_indent
+        if current and format_feishu_chat_message_text(current):
+            messages.append(current)
+        current = None
+        quote_mode = False
+        quote_indent = None
+
+    for index, item in enumerate(items):
+        value = item["text"]
+        next_item = items[index + 1] if index + 1 < len(items) else None
+
+        if is_feishu_chat_speaker_item(item) and next_item and next_item.get("text") == "1 条回复":
+            pending_reply_author = value
+            continue
+
+        if pending_reply_author and value != "1 条回复":
+            flush_current()
+            current = {
+                "speaker": pending_reply_author,
+                "content": [],
+                "line": item.get("line"),
+                "metadata": ["thread_reply"],
+            }
+            pending_reply_author = None
+        elif is_feishu_chat_speaker_item(item):
+            flush_current()
+            current = {
+                "speaker": value,
+                "content": [],
+                "line": item.get("line"),
+                "metadata": [],
+            }
+            continue
+
+        if current is None:
+            continue
+
+        if value == "1 条回复":
+            append_unique(current.setdefault("metadata", []), [value], limit=12)
+            continue
+        if value.startswith("回复 "):
+            current["reply_to"] = value.replace("回复 ", "", 1).strip()
+            quote_mode = True
+            quote_indent = item.get("indent")
+            continue
+        if value in {"（已编辑）", "(已编辑)"}:
+            if quote_mode:
+                append_unique(current.setdefault("quote_metadata", []), [value], limit=12)
+            else:
+                current["edited"] = True
+            continue
+
+        if quote_mode and quote_indent is not None and item.get("indent", 0) > quote_indent:
+            quote_mode = False
+
+        if quote_mode and not value.startswith("@"):
+            append_unique(current.setdefault("quote", []), [value], limit=20)
+        else:
+            append_unique(current.setdefault("content", []), [value], limit=20)
+
+    flush_current()
+    normalized_messages = []
+    for message in messages:
+        content = format_feishu_chat_message_text(message)
+        if not content:
+            continue
+        normalized = {
+            "speaker": message.get("speaker") or "",
+            "text": content,
+            "line": message.get("line"),
+        }
+        if message.get("reply_to"):
+            normalized["reply_to"] = message.get("reply_to")
+        if message.get("quote"):
+            normalized["quote_text"] = " ".join(message.get("quote") or []).strip()
+        if message.get("metadata"):
+            normalized["metadata"] = message.get("metadata")
+        if message.get("edited"):
+            normalized["edited"] = True
+        normalized_messages.append(normalized)
+
+    formatted_lines = [
+        f"{message['speaker']}说{message['text']}"
+        for message in normalized_messages
+        if message.get("speaker") and message.get("text")
+    ]
+    return normalized_messages, formatted_lines
+
+
 def extract_feishu_messenger_chat_context(visible_text):
     subtree = extract_indented_subtree(visible_text, "messenger-chat", max_lines=160)
     if not subtree:
@@ -1434,6 +1589,7 @@ def extract_feishu_messenger_chat_context(visible_text):
     message_lines = []
     conversation_title = None
     skip_values = {"消息", "云文档", "文件", "收起", "展开"}
+    chat_messages, formatted_chat_lines = extract_feishu_chat_messages_from_subtree(subtree)
     for raw_line in subtree:
         value = clean_ax_tree_line(raw_line)
         if not value:
@@ -1456,12 +1612,17 @@ def extract_feishu_messenger_chat_context(visible_text):
         return None
 
     visible_people = []
+    for message in chat_messages:
+        if is_valid_context_person_candidate(message.get("speaker")):
+            append_unique(visible_people, [message.get("speaker")], limit=12)
     for value in message_lines:
         if is_valid_context_person_candidate(value):
             append_unique(visible_people, [value], limit=12)
 
     summary_parts = [f"飞书聊天「{conversation_title}」"]
-    if message_lines:
+    if formatted_chat_lines:
+        summary_parts.append("可见对话：" + " / ".join(formatted_chat_lines[:8])[:600])
+    elif message_lines:
         summary_parts.append("可见内容：" + " / ".join(message_lines[:8])[:600])
 
     return {
@@ -1469,8 +1630,9 @@ def extract_feishu_messenger_chat_context(visible_text):
         "conversation_title": conversation_title,
         "tabs": tabs,
         "visible_people": visible_people,
+        "messages": chat_messages,
         "message_lines": message_lines,
-        "chat_text": "\n".join(message_lines),
+        "chat_text": "\n".join(formatted_chat_lines or message_lines),
         "structure_summary": "，".join(summary_parts) + "。",
     }
 
