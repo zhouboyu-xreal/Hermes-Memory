@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the screen-memory pipeline against recorded source databases.
-
-Two modes are supported:
-
-* once: fact_extraction the complete source time range, then run fact clustering and
-  observation generation once.
-* timeline: start at the earliest source timestamp and simulate the production
-  schedule in chronological order.
+"""Exercise selected screen-memory pipeline phases against recorded databases.
 
 The script uses an isolated output database and in-memory schedule state. It
 does not read or update the production screen-memory schedule_state.json.
@@ -19,7 +12,7 @@ import json
 import logging
 import sqlite3
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -37,14 +30,16 @@ from agent.screen_memory.service import (
     _inject_runtime_config,
     _run_fact_extraction,
     _run_observations,
+    _run_tasks,
 )
 from hermes_cli.config import load_config
 from hermes_constants import get_hermes_home
 
 
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "tmp" / "screen_memory_pipeline_test"
-DEFAULT_LOG_PATH = DEFAULT_OUTPUT_DIR / "screen_memory_pipeline_test.log"
-DEFAULT_REPORT_PATH = DEFAULT_OUTPUT_DIR / "screen_memory_pipeline_report.json"
+DEFAULT_OUTPUT_ROOT = REPO_ROOT / "tmp" / "screen_memory_pipeline_test"
+DEFAULT_OUTPUT_DIR = DEFAULT_OUTPUT_ROOT / "all"
+DEFAULT_LOG_FILENAME = "screen_memory_pipeline_test.log"
+DEFAULT_REPORT_FILENAME = "screen_memory_pipeline_report.json"
 
 DETAIL_TABLES = (
     "window_workstream",
@@ -53,6 +48,9 @@ DETAIL_TABLES = (
     "screen_fact_cluster_members",
     "screen_observations",
     "screen_observation_facts",
+    "task_workstream",
+    "task_workstream_observations",
+    "task_workstream_members",
 )
 COUNT_TABLES = (
     "records",
@@ -65,21 +63,27 @@ COUNT_TABLES = (
     "screen_fact_cluster_members",
     "screen_observations",
     "screen_observation_facts",
+    "task_workstream",
+    "task_workstream_observations",
+    "task_workstream_members",
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run screen-memory fact_extraction, fact clustering, and observation "
-            "generation against Screenpipe and OpenChronicle databases."
+            "Run selected screen-memory fact extraction, observation, and task "
+            "generation phases against Screenpipe and OpenChronicle databases."
         )
     )
     parser.add_argument(
-        "--mode",
-        choices=("once", "timeline"),
-        default="once",
-        help="Run one full-range pipeline or simulate the configured schedule.",
+        "--phase",
+        action="append",
+        choices=("all", "fact_extraction", "observations", "tasks"),
+        help=(
+            "Pipeline phase to run. Pass multiple times to run a subset in "
+            "order. Defaults to all."
+        ),
     )
     parser.add_argument(
         "--screenpipe-db",
@@ -97,38 +101,31 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
+        help=(
+            "Output directory. Defaults to "
+            "tmp/screen_memory_pipeline_test/<selected-phases>."
+        ),
     )
     parser.add_argument(
         "--db-name",
         default="screen_memory_pipeline_test.db",
     )
-    parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
-    parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH)
     parser.add_argument(
-        "--fact-extraction-interval-minutes",
-        dest="fact_extraction_interval_minutes",
-        type=int,
-        help="Override screen_memory.fact_extraction_interval_minutes.",
-    )
-    parser.add_argument(
-        "--observation-interval-hours",
-        type=float,
-        help="Override screen_memory.observation_interval_hours.",
-    )
-    parser.add_argument(
-        "--no-finalize",
-        action="store_false",
-        dest="finalize",
+        "--input-db",
+        "--seed-db",
+        dest="input_db",
+        type=Path,
         help=(
-            "In timeline mode, do not run the default completion pass at the "
-            "last source timestamp."
+            "Existing cleaned screen-memory database to copy into the output "
+            "database before running the selected phases."
         ),
     )
-    parser.set_defaults(finalize=True)
+    parser.add_argument("--log-path", type=Path)
+    parser.add_argument("--report-path", type=Path)
     parser.add_argument(
         "--disable-llm",
         action="store_true",
-        help="Disable screen fact and observation LLM calls for a local smoke test.",
+        help="Disable screen-memory LLM calls for a local smoke test.",
     )
     parser.add_argument(
         "--overwrite",
@@ -162,6 +159,8 @@ def configure_logging(log_path: Path, log_level: str) -> None:
 
 
 def remove_existing_outputs(paths: Iterable[Path], overwrite: bool) -> None:
+    if not overwrite:
+        return
     expanded: List[Path] = []
     for path in paths:
         expanded.extend([
@@ -169,15 +168,150 @@ def remove_existing_outputs(paths: Iterable[Path], overwrite: bool) -> None:
             Path(f"{path}-wal"),
             Path(f"{path}-shm"),
         ])
-    existing = [path for path in expanded if path.exists()]
-    if existing and not overwrite:
-        joined = "\n  ".join(str(path) for path in existing)
-        raise FileExistsError(
-            "Output already exists. Pass --overwrite to replace:\n  "
-            f"{joined}"
-        )
-    for path in existing:
+    for path in (path for path in expanded if path.exists()):
         path.unlink()
+
+
+def _clear_tables_if_present(
+    connection: sqlite3.Connection,
+    tables: Iterable[str],
+) -> List[str]:
+    existing = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    cleared: List[str] = []
+    for table in tables:
+        if table not in existing:
+            continue
+        connection.execute(f"DELETE FROM {table}")
+        cleared.append(table)
+    return cleared
+
+
+def prune_seed_database_for_phases(
+    database_path: Path,
+    phases: Iterable[str],
+) -> Dict[str, Any]:
+    ordered_phases = ["fact_extraction", "observations", "tasks"]
+    phase_set = set(phases)
+    first_phase = next((phase for phase in ordered_phases if phase in phase_set), "fact_extraction")
+    connection = sqlite3.connect(database_path)
+    try:
+        cleared: List[str] = []
+        reset_clusters = False
+        if first_phase == "fact_extraction":
+            cleared.extend(_clear_tables_if_present(
+                connection,
+                [
+                    "report_blocks",
+                    "task_workstream_observations",
+                    "task_workstream_members",
+                    "task_workstream",
+                    "screen_observation_facts",
+                    "screen_observations",
+                    "screen_fact_cluster_members",
+                    "screen_fact_clusters",
+                    "screen_facts",
+                    "window_workstream_members",
+                    "window_workstream",
+                    "view_records",
+                    "view_segments",
+                    "views",
+                    "segments",
+                    "record_ax_events",
+                    "openchronicle_events",
+                    "records",
+                ],
+            ))
+        elif first_phase == "observations":
+            cleared.extend(_clear_tables_if_present(
+                connection,
+                [
+                    "report_blocks",
+                    "task_workstream_observations",
+                    "task_workstream_members",
+                    "task_workstream",
+                    "screen_observation_facts",
+                    "screen_observations",
+                ],
+            ))
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'screen_fact_clusters'"
+            ).fetchone():
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(screen_fact_clusters)"
+                    ).fetchall()
+                }
+                assignments = []
+                if "observation_id" in columns:
+                    assignments.append("observation_id = NULL")
+                if "observed_fact_count" in columns:
+                    assignments.append("observed_fact_count = 0")
+                if assignments:
+                    connection.execute(
+                        f"UPDATE screen_fact_clusters SET {', '.join(assignments)}"
+                    )
+                    reset_clusters = True
+        elif first_phase == "tasks":
+            cleared.extend(_clear_tables_if_present(
+                connection,
+                [
+                    "report_blocks",
+                    "task_workstream_observations",
+                    "task_workstream_members",
+                    "task_workstream",
+                ],
+            ))
+        connection.commit()
+        return {
+            "first_phase": first_phase,
+            "cleared_tables": cleared,
+            "reset_screen_fact_clusters": reset_clusters,
+        }
+    finally:
+        connection.close()
+
+
+def copy_seed_database(
+    seed_db: Path,
+    output_db: Path,
+    *,
+    overwrite: bool,
+    phases: Iterable[str],
+) -> Dict[str, Any]:
+    seed_db = seed_db.expanduser().resolve()
+    output_db = output_db.expanduser().resolve()
+    if not seed_db.is_file():
+        raise FileNotFoundError(f"Input cleaned database not found: {seed_db}")
+    if output_db.exists() and not overwrite:
+        raise FileExistsError(
+            "Output database already exists. Pass --overwrite to replace it "
+            f"from --input-db, or use the existing output directly: {output_db}"
+        )
+    output_db.parent.mkdir(parents=True, exist_ok=True)
+    if output_db.exists():
+        remove_existing_outputs((output_db,), overwrite=True)
+    source = sqlite3.connect(seed_db)
+    try:
+        target = sqlite3.connect(output_db)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+    finally:
+        source.close()
+    prune_report = prune_seed_database_for_phases(output_db, phases)
+    return {
+        "copied": True,
+        "input_db": str(seed_db),
+        "output_db": str(output_db),
+        **prune_report,
+    }
 
 
 def _source_edge_timestamp(
@@ -270,73 +404,56 @@ def run_once(
     manager: ScreenMemoryManager,
     start: datetime,
     end: datetime,
+    *,
+    phases: Iterable[str],
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     state: Dict[str, Any] = {
         "last_fact_extraction_at": _format_utc_time(start),
     }
-    events = [
-        _phase_result("fact_extraction", end, _run_fact_extraction(manager, state, end)),
-        _phase_result(
-            "observations",
-            end,
-            _run_observations(manager, state, end),
-        ),
-    ]
-    return state, events
-
-
-def run_timeline(
-    manager: ScreenMemoryManager,
-    start: datetime,
-    end: datetime,
-    *,
-    fact_extraction_interval: timedelta,
-    observation_interval: timedelta,
-    finalize: bool,
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    state: Dict[str, Any] = {}
     events: List[Dict[str, Any]] = []
-    next_fact_extraction = start
-    next_observation = start
-
-    while min(next_fact_extraction, next_observation) <= end:
-        now = min(next_fact_extraction, next_observation)
-        logging.info("timeline tick=%s", _format_utc_time(now))
-        if next_fact_extraction == now:
+    for phase in phases:
+        if phase == "fact_extraction":
             events.append(
                 _phase_result(
                     "fact_extraction",
-                    now,
-                    _run_fact_extraction(manager, state, now),
+                    end,
+                    _run_fact_extraction(manager, state, end),
                 )
             )
-            next_fact_extraction += fact_extraction_interval
-        if next_observation == now:
+        elif phase == "observations":
             events.append(
                 _phase_result(
                     "observations",
-                    now,
-                    _run_observations(manager, state, now),
+                    end,
+                    _run_observations(manager, state, end),
                 )
             )
-            next_observation += observation_interval
-
-    last_fact_extraction = state.get("last_fact_extraction_at")
-    if finalize and last_fact_extraction != _format_utc_time(end):
-        logging.info("timeline finalization tick=%s", _format_utc_time(end))
-        events.extend([
-            _phase_result(
-                "fact_extraction",
-                end,
-                _run_fact_extraction(manager, state, end),
-            ),
-            _phase_result(
-                "observations",
-                end,
-                _run_observations(manager, state, end),
-            ),
-        ])
+        elif phase == "tasks":
+            events.append(
+                _phase_result(
+                    "tasks",
+                    end,
+                    _run_tasks(manager, state, end),
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported screen-memory phase: {phase}")
     return state, events
+
+
+def normalize_phases(raw_phases: Optional[List[str]]) -> List[str]:
+    default_phases = ["fact_extraction", "observations", "tasks"]
+    if not raw_phases or "all" in raw_phases:
+        return default_phases
+    phases: List[str] = []
+    for phase in raw_phases:
+        if phase not in phases:
+            phases.append(phase)
+    return phases
+
+
+def phase_output_slug(phases: Iterable[str]) -> str:
+    return "__".join(str(phase).strip() for phase in phases if str(phase).strip()) or "all"
 
 
 def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
@@ -382,8 +499,8 @@ def collect_database_report(
 
 
 def main() -> int:
-    load_dotenv(REPO_ROOT / ".env")
-    load_dotenv(get_hermes_home() / ".env")
+    # load_dotenv(REPO_ROOT / ".env")
+    # load_dotenv(get_hermes_home() / ".env")
     args = parse_args()
 
     screenpipe_db = args.screenpipe_db.expanduser().resolve()
@@ -395,11 +512,24 @@ def main() -> int:
         if not path.is_file():
             raise FileNotFoundError(f"{label} database not found: {path}")
 
-    output_dir = args.output_dir.expanduser().resolve()
+    phases = normalize_phases(args.phase)
+    selected_output_dir = args.output_dir
+    if selected_output_dir == DEFAULT_OUTPUT_DIR:
+        selected_output_dir = DEFAULT_OUTPUT_ROOT / phase_output_slug(phases)
+    output_dir = selected_output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     output_db = output_dir / args.db_name
-    log_path = args.log_path.expanduser().resolve()
-    report_path = args.report_path.expanduser().resolve()
+    input_db = args.input_db.expanduser().resolve() if args.input_db else None
+    log_path = (
+        args.log_path.expanduser().resolve()
+        if args.log_path
+        else output_dir / DEFAULT_LOG_FILENAME
+    )
+    report_path = (
+        args.report_path.expanduser().resolve()
+        if args.report_path
+        else output_dir / DEFAULT_REPORT_FILENAME
+    )
     remove_existing_outputs(
         (output_db, log_path, report_path),
         args.overwrite,
@@ -415,33 +545,48 @@ def main() -> int:
         "cleaned_db": str(output_db),
     })
     schedule = manager_config["schedule"]
-    if args.fact_extraction_interval_minutes is not None:
-        schedule["fact_extraction_interval_minutes"] = max(
-            1,
-            int(args.fact_extraction_interval_minutes),
+    seed_copy_report = None
+    if input_db is not None:
+        seed_copy_report = copy_seed_database(
+            input_db,
+            output_db,
+            overwrite=args.overwrite,
+            phases=phases,
         )
-    if args.observation_interval_hours is not None:
-        schedule["observation_interval_hours"] = max(
-            0.001,
-            float(args.observation_interval_hours),
+        logging.info(
+            "seeded output database report=%s",
+            json.dumps(seed_copy_report, ensure_ascii=False, sort_keys=True),
+        )
+    if "fact_extraction" not in phases and not output_db.exists():
+        raise FileNotFoundError(
+            "Selected phases need an existing cleaned database with prior facts. "
+            "Run fact_extraction first, reuse an existing --output-dir/--db-name, "
+            "or pass --input-db/--seed-db."
         )
     if args.disable_llm:
         manager_config["segment_generation"]["enable_LLM_summary"] = False
         manager_config["window_workstream_generation"][
             "enable_LLM_summary"
         ] = False
-        screen_generation = manager_config["screen_memory_generation"]
-        screen_generation["enable_LLM_fact_extraction"] = False
-        screen_generation["enable_LLM_observation"] = False
+        manager_config["screen_fact_generation"]["enable_LLM"] = False
+        manager_config["screen_observation_generation"][
+            "enable_LLM_observation_generation"
+        ] = False
+        manager_config["task_workstream_generation"][
+            "enable_LLM_observation_matching"
+        ] = False
+        manager_config["task_workstream_generation"][
+            "enable_LLM_task_profile_update"
+        ] = False
 
     start, end, source_edges = load_source_time_range(
         screenpipe_db,
         openchronicle_db,
     )
     logging.info(
-        "screen-memory test mode=%s executable=%s source_range=%s..%s "
+        "screen-memory test phases=%s executable=%s source_range=%s..%s "
         "screenpipe=%s openchronicle=%s output=%s schedule=%s",
-        args.mode,
+        phases,
         sys.executable,
         _format_utc_time(start),
         _format_utc_time(end),
@@ -466,36 +611,26 @@ def main() -> int:
         quiet=True,
         screen_db=screen_db,
     )
-    effective_start = datetime(2026, 5, 9, 0, 0, tzinfo=timezone.utc) if args.mode == "once" else start
+    effective_start = datetime(2026, 5, 9, 0, 0, tzinfo=timezone.utc)
     try:
-        if args.mode == "once":
-            state, events = run_once(manager, effective_start, end)
-        else:
-            state, events = run_timeline(
-                manager,
-                effective_start,
-                end,
-                fact_extraction_interval=timedelta(
-                    minutes=max(1, int(schedule["fact_extraction_interval_minutes"]))
-                ),
-                observation_interval=timedelta(
-                    hours=max(
-                        0.001,
-                        float(schedule["observation_interval_hours"]),
-                    )
-                ),
-                finalize=bool(args.finalize),
-            )
+        state, events = run_once(
+            manager,
+            effective_start,
+            end,
+            phases=phases,
+        )
 
         database_report = collect_database_report(
             output_db,
             row_limit=max(0, int(args.detail_row_limit)),
         )
         report = {
-            "mode": args.mode,
+            "mode": "once",
+            "phases": phases,
             "source_databases": {
                 "screenpipe": str(screenpipe_db),
                 "openchronicle": str(openchronicle_db),
+                "input_cleaned": str(input_db) if input_db else None,
             },
             "source_edges": source_edges,
             "source_range": {
@@ -503,8 +638,8 @@ def main() -> int:
                 "end": _format_utc_time(end),
             },
             "schedule": schedule,
-            "finalized": bool(args.finalize),
             "llm_disabled": bool(args.disable_llm),
+            "seed_copy": seed_copy_report,
             "state": state,
             "events": events,
             "output_db": str(output_db),
@@ -533,9 +668,11 @@ def main() -> int:
         logging.info("report=%s log=%s", report_path, log_path)
         print(json.dumps({
             "status": "ok",
-            "mode": args.mode,
+            "mode": "once",
+            "phases": phases,
             "events": len(events),
             "output_db": str(output_db),
+            "input_db": str(input_db) if input_db else None,
             "report": str(report_path),
             "log": str(log_path),
             "counts": database_report["counts"],

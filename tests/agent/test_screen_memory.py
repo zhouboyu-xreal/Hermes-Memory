@@ -613,6 +613,526 @@ def test_low_fact_screen_cluster_uses_fallback_observation(tmp_path):
     connection.close()
 
 
+def test_screen_observations_generate_task_workstreams(tmp_path):
+    cleaner = _cleaner(tmp_path)
+    cleaner.task_workstream_cfg["enable_LLM_task_profile_update"] = False
+    cleaner.task_workstream_cfg["min_observations_to_create_task"] = 1
+    cleaner.screen_db = ScreenMemoryDB.ensure_cleaned_db(
+        cleaner.screen_db,
+        cleaner.cleaned_db,
+    )
+    connection = cleaner.screen_db.connection
+    cursor = connection.cursor()
+    _workstream_id, view_id = _seed_workstream(cursor)
+    for index in range(1, 6):
+        _add_fact(
+            cursor,
+            view_id,
+            f"fact-{index}",
+            f"Improved screen task aggregation from observation {index}.",
+            f"2026-06-01 10:{index + 5:02d}:00",
+        )
+    connection.commit()
+    observation_stats = cleaner.update_screen_observation_tables()
+
+    task_stats = cleaner.update_screen_task_tables()
+
+    assert observation_stats["screen_observations_generated"] == 1
+    assert task_stats["screen_tasks_generated"] == 1
+    assert task_stats["screen_observations_assigned_to_tasks"] == 1
+    task_row = cursor.execute(
+        """
+        SELECT id, title, observation_count, project_key, objective_key
+        FROM task_workstream
+        """
+    ).fetchone()
+    assert task_row is not None
+    assert task_row[2] == 1
+    assert task_row[3] == "hermes-agent"
+    assert task_row[4] == "screen-memory"
+    assert cursor.execute(
+        """
+        SELECT count(*)
+        FROM task_workstream_observations
+        WHERE task_workstream_id = ?
+        """,
+        (task_row[0],),
+    ).fetchone()[0] == 1
+    connection.close()
+
+
+def test_screen_task_generation_defers_singleton_observations_by_default(tmp_path):
+    cleaner = _cleaner(tmp_path)
+    cleaner.task_workstream_cfg["enable_LLM_observation_matching"] = False
+    cleaner.task_workstream_cfg["enable_LLM_task_profile_update"] = False
+    cleaner.screen_db = ScreenMemoryDB.ensure_cleaned_db(
+        cleaner.screen_db,
+        cleaner.cleaned_db,
+    )
+    connection = cleaner.screen_db.connection
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        INSERT INTO screen_observations
+        (observation_type, scope_type, scope_id, cluster_key, period_key,
+         period_start, period_end, title, summary_text, progress_text,
+         project_key, objective_key, work_type, category, key_points_json,
+         decisions_json, blockers_json, next_actions_json, entities_json,
+         artifacts_json, evidence_view_ids_json, evidence_record_ids_json,
+         evidence_window_workstream_ids_json, confidence, generation_method,
+         metadata_json, created_at, updated_at)
+        VALUES
+        ('context', 'window_workstream', 1, 'cluster-singleton', 'period-singleton',
+         '2026-06-01 12:00:00', '2026-06-01 12:05:00',
+         '单条观察不应立即形成 task',
+         '用户只产生了一条 task 候选 observation。',
+         '等待后续 observation 形成更稳定任务。',
+         'unknown', 'general', 'planning',
+         'general_work', '[]', '[]', '[]', '[]',
+         '["ScreenMemoryManager"]', '["agent/screen_memory/manager.py"]',
+         '[]', '[]', '[1]', 0.7, 'test', '{}',
+         '2026-06-01 12:05:00', '2026-06-01 12:05:00')
+        """
+    )
+    connection.commit()
+
+    task_stats = cleaner.update_screen_task_tables()
+
+    assert task_stats["screen_tasks_generated"] == 0
+    assert task_stats["screen_observations_assigned_to_tasks"] == 0
+    assert task_stats["screen_task_deferred_observation_count"] == 1
+    assert cursor.execute("SELECT count(*) FROM task_workstream").fetchone()[0] == 0
+    assert cursor.execute("SELECT count(*) FROM task_workstream_observations").fetchone()[0] == 0
+    connection.close()
+
+
+def test_screen_task_generation_builds_pending_task_from_all_observations(tmp_path):
+    cleaner = _cleaner(tmp_path)
+    cleaner.task_workstream_cfg["enable_LLM_observation_matching"] = False
+    cleaner.task_workstream_cfg["enable_LLM_task_profile_update"] = False
+    cleaner.screen_db = ScreenMemoryDB.ensure_cleaned_db(
+        cleaner.screen_db,
+        cleaner.cleaned_db,
+    )
+    connection = cleaner.screen_db.connection
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        INSERT INTO screen_observations
+        (observation_type, scope_type, scope_id, cluster_key, period_key,
+         period_start, period_end, title, summary_text, progress_text,
+         project_key, objective_key, work_type, category, key_points_json,
+         decisions_json, blockers_json, next_actions_json, entities_json,
+         artifacts_json, evidence_view_ids_json, evidence_record_ids_json,
+         evidence_window_workstream_ids_json, confidence, generation_method,
+         metadata_json, created_at, updated_at)
+        VALUES
+        ('context', 'window_workstream', 1, 'cluster-a', 'period-a',
+         '2026-06-01 09:00:00', '2026-06-01 09:05:00',
+         'screen memory task 聚合',
+         '用户在设计 pending observation 生成 task 的聚合逻辑。',
+         '完成 pending observation 聚合入口。',
+         'hermes-agent', 'screen-memory-task', 'implementation',
+         'general_work', '["聚合入口"]', '[]', '[]', '["继续验证"]',
+         '["ScreenMemoryManager"]', '["agent/screen_memory/manager.py"]',
+         '[]', '[]', '[1]', 0.7, 'test', '{}',
+         '2026-06-01 09:05:00', '2026-06-01 09:05:00'),
+        ('context', 'window_workstream', 1, 'cluster-b', 'period-b',
+         '2026-06-01 09:10:00', '2026-06-01 09:15:00',
+         'screen memory task 关联',
+         '用户发现组内剩余 observation 没有更新 task profile。',
+         '修复 task 与全部 observation 的关联和画像更新。',
+         'hermes-agent', 'screen-memory-task', 'implementation',
+         'general_work', '["画像更新"]', '[]', '[]', '["补充单测"]',
+         '["ScreenMemoryManager", "task_workstream_observations"]', '["agent/screen_memory/manager.py", "agent/screen_memory/screen_db.py"]',
+         '[]', '[]', '[2]', 0.9, 'test', '{}',
+         '2026-06-01 09:15:00', '2026-06-01 09:15:00')
+        """
+    )
+    connection.commit()
+
+    task_stats = cleaner.update_screen_task_tables()
+
+    assert task_stats["screen_tasks_generated"] == 1
+    assert task_stats["screen_observations_assigned_to_tasks"] == 2
+    row = cursor.execute(
+        """
+        SELECT observation_count, start_timestamp, end_timestamp, summary,
+               entities_json, artifacts_json, metadata_json,
+               window_workstream_count
+        FROM task_workstream
+        LIMIT 1
+        """
+    ).fetchone()
+    assert row[0] == 2
+    assert row[1].startswith("2026-06-01T09:00:00")
+    assert row[2].startswith("2026-06-01T09:15:00")
+    assert "pending observation 生成 task" in row[3]
+    assert "剩余 observation 没有更新 task profile" in row[3]
+    assert "ScreenMemoryManager" in row[4]
+    assert "task_workstream_observations" in row[4]
+    assert "manager.py" in row[5]
+    assert "screen_db.py" in row[5]
+    assert "screen_observation_group" in row[6]
+    assert row[7] == 2
+    assert cursor.execute(
+        "SELECT count(*) FROM task_workstream_observations"
+    ).fetchone()[0] == 2
+    connection.close()
+
+
+def test_screen_task_pending_group_ignores_objective_and_primary_artifact(tmp_path):
+    cleaner = _cleaner(tmp_path)
+    cleaner.task_workstream_cfg["enable_LLM_observation_matching"] = False
+    cleaner.task_workstream_cfg["enable_LLM_task_profile_update"] = False
+    cleaner.screen_db = ScreenMemoryDB.ensure_cleaned_db(
+        cleaner.screen_db,
+        cleaner.cleaned_db,
+    )
+    connection = cleaner.screen_db.connection
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        INSERT INTO screen_observations
+        (observation_type, scope_type, scope_id, cluster_key, period_key,
+         period_start, period_end, title, summary_text, progress_text,
+         project_key, objective_key, work_type, category, key_points_json,
+         decisions_json, blockers_json, next_actions_json, entities_json,
+         artifacts_json, evidence_view_ids_json, evidence_record_ids_json,
+         evidence_window_workstream_ids_json, confidence, generation_method,
+         metadata_json, created_at, updated_at)
+        VALUES
+        ('context', 'window_workstream', 1, 'cluster-a', 'period-a',
+         '2026-06-01 13:00:00', '2026-06-01 13:05:00',
+         'Aura 配件生态调研',
+         '用户整理 Aura 配件生态调研材料。',
+         '形成配件调研材料。',
+         'aura-accessory-ecosystem', 'accessory-survey', 'research',
+         'general_work', '[]', '[]', '[]', '[]',
+         '["Aura"]', '["Aura 配件专项调研表.md"]',
+         '[]', '[]', '[1]', 0.8, 'test', '{}',
+         '2026-06-01 13:05:00', '2026-06-01 13:05:00'),
+        ('context', 'window_workstream', 1, 'cluster-b', 'period-b',
+         '2026-06-01 13:10:00', '2026-06-01 13:15:00',
+         'Aura USB 连接调研',
+         '用户梳理 Aura 配件生态 USB 连接链路。',
+         '形成 USB 连接链路理解。',
+         'aura-accessory-ecosystem', 'usb-connection-optimization', 'research',
+         'general_work', '[]', '[]', '[]', '[]',
+         '["XREAL"]', '["PRD文档"]',
+         '[]', '[]', '[2]', 0.8, 'test', '{}',
+         '2026-06-01 13:15:00', '2026-06-01 13:15:00')
+        """
+    )
+    connection.commit()
+
+    task_stats = cleaner.update_screen_task_tables()
+
+    assert task_stats["screen_tasks_generated"] == 1
+    assert task_stats["screen_observations_assigned_to_tasks"] == 2
+    row = cursor.execute(
+        """
+        SELECT project_key, work_type, observation_count, summary, artifacts_json
+        FROM task_workstream
+        LIMIT 1
+        """
+    ).fetchone()
+    assert row[0] == "aura-accessory-ecosystem"
+    assert row[1] == "research"
+    assert row[2] == 2
+    assert "配件生态调研材料" in row[3]
+    assert "USB 连接链路" in row[3]
+    assert "Aura 配件专项调研表.md" in row[4]
+    assert "PRD文档" in row[4]
+    connection.close()
+
+
+def test_screen_task_matching_key_ignores_objective_and_primary_artifact(tmp_path):
+    cleaner = _cleaner(tmp_path)
+    cleaner.task_workstream_cfg["enable_LLM_observation_matching"] = False
+    cleaner.task_workstream_cfg["enable_LLM_task_profile_update"] = False
+    cleaner.task_workstream_cfg["min_observations_to_create_task"] = 1
+    cleaner.screen_db = ScreenMemoryDB.ensure_cleaned_db(
+        cleaner.screen_db,
+        cleaner.cleaned_db,
+    )
+    connection = cleaner.screen_db.connection
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        INSERT INTO screen_observations
+        (observation_type, scope_type, scope_id, cluster_key, period_key,
+         period_start, period_end, title, summary_text, progress_text,
+         project_key, objective_key, work_type, category, key_points_json,
+         decisions_json, blockers_json, next_actions_json, entities_json,
+         artifacts_json, evidence_view_ids_json, evidence_record_ids_json,
+         evidence_window_workstream_ids_json, confidence, generation_method,
+         metadata_json, created_at, updated_at)
+        VALUES
+        ('context', 'window_workstream', 1, 'cluster-a', 'period-a',
+         '2026-06-01 14:00:00', '2026-06-01 14:05:00',
+         'Hermes recall ranking 优化',
+         '用户优化 Hermes recall ranking 逻辑。',
+         '调整 recall ranking。',
+         'hermes', 'recall-ranking', 'implementation',
+         'general_work', '[]', '[]', '[]', '[]',
+         '["Hermes"]', '["memory_node_manager.py"]',
+         '[]', '[]', '[1]', 0.8, 'test', '{}',
+         '2026-06-01 14:05:00', '2026-06-01 14:05:00'),
+        ('context', 'window_workstream', 1, 'cluster-b', 'period-b',
+         '2026-06-01 14:10:00', '2026-06-01 14:15:00',
+         'Hermes screen task 优化',
+         '用户继续优化 Hermes screen task 匹配逻辑。',
+         '调整 task matching key。',
+         'hermes', 'screen-task-matching', 'implementation',
+         'general_work', '[]', '[]', '[]', '[]',
+         '["ScreenMemoryManager"]', '["agent/screen_memory/manager.py"]',
+         '[]', '[]', '[2]', 0.8, 'test', '{}',
+         '2026-06-01 14:15:00', '2026-06-01 14:15:00')
+        """
+    )
+    connection.commit()
+
+    task_stats = cleaner.update_screen_task_tables()
+
+    assert task_stats["screen_tasks_generated"] == 1
+    assert task_stats["screen_tasks_updated"] == 1
+    assert task_stats["screen_observations_assigned_to_tasks"] == 2
+    assert cursor.execute("SELECT count(*) FROM task_workstream").fetchone()[0] == 1
+    row = cursor.execute(
+        "SELECT task_key, observation_count, artifacts_json FROM task_workstream LIMIT 1"
+    ).fetchone()
+    assert row[0] == "hermes-implementation"
+    assert row[1] == 2
+    assert "memory_node_manager.py" in row[2]
+    assert "manager.py" in row[2]
+    connection.close()
+
+
+def test_screen_task_unknown_project_key_uses_disambiguation(tmp_path):
+    cleaner = _cleaner(tmp_path)
+    cleaner.task_workstream_cfg["enable_LLM_observation_matching"] = False
+    cleaner.task_workstream_cfg["enable_LLM_task_profile_update"] = False
+    cleaner.task_workstream_cfg["min_observations_to_create_task"] = 1
+    cleaner.screen_db = ScreenMemoryDB.ensure_cleaned_db(
+        cleaner.screen_db,
+        cleaner.cleaned_db,
+    )
+    connection = cleaner.screen_db.connection
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        INSERT INTO screen_observations
+        (observation_type, scope_type, scope_id, cluster_key, period_key,
+         period_start, period_end, title, summary_text, progress_text,
+         project_key, objective_key, work_type, category, key_points_json,
+         decisions_json, blockers_json, next_actions_json, entities_json,
+         artifacts_json, evidence_view_ids_json, evidence_record_ids_json,
+         evidence_window_workstream_ids_json, confidence, generation_method,
+         metadata_json, created_at, updated_at)
+        VALUES
+        ('context', 'window_workstream', 1, 'cluster-a', 'period-a',
+         '2026-06-01 15:00:00', '2026-06-01 15:05:00',
+         'RRA SAR 文案模板查询',
+         '用户查询韩国 RRA SAR 文案模板。',
+         '获得 SAR 文案模板。',
+         'unknown', 'general', 'research',
+         'general_work', '[]', '[]', '[]', '[]',
+         '["韩国RRA"]', '["SAR文案模板"]',
+         '[]', '[]', '[1]', 0.8, 'test', '{}',
+         '2026-06-01 15:05:00', '2026-06-01 15:05:00'),
+        ('context', 'window_workstream', 1, 'cluster-b', 'period-b',
+         '2026-06-01 15:10:00', '2026-06-01 15:15:00',
+         'VR180 视场角资料阅读',
+         '用户阅读 VR180 模式视场角对比资料。',
+         '了解 VR180 视场角差异。',
+         'unknown', 'general', 'research',
+         'general_work', '[]', '[]', '[]', '[]',
+         '["Insta360 EVO"]', '["VR180视场角对比"]',
+         '[]', '[]', '[2]', 0.8, 'test', '{}',
+         '2026-06-01 15:15:00', '2026-06-01 15:15:00')
+        """
+    )
+    connection.commit()
+
+    task_stats = cleaner.update_screen_task_tables()
+
+    assert task_stats["screen_tasks_generated"] == 2
+    assert task_stats["screen_tasks_updated"] == 0
+    assert task_stats["screen_observations_assigned_to_tasks"] == 2
+    rows = cursor.execute(
+        "SELECT task_key, observation_count FROM task_workstream ORDER BY id"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0][1] == 1
+    assert rows[1][1] == 1
+    assert rows[0][0] != rows[1][0]
+    connection.close()
+
+
+def test_screen_task_generation_uses_llm_to_match_candidate_task(tmp_path, monkeypatch):
+    cleaner = _cleaner(tmp_path)
+    cleaner.task_workstream_cfg["enable_LLM_observation_matching"] = True
+    cleaner.task_workstream_cfg["enable_LLM_task_profile_update"] = False
+    cleaner.task_workstream_cfg["observation_match_llm_budget"] = 5
+    cleaner.task_workstream_cfg["min_observations_to_create_task"] = 1
+    cleaner.screen_db = ScreenMemoryDB.ensure_cleaned_db(
+        cleaner.screen_db,
+        cleaner.cleaned_db,
+    )
+    connection = cleaner.screen_db.connection
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        INSERT INTO screen_observations
+        (observation_type, scope_type, scope_id, cluster_key, period_key,
+         period_start, period_end, title, summary_text, progress_text,
+         project_key, objective_key, work_type, category, key_points_json,
+         decisions_json, blockers_json, next_actions_json, entities_json,
+         artifacts_json, evidence_view_ids_json, evidence_record_ids_json,
+         evidence_window_workstream_ids_json, confidence, generation_method,
+         metadata_json, created_at, updated_at)
+        VALUES
+        ('context', 'window_workstream', 1, 'cluster-a', 'period-a',
+         '2026-06-01 10:00:00', '2026-06-01 10:05:00',
+         '优化 screen memory task 聚合',
+         '用户在优化 screen memory task 聚合逻辑。',
+         '推进 observation 到 task 的聚合实现。',
+         'hermes-agent', 'screen-memory-task', 'implementation',
+         'general_work', '[]', '[]', '[]', '[]',
+         '["ScreenMemoryManager"]', '["agent/screen_memory/manager.py"]',
+         '[]', '[]', '[1]', 0.8, 'test', '{}',
+         '2026-06-01 10:05:00', '2026-06-01 10:05:00'),
+        ('context', 'window_workstream', 1, 'cluster-b', 'period-b',
+         '2026-06-01 10:10:00', '2026-06-01 10:15:00',
+         '继续优化 screen memory task 匹配',
+         '用户继续优化 observation 与 task 的匹配逻辑。',
+         '使用 LLM 判断 observation 是否属于已有 task。',
+         'hermes-agent', 'screen-memory-task', 'implementation',
+         'general_work', '[]', '[]', '[]', '[]',
+         '["ScreenMemoryManager"]', '["agent/screen_memory/manager.py"]',
+         '[]', '[]', '[1]', 0.8, 'test', '{}',
+         '2026-06-01 10:15:00', '2026-06-01 10:15:00')
+        """
+    )
+    connection.commit()
+    calls = []
+
+    def _match_with_llm(observation, candidates, _config):
+        calls.append((observation["id"], [item["task"]["id"] for item in candidates]))
+        return {
+            "decision": "match_existing",
+            "task_workstream_id": candidates[0]["task"]["id"],
+            "confidence": 0.91,
+            "role": "progress",
+            "reason": "同一文件和同一目标的连续优化。",
+        }
+
+    monkeypatch.setattr(cleaner, "match_observation_to_task_using_llm", _match_with_llm)
+
+    task_stats = cleaner.update_screen_task_tables()
+
+    assert len(calls) == 1
+    assert task_stats["screen_tasks_generated"] == 1
+    assert task_stats["screen_tasks_updated"] == 1
+    assert task_stats["screen_task_llm_match_count"] == 1
+    assert cursor.execute("SELECT count(*) FROM task_workstream").fetchone()[0] == 1
+    assert cursor.execute(
+        "SELECT count(*) FROM task_workstream_observations"
+    ).fetchone()[0] == 2
+    role, reason = cursor.execute(
+        """
+        SELECT role, reason
+        FROM task_workstream_observations
+        ORDER BY observation_id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    assert role == "progress"
+    assert reason.startswith("llm:")
+    connection.close()
+
+
+def test_screen_task_generation_uses_llm_to_update_task_profile(tmp_path, monkeypatch):
+    cleaner = _cleaner(tmp_path)
+    cleaner.task_workstream_cfg["enable_LLM_observation_matching"] = False
+    cleaner.task_workstream_cfg["enable_LLM_task_profile_update"] = True
+    cleaner.task_workstream_cfg["task_profile_llm_budget"] = 5
+    cleaner.task_workstream_cfg["min_observations_to_create_task"] = 1
+    cleaner.screen_db = ScreenMemoryDB.ensure_cleaned_db(
+        cleaner.screen_db,
+        cleaner.cleaned_db,
+    )
+    connection = cleaner.screen_db.connection
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        INSERT INTO screen_observations
+        (observation_type, scope_type, scope_id, cluster_key, period_key,
+         period_start, period_end, title, summary_text, progress_text,
+         project_key, objective_key, work_type, category, key_points_json,
+         decisions_json, blockers_json, next_actions_json, entities_json,
+         artifacts_json, evidence_view_ids_json, evidence_record_ids_json,
+         evidence_window_workstream_ids_json, confidence, generation_method,
+         metadata_json, created_at, updated_at)
+        VALUES
+        ('context', 'window_workstream', 1, 'cluster-profile', 'period-profile',
+         '2026-06-01 11:00:00', '2026-06-01 11:05:00',
+         '规则标题',
+         '用户实现 observation 到 task 的 profile 更新。',
+         'LLM 生成 task profile。',
+         'hermes-agent', 'screen-memory-task', 'implementation',
+         'general_work', '[]', '[]', '[]', '[]',
+         '["ScreenMemoryManager"]', '["agent/screen_memory/manager.py"]',
+         '[]', '[]', '[1]', 0.7, 'test', '{}',
+         '2026-06-01 11:05:00', '2026-06-01 11:05:00')
+        """
+    )
+    connection.commit()
+    calls = []
+
+    def _profile_with_llm(mode, previous_task, observation, local_task, _config):
+        calls.append((mode, previous_task, observation["id"], local_task["title"]))
+        return {
+            "title": "LLM 生成的任务标题",
+            "summary": "LLM 归纳后的长期任务摘要。",
+            "progress_text": "LLM 归纳后的当前进展。",
+            "status": "active",
+            "category": "implement_feature",
+            "project_key": "hermes-agent",
+            "objective_key": "screen-memory-task",
+            "work_type": "implementation",
+            "entities": ["ScreenMemoryManager", "update_screen_task_tables"],
+            "artifacts": ["agent/screen_memory/manager.py"],
+            "blockers": [],
+            "next_actions": ["继续验证 profile 更新效果"],
+            "confidence": 0.92,
+        }
+
+    monkeypatch.setattr(cleaner, "update_task_profile_using_llm", _profile_with_llm)
+
+    task_stats = cleaner.update_screen_task_tables()
+
+    assert calls and calls[0][0] == "create"
+    assert task_stats["screen_task_profile_llm_count"] == 1
+    row = cursor.execute(
+        """
+        SELECT title, summary, progress_text, confidence, entities_json,
+               next_actions_json, metadata_json
+        FROM task_workstream
+        LIMIT 1
+        """
+    ).fetchone()
+    assert row[0] == "LLM 生成的任务标题"
+    assert row[1] == "LLM 归纳后的长期任务摘要。"
+    assert row[2] == "LLM 归纳后的当前进展。"
+    assert row[3] == 0.92
+    assert "update_screen_task_tables" in row[4]
+    assert "继续验证 profile 更新效果" in row[5]
+    assert "profile_update_method" in row[6]
+    connection.close()
+
+
 def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
     config = _cleaner(tmp_path).config
     screenpipe_db = tmp_path / "screenpipe.db"
@@ -662,12 +1182,18 @@ def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
         state["last_observation_at"] = now.isoformat()
         return {}
 
+    def _task(_cleaner, state, now):
+        calls.append("task")
+        state["last_task_at"] = now.isoformat()
+        return {}
+
     monkeypatch.setattr(service, "_run_fact_extraction", _ingest)
     monkeypatch.setattr(service, "_run_observations", _observe)
+    monkeypatch.setattr(service, "_run_tasks", _task)
 
     start = datetime(2026, 6, 1, tzinfo=timezone.utc)
     service.run_screen_memory_due_work(now=start)
-    assert calls == ["ingest", "observation"]
+    assert calls == ["ingest", "observation", "task"]
 
     calls.clear()
     service.run_screen_memory_due_work(
@@ -679,13 +1205,13 @@ def test_screen_memory_service_runs_independent_cadences(tmp_path, monkeypatch):
     service.run_screen_memory_due_work(
         now=datetime(2026, 6, 1, 6, tzinfo=timezone.utc)
     )
-    assert calls == ["ingest"]
+    assert calls == ["ingest", "task"]
 
     calls.clear()
     service.run_screen_memory_due_work(
         now=datetime(2026, 6, 2, tzinfo=timezone.utc)
     )
-    assert calls == ["ingest", "observation"]
+    assert calls == ["ingest", "observation", "task"]
 
 
 def test_incremental_update_screen_facts_table_merges_screenpipe_and_openchronicle_into_workstream(tmp_path):
