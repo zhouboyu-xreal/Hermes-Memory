@@ -102,9 +102,6 @@ SCREEN_MEMORY_DEFAULTS: Dict[str, Any] = {
         "max_observations_per_run": 200,
         "llm_timeout": 120,
     },
-    "report_block_generation": {
-        "enabled": False,
-    },
 }
 
 
@@ -170,7 +167,6 @@ def load_screen_memory_config(config: Dict[str, Any] | None = None) -> Dict[str,
         "segment_generation": settings["segment_generation"],
         "window_workstream_generation": settings["window_workstream_generation"],
         "task_workstream_generation": settings["task_workstream_generation"],
-        "report_block_generation": settings["report_block_generation"],
         "screen_fact_generation": settings["screen_fact_generation"],
         "screen_observation_generation": settings["screen_observation_generation"],
         "embedding": _load_embedding_config(config),

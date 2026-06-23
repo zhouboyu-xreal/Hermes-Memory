@@ -459,125 +459,6 @@ class ScreenMemoryDB:
         """)
 
         cursor.execute("""
-        CREATE TABLE IF NOT EXISTS report_blocks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_workstream_id INTEGER,
-            source_type TEXT,
-            source_id INTEGER,
-            period_key TEXT NOT NULL,
-            period_start TEXT NOT NULL,
-            period_end TEXT NOT NULL,
-            title TEXT,
-            category TEXT,
-            project_key TEXT,
-            objective_key TEXT,
-            work_type TEXT,
-            summary_text TEXT,
-            progress_text TEXT,
-            key_points_json TEXT,
-            decisions_json TEXT,
-            blockers_json TEXT,
-            next_actions_json TEXT,
-            entities_json TEXT,
-            artifacts_json TEXT,
-            evidence_view_ids_json TEXT,
-            evidence_window_workstream_ids_json TEXT,
-            evidence_record_ids_json TEXT,
-            confidence REAL,
-            llm_summary_json TEXT,
-            llm_model TEXT,
-            llm_status TEXT,
-            llm_error TEXT,
-            llm_hash TEXT,
-            llm_updated_at TEXT,
-            created_at TEXT,
-            updated_at TEXT,
-            FOREIGN KEY (task_workstream_id) REFERENCES task_workstream(id) ON DELETE CASCADE
-        );
-        """)
-
-        existing_report_block_columns = {
-            row[1] for row in cursor.execute("PRAGMA table_info(report_blocks)").fetchall()
-        }
-        for column_name, column_type in [
-            ("source_type", "TEXT"),
-            ("source_id", "INTEGER"),
-            ("project_key", "TEXT"),
-            ("objective_key", "TEXT"),
-            ("work_type", "TEXT"),
-        ]:
-            if column_name not in existing_report_block_columns:
-                cursor.execute(f"ALTER TABLE report_blocks ADD COLUMN {column_name} {column_type}")
-
-        report_block_info = cursor.execute("PRAGMA table_info(report_blocks)").fetchall()
-        report_block_columns = {row[1] for row in report_block_info}
-        task_id_column = next((row for row in report_block_info if row[1] == "task_workstream_id"), None)
-        if task_id_column and task_id_column[3]:
-            source_type_expr = "'task_workstream'"
-            source_id_expr = "task_workstream_id"
-            if "source_type" in report_block_columns:
-                source_type_expr = "COALESCE(source_type, 'task_workstream')"
-            if "source_id" in report_block_columns:
-                source_id_expr = "COALESCE(source_id, task_workstream_id)"
-            cursor.execute("ALTER TABLE report_blocks RENAME TO report_blocks_old")
-            cursor.execute("""
-            CREATE TABLE report_blocks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_workstream_id INTEGER,
-                source_type TEXT,
-                source_id INTEGER,
-                period_key TEXT NOT NULL,
-                period_start TEXT NOT NULL,
-                period_end TEXT NOT NULL,
-                title TEXT,
-                category TEXT,
-                project_key TEXT,
-                objective_key TEXT,
-                work_type TEXT,
-                summary_text TEXT,
-                progress_text TEXT,
-                key_points_json TEXT,
-                decisions_json TEXT,
-                blockers_json TEXT,
-                next_actions_json TEXT,
-                entities_json TEXT,
-                artifacts_json TEXT,
-                evidence_view_ids_json TEXT,
-                evidence_window_workstream_ids_json TEXT,
-                evidence_record_ids_json TEXT,
-                confidence REAL,
-                llm_summary_json TEXT,
-                llm_model TEXT,
-                llm_status TEXT,
-                llm_error TEXT,
-                llm_hash TEXT,
-                llm_updated_at TEXT,
-                created_at TEXT,
-                updated_at TEXT,
-                FOREIGN KEY (task_workstream_id) REFERENCES task_workstream(id) ON DELETE CASCADE
-            );
-            """)
-            cursor.execute(f"""
-            INSERT INTO report_blocks
-            (id, task_workstream_id, source_type, source_id, period_key, period_start, period_end,
-             title, category, project_key, objective_key, work_type, summary_text, progress_text,
-             key_points_json, decisions_json, blockers_json, next_actions_json, entities_json,
-             artifacts_json, evidence_view_ids_json, evidence_window_workstream_ids_json,
-             evidence_record_ids_json, confidence, llm_summary_json, llm_model, llm_status,
-             llm_error, llm_hash, llm_updated_at, created_at, updated_at)
-            SELECT
-             id, task_workstream_id, {source_type_expr}, {source_id_expr}, period_key,
-             period_start, period_end, title, category, project_key, objective_key, work_type,
-             summary_text, progress_text, key_points_json, decisions_json, blockers_json,
-             next_actions_json, entities_json, artifacts_json, evidence_view_ids_json,
-             evidence_window_workstream_ids_json, evidence_record_ids_json, confidence,
-             llm_summary_json, llm_model, llm_status, llm_error, llm_hash, llm_updated_at,
-             created_at, updated_at
-            FROM report_blocks_old
-            """)
-            cursor.execute("DROP TABLE report_blocks_old")
-
-        cursor.execute("""
         CREATE TABLE IF NOT EXISTS screen_facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             view_id INTEGER NOT NULL,
@@ -759,11 +640,6 @@ class ScreenMemoryDB:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_workstream_members_window ON task_workstream_members(window_workstream_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_workstream_observations_task ON task_workstream_observations(task_workstream_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_workstream_observations_observation ON task_workstream_observations(observation_id);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_report_blocks_period ON report_blocks(period_start, period_end);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_report_blocks_task ON report_blocks(task_workstream_id);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_report_blocks_source ON report_blocks(source_type, source_id);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_report_blocks_project ON report_blocks(project_key);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_report_blocks_objective ON report_blocks(objective_key);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_screen_facts_view ON screen_facts(view_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_screen_facts_time ON screen_facts(start_timestamp, end_timestamp);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_screen_facts_project ON screen_facts(project_key, objective_key);")
@@ -778,15 +654,6 @@ class ScreenMemoryDB:
             "CREATE INDEX IF NOT EXISTS idx_screen_fact_cluster_members_cluster "
             "ON screen_fact_cluster_members(cluster_id);"
         )
-        cursor.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_report_blocks_task_period "
-            "ON report_blocks(task_workstream_id, period_start, period_end);"
-        )
-        cursor.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_report_blocks_source_period "
-            "ON report_blocks(source_type, source_id, period_start, period_end);"
-        )
-
         fts_row = cursor.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='records_fts'"
         ).fetchone()
@@ -2006,7 +1873,6 @@ class ScreenMemoryDB:
             total_member_count = cursor.execute("SELECT count(*) FROM window_workstream_members").fetchone()[0]
             total_task_count = cursor.execute("SELECT count(*) FROM task_workstream").fetchone()[0]
             total_task_member_count = cursor.execute("SELECT count(*) FROM task_workstream_members").fetchone()[0]
-            total_report_block_count = cursor.execute("SELECT count(*) FROM report_blocks").fetchone()[0]
             total_screen_fact_count = cursor.execute("SELECT count(*) FROM screen_facts").fetchone()[0]
             total_screen_observation_count = cursor.execute("SELECT count(*) FROM screen_observations").fetchone()[0]
         except sqlite3.Error:
@@ -2015,7 +1881,6 @@ class ScreenMemoryDB:
                 "window_workstream_members": 0,
                 "task_workstream": 0,
                 "task_workstream_members": 0,
-                "report_blocks": 0,
                 "screen_facts": 0,
                 "screen_observations": 0,
             }
@@ -2024,7 +1889,6 @@ class ScreenMemoryDB:
             "window_workstream_members": total_member_count,
             "task_workstream": total_task_count,
             "task_workstream_members": total_task_member_count,
-            "report_blocks": total_report_block_count,
             "screen_facts": total_screen_fact_count,
             "screen_observations": total_screen_observation_count,
         }
