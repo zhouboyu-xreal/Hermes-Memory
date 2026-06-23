@@ -118,6 +118,7 @@ def _inject_runtime_config(
         "window_workstream_generation",
         "screen_fact_generation",
         "screen_observation_generation",
+        "task_workstream_generation",
     ):
         section = manager_config.get(section_name)
         if not isinstance(section, dict):
@@ -186,6 +187,18 @@ def _run_observations(
     return stats
 
 
+def _run_tasks(
+    manager: ScreenMemoryManager,
+    state: Dict[str, Any],
+    now: datetime,
+) -> Dict[str, Any]:
+    now = _as_utc(now)
+    stats = manager.update_screen_task_tables()
+    state["last_task_at"] = _format_utc_time(now)
+    state["last_task_stats"] = stats
+    return stats
+
+
 def run_screen_memory_due_work(
     *,
     now: Optional[datetime] = None,
@@ -238,7 +251,15 @@ def run_screen_memory_due_work(
                 timedelta(hours=max(1, int(schedule["observation_interval_hours"]))),
             )
         )
-        if not any((fact_extraction_due, observation_due)):
+        task_due = force_phase in {"task", "tasks"} or (
+            force_phase is None
+            and _is_due(
+                state.get("last_task_at"),
+                current,
+                timedelta(hours=max(1, int(schedule.get("task_interval_hours", 6)))),
+            )
+        )
+        if not any((fact_extraction_due, observation_due, task_due)):
             return {
                 "status": "ok",
                 "phases": {},
@@ -262,6 +283,9 @@ def run_screen_memory_due_work(
             _save_state(state)
         if observation_due:
             phases["observations"] = _run_observations(manager, state, current)
+            _save_state(state)
+        if task_due:
+            phases["tasks"] = _run_tasks(manager, state, current)
             _save_state(state)
 
         if phases:

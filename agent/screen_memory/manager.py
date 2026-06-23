@@ -12,7 +12,7 @@ import struct
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -193,6 +193,89 @@ TASK_WORKSTREAM_LLM_USER_PROMPT_TEMPLATE = """请更新以下 task_workstream �
 {payload_json}
 """.strip()
 
+TASK_OBSERVATION_MATCH_LLM_SYSTEM_PROMPT = """你是屏幕记忆 task_workstream 匹配助手。你的任务是判断一条新的 screen_observation 是否属于已有 task_workstream 候选，或是否应该新建任务。
+规则：
+- 只基于输入中的 observation 和 candidate_task_workstreams 判断。
+- candidate_task_workstreams 已经由本地规则召回，不代表一定匹配；你需要保守判断。
+- 如果 observation 延续同一个目标、同一组代码/文档/项目、同一问题排查或同一讨论主题，应匹配已有 task。
+- 如果 observation 是新的明确任务、目标或项目，应 create_new。
+- 不要因为宽泛词相似就强行匹配，例如只都属于“聊天”“浏览”“代码”不足以匹配。
+- 输出必须是 JSON object，不要输出 Markdown、解释文字或代码块。
+
+输出 JSON 必须严格使用以下格式和字段名：
+{
+  "decision": "match_existing|create_new",
+  "task_workstream_id": 0,
+  "confidence": 0.0,
+  "role": "evidence|progress|blocker|outcome|context",
+  "reason": "中文一句话说明依据"
+}
+""".strip()
+
+TASK_OBSERVATION_MATCH_LLM_USER_PROMPT_TEMPLATE = """请判断 observation 是否属于某个候选 task_workstream。
+
+输入字段说明：
+- observation: 待归属的 screen_observation，包含标题、摘要、进展、项目键、目标键、实体、材料和时间范围。
+- candidate_task_workstreams: 本地规则召回的候选 task；如果候选都不合适，请输出 create_new。
+- local_candidate_scores: 本地规则给出的粗略相似度，只能作为参考，不能替代你的判断。
+
+判断要求：
+- 优先看具体 artifact/entity/目标是否连续。
+- 如果 observation 只是同一项目下完全不同目标，应该 create_new。
+- 如果候选为空，只能 create_new。
+- task_workstream_id 只能取 candidate_task_workstreams[].id；create_new 时输出 0。
+
+输入 JSON：
+{payload_json}
+""".strip()
+
+TASK_PROFILE_UPDATE_LLM_SYSTEM_PROMPT = """你是屏幕记忆 task_workstream profile 生成与更新助手。你的任务是根据一条新的 screen_observation，以及可选的既有 task_workstream，生成或更新该 task 的长期任务画像。
+规则：
+- 只基于输入中的 observation 和 previous_task 判断。
+- mode=create 时，生成一个新的 task_workstream profile。
+- mode=update 时，保留 previous_task 的长期连续性，并吸收 observation 中被证据支持的新进展。
+- 不要编造 observation 或 previous_task 中没有支持的人名、决定、完成状态、阻塞或下一步。
+- title 要描述真实任务目标，不要只是复制窗口名或 observation 标题。
+- summary 描述长期任务目标和范围；progress_text 描述当前累计进展。
+- status 只能在证据显示任务完成时设为 completed；一般持续工作设为 active。
+- 输出必须是 JSON object，不要输出 Markdown、解释文字或代码块。
+
+输出 JSON 必须严格使用以下格式和字段名：
+{
+  "title": "中文短标题，概括长期任务目标",
+  "summary": "中文 1-3 句话，说明该 task_workstream 长期围绕什么目标和工作范围",
+  "progress_text": "中文 1-3 句话，说明目前已有进展或最近变化",
+  "status": "active|paused|completed|stale",
+  "category": "implement_feature|debug_issue|research_topic|write_document|attend_meeting|reply_message|configure_system|general_work|other",
+  "project_key": "稳定项目键；证据不足时 unknown",
+  "objective_key": "稳定目标键；证据不足时 general",
+  "work_type": "implementation|debugging|research|documentation|communication|meeting|configuration|planning|general_work|other",
+  "entities": ["人名、项目名、产品名、库名、函数、类、配置字段、数据库表/列名等，0-20 个"],
+  "artifacts": ["文件名、路径、URL、命令、错误名、数据库文件、文档标题等，0-20 个"],
+  "blockers": ["阻塞项，0-6 条"],
+  "next_actions": ["下一步，0-6 条"],
+  "confidence": 0.0
+}
+""".strip()
+
+TASK_PROFILE_UPDATE_LLM_USER_PROMPT_TEMPLATE = """请根据新的 observation 生成或更新 task_workstream profile。
+
+输入字段说明：
+- mode: create 表示新建 task；update 表示更新已有 task。
+- observation: 新 observation，是这次更新的直接证据。
+- previous_task: 既有 task_workstream；create 时为 null。
+- local_task_after_rule_update: 本地规则合并后的 task 草稿，只作为 fallback 参考，不要盲从。
+
+证据使用要求：
+- observation 是最新证据，必须被吸收到 progress_text 或标签中。
+- previous_task 提供长期上下文；不要因为单条 observation 覆盖掉长期目标。
+- 如果 observation 是阶段性小进展，更新 progress_text；不要把 task title 改得过窄。
+- entities/artifacts 只输出输入中能支持的具体对象。
+
+输入 JSON：
+{payload_json}
+""".strip()
+
 REPORT_BLOCK_LLM_SYSTEM_PROMPT = """你是一个周期工作报告整理助手。你的任务是根据一个工作流来源在当前报告周期内的证据，生成可直接用于日报或周报的 report_block。
 规则：
 - 只基于输入中的 task_profile、period_window_workstreams 和 period_views 做判断。
@@ -266,6 +349,13 @@ SCREEN_FACT_LLM_SYSTEM_PROMPT = """你是屏幕记忆 fact 提取模块。你的
 - 对信息密集的对话、文档或网页，应按不同论点、概念、结论或进展拆成多个 facts，而不是压缩成一个主题标签。
 - 如果证据只是阅读/浏览/讨论，不要写成已经完成或已经实现。
 - evidence_text 必须是支持 fact 的简短证据摘录或概述。
+- project_key 是稳定项目归类键，用来把 fact 归到一个长期项目/产品/代码库/文档/工作主题下；应优先根据当前 view 证据中的文件路径、仓库名、产品名、文档标题、会议主题、反复出现的具体项目实体判断。
+- objective_key 是稳定目标归类键，用来表达同一 project_key 内当前 fact 所属的目标、问题、任务方向或会议主题；应根据证据中的任务标题、问题名称、功能模块、需求主题、调研方向或正在推进的具体目标判断。
+- project_key/objective_key 是单个 view 级别的粗略归类线索，后续 observation 会重新综合判断；fact 层不要为了填字段而过度推断。
+- project_key/objective_key 必须使用小写短横线 key，例如 screen-memory、aura-accessory-ecosystem、observation-task-clustering、ota-update-flow；不要输出中文、空格、标点或整句摘要。
+- 不要因为 app/window 名称生成项目键，例如 feishu、wechat、microsoft-edge、safari、chrome 通常只是来源，不是 project_key；只有当软件本身就是工作对象时才可使用。
+- 如果当前 view 只显示来源 app、泛泛会议、聊天或浏览动作，而没有明确项目/产品/文档/代码对象，project_key 输出 "unknown"，objective_key 输出 "general"。
+- 如果证据明确出现产品、项目、文档、代码库、数据库、配置字段、文件路径或会议主题，不要轻易回退到 unknown/general；但只能输出证据支持的短 key。
 - 最终响应只能包含一个 JSON object，不要输出 Markdown、代码块、前后说明或思考过程。
 
 JSON 语法要求：
@@ -339,6 +429,14 @@ SCREEN_OBSERVATION_LLM_SYSTEM_PROMPT = """你是屏幕记忆 observation consoli
 - 只基于输入 facts 和 window_workstream_context 做判断。
 - observation 要面向长期记忆和周报生成，描述一组 facts 共同形成的工作进展、事件簇、状态变化、结果、阻塞或上下文。
 - 不要生成用户偏好推断、Agent 行动策略或无证据的下一步。
+- project_key 是稳定项目归类键，用来把 observation 归到同一个长期项目/产品/代码库/文档/工作主题下；应基于整组 facts 共同指向的文件路径、仓库名、产品名、文档标题、会议主题、反复出现的具体项目实体重新判断。
+- objective_key 是稳定目标归类键，用来表达同一 project_key 内的当前目标、问题、任务方向或会议主题；应基于整组 facts 共同回答的问题、任务标题、问题名称、功能模块、需求主题或调研方向重新判断。
+- facts[].project_key 和 facts[].objective_key 是单个 view 级别的粗略推断，可能不准确；它们只能作为弱参考，不能直接继承到 observation。
+- project_key/objective_key 必须使用小写短横线 key，例如 screen-memory、aura-accessory-ecosystem、observation-task-clustering、ota-update-flow；不要输出中文、空格、标点或整句摘要。
+- 不要因为 app/window 名称生成项目键，例如 feishu、wechat、microsoft-edge、safari、chrome 通常只是来源，不是 project_key；只有当软件本身就是工作对象时才可使用。
+- 只有当多个 facts 给出相同的非 unknown/general key，且该 key 被 fact_text/evidence_text/entities/artifacts/topics 明确支持时，才可沿用；否则以整组证据重新生成。
+- 如果 facts 中多个 key 冲突，以整组 facts 共同主题为准，不要做投票式继承；如果只是同一次会议的多个议题，应选择会议或项目层面的 project_key，并用 objective_key 表达本组共同目标。
+- 证据不足时 project_key 输出 "unknown"，objective_key 输出 "general"；但如果 facts 明确出现产品/项目/文档/代码对象，不要轻易回退到 unknown/general。
 - 输出必须是 JSON object，不要输出 Markdown、解释文字或代码块。
 
 输出 JSON 必须严格使用以下格式和字段名：
@@ -373,11 +471,18 @@ SCREEN_OBSERVATION_LLM_USER_PROMPT_TEMPLATE = """请根据同一个 window_works
 - facts: 本次聚类得到的相关 screen_facts，是最重要的事实依据。
 - facts[].fact_text: 保守事实陈述。
 - facts[].evidence_text: 支持该 fact 的证据摘录。
-- facts[].fact_kind/work_type/project_key/objective_key/topics/entities/artifacts: 聚类和归纳线索。
+- facts[].fact_kind/work_type/topics/entities/artifacts: 聚类和归纳线索。
+- facts[].project_key/objective_key: 单个 view 的粗略推断，可能不准确，只能作为弱参考；observation 需要基于整组 facts 重新判断项目和目标。
 - evidence_counts: 证据数量统计。
 
 要求：
 - 优先综合 facts，window_workstream_context 只作为背景。
+- project_key 表示“属于哪个项目/产品/工作流”，objective_key 表示“这个项目下正在推进什么目标/问题”；不要把同一个宽泛词同时放进两个字段。
+- 生成 project_key 时，不要优先继承 facts[].project_key；应从整组 facts 的 fact_text/evidence_text/entities/artifacts/topics 以及必要的 window_workstream_context 中重新判断共同项目、产品、代码库、文档或会议主题，并抽取稳定英文/拼音短横线 key。
+- 生成 objective_key 时，不要优先继承 facts[].objective_key；应根据这组 facts 共同推进/讨论/排查/阅读的目标生成短 key，例如 task-workstream-generation、aura-direction-alignment、ota-update-flow、gesture-feedback-analysis。
+- 只有当多个 facts 的 project_key/objective_key 一致、非 unknown/general，且被文本证据明确支持时，才可沿用这些 fact key。
+- 如果只知道来源 app/window，而不知道真实项目，project_key 保持 unknown；不要把 feishu、wechat、browser、meeting 这类来源词当项目。
+- 对会议类 observation，如果会议有明确主题，project_key 可取会议所属项目/产品，objective_key 可取会议主题；如果只知道参会人和时间而不知道主题，project_key/objective_key 才使用 unknown/general。
 - 如果 facts 只表示用户在阅读/讨论/排查，不要写成已经完成。
 - 如果 facts 之间存在变化或冲突，用“曾经/随后/当前证据显示/存在不一致”描述，不要强行裁决。
 - title 面向周报小节标题，summary_text 面向周报正文，progress_text 面向“本周进展”字段。
@@ -4391,6 +4496,839 @@ class ScreenMemoryManager:
             "screen_observation_low_fact_fallback_count": low_fact_fallback_count,
             "screen_observation_llm_generation_count": llm_generation_count,
             "screen_observation_llm_failed_count": llm_failed_count,
+        }
+
+    def screen_task_text_tokens(self, item):
+        text = " ".join([
+            item.get("title") or "",
+            item.get("summary") or "",
+            item.get("summary_text") or "",
+            item.get("progress_text") or "",
+            " ".join(str(value) for value in item.get("entities") or []),
+            " ".join(str(value) for value in item.get("artifacts") or []),
+            " ".join(str(value) for value in item.get("key_points") or []),
+        ])
+        return tokenize_signature_text(text)
+
+    def screen_task_disambiguation_key_part_for_observation(self, observation):
+        objective_key = observation.get("objective_key") or "general"
+        if self.is_meaningful_task_key_part(objective_key, {"general", "unknown", "other"}):
+            return objective_key
+        for key in ["artifacts", "entities"]:
+            value = next(
+                (item for item in observation.get(key) or [] if str(item).strip()),
+                "",
+            )
+            if value:
+                return value
+        return observation.get("title") or observation.get("summary_text") or "screen-task"
+
+    def screen_task_key_for_observation(self, observation):
+        project_key = observation.get("project_key") or "unknown"
+        parts = [
+            project_key,
+            observation.get("work_type") or "other",
+        ]
+        if not self.is_meaningful_task_key_part(project_key, {"unknown", "general", "other"}):
+            parts.append(self.screen_task_disambiguation_key_part_for_observation(observation))
+        return make_stable_key(" ".join(parts), fallback="screen-task", max_tokens=6)
+
+    def pending_screen_task_group_key_for_observation(self, observation):
+        project_key = observation.get("project_key") or "unknown"
+        parts = [
+            project_key,
+            observation.get("work_type") or "other",
+        ]
+        if not self.is_meaningful_task_key_part(project_key, {"unknown", "general", "other"}):
+            parts.append(self.screen_task_disambiguation_key_part_for_observation(observation))
+        return make_stable_key(" ".join(parts), fallback="screen-task", max_tokens=6)
+
+    def is_meaningful_task_key_part(self, value, generic_values):
+        value = str(value or "").strip().lower()
+        return bool(value) and value not in generic_values
+
+    def task_title_from_observation(self, observation):
+        title = str(observation.get("title") or "").strip()
+        summary = str(observation.get("summary_text") or observation.get("progress_text") or "").strip()
+        generic_title = False
+        if title:
+            normalized_title = normalize_signature_text(title)
+            app_like_tokens = {"feishu", "wechat", "microsoft", "edge", "safari", "chrome", "telegram", "littlebird"}
+            generic_title = (
+                normalized_title in {"fei-shu-fei-shu", "wei-xin-wei-xin", "microsoft-edge-tong-yong"}
+                or " - " in title
+                and len(tokenize_signature_text(title) & app_like_tokens) > 0
+                and len(tokenize_signature_text(title)) <= 5
+            )
+        if summary and (not title or generic_title):
+            first_sentence = re.split(r"[。；;.!?！？\n]", summary, maxsplit=1)[0].strip()
+            if first_sentence:
+                return first_sentence[:160]
+        return (title or summary or "屏幕任务工作流")[:160]
+
+    def score_observation_against_task(self, observation, task):
+        score = 0.0
+        reasons = []
+        observation_project = observation.get("project_key") or "unknown"
+        task_project = task.get("project_key") or "unknown"
+        observation_objective = observation.get("objective_key") or "general"
+        task_objective = task.get("objective_key") or "general"
+        if (
+            observation_project == task_project
+            and self.is_meaningful_task_key_part(observation_project, {"unknown", "general", "other"})
+        ):
+            score += 0.18
+            reasons.append("project")
+        if (
+            observation_objective == task_objective
+            and self.is_meaningful_task_key_part(observation_objective, {"general", "unknown", "other"})
+        ):
+            score += 0.18
+            reasons.append("objective")
+        if (observation.get("work_type") or "other") == (task.get("work_type") or "other"):
+            score += 0.06
+            reasons.append("work_type")
+        artifact_overlap = list_overlap_score(observation.get("artifacts"), task.get("artifacts"))
+        if artifact_overlap:
+            score += 0.28 * artifact_overlap
+            reasons.append(f"artifact:{artifact_overlap:.2f}")
+        entity_overlap = list_overlap_score(observation.get("entities"), task.get("entities"))
+        if entity_overlap:
+            score += 0.18 * entity_overlap
+            reasons.append(f"entity:{entity_overlap:.2f}")
+        observation_tokens = observation.get("tokens") or self.screen_task_text_tokens(observation)
+        task_tokens = task.get("tokens") or self.screen_task_text_tokens(task)
+        if observation_tokens and task_tokens:
+            token_overlap = len(set(observation_tokens) & set(task_tokens)) / max(
+                1,
+                min(len(set(observation_tokens)), len(set(task_tokens))),
+            )
+            if token_overlap:
+                score += 0.14 * token_overlap
+                reasons.append(f"token:{token_overlap:.2f}")
+        if task.get("status") in {"completed", "stale"}:
+            score *= 0.75
+            reasons.append("status_penalty")
+        return round(max(0.0, min(1.0, score)), 3), ",".join(reasons)
+
+    def select_task_for_observation(self, observation, tasks, min_score):
+        best_task = None
+        best_score = 0.0
+        best_reason = ""
+        observation_task_key = self.screen_task_key_for_observation(observation)
+        for task in tasks:
+            score, reason = self.score_observation_against_task(observation, task)
+            if task.get("task_key") and task.get("task_key") == observation_task_key:
+                score = max(score, 0.72)
+                reason = ",".join(item for item in ["task_key", reason] if item)
+            if score > best_score:
+                best_task = task
+                best_score = score
+                best_reason = reason
+        if best_task and best_score >= min_score:
+            return best_task, best_score, best_reason
+        return None, best_score, best_reason
+
+    def candidate_tasks_for_observation(self, observation, tasks, min_score, top_k=8):
+        candidates = []
+        observation_task_key = self.screen_task_key_for_observation(observation)
+        for task in tasks:
+            score, reason = self.score_observation_against_task(observation, task)
+            if task.get("task_key") and task.get("task_key") == observation_task_key:
+                score = max(score, 0.72)
+                reason = ",".join(item for item in ["task_key", reason] if item)
+            if score >= min_score * 0.55 or "task_key" in reason:
+                candidates.append({
+                    "task": task,
+                    "score": score,
+                    "reason": reason,
+                })
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+        return candidates[:max(1, int(top_k or 8))]
+
+    def is_acceptable_task_match(self, score, reason, min_score, low_confidence_floor):
+        reason = str(reason or "")
+        try:
+            score = float(score or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        if "task_key" in reason and score >= low_confidence_floor:
+            return True
+        strong_markers = ("artifact:", "entity:", "project", "objective", "llm:")
+        has_strong_marker = any(marker in reason for marker in strong_markers)
+        if not has_strong_marker:
+            return False
+        return score >= max(float(min_score or 0.0), float(low_confidence_floor or 0.0))
+
+    def build_task_observation_match_payload(self, observation, candidates):
+        return {
+            "observation": {
+                "id": observation.get("id"),
+                "observation_type": observation.get("observation_type"),
+                "title": observation.get("title"),
+                "summary_text": observation.get("summary_text"),
+                "progress_text": observation.get("progress_text"),
+                "project_key": observation.get("project_key"),
+                "objective_key": observation.get("objective_key"),
+                "work_type": observation.get("work_type"),
+                "category": observation.get("category"),
+                "time_range": {
+                    "start": observation.get("period_start"),
+                    "end": observation.get("period_end"),
+                },
+                "key_points": observation.get("key_points") or [],
+                "blockers": observation.get("blockers") or [],
+                "next_actions": observation.get("next_actions") or [],
+                "entities": observation.get("entities") or [],
+                "artifacts": observation.get("artifacts") or [],
+                "confidence": observation.get("confidence"),
+            },
+            "candidate_task_workstreams": [
+                {
+                    "id": item["task"].get("id"),
+                    "title": item["task"].get("title"),
+                    "summary": item["task"].get("summary"),
+                    "progress_text": item["task"].get("progress_text"),
+                    "status": item["task"].get("status"),
+                    "project_key": item["task"].get("project_key"),
+                    "objective_key": item["task"].get("objective_key"),
+                    "work_type": item["task"].get("work_type"),
+                    "category": item["task"].get("category"),
+                    "entities": item["task"].get("entities") or [],
+                    "artifacts": item["task"].get("artifacts") or [],
+                    "observation_count": item["task"].get("observation_count"),
+                    "last_activity_timestamp": item["task"].get("last_activity_timestamp"),
+                }
+                for item in candidates
+            ],
+            "local_candidate_scores": [
+                {
+                    "task_workstream_id": item["task"].get("id"),
+                    "score": item.get("score"),
+                    "reason": item.get("reason"),
+                }
+                for item in candidates
+            ],
+        }
+
+    def normalize_task_observation_match_llm_result(self, llm_result, candidate_ids):
+        decision = str(llm_result.get("decision") or "create_new").strip().lower()
+        if decision not in {"match_existing", "create_new"}:
+            decision = "create_new"
+        try:
+            task_workstream_id = int(llm_result.get("task_workstream_id") or 0)
+        except (TypeError, ValueError):
+            task_workstream_id = 0
+        if decision == "match_existing" and task_workstream_id not in candidate_ids:
+            decision = "create_new"
+            task_workstream_id = 0
+        try:
+            confidence = round(float(llm_result.get("confidence") or 0.0), 3)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        role = str(llm_result.get("role") or "evidence").strip().lower()
+        if role not in {"evidence", "progress", "blocker", "outcome", "context"}:
+            role = "evidence"
+        return {
+            "decision": decision,
+            "task_workstream_id": task_workstream_id,
+            "confidence": max(0.0, min(1.0, confidence)),
+            "role": role,
+            "reason": str(llm_result.get("reason") or "").strip()[:500],
+        }
+
+    def match_observation_to_task_using_llm(self, observation, candidates, config):
+        payload = self.build_task_observation_match_payload(observation, candidates)
+        user_prompt = TASK_OBSERVATION_MATCH_LLM_USER_PROMPT_TEMPLATE.format(
+            payload_json=json.dumps(payload, ensure_ascii=False)
+        )
+        candidate_ids = {
+            int(item["task"]["id"])
+            for item in candidates
+            if item.get("task") and item["task"].get("id") is not None
+        }
+        llm_result = self.call_json_llm(
+            TASK_OBSERVATION_MATCH_LLM_SYSTEM_PROMPT,
+            user_prompt,
+            config,
+        )
+        return self.normalize_task_observation_match_llm_result(llm_result, candidate_ids)
+
+    def build_task_profile_update_payload(self, mode, previous_task, observation, local_task):
+        def task_payload(task):
+            if not task:
+                return None
+            return {
+                "id": task.get("id"),
+                "title": task.get("title"),
+                "summary": task.get("summary"),
+                "progress_text": task.get("progress_text"),
+                "status": task.get("status"),
+                "category": task.get("category"),
+                "project_key": task.get("project_key"),
+                "objective_key": task.get("objective_key"),
+                "work_type": task.get("work_type"),
+                "entities": task.get("entities") or [],
+                "artifacts": task.get("artifacts") or [],
+                "blockers": task.get("blockers") or [],
+                "next_actions": task.get("next_actions") or [],
+                "observation_count": task.get("observation_count"),
+                "time_range": {
+                    "start": task.get("start_timestamp"),
+                    "end": task.get("end_timestamp"),
+                    "last_activity": task.get("last_activity_timestamp"),
+                },
+                "confidence": task.get("confidence"),
+            }
+
+        return {
+            "mode": mode,
+            "observation": self.build_task_observation_match_payload(observation, [])["observation"],
+            "previous_task": task_payload(previous_task),
+            "local_task_after_rule_update": task_payload(local_task),
+        }
+
+    def normalize_task_profile_update_llm_result(self, llm_result):
+        normalized = {
+            "title": str(llm_result.get("title") or "").strip(),
+            "summary": str(llm_result.get("summary") or "").strip(),
+            "progress_text": str(llm_result.get("progress_text") or "").strip(),
+            "status": str(llm_result.get("status") or "active").strip().lower(),
+            "category": str(llm_result.get("category") or "general_work").strip(),
+            "project_key": str(llm_result.get("project_key") or "unknown").strip(),
+            "objective_key": str(llm_result.get("objective_key") or "general").strip(),
+            "work_type": str(llm_result.get("work_type") or "other").strip(),
+            "entities": llm_result.get("entities") or [],
+            "artifacts": llm_result.get("artifacts") or [],
+            "blockers": llm_result.get("blockers") or [],
+            "next_actions": llm_result.get("next_actions") or [],
+            "confidence": llm_result.get("confidence", 0.0),
+        }
+        if normalized["status"] not in {"active", "paused", "completed", "stale"}:
+            normalized["status"] = "active"
+        if normalized["work_type"] not in {
+            "implementation",
+            "debugging",
+            "research",
+            "documentation",
+            "communication",
+            "meeting",
+            "configuration",
+            "planning",
+            "general_work",
+            "other",
+        }:
+            normalized["work_type"] = "other"
+        for key in ["entities", "artifacts", "blockers", "next_actions"]:
+            if not isinstance(normalized[key], list):
+                normalized[key] = [str(normalized[key])]
+            normalized[key] = [
+                str(item).strip()
+                for item in normalized[key]
+                if str(item).strip()
+            ][:20]
+        try:
+            normalized["confidence"] = round(float(normalized["confidence"]), 3)
+        except (TypeError, ValueError):
+            normalized["confidence"] = 0.0
+        normalized["confidence"] = max(0.0, min(1.0, normalized["confidence"]))
+        return normalized
+
+    def update_task_profile_using_llm(self, mode, previous_task, observation, local_task, config):
+        payload = self.build_task_profile_update_payload(
+            mode,
+            previous_task,
+            observation,
+            local_task,
+        )
+        user_prompt = TASK_PROFILE_UPDATE_LLM_USER_PROMPT_TEMPLATE.format(
+            payload_json=json.dumps(payload, ensure_ascii=False)
+        )
+        llm_result = self.call_json_llm(
+            TASK_PROFILE_UPDATE_LLM_SYSTEM_PROMPT,
+            user_prompt,
+            config,
+        )
+        return self.normalize_task_profile_update_llm_result(llm_result)
+
+    def apply_task_profile_update(self, task, profile):
+        for key in [
+            "title",
+            "summary",
+            "progress_text",
+            "status",
+            "category",
+            "project_key",
+            "objective_key",
+            "work_type",
+        ]:
+            if profile.get(key):
+                task[key] = profile[key]
+        if profile.get("entities") is not None:
+            task["entities"] = profile.get("entities") or []
+        if profile.get("artifacts") is not None:
+            task["artifacts"] = profile.get("artifacts") or []
+        if profile.get("blockers") is not None:
+            task["blockers"] = profile.get("blockers") or []
+        if profile.get("next_actions") is not None:
+            task["next_actions"] = profile.get("next_actions") or []
+        if profile.get("confidence") is not None:
+            old_confidence = float(task.get("confidence") or 0.0)
+            task["confidence"] = round(max(old_confidence, float(profile.get("confidence") or 0.0)), 3)
+        task["tokens"] = self.screen_task_text_tokens(task)
+        metadata = task.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["profile_update_method"] = "llm"
+        task["metadata"] = metadata
+        task["llm_status"] = "ok"
+        task["llm_error"] = ""
+        return task
+
+    def create_screen_task_from_observation(self, observation):
+        title = self.task_title_from_observation(observation)
+        summary = observation.get("summary_text") or observation.get("progress_text") or title
+        task_key = self.screen_task_key_for_observation(observation)
+        period_start = observation.get("period_start") or observation.get("period_end") or now_db_timestamp()
+        period_end = observation.get("period_end") or observation.get("period_start") or period_start
+        return {
+            "id": None,
+            "task_key": task_key,
+            "status": "active",
+            "title": title[:160],
+            "summary": summary[:2000],
+            "progress_text": observation.get("progress_text") or summary,
+            "category": observation.get("category") or observation.get("observation_type") or "general_work",
+            "project_key": observation.get("project_key") or "unknown",
+            "objective_key": observation.get("objective_key") or "general",
+            "work_type": observation.get("work_type") or "other",
+            "start_timestamp": period_start,
+            "end_timestamp": period_end,
+            "last_activity_timestamp": period_end,
+            "topics": [],
+            "entities": list(observation.get("entities") or [])[:60],
+            "artifacts": list(observation.get("artifacts") or [])[:60],
+            "app_names": [],
+            "window_titles": [],
+            "blockers": list(observation.get("blockers") or [])[:20],
+            "next_actions": list(observation.get("next_actions") or [])[:20],
+            "evidence_window_workstream_ids": list(observation.get("evidence_window_workstream_ids") or [])[:60],
+            "window_workstream_count": len(set(observation.get("evidence_window_workstream_ids") or [])),
+            "view_count": 0,
+            "segment_count": 0,
+            "observation_count": 1,
+            "confidence": observation.get("confidence") or 0.0,
+            "tokens": observation.get("tokens") or self.screen_task_text_tokens(observation),
+            "metadata": {
+                "source": "screen_observation",
+                "source_observation_ids": [observation.get("id")],
+            },
+        }
+
+    def create_screen_task_from_observations(self, observations):
+        items = sorted(
+            [item for item in observations if item],
+            key=lambda item: (item.get("period_start") or item.get("period_end") or "", item.get("id") or 0),
+        )
+        if not items:
+            return None
+        task = self.create_screen_task_from_observation(items[0])
+        for observation in items[1:]:
+            task = self.merge_observation_into_screen_task(task, observation)
+        metadata = task.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["source"] = "screen_observation_group"
+        metadata["source_observation_ids"] = [
+            item.get("id")
+            for item in items
+            if item.get("id") is not None
+        ]
+        task["metadata"] = metadata
+        task["observation_count"] = len(items)
+        task["tokens"] = self.screen_task_text_tokens(task)
+        return task
+
+    def build_grouped_task_profile_observation(self, observations, task):
+        items = sorted(
+            [item for item in observations if item],
+            key=lambda item: (item.get("period_start") or item.get("period_end") or "", item.get("id") or 0),
+        )
+        if not items:
+            return {}
+        period_starts = [item.get("period_start") for item in items if item.get("period_start")]
+        period_ends = [item.get("period_end") for item in items if item.get("period_end")]
+        summaries = []
+        key_points = []
+        entities = []
+        artifacts = []
+        blockers = []
+        next_actions = []
+        evidence_window_workstream_ids = []
+        for item in items:
+            summary = item.get("summary_text") or item.get("progress_text") or item.get("title") or ""
+            if summary:
+                append_unique(summaries, [summary], limit=12)
+            append_unique(key_points, item.get("key_points") or [], limit=30)
+            append_unique(entities, item.get("entities") or [], limit=60)
+            append_unique(artifacts, item.get("artifacts") or [], limit=60)
+            append_unique(blockers, item.get("blockers") or [], limit=20)
+            append_unique(next_actions, item.get("next_actions") or [], limit=20)
+            append_unique(
+                evidence_window_workstream_ids,
+                item.get("evidence_window_workstream_ids") or [],
+                limit=60,
+            )
+        return {
+            "id": ",".join(str(item.get("id")) for item in items if item.get("id") is not None),
+            "observation_type": "grouped_observation",
+            "title": task.get("title") or self.task_title_from_observation(items[0]),
+            "summary_text": "\n".join(summaries)[:4000],
+            "progress_text": task.get("progress_text") or "",
+            "project_key": task.get("project_key") or "unknown",
+            "objective_key": task.get("objective_key") or "general",
+            "work_type": task.get("work_type") or "other",
+            "category": task.get("category") or "general_work",
+            "period_start": min(period_starts) if period_starts else task.get("start_timestamp"),
+            "period_end": max(period_ends) if period_ends else task.get("end_timestamp"),
+            "key_points": key_points,
+            "blockers": blockers,
+            "next_actions": next_actions,
+            "entities": entities,
+            "artifacts": artifacts,
+            "evidence_window_workstream_ids": evidence_window_workstream_ids,
+            "confidence": task.get("confidence") or 0.0,
+        }
+
+    def merge_observation_into_screen_task(self, task, observation):
+        task["start_timestamp"] = min(
+            item for item in [task.get("start_timestamp"), observation.get("period_start")] if item
+        ) if any([task.get("start_timestamp"), observation.get("period_start")]) else now_db_timestamp()
+        task["end_timestamp"] = max(
+            item for item in [task.get("end_timestamp"), observation.get("period_end")] if item
+        ) if any([task.get("end_timestamp"), observation.get("period_end")]) else task["start_timestamp"]
+        task["last_activity_timestamp"] = task["end_timestamp"]
+        summary = observation.get("summary_text") or observation.get("progress_text") or ""
+        if summary and summary not in (task.get("summary") or ""):
+            existing_summary = task.get("summary") or ""
+            task["summary"] = (
+                f"{existing_summary}\n{summary}" if existing_summary else summary
+            )[:2000]
+            task["progress_text"] = summary[:2000]
+        append_unique(task.setdefault("entities", []), observation.get("entities") or [], limit=60)
+        append_unique(task.setdefault("artifacts", []), observation.get("artifacts") or [], limit=60)
+        append_unique(task.setdefault("blockers", []), observation.get("blockers") or [], limit=20)
+        append_unique(task.setdefault("next_actions", []), observation.get("next_actions") or [], limit=20)
+        evidence_window_ids = task.setdefault("evidence_window_workstream_ids", [])
+        seen_window_ids = {int(item) for item in evidence_window_ids if str(item).strip().isdigit()}
+        for window_workstream_id in observation.get("evidence_window_workstream_ids") or []:
+            try:
+                normalized_id = int(window_workstream_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized_id not in seen_window_ids:
+                evidence_window_ids.append(normalized_id)
+                seen_window_ids.add(normalized_id)
+            if len(evidence_window_ids) >= 60:
+                break
+        task["window_workstream_count"] = len(set(task.get("evidence_window_workstream_ids") or []))
+        task["observation_count"] = int(task.get("observation_count") or 0) + 1
+        old_confidence = float(task.get("confidence") or 0.0)
+        new_confidence = float(observation.get("confidence") or 0.0)
+        task["confidence"] = round(max(old_confidence, (old_confidence + new_confidence) / 2), 3)
+        task["tokens"] = self.screen_task_text_tokens(task)
+        return task
+
+    def build_screen_task_entry(self, task):
+        metadata = task.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return {
+            "id": task.get("id"),
+            "task_key": task.get("task_key") or make_stable_key(task.get("title"), fallback="screen-task"),
+            "status": task.get("status") or "active",
+            "title": task.get("title") or "屏幕任务工作流",
+            "summary": task.get("summary") or task.get("progress_text") or "",
+            "progress_text": task.get("progress_text") or task.get("summary") or "",
+            "category": task.get("category") or "general_work",
+            "project_key": task.get("project_key") or "unknown",
+            "objective_key": task.get("objective_key") or "general",
+            "work_type": task.get("work_type") or "other",
+            "start_timestamp": task.get("start_timestamp") or task.get("end_timestamp") or now_db_timestamp(),
+            "end_timestamp": task.get("end_timestamp") or task.get("start_timestamp") or now_db_timestamp(),
+            "last_activity_timestamp": task.get("last_activity_timestamp") or task.get("end_timestamp") or now_db_timestamp(),
+            "topics_json": dump_json_list(task.get("topics") or []),
+            "entities_json": dump_json_list(task.get("entities") or []),
+            "artifacts_json": dump_json_list(task.get("artifacts") or []),
+            "app_names_json": dump_json_list(task.get("app_names") or []),
+            "window_titles_json": dump_json_list(task.get("window_titles") or []),
+            "window_workstream_count": (
+                len(set(task.get("evidence_window_workstream_ids") or []))
+                if task.get("evidence_window_workstream_ids")
+                else task.get("window_workstream_count") or 0
+            ),
+            "view_count": task.get("view_count") or 0,
+            "segment_count": task.get("segment_count") or 0,
+            "observation_count": task.get("observation_count") or 0,
+            "confidence": task.get("confidence") or 0.0,
+            "blockers_json": dump_json_list(task.get("blockers") or []),
+            "next_actions_json": dump_json_list(task.get("next_actions") or []),
+            "metadata_json": json.dumps(metadata, ensure_ascii=False),
+            "generation_method": "screen_observation_task_clustering",
+            "llm_status": task.get("llm_status") or "",
+            "llm_error": task.get("llm_error") or "",
+            "llm_model": task.get("llm_model") or (self.task_workstream_cfg or {}).get("llm_model") or "",
+            "llm_updated_at": now_db_timestamp() if task.get("llm_status") else None,
+        }
+
+    def task_item_from_screen_task_entry(self, entry):
+        return {
+            "id": entry.get("id"),
+            "title": entry.get("title") or "",
+            "summary": entry.get("summary") or "",
+            "category": entry.get("category") or "general_work",
+            "start_timestamp": entry.get("start_timestamp"),
+            "end_timestamp": entry.get("end_timestamp"),
+            "task_key": entry.get("task_key") or "",
+            "status": entry.get("status") or "active",
+            "project_key": entry.get("project_key") or "unknown",
+            "objective_key": entry.get("objective_key") or "general",
+            "work_type": entry.get("work_type") or "other",
+            "progress_text": entry.get("progress_text") or "",
+            "entities": parse_json_list(entry.get("entities_json")),
+            "artifacts": parse_json_list(entry.get("artifacts_json")),
+            "blockers": parse_json_list(entry.get("blockers_json")),
+            "next_actions": parse_json_list(entry.get("next_actions_json")),
+            "observation_count": entry.get("observation_count") or 0,
+            "window_workstream_count": entry.get("window_workstream_count") or 0,
+            "view_count": entry.get("view_count") or 0,
+            "segment_count": entry.get("segment_count") or 0,
+            "confidence": entry.get("confidence") or 0.0,
+            "tokens": tokenize_signature_text(
+                " ".join([entry.get("title") or "", entry.get("summary") or "", entry.get("progress_text") or ""])
+            ),
+        }
+
+    def update_screen_task_tables(self):
+        task_cfg = self.task_workstream_cfg or {}
+        if not task_cfg.get("enabled", True):
+            return {
+                "task_workstream": self.screen_db.get_task_workstream_count(),
+                "screen_tasks_generated": 0,
+                "screen_tasks_updated": 0,
+                "screen_observations_assigned_to_tasks": 0,
+                "screen_task_deferred_observation_count": 0,
+                "screen_task_low_confidence_match_count": 0,
+                "screen_task_llm_match_count": 0,
+                "screen_task_llm_failed_count": 0,
+                "screen_task_profile_llm_count": 0,
+                "screen_task_profile_llm_failed_count": 0,
+                "touched_task_workstream_ids": [],
+            }
+        observations = self.screen_db.load_unassigned_screen_observations_for_task_generation(
+            limit=task_cfg.get("max_observations_per_run") or None,
+        )
+        tasks = self.screen_db.load_task_workstreams_for_observation_generation()
+        min_score = float(task_cfg.get("observation_match_min_score", 0.48))
+        low_confidence_floor = float(task_cfg.get("observation_match_low_confidence_floor", 0.5))
+        min_observations_to_create = max(1, int(task_cfg.get("min_observations_to_create_task", 2) or 2))
+        candidate_top_k = int(task_cfg.get("observation_match_candidate_top_k", 8) or 8)
+        llm_enabled = bool(task_cfg.get("enable_LLM_observation_matching", True))
+        llm_budget = int(task_cfg.get("observation_match_llm_budget", 50) or 0)
+        profile_llm_enabled = bool(task_cfg.get("enable_LLM_task_profile_update", True))
+        profile_llm_budget = int(task_cfg.get("task_profile_llm_budget", 50) or 0)
+        llm_match_count = 0
+        llm_failed_count = 0
+        profile_llm_count = 0
+        profile_llm_failed_count = 0
+        generated_count = 0
+        updated_count = 0
+        assigned_count = 0
+        low_confidence_match_count = 0
+        deferred_observation_count = 0
+        touched_task_ids = []
+        pending_new_observations = defaultdict(list)
+
+        def persist_task_assignment(
+            task,
+            observation,
+            *,
+            created,
+            previous_task,
+            profile_mode,
+            role,
+            score,
+            reason,
+            profile_observation=None,
+        ):
+            nonlocal profile_llm_count
+            nonlocal profile_llm_failed_count
+            nonlocal generated_count
+            nonlocal updated_count
+            nonlocal assigned_count
+            if profile_llm_enabled and profile_llm_count + profile_llm_failed_count < profile_llm_budget:
+                try:
+                    profile = self.update_task_profile_using_llm(
+                        profile_mode,
+                        previous_task,
+                        profile_observation or observation,
+                        task,
+                        task_cfg,
+                    )
+                    task = self.apply_task_profile_update(task, profile)
+                    profile_llm_count += 1
+                except Exception as exc:
+                    profile_llm_failed_count += 1
+                    self._print(f"LLM task profile update failed: {exc}")
+            entry = self.build_screen_task_entry(task)
+            task_id = self.screen_db.save_or_update_observation_task_workstream(entry)
+            task["id"] = task_id
+            entry["id"] = task_id
+            if created:
+                tasks.append(self.task_item_from_screen_task_entry(entry))
+                generated_count += 1
+            else:
+                updated_count += 1
+            self.screen_db.attach_observation_to_task_workstream(
+                task_id,
+                observation["id"],
+                role=role,
+                confidence=score,
+                reason=reason,
+            )
+            touched_task_ids.append(task_id)
+            assigned_count += 1
+            return task_id
+
+        for observation in observations:
+            candidates = self.candidate_tasks_for_observation(
+                observation,
+                tasks,
+                min_score,
+                top_k=candidate_top_k,
+            )
+            task = None
+            score = 0.0
+            reason = ""
+            role = "evidence"
+            llm_failed_for_observation = False
+            use_llm = (
+                llm_enabled
+                and candidates
+                and llm_match_count + llm_failed_count < llm_budget
+            )
+            if use_llm:
+                try:
+                    match_result = self.match_observation_to_task_using_llm(
+                        observation,
+                        candidates,
+                        task_cfg,
+                    )
+                    llm_match_count += 1
+                    if match_result["decision"] == "match_existing":
+                        task = next(
+                            (
+                                item["task"]
+                                for item in candidates
+                                if int(item["task"].get("id") or 0) == match_result["task_workstream_id"]
+                            ),
+                            None,
+                        )
+                        score = match_result["confidence"]
+                        reason = f"llm:{match_result['reason']}"
+                        role = match_result["role"]
+                        if not self.is_acceptable_task_match(score, reason, min_score, low_confidence_floor):
+                            low_confidence_match_count += 1
+                            task = None
+                            score = 0.0
+                            reason = "llm_low_confidence_create_new"
+                except Exception as exc:
+                    llm_failed_count += 1
+                    llm_failed_for_observation = True
+                    self._print(f"LLM task observation matching failed: {exc}")
+            if task is None and (not use_llm or llm_failed_for_observation):
+                task, score, reason = self.select_task_for_observation(observation, tasks, min_score)
+                if task is not None and not self.is_acceptable_task_match(score, reason, min_score, low_confidence_floor):
+                    low_confidence_match_count += 1
+                    task = None
+                    score = 0.0
+                    reason = "rule_low_confidence_create_new"
+            elif task is None and use_llm:
+                reason = "llm_create_new"
+            if task is None:
+                if min_observations_to_create <= 1:
+                    task = self.create_screen_task_from_observation(observation)
+                    persist_task_assignment(
+                        task,
+                        observation,
+                        created=True,
+                        previous_task=None,
+                        profile_mode="create",
+                        role="evidence",
+                        score=score or 1.0,
+                        reason=reason or "new_task_from_observation",
+                    )
+                    continue
+                pending_new_observations[
+                    self.pending_screen_task_group_key_for_observation(observation)
+                ].append(observation)
+                continue
+            previous_task = dict(task)
+            for list_key in ["entities", "artifacts", "blockers", "next_actions", "tokens"]:
+                if isinstance(task.get(list_key), list):
+                    previous_task[list_key] = list(task[list_key])
+            task = self.merge_observation_into_screen_task(task, observation)
+            persist_task_assignment(
+                task,
+                observation,
+                created=False,
+                previous_task=previous_task,
+                profile_mode="update",
+                role=role,
+                score=score,
+                reason=reason,
+            )
+
+        for pending_items in pending_new_observations.values():
+            if len(pending_items) < min_observations_to_create:
+                deferred_observation_count += len(pending_items)
+                continue
+            task = self.create_screen_task_from_observations(pending_items)
+            if task is None:
+                continue
+            profile_observation = self.build_grouped_task_profile_observation(pending_items, task)
+            task_id = persist_task_assignment(
+                task,
+                pending_items[-1],
+                created=True,
+                previous_task=None,
+                profile_mode="create",
+                role="evidence",
+                score=1.0,
+                reason=f"new_task_from_{len(pending_items)}_observations",
+                profile_observation=profile_observation,
+            )
+            for observation in pending_items[:-1]:
+                self.screen_db.attach_observation_to_task_workstream(
+                    task_id,
+                    observation["id"],
+                    role="evidence",
+                    confidence=1.0,
+                    reason=f"new_task_from_{len(pending_items)}_observations",
+                )
+                assigned_count += 1
+        return {
+            "task_workstream": self.screen_db.get_task_workstream_count(),
+            "screen_tasks_generated": generated_count,
+            "screen_tasks_updated": updated_count,
+            "screen_observations_assigned_to_tasks": assigned_count,
+            "screen_task_deferred_observation_count": deferred_observation_count,
+            "screen_task_low_confidence_match_count": low_confidence_match_count,
+            "screen_task_llm_match_count": llm_match_count,
+            "screen_task_llm_failed_count": llm_failed_count,
+            "screen_task_profile_llm_count": profile_llm_count,
+            "screen_task_profile_llm_failed_count": profile_llm_failed_count,
+            "touched_task_workstream_ids": sorted(set(touched_task_ids)),
         }
 
     def generate_segment_info(self, records, segment_config=None, view_infos=None):

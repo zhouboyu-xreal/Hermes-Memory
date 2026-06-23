@@ -411,6 +411,25 @@ class ScreenMemoryDB:
             updated_at TEXT
         );
         """)
+        existing_task_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(task_workstream)").fetchall()
+        }
+        for column_name, column_type in [
+            ("task_key", "TEXT"),
+            ("status", "TEXT"),
+            ("project_key", "TEXT"),
+            ("objective_key", "TEXT"),
+            ("work_type", "TEXT"),
+            ("progress_text", "TEXT"),
+            ("blockers_json", "TEXT"),
+            ("next_actions_json", "TEXT"),
+            ("observation_count", "INTEGER DEFAULT 0"),
+            ("last_activity_timestamp", "TEXT"),
+            ("metadata_json", "TEXT"),
+            ("generation_method", "TEXT"),
+        ]:
+            if column_name not in existing_task_columns:
+                cursor.execute(f"ALTER TABLE task_workstream ADD COLUMN {column_name} {column_type}")
 
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS task_workstream_members (
@@ -422,6 +441,20 @@ class ScreenMemoryDB:
             created_at TEXT,
             FOREIGN KEY (task_workstream_id) REFERENCES task_workstream(id) ON DELETE CASCADE,
             FOREIGN KEY (window_workstream_id) REFERENCES window_workstream(id) ON DELETE CASCADE
+        );
+        """)
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS task_workstream_observations (
+            task_workstream_id INTEGER NOT NULL,
+            observation_id INTEGER NOT NULL UNIQUE,
+            role TEXT NOT NULL DEFAULT 'evidence',
+            confidence REAL DEFAULT 1.0,
+            reason TEXT,
+            created_at TEXT,
+            PRIMARY KEY (task_workstream_id, observation_id),
+            FOREIGN KEY (task_workstream_id) REFERENCES task_workstream(id) ON DELETE CASCADE,
+            FOREIGN KEY (observation_id) REFERENCES screen_observations(id) ON DELETE CASCADE
         );
         """)
 
@@ -724,6 +757,8 @@ class ScreenMemoryDB:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_workstream_time ON task_workstream(start_timestamp, end_timestamp);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_workstream_members_task ON task_workstream_members(task_workstream_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_workstream_members_window ON task_workstream_members(window_workstream_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_workstream_observations_task ON task_workstream_observations(task_workstream_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_workstream_observations_observation ON task_workstream_observations(observation_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_report_blocks_period ON report_blocks(period_start, period_end);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_report_blocks_task ON report_blocks(task_workstream_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_report_blocks_source ON report_blocks(source_type, source_id);")
@@ -1155,6 +1190,255 @@ class ScreenMemoryDB:
             return self._conn.cursor().execute("SELECT count(*) FROM screen_observations").fetchone()[0]
         except sqlite3.Error:
             return 0
+
+    def get_task_workstream_count(self):
+        try:
+            return self._conn.cursor().execute("SELECT count(*) FROM task_workstream").fetchone()[0]
+        except sqlite3.Error:
+            return 0
+
+    def build_screen_observation_item_from_row(self, item):
+        entities = parse_json_list(item.get("entities_json"))
+        artifacts = parse_json_list(item.get("artifacts_json"))
+        key_points = parse_json_list(item.get("key_points_json"))
+        blockers = parse_json_list(item.get("blockers_json"))
+        next_actions = parse_json_list(item.get("next_actions_json"))
+        evidence_window_workstream_ids = parse_json_list(
+            item.get("evidence_window_workstream_ids_json")
+        )
+        token_text = " ".join([
+            item.get("title") or "",
+            item.get("summary_text") or "",
+            item.get("progress_text") or "",
+            " ".join(str(value) for value in entities),
+            " ".join(str(value) for value in artifacts),
+            " ".join(str(value) for value in key_points),
+        ])
+        return {
+            "id": item.get("id"),
+            "observation_type": item.get("observation_type") or "context",
+            "scope_type": item.get("scope_type") or "",
+            "scope_id": item.get("scope_id"),
+            "period_start": item.get("period_start"),
+            "period_end": item.get("period_end"),
+            "title": item.get("title") or "",
+            "summary_text": item.get("summary_text") or "",
+            "progress_text": item.get("progress_text") or "",
+            "project_key": item.get("project_key") or "unknown",
+            "objective_key": item.get("objective_key") or "general",
+            "work_type": item.get("work_type") or "other",
+            "category": item.get("category") or "other",
+            "key_points": key_points,
+            "blockers": blockers,
+            "next_actions": next_actions,
+            "entities": entities,
+            "entity_keys": {normalize_signature_text(value) for value in entities if str(value).strip()},
+            "artifacts": artifacts,
+            "artifact_keys": {normalize_signature_text(value) for value in artifacts if str(value).strip()},
+            "evidence_window_workstream_ids": evidence_window_workstream_ids,
+            "confidence": item.get("confidence") or 0.0,
+            "tokens": tokenize_signature_text(token_text),
+        }
+
+    def load_unassigned_screen_observations_for_task_generation(self, limit=None):
+        cursor = self._conn.cursor()
+        params = []
+        limit_clause = ""
+        if limit:
+            limit_clause = "LIMIT ?"
+            params.append(int(limit))
+        rows = cursor.execute(
+            f"""
+            SELECT
+                so.id, so.observation_type, so.scope_type, so.scope_id,
+                so.period_start, so.period_end, so.title, so.summary_text,
+                so.progress_text, so.project_key, so.objective_key,
+                so.work_type, so.category, so.key_points_json,
+                so.blockers_json, so.next_actions_json, so.entities_json,
+                so.artifacts_json, so.evidence_window_workstream_ids_json,
+                so.confidence
+            FROM screen_observations so
+            LEFT JOIN task_workstream_observations two
+                ON two.observation_id = so.id
+            WHERE two.observation_id IS NULL
+            ORDER BY so.period_start ASC, so.id ASC
+            {limit_clause}
+            """,
+            params,
+        ).fetchall()
+        columns = [column[0] for column in cursor.description]
+        return [
+            self.build_screen_observation_item_from_row(dict(zip(columns, row)))
+            for row in rows
+        ]
+
+    def load_task_workstreams_for_observation_generation(self):
+        cursor = self._conn.cursor()
+        rows = cursor.execute(
+            """
+            SELECT
+                id, title, summary, category, start_timestamp, end_timestamp,
+                topics_json, entities_json, artifacts_json, app_names_json,
+                window_titles_json, window_workstream_count, view_count,
+                segment_count, confidence, task_key, status, project_key,
+                objective_key, work_type, progress_text, blockers_json,
+                next_actions_json, observation_count, last_activity_timestamp,
+                metadata_json, generation_method, created_at, updated_at
+            FROM task_workstream
+            ORDER BY COALESCE(last_activity_timestamp, end_timestamp, updated_at) DESC, id DESC
+            """
+        ).fetchall()
+        columns = [column[0] for column in cursor.description]
+        tasks = []
+        for row in rows:
+            item = dict(zip(columns, row))
+            topics = parse_json_list(item.get("topics_json"))
+            entities = parse_json_list(item.get("entities_json"))
+            artifacts = parse_json_list(item.get("artifacts_json"))
+            app_names = parse_json_list(item.get("app_names_json"))
+            window_titles = parse_json_list(item.get("window_titles_json"))
+            blockers = parse_json_list(item.get("blockers_json"))
+            next_actions = parse_json_list(item.get("next_actions_json"))
+            token_text = " ".join([
+                item.get("title") or "",
+                item.get("summary") or "",
+                item.get("progress_text") or "",
+                " ".join(str(value) for value in topics),
+                " ".join(str(value) for value in entities),
+                " ".join(str(value) for value in artifacts),
+            ])
+            tasks.append({
+                "id": item.get("id"),
+                "title": item.get("title") or "",
+                "summary": item.get("summary") or "",
+                "category": item.get("category") or "other",
+                "start_timestamp": item.get("start_timestamp"),
+                "end_timestamp": item.get("end_timestamp"),
+                "topics": topics,
+                "entities": entities,
+                "entity_keys": {normalize_signature_text(value) for value in entities if str(value).strip()},
+                "artifacts": artifacts,
+                "artifact_keys": {normalize_signature_text(value) for value in artifacts if str(value).strip()},
+                "app_names": app_names,
+                "window_titles": window_titles,
+                "window_workstream_count": item.get("window_workstream_count") or 0,
+                "view_count": item.get("view_count") or 0,
+                "segment_count": item.get("segment_count") or 0,
+                "confidence": item.get("confidence") or 0.0,
+                "task_key": item.get("task_key") or "",
+                "status": item.get("status") or "active",
+                "project_key": item.get("project_key") or "unknown",
+                "objective_key": item.get("objective_key") or "general",
+                "work_type": item.get("work_type") or "other",
+                "progress_text": item.get("progress_text") or "",
+                "blockers": blockers,
+                "next_actions": next_actions,
+                "observation_count": item.get("observation_count") or 0,
+                "last_activity_timestamp": item.get("last_activity_timestamp"),
+                "metadata_json": item.get("metadata_json"),
+                "generation_method": item.get("generation_method"),
+                "tokens": tokenize_signature_text(token_text),
+            })
+        return tasks
+
+    def save_or_update_observation_task_workstream(self, task_entry):
+        cursor = self._conn.cursor()
+        now = now_db_timestamp()
+        task_workstream_id = task_entry.get("id")
+        values = (
+            task_entry.get("title") or "",
+            task_entry.get("summary") or "",
+            task_entry.get("category") or "general_work",
+            format_db_timestamp(task_entry.get("start_timestamp")),
+            format_db_timestamp(task_entry.get("end_timestamp")),
+            task_entry.get("topics_json") or "[]",
+            task_entry.get("entities_json") or "[]",
+            task_entry.get("artifacts_json") or "[]",
+            task_entry.get("app_names_json") or "[]",
+            task_entry.get("window_titles_json") or "[]",
+            int(task_entry.get("window_workstream_count") or 0),
+            int(task_entry.get("view_count") or 0),
+            int(task_entry.get("segment_count") or 0),
+            float(task_entry.get("confidence") or 0.0),
+            task_entry.get("task_key") or "",
+            task_entry.get("status") or "active",
+            task_entry.get("project_key") or "unknown",
+            task_entry.get("objective_key") or "general",
+            task_entry.get("work_type") or "other",
+            task_entry.get("progress_text") or "",
+            task_entry.get("blockers_json") or "[]",
+            task_entry.get("next_actions_json") or "[]",
+            int(task_entry.get("observation_count") or 0),
+            format_db_timestamp(task_entry.get("last_activity_timestamp") or task_entry.get("end_timestamp")),
+            task_entry.get("metadata_json") or "{}",
+            task_entry.get("generation_method") or "screen_observation_task_clustering",
+            task_entry.get("llm_model") or "",
+            task_entry.get("llm_status") or "",
+            task_entry.get("llm_error") or "",
+            format_db_timestamp(task_entry.get("llm_updated_at")) if task_entry.get("llm_updated_at") else None,
+        )
+        if task_workstream_id:
+            cursor.execute(
+                """
+                UPDATE task_workstream
+                SET title = ?, summary = ?, category = ?, start_timestamp = ?,
+                    end_timestamp = ?, topics_json = ?, entities_json = ?,
+                    artifacts_json = ?, app_names_json = ?, window_titles_json = ?,
+                    window_workstream_count = ?, view_count = ?, segment_count = ?,
+                    confidence = ?, task_key = ?, status = ?, project_key = ?,
+                    objective_key = ?, work_type = ?, progress_text = ?,
+                    blockers_json = ?, next_actions_json = ?, observation_count = ?,
+                    last_activity_timestamp = ?, metadata_json = ?,
+                    generation_method = ?, llm_model = ?, llm_status = ?,
+                    llm_error = ?, llm_updated_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (*values, now, task_workstream_id),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO task_workstream
+                (title, summary, category, start_timestamp, end_timestamp,
+                 topics_json, entities_json, artifacts_json, app_names_json,
+                 window_titles_json, window_workstream_count, view_count,
+                 segment_count, confidence, task_key, status, project_key,
+                 objective_key, work_type, progress_text, blockers_json,
+                 next_actions_json, observation_count, last_activity_timestamp,
+                 metadata_json, generation_method, llm_model, llm_status,
+                 llm_error, llm_updated_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (*values, now, now),
+            )
+            task_workstream_id = cursor.lastrowid
+        return int(task_workstream_id)
+
+    def attach_observation_to_task_workstream(
+        self,
+        task_workstream_id,
+        observation_id,
+        *,
+        role="evidence",
+        confidence=1.0,
+        reason="",
+    ):
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO task_workstream_observations
+            (task_workstream_id, observation_id, role, confidence, reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(task_workstream_id),
+                int(observation_id),
+                role,
+                float(confidence or 0.0),
+                reason,
+                now_db_timestamp(),
+            ),
+        )
+        self._conn.commit()
 
     def load_dirty_persisted_screen_fact_clusters(self, window_workstream_ids=None):
         cursor = self._conn.cursor()
