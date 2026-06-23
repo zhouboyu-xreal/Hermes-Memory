@@ -3934,7 +3934,7 @@ class ScreenMemoryManager:
         }
 
     def load_window_workstream_context_for_observation(self, window_workstream_id):
-        rows = self.screen_db.load_window_workstream_signatures_for_task_generation(
+        rows = self.screen_db.load_window_workstream_signatures(
             window_workstream_ids=[window_workstream_id],
         )
         if not rows:

@@ -1707,6 +1707,87 @@ class ScreenMemoryDB:
             workstream["member_views"] = self.load_window_workstream_member_views(cursor, workstream["id"])
         return window_workstream
     
+    def load_window_workstream_signatures(self, window_workstream_ids=None):
+
+        cursor = self._conn.cursor()
+        where_clause = ""
+        params = []
+        if window_workstream_ids is not None:
+            window_workstream_ids = [item for item in window_workstream_ids if item is not None]
+            if not window_workstream_ids:
+                return []
+            placeholders = ",".join("?" for _ in window_workstream_ids)
+            where_clause = f"WHERE ww.id IN ({placeholders})"
+            params = window_workstream_ids
+
+        cursor.execute(f"""
+            SELECT
+                ww.id,
+                ww.title,
+                ww.summary,
+                ww.category,
+                ww.start_timestamp,
+                ww.end_timestamp,
+                ww.topics_json,
+                ww.entities_json,
+                ww.artifacts_json,
+                ww.app_names_json,
+                ww.window_titles_json,
+                ww.view_count,
+                ww.segment_count,
+                ww.confidence,
+                ww.created_at,
+                ww.updated_at
+            FROM window_workstream ww
+            {where_clause}
+            ORDER BY ww.start_timestamp ASC, ww.id ASC
+        """, params)
+        columns = [column[0] for column in cursor.description]
+        items = []
+        for row in cursor.fetchall():
+            item = dict(zip(columns, row))
+            topics = parse_json_list(item.get("topics_json"))
+            entities = parse_json_list(item.get("entities_json"))
+            artifacts = parse_json_list(item.get("artifacts_json"))
+            app_names = parse_json_list(item.get("app_names_json"))
+            window_titles = parse_json_list(item.get("window_titles_json"))
+            signature_text = " ".join([
+                item.get("title") or "",
+                item.get("summary") or "",
+                " ".join(str(value) for value in topics),
+                " ".join(str(value) for value in entities),
+                " ".join(str(value) for value in artifacts),
+                " ".join(str(value) for value in app_names),
+                " ".join(str(value) for value in window_titles),
+            ])
+            try:
+                confidence = float(item.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            items.append({
+                "id": item["id"],
+                "title": item.get("title") or "",
+                "summary": item.get("summary") or "",
+                "category": item.get("category") or "other",
+                "start_timestamp": item.get("start_timestamp"),
+                "end_timestamp": item.get("end_timestamp"),
+                "topics": topics,
+                "topic_keys": {normalize_signature_text(value) for value in topics if str(value).strip()},
+                "entities": entities,
+                "entity_keys": {normalize_signature_text(value) for value in entities if str(value).strip()},
+                "artifacts": artifacts,
+                "artifact_keys": {normalize_signature_text(value) for value in artifacts if str(value).strip()},
+                "app_names": app_names,
+                "window_titles": window_titles,
+                "tokens": tokenize_signature_text(signature_text),
+                "view_count": item.get("view_count") or 0,
+                "segment_count": item.get("segment_count") or 0,
+                "confidence": max(0.0, min(1.0, confidence)),
+                "created_at": item.get("created_at"),
+                "updated_at": item.get("updated_at"),
+            })
+        return items
+    
     def load_window_workstream_member_views(self, window_workstream_id):
 
         cursor = self._conn.cursor()
