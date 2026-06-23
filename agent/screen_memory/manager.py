@@ -1918,134 +1918,6 @@ def _is_hard_activity_switch(previous_group, current_group):
     return "meeting" in {previous_group, current_group} or "chat" in {previous_group, current_group}
 
 
-def _should_start_new_segment(current_group, next_record, gap, max_duration, focus_switch_gap):
-    anchor_record = _last_non_system_record(current_group)
-    if anchor_record is None:
-        return False
-
-    time_gap = next_record["timestamp_dt"] - anchor_record["timestamp_dt"]
-    if time_gap > gap:
-        return True
-
-    segment_duration = next_record["timestamp_dt"] - current_group[0]["timestamp_dt"]
-    if segment_duration > max_duration:
-        return True
-
-    next_activity = _activity_group(next_record)
-    anchor_activity = _activity_group(anchor_record)
-    if next_activity == "system":
-        return False
-
-    if _is_hard_activity_switch(anchor_activity, next_activity) and next_record["focused"] == 1 and time_gap > timedelta(seconds=30):
-        return True
-
-    if next_record["focused"] == 1 and anchor_record.get("focused") == 1:
-        app_changed = next_record.get("app") != anchor_record.get("app")
-        window_changed = next_record.get("window") != anchor_record.get("window")
-        if app_changed and window_changed and time_gap > focus_switch_gap:
-            return True
-
-        next_artifacts = _artifact_keys(next_record)
-        anchor_artifacts = _artifact_keys(anchor_record)
-        if next_artifacts and anchor_artifacts and not (next_artifacts & anchor_artifacts):
-            return time_gap > timedelta(minutes=2)
-
-    return False
-
-def summarize_segment(records, view_infos=None):
-    view_infos = view_infos or []
-    app_counts = Counter(record["app"] for record in records if record["app"])
-    kind_counts = Counter(record["content_kind"] for record in records if record["content_kind"])
-    activity_type = kind_counts.most_common(1)[0][0] if kind_counts else "other"
-    apps = [app for app, _ in app_counts.most_common(6)]
-    windows = []
-    artifacts = []
-
-    for record in records:
-        if record["window"] and record["window"] not in windows:
-            windows.append(record["window"])
-        for artifact in extract_artifacts(record["window"], record["cleaned_text"]):
-            if artifact not in artifacts:
-                artifacts.append(artifact)
-
-    representative = sorted(
-        records,
-        key=lambda item: (item["focused"], item["ocr_quality_score"], len(item["cleaned_text"])),
-        reverse=True,
-    )[:4]
-    snippets = []
-    for record in representative:
-        snippet = compact_ocr_excerpt(record["cleaned_text"], 360)
-        if snippet:
-            snippets.append(snippet)
-
-    action_prefix = {
-        "coding": "处理代码或工程实现",
-        "meeting": "参与会议或跟进会议内容",
-        "chat": "处理沟通消息",
-        "writing": "编辑或阅读文档",
-        "browsing": "查阅网页资料",
-        "system": "处理系统设置或状态",
-        "other": "处理屏幕上的工作内容",
-    }.get(activity_type, "处理屏幕上的工作内容")
-
-    actions = [action_prefix]
-    if artifacts:
-        actions.append(f"涉及产出物或材料：{', '.join(artifacts[:5])}")
-    for snippet in snippets[:3]:
-        actions.append(f"屏幕证据显示：{snippet[:160]}")
-
-    view_summaries = []
-    for view_info in view_infos:
-        overlap = view_info.get("segment_overlap") or {}
-        view_text = compact_ocr_excerpt(overlap.get("representative_text"), 220)
-        app_name = view_info.get("app_name") or "未知应用"
-        window_title = view_info.get("window_title") or "未知窗口"
-        if view_text:
-            view_summaries.append(f"{app_name} - {window_title}: {view_text[:220]}")
-
-    if view_summaries:
-        actions.append(f"综合了 {len(view_summaries)} 个应用窗口视图。")
-        for view_summary in view_summaries[:4]:
-            actions.append(f"视图证据显示：{view_summary}")
-
-    start = records[0]["timestamp_dt"]
-    end = records[-1]["timestamp_dt"]
-    duration_min = max(1, round((end - start).total_seconds() / 60))
-    summary = (
-        f"{format_db_timestamp(start)} 至 {format_db_timestamp(end)}，主要在 {', '.join(apps) or '未知应用'} "
-        f"进行{activity_type}类工作，持续约 {duration_min} 分钟。"
-    )
-    if windows:
-        summary += f" 主要窗口包括：{'; '.join(windows[:3])}。"
-    if artifacts:
-        summary += f" 识别到的文件或链接线索：{', '.join(artifacts[:5])}。"
-    if view_summaries:
-        summary += " 视图层面显示：" + "；".join(view_summaries[:3])[:600] + "。"
-
-    confidence = sum(record["ocr_quality_score"] for record in records) / max(1, len(records))
-    if len(records) >= 5:
-        confidence += 0.08
-    if any(record["focused"] for record in records):
-        confidence += 0.05
-
-    return {
-        "start_timestamp": format_db_timestamp(start),
-        "end_timestamp": format_db_timestamp(end),
-        "duration_seconds": int((end - start).total_seconds()),
-        "activity_type": activity_type,
-        "project_hint": "unknown",
-        "app_names": json.dumps(apps, ensure_ascii=False),
-        "window_titles": json.dumps(windows[:12], ensure_ascii=False),
-        "summary": summary,
-        "actions_json": json.dumps(actions, ensure_ascii=False),
-        "artifacts_json": json.dumps(artifacts[:20], ensure_ascii=False),
-        "evidence_ids_json": json.dumps([record["id"] for record in records], ensure_ascii=False),
-        "confidence": round(max(0.0, min(1.0, confidence)), 3),
-        "record_count": len(records),
-    }
-
-
 def summarize_view(records):
     sorted_records = sorted(records, key=lambda item: item["timestamp_dt"])
     app = sorted_records[0].get("app")
@@ -2294,7 +2166,6 @@ class ScreenMemoryManager:
         self.llm_client = llm_client
         self.db_cfg = self.config.get("database", {})
         self.policy_cfg = self.config.get("cleaning_policy", {})
-        self.segment_cfg = self.config.get("segment_generation", {})
         self.view_cfg = self.config.get("view_generation", {})
         self.window_workstream_cfg = self.config.get("window_workstream_generation", {})
         self.task_workstream_cfg = self.config.get("task_workstream_generation", {})
@@ -2326,12 +2197,6 @@ class ScreenMemoryManager:
             self.policy_cfg.get("system_apps_keep_if_focused", [])
         )
         self.min_useful_chars = self.policy_cfg.get("min_useful_chars", 8)
-        self.segment_gap_minutes = self.segment_cfg.get("gap_minutes", 8)
-        self.max_segment_minutes = self.segment_cfg.get("max_minutes", 30)
-        self.focus_switch_split_minutes = self.segment_cfg.get(
-            "focus_switch_split_minutes",
-            5,
-        )
 
     def _print(self, *args, **kwargs):
         if not self.quiet:
@@ -2808,53 +2673,6 @@ class ScreenMemoryManager:
 
         return kept_records, stats
 
-    def build_llm_segment_payload(self, segment_summary, view_infos=None):
-        view_infos = view_infos or []
-        view_overlaps = []
-        for view_info in view_infos:
-            segment_overlap = view_info.get("segment_overlap") or {}
-            view_overlaps.append({
-                "app_name": view_info.get("app_name"),
-                "window_title": view_info.get("window_title"),
-                "content_kind": view_info.get("content_kind"),
-                "segment_overlap": {
-                    "time_range": {
-                        "start": segment_overlap.get("start_timestamp"),
-                        "end": segment_overlap.get("end_timestamp"),
-                    },
-                    "representative_text": compact_ocr_excerpt(segment_overlap.get("representative_text"), 1400),
-                    "evidence_ids": json.loads(segment_overlap.get("evidence_ids_json") or "[]"),
-                    "record_count": segment_overlap.get("record_count"),
-                },
-                "global_view_context": {
-                    "time_range": {
-                        "start": view_info.get("start_timestamp"),
-                        "end": view_info.get("end_timestamp"),
-                    },
-                    "representative_text": compact_ocr_excerpt(view_info.get("representative_text"), 1000),
-                    "confidence": view_info.get("confidence"),
-                    "record_count": view_info.get("record_count"),
-                },
-                "topics": json.loads(view_info.get("topics_json") or "[]"),
-                "entities": json.loads(view_info.get("entities_json") or "[]"),
-                "artifacts": json.loads(view_info.get("artifacts_json") or "[]"),
-            })
-
-        return {
-            "time_range": {
-                "start": segment_summary["start_timestamp"],
-                "end": segment_summary["end_timestamp"],
-                "duration_seconds": segment_summary["duration_seconds"],
-            },
-            "activity_type": segment_summary["activity_type"],
-            "apps": json.loads(segment_summary["app_names"]),
-            "windows": json.loads(segment_summary["window_titles"]),
-            "artifacts": json.loads(segment_summary["artifacts_json"]),
-            "local_summary": segment_summary["summary"],
-            "local_actions": json.loads(segment_summary["actions_json"]),
-            "view_overlaps": view_overlaps,
-        }
-
     def hash_llm_payload(self, payload):
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(body.encode("utf-8")).hexdigest()
@@ -3046,38 +2864,6 @@ class ScreenMemoryManager:
             normalized["confidence"] = 0.0
         normalized["confidence"] = max(0.0, min(1.0, normalized["confidence"]))
         return normalized
-
-    def generate_segment_using_llm(self, segment_summary, config, view_infos=None):
-        payload = self.build_llm_segment_payload(segment_summary, view_infos=view_infos)
-        payload_hash = self.hash_llm_payload(payload)
-        now = now_db_timestamp()
-
-        try:
-            user_prompt = SEGMENT_LLM_USER_PROMPT_TEMPLATE.format(
-                payload_json=json.dumps(payload, ensure_ascii=False)
-            )
-            llm_result = self.normalize_llm_summary(
-                self.call_json_llm(SEGMENT_LLM_SYSTEM_PROMPT, user_prompt, config)
-            )
-            return {
-                "llm_summary_json": json.dumps(llm_result, ensure_ascii=False),
-                "llm_summary_text": llm_result.get("summary", ""),
-                "llm_model": config.get("llm_model"),
-                "llm_status": "ok",
-                "llm_error": None,
-                "llm_hash": payload_hash,
-                "llm_updated_at": now,
-            }, True, None
-        except Exception as e:
-            return {
-                "llm_summary_json": None,
-                "llm_summary_text": None,
-                "llm_model": config.get("llm_model"),
-                "llm_status": "error",
-                "llm_error": str(e)[:1000],
-                "llm_hash": payload_hash,
-                "llm_updated_at": now,
-            }, False, str(e)
 
     def normalize_window_workstream_llm_summary(self, llm_result):
         normalized = {
@@ -3438,7 +3224,7 @@ class ScreenMemoryManager:
             **llm_fields,
         }
 
-    def generate_screen_facts_for_views(self, view_entries):
+    def generate_screen_facts_using_views(self, view_entries):
         screen_fact_cfg = self.screen_fact_cfg or {}
         if not screen_fact_cfg.get("enabled", False):
             return {
@@ -3509,7 +3295,6 @@ class ScreenMemoryManager:
             "app_names": item.get("app_names") or [],
             "window_titles": item.get("window_titles") or [],
             "view_count": item.get("view_count") or 0,
-            "segment_count": item.get("segment_count") or 0,
             "confidence": item.get("confidence") or 0.0,
         }
 
@@ -4469,7 +4254,6 @@ class ScreenMemoryManager:
             "evidence_window_workstream_ids": list(observation.get("evidence_window_workstream_ids") or [])[:60],
             "window_workstream_count": len(set(observation.get("evidence_window_workstream_ids") or [])),
             "view_count": 0,
-            "segment_count": 0,
             "observation_count": 1,
             "confidence": observation.get("confidence") or 0.0,
             "tokens": observation.get("tokens") or self.screen_task_text_tokens(observation),
@@ -4622,7 +4406,6 @@ class ScreenMemoryManager:
                 else task.get("window_workstream_count") or 0
             ),
             "view_count": task.get("view_count") or 0,
-            "segment_count": task.get("segment_count") or 0,
             "observation_count": task.get("observation_count") or 0,
             "confidence": task.get("confidence") or 0.0,
             "blockers_json": dump_json_list(task.get("blockers") or []),
@@ -4656,7 +4439,6 @@ class ScreenMemoryManager:
             "observation_count": entry.get("observation_count") or 0,
             "window_workstream_count": entry.get("window_workstream_count") or 0,
             "view_count": entry.get("view_count") or 0,
-            "segment_count": entry.get("segment_count") or 0,
             "confidence": entry.get("confidence") or 0.0,
             "tokens": tokenize_signature_text(
                 " ".join([entry.get("title") or "", entry.get("summary") or "", entry.get("progress_text") or ""])
@@ -4885,178 +4667,6 @@ class ScreenMemoryManager:
             "touched_task_workstream_ids": sorted(set(touched_task_ids)),
         }
 
-    def generate_segment_info(self, records, segment_config=None, view_infos=None):
-        view_infos = view_infos or []
-        info = summarize_segment(records, view_infos=view_infos)
-        info.update({
-            "llm_summary_json": None,
-            "llm_summary_text": None,
-            "llm_model": None,
-            "llm_status": None,
-            "llm_error": None,
-            "llm_hash": None,
-            "llm_updated_at": None,
-        })
-        if segment_config:
-            llm_fields, ok, error = self.generate_segment_using_llm(
-                info,
-                segment_config,
-                view_infos=view_infos,
-            )
-            info.update(llm_fields)
-            return info, ok, error
-        return info, None, None
-
-    def group_segments_from_records(self, records, gap_minutes, max_segment_minutes=30, focus_switch_split_minutes=5):
-        if not records:
-            return []
-
-        sorted_records = sorted(records, key=lambda item: item["timestamp_dt"])
-        gap = timedelta(minutes=gap_minutes)
-        max_duration = timedelta(minutes=max_segment_minutes)
-        focus_switch_gap = timedelta(minutes=focus_switch_split_minutes)
-        segments = []
-        current_group = []
-
-        for record in sorted_records:
-            if not current_group:
-                current_group = [record]
-                continue
-
-            if _should_start_new_segment(current_group, record, gap, max_duration, focus_switch_gap):
-                segments.append(current_group)
-                current_group = [record]
-            else:
-                current_group.append(record)
-
-        if current_group:
-            segments.append(current_group)
-
-        return segments
-
-    def generate_segment_record_entries(
-        self,
-        inserted_records,
-        gap_minutes,
-        max_segment_minutes=30,
-        focus_switch_split_minutes=5,
-    ):
-        gap_minutes = self.segment_gap_minutes
-        max_segment_minutes = self.max_segment_minutes
-        focus_switch_split_minutes = self.focus_switch_split_minutes
-
-        segment_record_groups = self.group_segments_from_records(
-            inserted_records,
-            gap_minutes,
-            max_segment_minutes=max_segment_minutes,
-            focus_switch_split_minutes=focus_switch_split_minutes,
-        )
-        return [
-            {
-                "segment_key": segment_key,
-                "records": records,
-            }
-            for segment_key, records in enumerate(segment_record_groups)
-        ]
-
-    def map_record_ids_to_segment_keys(self, segment_record_entries):
-        record_segment_key_by_id = {}
-        for segment_entry in segment_record_entries:
-            segment_key = segment_entry["segment_key"]
-            for record in segment_entry["records"]:
-                record_segment_key_by_id[record["id"]] = segment_key
-        return record_segment_key_by_id
-
-    def group_view_infos_by_segment(self, view_entries):
-        view_infos_by_segment = {}
-        for view_entry in view_entries:
-            for segment_key, slice_info in view_entry.get("segment_slices", {}).items():
-                if segment_key is None:
-                    continue
-                view_infos_by_segment.setdefault(segment_key, []).append({
-                    **view_entry["info"],
-                    "segment_overlap": slice_info,
-                })
-        return view_infos_by_segment
-
-    def generate_segment_entries(
-        self,
-        segment_record_entries,
-        view_entries,
-        segment_config=None,
-    ):
-        view_infos_by_segment = self.group_view_infos_by_segment(view_entries)
-        segment_llm_budget = self.segment_cfg.get("llm_budget", 0) if self.segment_cfg else 0
-
-        segment_entries = []
-        llm_generation_count = 0
-        llm_failed_count = 0
-        llm_enabled = bool(segment_config and segment_config.get("enable_LLM_summary"))
-        for segment_record_entry in segment_record_entries:
-            segment_key = segment_record_entry["segment_key"]
-            records = segment_record_entry["records"]
-            view_infos = view_infos_by_segment.get(segment_key, [])
-            use_llm = llm_enabled and llm_generation_count + llm_failed_count < segment_llm_budget
-            if use_llm:
-                self._print(
-                    f"Summarizing segment candidate {segment_key + 1} with LLM "
-                        f"({llm_generation_count + llm_failed_count + 1}/{segment_llm_budget})..."
-                )
-            info, ok, error = self.generate_segment_info(
-                records,
-                segment_config if use_llm else None,
-                view_infos=view_infos,
-            )
-            if ok is True:
-                llm_generation_count += 1
-            elif ok is False:
-                llm_failed_count += 1
-                self._print(f"LLM summary failed for segment candidate {segment_key + 1}: {error}")
-            segment_entries.append({
-                "segment_key": segment_key,
-                "info": info,
-                "records": records,
-            })
-        return segment_entries, {
-            "segment_llm_generation_count": llm_generation_count,
-            "segment_llm_failed_count": llm_failed_count,
-        }
-
-    def save_segment(self, cursor, segment_summary):
-        cursor.execute(
-            """
-            INSERT INTO segments
-            (start_timestamp, end_timestamp, duration_seconds, activity_type, project_hint,
-             app_names, window_titles, summary, actions_json, artifacts_json,
-             evidence_ids_json, llm_summary_json, llm_summary_text, llm_model, llm_status,
-             llm_error, llm_hash, llm_updated_at, confidence, record_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                format_db_timestamp(segment_summary["start_timestamp"]),
-                format_db_timestamp(segment_summary["end_timestamp"]),
-                segment_summary["duration_seconds"],
-                segment_summary["activity_type"],
-                segment_summary["project_hint"],
-                segment_summary["app_names"],
-                segment_summary["window_titles"],
-                segment_summary["summary"],
-                segment_summary["actions_json"],
-                segment_summary["artifacts_json"],
-                segment_summary["evidence_ids_json"],
-                segment_summary.get("llm_summary_json"),
-                segment_summary.get("llm_summary_text"),
-                segment_summary.get("llm_model"),
-                segment_summary.get("llm_status"),
-                segment_summary.get("llm_error"),
-                segment_summary.get("llm_hash"),
-                segment_summary.get("llm_updated_at"),
-                segment_summary["confidence"],
-                segment_summary["record_count"],
-            ),
-        )
-        return cursor.lastrowid
-
     def generate_view_record_entries(self, records, gap_minutes=8, max_duration_minutes=30):
         records_by_window = {}
         for record in records:
@@ -5120,17 +4730,6 @@ class ScreenMemoryManager:
             cleaned_records.append(cleaned_record)
         return cleaned_records
 
-    def build_view_segment_slices(self, records, record_segment_key_by_id):
-        records_by_segment_key = {}
-        for record in records:
-            segment_key = record_segment_key_by_id.get(record["id"])
-            if segment_key is not None:
-                records_by_segment_key.setdefault(segment_key, []).append(record)
-        return {
-            segment_key: summarize_view_overlap_slice(self.records_with_clean_view_window(segment_records))
-            for segment_key, segment_records in sorted(records_by_segment_key.items())
-        }
-
     def generate_view_info(self, records):
         info = summarize_view(self.records_with_clean_view_window(records))
         info["window_title"] = self.clean_view_window_title(info.get("window_title"))
@@ -5148,18 +4747,12 @@ class ScreenMemoryManager:
     def generate_view_entries(
         self,
         records,
-        record_segment_key_by_id=None,
     ):
         view_entries = []
 
-        if self.view_cfg:
-            view_gap_minutes = self.view_cfg.get("gap_minutes") or self.segment_gap_minutes
-            view_max_minutes = self.view_cfg.get("max_minutes") or self.max_segment_minutes
-        else:
-            view_gap_minutes = self.segment_gap_minutes
-            view_max_minutes = self.max_segment_minutes
+        view_gap_minutes = self.view_cfg.get("gap_minutes")
+        view_max_minutes = self.view_cfg.get("max_minutes")
 
-        record_segment_key_by_id = record_segment_key_by_id or {}
         view_record_groups = self.generate_view_record_entries(
             records,
             gap_minutes=view_gap_minutes,
@@ -5168,20 +4761,7 @@ class ScreenMemoryManager:
         for view_records in view_record_groups:
             info = self.generate_view_info(view_records)
 
-            segment_key_counts = self.get_view_segment_key_counts(view_records, record_segment_key_by_id)
-            segment_slices = self.build_view_segment_slices(view_records, record_segment_key_by_id)
-            segment_keys = list(segment_key_counts.keys())
-            primary_segment_key = None
-            if segment_key_counts:
-                primary_segment_key = max(
-                    segment_key_counts.items(),
-                    key=lambda item: (item[1], -item[0]),
-                )[0]
             view_entries.append({
-                "segment_key": primary_segment_key,
-                "segment_keys": segment_keys,
-                "segment_key_counts": segment_key_counts,
-                "segment_slices": segment_slices,
                 "info": info,
                 "records": view_records,
             })
@@ -5239,26 +4819,6 @@ class ScreenMemoryManager:
                 links,
             )
 
-    def save_view_segment_links(self, cursor, view_id, segment_entries):
-        for segment_id, slice_info in segment_entries.items():
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO view_segments
-                (view_id, segment_id, record_count, start_timestamp, end_timestamp,
-                 representative_text, evidence_ids_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    view_id,
-                    segment_id,
-                    slice_info["record_count"],
-                    format_db_timestamp(slice_info["start_timestamp"]),
-                    format_db_timestamp(slice_info["end_timestamp"]),
-                    slice_info["representative_text"],
-                    slice_info["evidence_ids_json"],
-                ),
-            )
-
     def create_window_workstream_from_view(self, view):
         workstream = {
             "id": None,
@@ -5281,7 +4841,6 @@ class ScreenMemoryManager:
             "artifacts": [],
             "artifact_keys": set(),
             "tokens": set(),
-            "segment_ids": set(),
             "confidence_values": [],
             "relevance_values": [],
         }
@@ -5315,9 +4874,6 @@ class ScreenMemoryManager:
         workstream["entity_keys"].update(view["entity_keys"])
         workstream["artifact_keys"].update(view["artifact_keys"])
         workstream["tokens"].update(view["tokens"])
-        workstream["segment_ids"].update(
-            segment_id for segment_id in view.get("segment_ids", []) if segment_id is not None
-        )
         workstream["confidence_values"].append(view["confidence"])
         workstream["relevance_values"].append(relevance)
 
@@ -5753,8 +5309,7 @@ class ScreenMemoryManager:
         app_names = workstream["app_names"][:5]
         view_count = workstream.get("existing_view_count", 0) + len(workstream["views"])
         local_summary = (
-            f"围绕 {title} 的跨时间 workstream，包含 {view_count} 个 view、"
-            f"{len(workstream['segment_ids'])} 个 segment。"
+            f"围绕 {title} 的跨时间 workstream，包含 {view_count} 个 view"
         )
         if app_names:
             local_summary += "主要应用：" + "、".join(app_names) + "。"
@@ -5777,7 +5332,6 @@ class ScreenMemoryManager:
             "app_names_json": json.dumps(workstream["app_names"][:20], ensure_ascii=False),
             "window_titles_json": json.dumps(workstream["window_titles"][:30], ensure_ascii=False),
             "view_count": view_count,
-            "segment_count": len(workstream["segment_ids"]),
             "confidence": confidence,
             "members": workstream["members"],
             "llm_summary_json": workstream.get("llm_summary_json"),
@@ -6096,14 +5650,11 @@ class ScreenMemoryManager:
 
         # Clean
         stats.update({
-            "segments": 0,
             "views": 0,
             "window_workstream": 0,
             "window_workstream_members": 0,
             "task_workstream": 0,
             "task_workstream_members": 0,
-            "segment_llm_generation_count": 0,
-            "segment_llm_failed_count": 0,
             "view_llm_generation_count": 0,
             "view_llm_failed_count": 0,
             "window_workstream_llm_generation_count": 0,
@@ -6119,31 +5670,13 @@ class ScreenMemoryManager:
             "screen_observation_llm_failed_count": 0,
         })
 
-        segment_record_entries = self.generate_segment_record_entries(
-            inserted_records,
-            self.segment_gap_minutes,
-            max_segment_minutes=self.max_segment_minutes,
-            focus_switch_split_minutes=self.focus_switch_split_minutes,
-        )
-        record_segment_key_by_id = self.map_record_ids_to_segment_keys(segment_record_entries)
-
         view_entries, view_llm_stats = self.generate_view_entries(
             inserted_records,
-            record_segment_key_by_id=record_segment_key_by_id,
         )
-
-        segment_entries, segment_llm_stats = self.generate_segment_entries(
-            segment_record_entries,
-            view_entries,
-            segment_config=self.segment_cfg,
-        )
-
-        segment_id_by_key = self.screen_db.write_segment_table(segment_entries)
         view_count = self.screen_db.write_view_table(
             view_entries,
-            segment_id_by_key,
         )
-        screen_fact_stats = self.generate_screen_facts_for_views(view_entries)
+        screen_fact_stats = self.generate_screen_facts_using_views(view_entries)
 
         touched_window_workstream_ids, window_stream_stats = self.update_window_workstream_tables(view_entries)
 
@@ -6151,11 +5684,9 @@ class ScreenMemoryManager:
         workstream_stats.update(window_stream_stats)
         workstream_stats["touched_window_workstream_ids"] = touched_window_workstream_ids
 
-        stats["segments"] = len(segment_entries)
         stats["views"] = view_count
         stats.update(screen_fact_stats)
         stats.update(workstream_stats)
-        stats.update(segment_llm_stats)
         stats.update(view_llm_stats)
 
         # Record the actual output path used

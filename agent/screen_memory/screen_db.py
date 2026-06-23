@@ -164,32 +164,6 @@ class ScreenMemoryDB:
                 cursor.execute(f"ALTER TABLE records ADD COLUMN {column_name} {column_type}")
 
         cursor.execute("""
-        CREATE TABLE IF NOT EXISTS segments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            start_timestamp TEXT NOT NULL,
-            end_timestamp TEXT NOT NULL,
-            duration_seconds INTEGER,
-            activity_type TEXT,
-            project_hint TEXT,
-            app_names TEXT,
-            window_titles TEXT,
-            summary TEXT,
-            actions_json TEXT,
-            artifacts_json TEXT,
-            evidence_ids_json TEXT,
-            llm_summary_json TEXT,
-            llm_summary_text TEXT,
-            llm_model TEXT,
-            llm_status TEXT,
-            llm_error TEXT,
-            llm_hash TEXT,
-            llm_updated_at TEXT,
-            confidence REAL,
-            record_count INTEGER
-        );
-        """)
-
-        cursor.execute("""
         CREATE TABLE IF NOT EXISTS views (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             app_name TEXT,
@@ -224,21 +198,6 @@ class ScreenMemoryDB:
             PRIMARY KEY (view_id, record_id),
             FOREIGN KEY (view_id) REFERENCES views(id) ON DELETE CASCADE,
             FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
-        );
-        """)
-
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS view_segments (
-            view_id INTEGER NOT NULL,
-            segment_id INTEGER NOT NULL,
-            record_count INTEGER,
-            start_timestamp TEXT,
-            end_timestamp TEXT,
-            representative_text TEXT,
-            evidence_ids_json TEXT,
-            PRIMARY KEY (view_id, segment_id),
-            FOREIGN KEY (view_id) REFERENCES views(id) ON DELETE CASCADE,
-            FOREIGN KEY (segment_id) REFERENCES segments(id) ON DELETE CASCADE
         );
         """)
 
@@ -303,12 +262,6 @@ class ScreenMemoryDB:
         if "visible_content_summary" in existing_view_columns:
             cursor.execute("ALTER TABLE views DROP COLUMN visible_content_summary")
 
-        existing_view_segment_columns = {
-            row[1] for row in cursor.execute("PRAGMA table_info(view_segments)").fetchall()
-        }
-        if "visible_content_summary" in existing_view_segment_columns:
-            cursor.execute("ALTER TABLE view_segments DROP COLUMN visible_content_summary")
-
         if not view_records_existed:
             existing_record_ids = {
                 row[0] for row in cursor.execute("SELECT id FROM records").fetchall()
@@ -344,7 +297,6 @@ class ScreenMemoryDB:
             app_names_json TEXT,
             window_titles_json TEXT,
             view_count INTEGER,
-            segment_count INTEGER,
             confidence REAL,
             llm_summary_json TEXT,
             llm_model TEXT,
@@ -399,7 +351,6 @@ class ScreenMemoryDB:
             window_titles_json TEXT,
             window_workstream_count INTEGER,
             view_count INTEGER,
-            segment_count INTEGER,
             confidence REAL,
             llm_summary_json TEXT,
             llm_model TEXT,
@@ -620,14 +571,11 @@ class ScreenMemoryDB:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_records_source_capture "
             "ON records(raw_frame_id, app_name, window_title);"
         )
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_segments_time ON segments(start_timestamp, end_timestamp);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_segments_project ON segments(project_hint);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_view_time ON views(start_timestamp, end_timestamp);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_view_app ON views(app_name, window_title);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_view_kind ON views(content_kind);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_view_records_view ON view_records(view_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_view_records_record ON view_records(record_id);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_view_segments_segment ON view_segments(segment_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_openchronicle_events_time ON openchronicle_events(timestamp_epoch);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_openchronicle_events_app ON openchronicle_events(app_name, bundle_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_record_ax_events_record ON record_ax_events(record_id);")
@@ -1147,7 +1095,7 @@ class ScreenMemoryDB:
                 id, title, summary, category, start_timestamp, end_timestamp,
                 topics_json, entities_json, artifacts_json, app_names_json,
                 window_titles_json, window_workstream_count, view_count,
-                segment_count, confidence, task_key, status, project_key,
+                confidence, task_key, status, project_key,
                 objective_key, work_type, progress_text, blockers_json,
                 next_actions_json, observation_count, last_activity_timestamp,
                 metadata_json, generation_method, created_at, updated_at
@@ -1190,7 +1138,6 @@ class ScreenMemoryDB:
                 "window_titles": window_titles,
                 "window_workstream_count": item.get("window_workstream_count") or 0,
                 "view_count": item.get("view_count") or 0,
-                "segment_count": item.get("segment_count") or 0,
                 "confidence": item.get("confidence") or 0.0,
                 "task_key": item.get("task_key") or "",
                 "status": item.get("status") or "active",
@@ -1225,7 +1172,6 @@ class ScreenMemoryDB:
             task_entry.get("window_titles_json") or "[]",
             int(task_entry.get("window_workstream_count") or 0),
             int(task_entry.get("view_count") or 0),
-            int(task_entry.get("segment_count") or 0),
             float(task_entry.get("confidence") or 0.0),
             task_entry.get("task_key") or "",
             task_entry.get("status") or "active",
@@ -1251,7 +1197,7 @@ class ScreenMemoryDB:
                 SET title = ?, summary = ?, category = ?, start_timestamp = ?,
                     end_timestamp = ?, topics_json = ?, entities_json = ?,
                     artifacts_json = ?, app_names_json = ?, window_titles_json = ?,
-                    window_workstream_count = ?, view_count = ?, segment_count = ?,
+                    window_workstream_count = ?, view_count = ?,
                     confidence = ?, task_key = ?, status = ?, project_key = ?,
                     objective_key = ?, work_type = ?, progress_text = ?,
                     blockers_json = ?, next_actions_json = ?, observation_count = ?,
@@ -1269,12 +1215,12 @@ class ScreenMemoryDB:
                 (title, summary, category, start_timestamp, end_timestamp,
                  topics_json, entities_json, artifacts_json, app_names_json,
                  window_titles_json, window_workstream_count, view_count,
-                 segment_count, confidence, task_key, status, project_key,
+                 confidence, task_key, status, project_key,
                  objective_key, work_type, progress_text, blockers_json,
                  next_actions_json, observation_count, last_activity_timestamp,
                  metadata_json, generation_method, llm_model, llm_status,
                  llm_error, llm_updated_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (*values, now, now),
             )
@@ -1493,7 +1439,6 @@ class ScreenMemoryDB:
                 app_names_json,
                 window_titles_json,
                 view_count,
-                segment_count,
                 confidence,
                 llm_summary_json,
                 llm_model,
@@ -1525,15 +1470,6 @@ class ScreenMemoryDB:
                 " ".join(str(value) for value in window_titles),
             ])
 
-            segment_rows = cursor.execute(
-                """
-                SELECT DISTINCT vs.segment_id
-                FROM window_workstream_members wm
-                JOIN view_segments vs ON vs.view_id = wm.view_id
-                WHERE wm.window_workstream_id = ?
-                """,
-                (item["id"],),
-            ).fetchall()
             existing_view_count = item.get("view_count") or 0
             confidence = item.get("confidence") or 0.0
             workstream = {
@@ -1557,7 +1493,6 @@ class ScreenMemoryDB:
                 "artifacts": artifact_list,
                 "artifact_keys": {normalize_signature_text(artifact) for artifact in artifact_list if str(artifact).strip()},
                 "tokens": tokenize_signature_text(token_text),
-                "segment_ids": {row[0] for row in segment_rows if row[0] is not None},
                 "confidence_values": [confidence] * max(1, existing_view_count),
                 "relevance_values": [confidence] * max(1, existing_view_count),
                 "llm_summary_json": item.get("llm_summary_json"),
@@ -1601,7 +1536,6 @@ class ScreenMemoryDB:
                 ww.app_names_json,
                 ww.window_titles_json,
                 ww.view_count,
-                ww.segment_count,
                 ww.confidence,
                 ww.created_at,
                 ww.updated_at
@@ -1648,7 +1582,6 @@ class ScreenMemoryDB:
                 "window_titles": window_titles,
                 "tokens": tokenize_signature_text(signature_text),
                 "view_count": item.get("view_count") or 0,
-                "segment_count": item.get("segment_count") or 0,
                 "confidence": max(0.0, min(1.0, confidence)),
                 "created_at": item.get("created_at"),
                 "updated_at": item.get("updated_at"),
@@ -1689,7 +1622,6 @@ class ScreenMemoryDB:
                 app_names_json,
                 window_titles_json,
                 view_count,
-                segment_count,
                 confidence,
                 llm_summary_json,
                 llm_model,
@@ -1721,15 +1653,6 @@ class ScreenMemoryDB:
                 " ".join(str(value) for value in window_titles),
             ])
 
-            segment_rows = cursor.execute(
-                """
-                SELECT DISTINCT vs.segment_id
-                FROM window_workstream_members wm
-                JOIN view_segments vs ON vs.view_id = wm.view_id
-                WHERE wm.window_workstream_id = ?
-                """,
-                (item["id"],),
-            ).fetchall()
             existing_view_count = item.get("view_count") or 0
             confidence = item.get("confidence") or 0.0
             workstream = {
@@ -1753,7 +1676,6 @@ class ScreenMemoryDB:
                 "artifacts": artifact_list,
                 "artifact_keys": {normalize_signature_text(artifact) for artifact in artifact_list if str(artifact).strip()},
                 "tokens": tokenize_signature_text(token_text),
-                "segment_ids": {row[0] for row in segment_rows if row[0] is not None},
                 "confidence_values": [confidence] * max(1, existing_view_count),
                 "relevance_values": [confidence] * max(1, existing_view_count),
                 "llm_summary_json": item.get("llm_summary_json"),
@@ -1798,24 +1720,8 @@ class ScreenMemoryDB:
                 v.llm_summary_json,
                 v.llm_summary_text,
                 v.confidence,
-                v.record_count,
-                COALESCE(
-                    (
-                        SELECT json_group_array(vs.segment_id)
-                        FROM view_segments vs
-                        WHERE vs.view_id = v.id
-                    ),
-                    '[]'
-                ) AS segment_ids_json,
-                s.activity_type AS segment_activity_type
+                v.record_count
             FROM views v
-            LEFT JOIN segments s ON s.id = (
-                SELECT vs.segment_id
-                FROM view_segments vs
-                WHERE vs.view_id = v.id
-                ORDER BY vs.record_count DESC, vs.segment_id ASC
-                LIMIT 1
-            )
             {where_clause}
             ORDER BY v.start_timestamp ASC, v.id ASC
         """, params)
@@ -1826,7 +1732,6 @@ class ScreenMemoryDB:
             topics = parse_json_list(item.get("topics_json"))
             entities = parse_json_list(item.get("entities_json"))
             artifacts = parse_json_list(item.get("artifacts_json"))
-            segment_ids = parse_json_list(item.get("segment_ids_json"))
 
             representative_text = item.get("representative_text") or ""
             signature_text = " ".join([
@@ -1844,12 +1749,11 @@ class ScreenMemoryDB:
                 confidence = 0.0
             views.append({
                 "id": item["id"],
-                "segment_ids": segment_ids,
                 "app_name": item.get("app_name") or "",
                 "app_key": normalize_signature_text(item.get("app_name")),
                 "window_title": item.get("window_title") or "",
                 "title_key": normalize_signature_text(item.get("window_title")),
-                "content_kind": item.get("content_kind") or item.get("segment_activity_type") or "other",
+                "content_kind": item.get("content_kind") or "other",
                 "start_timestamp": item.get("start_timestamp"),
                 "end_timestamp": item.get("end_timestamp"),
                 "representative_text": representative_text,
@@ -1901,9 +1805,9 @@ class ScreenMemoryDB:
             INSERT INTO window_workstream
             (title, summary, category, start_timestamp, end_timestamp,
              topics_json, entities_json, artifacts_json, app_names_json, window_titles_json,
-             view_count, segment_count, confidence, llm_summary_json, llm_model, llm_status,
+             view_count, confidence, llm_summary_json, llm_model, llm_status,
              llm_error, llm_hash, llm_updated_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 workstream_entry["title"],
@@ -1917,7 +1821,6 @@ class ScreenMemoryDB:
                 workstream_entry["app_names_json"],
                 workstream_entry["window_titles_json"],
                 workstream_entry["view_count"],
-                workstream_entry["segment_count"],
                 workstream_entry["confidence"],
                 workstream_entry.get("llm_summary_json"),
                 workstream_entry.get("llm_model"),
@@ -1967,7 +1870,6 @@ class ScreenMemoryDB:
                 app_names_json = ?,
                 window_titles_json = ?,
                 view_count = ?,
-                segment_count = ?,
                 confidence = ?,
                 llm_summary_json = ?,
                 llm_model = ?,
@@ -1990,7 +1892,6 @@ class ScreenMemoryDB:
                 workstream_entry["app_names_json"],
                 workstream_entry["window_titles_json"],
                 workstream_entry["view_count"],
-                workstream_entry["segment_count"],
                 workstream_entry["confidence"],
                 workstream_entry.get("llm_summary_json"),
                 workstream_entry.get("llm_model"),
@@ -2193,19 +2094,13 @@ class ScreenMemoryDB:
         self._conn.commit()
         return {source_capture_id: event_id for event_id, source_capture_id in rows}
 
-    def write_view_table(self, view_entries, segment_id_by_key):
+    def write_view_table(self, view_entries):
         cursor = self._conn.cursor()
         for view_entry in view_entries:
             view_info = dict(view_entry["info"])
             view_id = self.save_view(cursor, view_info)
             view_entry["view_id"] = view_id
             self.save_view_record_links(cursor, view_id, view_entry.get("records"))
-            segment_entries = {
-                segment_id_by_key[segment_key]: slice_info
-                for segment_key, slice_info in view_entry.get("segment_slices", {}).items()
-                if segment_key in segment_id_by_key
-            }
-            self.save_view_segment_links(cursor, view_id, segment_entries)
         self._conn.commit()
         return len(view_entries)
 
@@ -2258,73 +2153,3 @@ class ScreenMemoryDB:
                 "INSERT OR IGNORE INTO view_records (view_id, record_id) VALUES (?, ?)",
                 links,
             )
-
-    @staticmethod
-    def save_view_segment_links(cursor, view_id, segment_entries):
-        for segment_id, slice_info in segment_entries.items():
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO view_segments
-                (view_id, segment_id, record_count, start_timestamp, end_timestamp,
-                 representative_text, evidence_ids_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    view_id,
-                    segment_id,
-                    slice_info["record_count"],
-                    _format_db_timestamp(slice_info["start_timestamp"]),
-                    _format_db_timestamp(slice_info["end_timestamp"]),
-                    slice_info["representative_text"],
-                    slice_info["evidence_ids_json"],
-                ),
-            )
-
-    def write_segment_table(
-        self,
-        segment_entries,
-    ):
-        cursor = self._conn.cursor()
-        segment_id_by_key = {}
-        for segment_entry in segment_entries:
-            summary = segment_entry["info"]
-            segment_id = self.save_segment(cursor, summary)
-            segment_id_by_key[segment_entry["segment_key"]] = segment_id
-        self._conn.commit()
-        return segment_id_by_key
-
-    @staticmethod
-    def save_segment(cursor, segment_summary):
-        cursor.execute(
-            """
-            INSERT INTO segments
-            (start_timestamp, end_timestamp, duration_seconds, activity_type, project_hint,
-             app_names, window_titles, summary, actions_json, artifacts_json,
-             evidence_ids_json, llm_summary_json, llm_summary_text, llm_model, llm_status,
-             llm_error, llm_hash, llm_updated_at, confidence, record_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                _format_db_timestamp(segment_summary["start_timestamp"]),
-                _format_db_timestamp(segment_summary["end_timestamp"]),
-                segment_summary["duration_seconds"],
-                segment_summary["activity_type"],
-                segment_summary["project_hint"],
-                segment_summary["app_names"],
-                segment_summary["window_titles"],
-                segment_summary["summary"],
-                segment_summary["actions_json"],
-                segment_summary["artifacts_json"],
-                segment_summary["evidence_ids_json"],
-                segment_summary.get("llm_summary_json"),
-                segment_summary.get("llm_summary_text"),
-                segment_summary.get("llm_model"),
-                segment_summary.get("llm_status"),
-                segment_summary.get("llm_error"),
-                segment_summary.get("llm_hash"),
-                segment_summary.get("llm_updated_at"),
-                segment_summary["confidence"],
-                segment_summary["record_count"],
-            ),
-        )
-        return cursor.lastrowid
