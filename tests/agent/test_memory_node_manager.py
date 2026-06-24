@@ -550,7 +550,7 @@ def test_reflect_applies_pending_interpretation_feedback_first(db):
     assert feedback_row["status"] == "applied"
 
 
-def test_search_memory_interpretations_uses_embedding_similarity(db):
+def test_memory_manager_ranks_interpretations_with_embedding_similarity(db):
     matching_id = db.memory_upsert_interpretation(
         claim="Design calibration should happen before implementation.",
         target_text="implementation workflow",
@@ -572,17 +572,24 @@ def test_search_memory_interpretations_uses_embedding_similarity(db):
         embedding_text="calendar cleanup",
     )
 
-    results = db.search_memory_interpretations(
+    raw_results = db.search_memory_interpretations(
         ["alignment"],
         top_k=5,
+    )
+    results = MemoryNodeManager._rank_interpretation_search_candidates(
+        raw_results,
+        keyword=["alignment"],
+        entities=[],
+        top_k=5,
         query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
+        min_embedding_similarity=None,
     )
 
     assert [item["id"] for item in results] == [matching_id]
     assert results[0]["embedding_similarity"] == pytest.approx(1.0)
 
 
-def test_search_memory_interpretations_filters_low_embedding_similarity(db):
+def test_memory_manager_filters_low_interpretation_embedding_similarity(db):
     matching_id = db.memory_upsert_interpretation(
         claim="Feedback calibration should update memory interpretation.",
         target_text="feedback calibration",
@@ -604,8 +611,14 @@ def test_search_memory_interpretations_filters_low_embedding_similarity(db):
         embedding_text="calendar cleanup",
     )
 
-    results = db.search_memory_interpretations(
+    raw_results = db.search_memory_interpretations(
         ["feedback", "calibration"],
+        top_k=5,
+    )
+    results = MemoryNodeManager._rank_interpretation_search_candidates(
+        raw_results,
+        keyword=["feedback", "calibration"],
+        entities=[],
         top_k=5,
         query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
         min_embedding_similarity=0.5,
@@ -614,7 +627,7 @@ def test_search_memory_interpretations_filters_low_embedding_similarity(db):
     assert [item["id"] for item in results] == [matching_id]
 
 
-def test_search_memory_observations_filters_low_embedding_similarity(db):
+def test_memory_manager_filters_low_observation_embedding_similarity(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     source_node_id = _add_memory_node(
         db,
@@ -674,8 +687,14 @@ def test_search_memory_observations_filters_low_embedding_similarity(db):
     )
     db._conn.commit()
 
-    results = db.search_memory_observations(
+    raw_results = db.search_memory_observations(
         ["feedback", "calibration"],
+        top_k=5,
+    )
+    results = MemoryNodeManager._rank_observation_search_candidates(
+        raw_results,
+        keyword=["feedback", "calibration"],
+        entities=[],
         top_k=5,
         query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
         min_embedding_similarity=0.5,
@@ -705,14 +724,28 @@ def test_search_memory_interpretations_separates_content_and_entity_matches(db):
         action_implication="Consider person-specific collaboration context.",
     )
 
-    keyword_results = db.search_memory_interpretations(["Alice", "Slack"], top_k=5)
+    keyword_results = MemoryNodeManager._rank_interpretation_search_candidates(
+        db.search_memory_interpretations(["Alice", "Slack"], top_k=5),
+        keyword=["Alice", "Slack"],
+        entities=[],
+        top_k=5,
+        query_embedding=None,
+        min_embedding_similarity=None,
+    )
 
     assert [item["id"] for item in keyword_results[:2]] == [content_match, entity_only]
 
-    entity_results = db.search_memory_interpretations(
-        "collaboration",
+    entity_results = MemoryNodeManager._rank_interpretation_search_candidates(
+        db.search_memory_interpretations(
+            "collaboration",
+            entities=[{"name": "Alice"}],
+            top_k=5,
+        ),
+        keyword="collaboration",
         entities=[{"name": "Alice"}],
         top_k=5,
+        query_embedding=None,
+        min_embedding_similarity=None,
     )
 
     assert entity_results[0]["id"] == entity_only

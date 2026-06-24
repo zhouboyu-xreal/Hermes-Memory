@@ -2787,7 +2787,13 @@ class MemoryNodeManager:
     def _as_embedding_vector(value: Any) -> Optional[np.ndarray]:
         if value is None:
             return None
-        arr = np.asarray(value, dtype=np.float32).reshape(-1)
+        try:
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                arr = np.frombuffer(bytes(value), dtype=np.float32)
+            else:
+                arr = np.asarray(value, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError):
+            return None
         if arr.size == 0:
             return None
         norm = float(np.linalg.norm(arr))
@@ -4905,12 +4911,20 @@ class MemoryNodeManager:
             searched = self._db.search_memory_interpretations(
                 query,
                 entities=entities,
-                top_k=12,
+                top_k=50,
                 statuses=["current", "conflicted"],
                 min_confidence=0.35,
             )
         except Exception:
             searched = []
+        searched = self._rank_interpretation_search_candidates(
+            searched,
+            keyword=query,
+            entities=entities,
+            top_k=12,
+            query_embedding=None,
+            min_embedding_similarity=None,
+        )
         for item in searched:
             try:
                 item_id = int(item["id"])
@@ -8399,6 +8413,210 @@ class MemoryNodeManager:
         score *= cls._recall_layer_intent_weight(layer, intent, item)
         return round(float(score), 4)
 
+    @staticmethod
+    def _recall_keyword_terms(keyword: Any) -> List[str]:
+        keyword_query = " ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
+        return [
+            term.strip().lower()
+            for term in re.split(r"\s+|OR", keyword_query)
+            if term.strip()
+        ]
+
+    @staticmethod
+    def _recall_entity_terms(entities: Optional[List[Any]]) -> List[str]:
+        terms: List[str] = []
+        for entity in entities or []:
+            if isinstance(entity, dict):
+                name = str(entity.get("name", "")).strip()
+            else:
+                name = str(entity or "").strip()
+            if name:
+                terms.append(name.lower())
+        return terms
+
+    @classmethod
+    def _recall_embedding_similarity(
+        cls,
+        query_embedding: Optional[np.ndarray],
+        stored_embedding: Any,
+    ) -> Optional[float]:
+        if query_embedding is None or stored_embedding is None:
+            return None
+        similarity = cls._cal_embedding_similarity(query_embedding, stored_embedding)
+        return max(0.0, min(1.0, float(similarity)))
+
+    @classmethod
+    def _rank_interpretation_search_candidates(
+        cls,
+        candidates: List[Dict[str, Any]],
+        *,
+        keyword: Any,
+        entities: Optional[List[Any]],
+        top_k: int,
+        query_embedding: Optional[np.ndarray],
+        min_embedding_similarity: Optional[float],
+    ) -> List[Dict[str, Any]]:
+        """Filter and rank interpretation rows fetched by SessionDB."""
+        terms = cls._recall_keyword_terms(keyword)
+        entity_terms = cls._recall_entity_terms(entities)
+        threshold = (
+            None
+            if min_embedding_similarity is None
+            else max(0.0, min(1.0, float(min_embedding_similarity)))
+        )
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for candidate in candidates or []:
+            item = dict(candidate)
+            content_haystack = " ".join(
+                str(item.get(key) or "")
+                for key in (
+                    "claim", "action_implication", "subject_text", "target_text",
+                    "scope", "interpretation_type", "resolution",
+                )
+            ).lower()
+            entity_haystack = str(item.get("entity_name") or "").lower()
+            matched_terms = [term for term in terms if term in content_haystack]
+            matched_entity_name_terms = [
+                term
+                for term in terms
+                if term in entity_haystack and term not in matched_terms
+            ]
+            entity_matches = sum(1 for term in entity_terms if term in entity_haystack)
+            embedding_similarity = cls._recall_embedding_similarity(
+                query_embedding,
+                item.get("embedding"),
+            )
+            if (
+                threshold is not None
+                and query_embedding is not None
+                and (
+                    embedding_similarity is None
+                    or embedding_similarity < threshold
+                )
+            ):
+                continue
+            embedding_match = embedding_similarity is not None and embedding_similarity >= 0.35
+            strong_embedding_match = embedding_similarity is not None and embedding_similarity >= 0.55
+            if terms or entity_terms:
+                if entity_terms:
+                    if (
+                        entity_matches <= 0
+                        and not matched_terms
+                        and not matched_entity_name_terms
+                        and not strong_embedding_match
+                    ):
+                        continue
+                elif not matched_terms and not matched_entity_name_terms and not embedding_match:
+                    continue
+            else:
+                matched_terms = ["_"]
+            keyword_score = (len(matched_terms) * 1.2) + (len(matched_entity_name_terms) * 0.6)
+            embedding_score = max(0.0, float(embedding_similarity or 0.0))
+            score = (
+                keyword_score
+                + (entity_matches * 1.5)
+                + (embedding_score * 1.4)
+                + float(item.get("confidence") or 0.0)
+                + (0.5 if item.get("status") == "current" else 0.0)
+            )
+            if embedding_similarity is not None:
+                item["embedding_similarity"] = round(float(embedding_similarity), 4)
+            item.pop("embedding", None)
+            scored.append((score, item))
+
+        scored.sort(
+            key=lambda pair: (
+                pair[0],
+                pair[1].get("last_supported_at")
+                or pair[1].get("updated_at")
+                or pair[1].get("created_at")
+                or "",
+            ),
+            reverse=True,
+        )
+        return [item for _, item in scored[:max(1, int(top_k or 3))]]
+
+    @classmethod
+    def _rank_observation_search_candidates(
+        cls,
+        candidates: List[Dict[str, Any]],
+        *,
+        keyword: Any,
+        entities: Optional[List[Any]],
+        top_k: int,
+        query_embedding: Optional[np.ndarray],
+        min_embedding_similarity: Optional[float],
+    ) -> List[Dict[str, Any]]:
+        """Filter and rank observation rows fetched by SessionDB."""
+        terms = cls._recall_keyword_terms(keyword)
+        entity_terms = cls._recall_entity_terms(entities)
+        threshold = (
+            None
+            if min_embedding_similarity is None
+            else max(0.0, min(1.0, float(min_embedding_similarity)))
+        )
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for candidate in candidates or []:
+            item = dict(candidate)
+            metadata = cls._json_dict(item.get("metadata", {}))
+            item["metadata"] = metadata
+            entity_name = str(item.get("entity_name") or "").lower()
+            haystack = " ".join([
+                str(item.get("summary") or ""),
+                str(item.get("observation_type") or ""),
+                str(item.get("topic_label") or ""),
+                entity_name,
+            ]).lower()
+            matched_terms = [term for term in terms if term in haystack]
+            entity_matches = sum(
+                1
+                for term in entity_terms
+                if term in entity_name or term in haystack
+            )
+            embedding_similarity = cls._recall_embedding_similarity(
+                query_embedding,
+                item.get("embedding"),
+            )
+            if (
+                threshold is not None
+                and query_embedding is not None
+                and (
+                    embedding_similarity is None
+                    or embedding_similarity < threshold
+                )
+            ):
+                continue
+            embedding_match = embedding_similarity is not None and embedding_similarity >= 0.35
+            if terms or entity_terms:
+                if entity_terms:
+                    if entity_matches <= 0 and not matched_terms and not embedding_match:
+                        continue
+                elif not matched_terms and not embedding_match:
+                    continue
+            score = (
+                len(matched_terms)
+                + (entity_matches * 1.5)
+                + (max(0.0, float(embedding_similarity or 0.0)) * 1.4)
+                + float(item.get("confidence") or 0.0)
+            )
+            if embedding_similarity is not None:
+                item["embedding_similarity"] = round(float(embedding_similarity), 4)
+            item.pop("embedding", None)
+            item.pop("evidence_centroid_embedding", None)
+            scored.append((score, item))
+
+        scored.sort(
+            key=lambda pair: (
+                pair[0],
+                pair[1].get("last_supported_at")
+                or pair[1].get("updated_at")
+                or pair[1].get("created_at")
+                or "",
+            ),
+            reverse=True,
+        )
+        return [item for _, item in scored[:max(1, int(top_k or 3))]]
+
     @classmethod
     def _rank_recall_candidates(
         cls,
@@ -8602,6 +8820,10 @@ class MemoryNodeManager:
                 layer: max(limit * 3, limit + 4)
                 for layer, limit in layer_limits.items()
             }
+            raw_candidate_limits = {
+                "interpretations": max(candidate_limits["interpretations"] * 10, 50),
+                "observations": max(candidate_limits["observations"] * 10, 50),
+            }
             self._log_info("memory_recall", "query_analyzed", {
                 "search_text": self._reflect_log_text(query_analysis.get("search_text"), limit=300),
                 "analysis_source": analysis_source,
@@ -8619,19 +8841,28 @@ class MemoryNodeManager:
                 "needs_evidence": query_analysis.get("needs_evidence"),
                 "layer_limits": layer_limits,
                 "candidate_limits": candidate_limits,
+                "raw_candidate_limits": raw_candidate_limits,
                 "min_embedding_similarity": self._recall_min_embedding_similarity,
                 "embedding_text": self._reflect_log_text(query_embedding_text, limit=300),
             })
-            interpretation_candidates = self._db.search_memory_interpretations(
-                keywords,
+            raw_interpretation_candidates = self._db.search_memory_interpretations(
+                top_k=raw_candidate_limits["interpretations"],
+            )
+            interpretation_candidates = self._rank_interpretation_search_candidates(
+                raw_interpretation_candidates,
+                keyword=keywords,
                 entities=entities,
                 top_k=candidate_limits["interpretations"],
                 query_embedding=query_embedding,
                 min_embedding_similarity=self._recall_min_embedding_similarity,
             )
 
-            observation_candidates = self._db.search_memory_observations(
-                keywords,
+            raw_observation_candidates = self._db.search_memory_observations(
+                top_k=raw_candidate_limits["observations"],
+            )
+            observation_candidates = self._rank_observation_search_candidates(
+                raw_observation_candidates,
+                keyword=keywords,
                 entities=entities,
                 top_k=candidate_limits["observations"],
                 query_embedding=query_embedding,

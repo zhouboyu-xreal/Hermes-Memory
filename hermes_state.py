@@ -4820,26 +4820,12 @@ class SessionDB:
 
     def search_memory_interpretations(
         self,
-        keyword: Any,
         *,
-        entities: Optional[List[Any]] = None,
         top_k: int = 3,
         statuses: Optional[List[str]] = None,
         min_confidence: float = 0.4,
-        query_embedding: Optional[np.ndarray] = None,
-        min_embedding_similarity: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Search current/conflicted agent interpretations relevant to a query."""
-        keyword_query = " ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
-        terms = [term.strip().lower() for term in re.split(r"\s+|OR", keyword_query) if term.strip()]
-        entity_terms: List[str] = []
-        for entity in entities or []:
-            if isinstance(entity, dict):
-                name = str(entity.get("name", "")).strip()
-            else:
-                name = str(entity or "").strip()
-            if name:
-                entity_terms.append(name.lower())
+        """Fetch current/conflicted agent interpretations for manager-side recall ranking."""
         normalized_statuses = [
             self._normalize_memory_interpretation_status(status)
             for status in (statuses or ["current", "conflicted"])
@@ -4853,68 +4839,18 @@ class SessionDB:
             f"WHERE mo.status IN ({placeholders}) AND mo.confidence >= ?",
             [*normalized_statuses, max(0.0, min(1.0, float(min_confidence or 0.0)))],
         ).fetchall()
-        scored: List[Tuple[float, Dict[str, Any]]] = []
-        for row in rows:
-            item = self._memory_interpretation_from_row(row)
-            content_haystack = " ".join(
-                str(item.get(key) or "")
-                for key in (
-                    "claim", "action_implication", "subject_text", "target_text",
-                    "scope", "interpretation_type", "resolution",
-                )
-            ).lower()
-            entity_haystack = " ".join(
-                str(item.get(key) or "")
-                for key in (
-                    "entity_name",
-                )
-            ).lower()
-            matched_terms = [term for term in terms if term in content_haystack]
-            matched_entity_name_terms = [
-                term for term in terms
-                if term in entity_haystack and term not in matched_terms
-            ]
-            entity_matches = sum(1 for term in entity_terms if term in entity_haystack)
-            embedding_similarity = self._embedding_similarity(query_embedding, item.get("embedding"))
-            if (
-                min_embedding_similarity is not None
-                and query_embedding is not None
-                and (
-                    embedding_similarity is None
-                    or embedding_similarity < max(0.0, min(1.0, float(min_embedding_similarity)))
-                )
-            ):
-                continue
-            embedding_match = embedding_similarity is not None and embedding_similarity >= 0.35
-            strong_embedding_match = embedding_similarity is not None and embedding_similarity >= 0.55
-            if terms or entity_terms:
-                if entity_terms:
-                    if (
-                        entity_matches <= 0
-                        and not matched_terms
-                        and not matched_entity_name_terms
-                        and not strong_embedding_match
-                    ):
-                        continue
-                elif not matched_terms and not matched_entity_name_terms and not embedding_match:
-                    continue
-            else:
-                matched_terms = ["_"]
-            keyword_score = (len(matched_terms) * 1.2) + (len(matched_entity_name_terms) * 0.6)
-            embedding_score = max(0.0, float(embedding_similarity or 0.0))
-            score = (
-                keyword_score
-                + (entity_matches * 1.5)
-                + (embedding_score * 1.4)
-                + float(item.get("confidence") or 0.0)
-                + (0.5 if item.get("status") == "current" else 0.0)
-            )
-            if embedding_similarity is not None:
-                item["embedding_similarity"] = round(float(embedding_similarity), 4)
-            item.pop("embedding", None)
-            scored.append((score, item))
-        scored.sort(key=lambda pair: (pair[0], pair[1].get("last_supported_at") or ""), reverse=True)
-        return [item for _, item in scored[:max(1, int(top_k or 3))]]
+        items = [self._memory_interpretation_from_row(row) for row in rows]
+        items.sort(
+            key=lambda item: (
+                item.get("last_supported_at")
+                or item.get("updated_at")
+                or item.get("created_at")
+                or "",
+                int(item.get("id") or 0),
+            ),
+            reverse=True,
+        )
+        return items[:max(1, int(top_k or 3))]
 
     def memory_active_task_interpretations(self, *, limit: int = 50) -> List[Dict[str, Any]]:
         """Return current task interpretations for fact-to-task matching."""
@@ -5741,32 +5677,10 @@ class SessionDB:
 
     def search_memory_observations(
         self,
-        keyword: Any,
-        *,
-        entities: Optional[List[Any]] = None,
         top_k: int = 3,
         entity_ids: Optional[List[int]] = None,
-        query_embedding: Optional[np.ndarray] = None,
-        min_embedding_similarity: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Search active observations by text, entity, topic, and embedding."""
-        keyword_query = (
-            " ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
-        )
-        terms = [
-            term.strip().lower()
-            for term in re.split(r"\s+|OR", keyword_query)
-            if term.strip()
-        ]
-        entity_terms: List[str] = []
-        for entity in entities or []:
-            name = (
-                str(entity.get("name", "")).strip()
-                if isinstance(entity, dict)
-                else str(entity or "").strip()
-            )
-            if name:
-                entity_terms.append(name.lower())
+        """Fetch active observations for manager-side recall ranking."""
         params: List[Any] = []
         where = ["obs.status = 'active'"]
         if entity_ids:
@@ -5783,73 +5697,25 @@ class SessionDB:
             f"WHERE {' AND '.join(where)}",
             params,
         ).fetchall()
-        scored: List[Tuple[float, Dict[str, Any]]] = []
+        items: List[Dict[str, Any]] = []
         for row in rows:
             item = dict(row)
-            entity_name = str(item.get("entity_name") or "").lower()
-            haystack = " ".join([
-                str(item.get("summary") or ""),
-                str(item.get("observation_type") or ""),
-                str(item.get("topic_label") or ""),
-                entity_name,
-            ]).lower()
-            matched_terms = [term for term in terms if term in haystack]
-            entity_matches = sum(
-                1
-                for term in entity_terms
-                if term in entity_name or term in haystack
-            )
-            embedding_similarity = self._embedding_similarity(
-                query_embedding,
-                item.get("embedding"),
-            )
-            if (
-                min_embedding_similarity is not None
-                and query_embedding is not None
-                and (
-                    embedding_similarity is None
-                    or embedding_similarity < max(0.0, min(1.0, float(min_embedding_similarity)))
-                )
-            ):
-                continue
-            embedding_match = (
-                embedding_similarity is not None
-                and embedding_similarity >= 0.35
-            )
-            if terms or entity_terms:
-                if entity_terms:
-                    if entity_matches <= 0 and not matched_terms and not embedding_match:
-                        continue
-                elif not matched_terms and not embedding_match:
-                    continue
-            score = (
-                len(matched_terms)
-                + (entity_matches * 1.5)
-                + (max(0.0, float(embedding_similarity or 0.0)) * 1.4)
-                + float(item.get("confidence") or 0.0)
-            )
-            if embedding_similarity is not None:
-                item["embedding_similarity"] = round(
-                    float(embedding_similarity),
-                    4,
-                )
             try:
                 item["metadata"] = json.loads(item.get("metadata") or "{}")
             except (TypeError, ValueError):
                 item["metadata"] = {}
-            item.pop("embedding", None)
-            item.pop("evidence_centroid_embedding", None)
-            scored.append((score, item))
-        scored.sort(
-            key=lambda pair: (
-                pair[0],
-                pair[1].get("last_supported_at")
-                or pair[1].get("updated_at")
+            items.append(item)
+        items.sort(
+            key=lambda item: (
+                item.get("last_supported_at")
+                or item.get("updated_at")
+                or item.get("created_at")
                 or "",
+                int(item.get("id") or 0),
             ),
             reverse=True,
         )
-        return [item for _, item in scored[:top_k]]
+        return items[:max(1, int(top_k or 3))]
 
     def get_observation_supporting_nodes(
         self,
