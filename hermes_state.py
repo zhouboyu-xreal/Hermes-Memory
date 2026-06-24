@@ -435,6 +435,54 @@ CREATE INDEX IF NOT EXISTS idx_memory_interpretations_type_scope
 ON memory_interpretations(interpretation_type, scope, status);
 """
 
+MEMORY_INTERPRETATION_FEEDBACK_SQL = """
+CREATE TABLE IF NOT EXISTS memory_recall_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query TEXT NOT NULL DEFAULT '',
+    assistant_response TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'awaiting_feedback',
+    metadata TEXT DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_recall_event_interpretations (
+    recall_event_id INTEGER NOT NULL REFERENCES memory_recall_events(id) ON DELETE CASCADE,
+    interpretation_id INTEGER NOT NULL REFERENCES memory_interpretations(id) ON DELETE CASCADE,
+    rank INTEGER NOT NULL DEFAULT 0,
+    recall_score REAL DEFAULT 0.0,
+    snapshot TEXT DEFAULT '{}',
+    PRIMARY KEY (recall_event_id, interpretation_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_interpretation_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recall_event_id INTEGER REFERENCES memory_recall_events(id) ON DELETE SET NULL,
+    interpretation_id INTEGER NOT NULL REFERENCES memory_interpretations(id) ON DELETE CASCADE,
+    feedback_type TEXT NOT NULL,
+    confidence REAL DEFAULT 0.5,
+    user_message TEXT NOT NULL DEFAULT '',
+    evidence_text TEXT NOT NULL DEFAULT '',
+    correction TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    metadata TEXT DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    applied_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_recall_events_status
+ON memory_recall_events(status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_memory_recall_event_interpretations_interp
+ON memory_recall_event_interpretations(interpretation_id);
+
+CREATE INDEX IF NOT EXISTS idx_memory_interpretation_feedback_pending
+ON memory_interpretation_feedback(status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_memory_interpretation_feedback_interp
+ON memory_interpretation_feedback(interpretation_id, status);
+"""
+
 
 class SessionDB:
     """
@@ -879,6 +927,7 @@ class SessionDB:
         self._drop_obsolete_evidence_bundle_columns(cursor)
         self._drop_legacy_memory_entity_columns(cursor)
         cursor.executescript(MEMORY_INTERPRETATIONS_SQL)
+        cursor.executescript(MEMORY_INTERPRETATION_FEEDBACK_SQL)
         cursor.executescript(MEMORY_OBSERVATIONS_SQL)
         for col_name in ("entity_name", "topic_key"):
             try:
@@ -4778,6 +4827,7 @@ class SessionDB:
         statuses: Optional[List[str]] = None,
         min_confidence: float = 0.4,
         query_embedding: Optional[np.ndarray] = None,
+        min_embedding_similarity: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Search current/conflicted agent interpretations relevant to a query."""
         keyword_query = " ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
@@ -4826,6 +4876,15 @@ class SessionDB:
             ]
             entity_matches = sum(1 for term in entity_terms if term in entity_haystack)
             embedding_similarity = self._embedding_similarity(query_embedding, item.get("embedding"))
+            if (
+                min_embedding_similarity is not None
+                and query_embedding is not None
+                and (
+                    embedding_similarity is None
+                    or embedding_similarity < max(0.0, min(1.0, float(min_embedding_similarity)))
+                )
+            ):
+                continue
             embedding_match = embedding_similarity is not None and embedding_similarity >= 0.35
             strong_embedding_match = embedding_similarity is not None and embedding_similarity >= 0.55
             if terms or entity_terms:
@@ -4913,6 +4972,327 @@ class SessionDB:
             (clean_id, max(1, int(limit or 20))),
         ).fetchall()
         return [self._memory_interpretation_from_row(row) for row in rows]
+
+    @staticmethod
+    def _json_object(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value or "{}")
+            except json.JSONDecodeError:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    @staticmethod
+    def _normalize_interpretation_feedback_type(value: Any) -> str:
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {
+            "accept",
+            "reject",
+            "modify",
+            "defer",
+            "outdated",
+            "implicit_positive",
+            "implicit_negative",
+            "none",
+        }
+        return text if text in allowed else "none"
+
+    @staticmethod
+    def _normalize_interpretation_feedback_status(value: Any) -> str:
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {"pending", "applied", "ignored"}
+        return text if text in allowed else "pending"
+
+    @staticmethod
+    def _normalize_recall_event_status(value: Any) -> str:
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {"awaiting_feedback", "feedback_analyzed", "expired"}
+        return text if text in allowed else "awaiting_feedback"
+
+    @staticmethod
+    def _interpretation_recall_snapshot(interpretation: Dict[str, Any]) -> Dict[str, Any]:
+        snapshot = dict(interpretation or {})
+        snapshot.pop("embedding", None)
+        if isinstance(snapshot.get("metadata"), str):
+            snapshot["metadata"] = SessionDB._json_object(snapshot.get("metadata"))
+        return snapshot
+
+    def memory_record_interpretation_recall_event(
+        self,
+        *,
+        query: str,
+        interpretations: List[Dict[str, Any]],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Record interpretations recalled for a turn so the next user reply can give feedback."""
+        clean_interpretations = [
+            item for item in (interpretations or []) if self._coerce_int_or_none(item.get("id"))
+        ]
+        if not clean_interpretations:
+            return None
+        now_text = datetime.now().astimezone().isoformat()
+        metadata_str = json.dumps(metadata or {}, ensure_ascii=False)
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE memory_recall_events SET status = 'expired', updated_at = ? "
+                "WHERE status = 'awaiting_feedback'",
+                (now_text,),
+            )
+            cursor = conn.execute(
+                "INSERT INTO memory_recall_events "
+                "(query, status, metadata, created_at, updated_at) "
+                "VALUES (?, 'awaiting_feedback', ?, ?, ?)",
+                (str(query or "").strip(), metadata_str, now_text, now_text),
+            )
+            recall_event_id = int(cursor.lastrowid)
+            for rank, interpretation in enumerate(clean_interpretations, 1):
+                interpretation_id = int(interpretation["id"])
+                try:
+                    recall_score = float(interpretation.get("_recall_score") or 0.0)
+                except (TypeError, ValueError):
+                    recall_score = 0.0
+                snapshot = self._interpretation_recall_snapshot(interpretation)
+                conn.execute(
+                    "INSERT INTO memory_recall_event_interpretations "
+                    "(recall_event_id, interpretation_id, rank, recall_score, snapshot) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        recall_event_id,
+                        interpretation_id,
+                        rank,
+                        recall_score,
+                        json.dumps(snapshot, ensure_ascii=False, default=str),
+                    ),
+                )
+            return recall_event_id
+
+        return self._execute_write(_do)
+
+    def memory_attach_latest_recall_event_response(
+        self,
+        *,
+        query: str,
+        assistant_response: str,
+    ) -> bool:
+        """Attach the final assistant response to the current turn's recall event."""
+        clean_response = str(assistant_response or "").strip()
+        if not clean_response:
+            return False
+        now_text = datetime.now().astimezone().isoformat()
+        clean_query = str(query or "").strip()
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id FROM memory_recall_events "
+                "WHERE status = 'awaiting_feedback' AND query = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (clean_query,),
+            ).fetchone()
+            if not row:
+                return False
+            event_id = int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
+            conn.execute(
+                "UPDATE memory_recall_events "
+                "SET assistant_response = ?, updated_at = ? "
+                "WHERE id = ?",
+                (clean_response, now_text, event_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def memory_latest_pending_recall_event(
+        self,
+        *,
+        limit_interpretations: int = 8,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the newest recall event awaiting feedback and its interpretation snapshots."""
+        event_row = self._conn.execute(
+            "SELECT * FROM memory_recall_events "
+            "WHERE status = 'awaiting_feedback' "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+        ).fetchone()
+        if not event_row:
+            return None
+        event = dict(event_row)
+        event["metadata"] = self._json_object(event.get("metadata"))
+        link_rows = self._conn.execute(
+            "SELECT * FROM memory_recall_event_interpretations "
+            "WHERE recall_event_id = ? "
+            "ORDER BY rank ASC, interpretation_id ASC "
+            "LIMIT ?",
+            (int(event["id"]), max(1, int(limit_interpretations or 8))),
+        ).fetchall()
+        interpretations: List[Dict[str, Any]] = []
+        for link_row in link_rows:
+            link = dict(link_row)
+            snapshot = self._json_object(link.get("snapshot"))
+            live = self.memory_get_interpretation_by_id(link.get("interpretation_id"))
+            item = {
+                **snapshot,
+                **(live or {}),
+                "id": int(link["interpretation_id"]),
+                "recall_rank": int(link.get("rank") or 0),
+                "recall_score": float(link.get("recall_score") or 0.0),
+            }
+            item.pop("embedding", None)
+            interpretations.append(item)
+        event["interpretations"] = interpretations
+        return event
+
+    def memory_recall_event_by_id(
+        self,
+        recall_event_id: int,
+        *,
+        limit_interpretations: int = 8,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a recall event by id, including events expired by a newer recall."""
+        event_row = self._conn.execute(
+            "SELECT * FROM memory_recall_events WHERE id = ?",
+            (int(recall_event_id),),
+        ).fetchone()
+        if not event_row:
+            return None
+        event = dict(event_row)
+        event["metadata"] = self._json_object(event.get("metadata"))
+        link_rows = self._conn.execute(
+            "SELECT * FROM memory_recall_event_interpretations "
+            "WHERE recall_event_id = ? "
+            "ORDER BY rank ASC, interpretation_id ASC "
+            "LIMIT ?",
+            (int(event["id"]), max(1, int(limit_interpretations or 8))),
+        ).fetchall()
+        interpretations: List[Dict[str, Any]] = []
+        for link_row in link_rows:
+            link = dict(link_row)
+            snapshot = self._json_object(link.get("snapshot"))
+            live = self.memory_get_interpretation_by_id(link.get("interpretation_id"))
+            item = {
+                **snapshot,
+                **(live or {}),
+                "id": int(link["interpretation_id"]),
+                "recall_rank": int(link.get("rank") or 0),
+                "recall_score": float(link.get("recall_score") or 0.0),
+            }
+            item.pop("embedding", None)
+            interpretations.append(item)
+        event["interpretations"] = interpretations
+        return event
+
+    def memory_mark_recall_event_status(self, recall_event_id: int, status: str) -> None:
+        clean_status = self._normalize_recall_event_status(status)
+        now_text = datetime.now().astimezone().isoformat()
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE memory_recall_events SET status = ?, updated_at = ? WHERE id = ?",
+                (clean_status, now_text, int(recall_event_id)),
+            )
+
+        self._execute_write(_do)
+
+    def memory_get_interpretation_by_id(
+        self,
+        interpretation_id: Any,
+    ) -> Optional[Dict[str, Any]]:
+        clean_id = self._coerce_int_or_none(interpretation_id)
+        if clean_id is None:
+            return None
+        row = self._conn.execute(
+            "SELECT mi.*, en.name AS entity_name "
+            "FROM memory_interpretations mi "
+            "LEFT JOIN entity_nodes en ON en.id = mi.entity_id "
+            "WHERE mi.id = ?",
+            (clean_id,),
+        ).fetchone()
+        return self._memory_interpretation_from_row(row) if row else None
+
+    def memory_add_interpretation_feedback(
+        self,
+        *,
+        recall_event_id: Optional[int],
+        interpretation_id: int,
+        feedback_type: str,
+        confidence: float = 0.5,
+        user_message: str = "",
+        evidence_text: str = "",
+        correction: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        clean_type = self._normalize_interpretation_feedback_type(feedback_type)
+        confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
+        now_text = datetime.now().astimezone().isoformat()
+        metadata_str = json.dumps(metadata or {}, ensure_ascii=False, default=str)
+
+        def _do(conn):
+            cursor = conn.execute(
+                "INSERT INTO memory_interpretation_feedback "
+                "(recall_event_id, interpretation_id, feedback_type, confidence, "
+                "user_message, evidence_text, correction, status, metadata, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    recall_event_id,
+                    int(interpretation_id),
+                    clean_type,
+                    confidence_value,
+                    str(user_message or ""),
+                    str(evidence_text or ""),
+                    str(correction or ""),
+                    metadata_str,
+                    now_text,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+        return self._execute_write(_do)
+
+    def memory_pending_interpretation_feedback(
+        self,
+        *,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Return pending interpretation feedback with the current target interpretation."""
+        rows = self._conn.execute(
+            "SELECT * FROM memory_interpretation_feedback "
+            "WHERE status = 'pending' "
+            "ORDER BY created_at ASC, id ASC LIMIT ?",
+            (max(1, int(limit or 50)),),
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["metadata"] = self._json_object(item.get("metadata"))
+            item["feedback_type"] = self._normalize_interpretation_feedback_type(
+                item.get("feedback_type")
+            )
+            item["status"] = self._normalize_interpretation_feedback_status(item.get("status"))
+            item["interpretation"] = self.memory_get_interpretation_by_id(
+                item.get("interpretation_id")
+            )
+            out.append(item)
+        return out
+
+    def memory_mark_interpretation_feedback_applied(
+        self,
+        feedback_id: int,
+        *,
+        status: str = "applied",
+    ) -> None:
+        clean_status = self._normalize_interpretation_feedback_status(status)
+        applied_at = datetime.now().astimezone().isoformat() if clean_status == "applied" else None
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE memory_interpretation_feedback "
+                "SET status = ?, applied_at = ? WHERE id = ?",
+                (clean_status, applied_at, int(feedback_id)),
+            )
+
+        self._execute_write(_do)
 
     def get_fact_nodes_using_entity_topic(
         self,
@@ -5367,6 +5747,7 @@ class SessionDB:
         top_k: int = 3,
         entity_ids: Optional[List[int]] = None,
         query_embedding: Optional[np.ndarray] = None,
+        min_embedding_similarity: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Search active observations by text, entity, topic, and embedding."""
         keyword_query = (
@@ -5422,6 +5803,15 @@ class SessionDB:
                 query_embedding,
                 item.get("embedding"),
             )
+            if (
+                min_embedding_similarity is not None
+                and query_embedding is not None
+                and (
+                    embedding_similarity is None
+                    or embedding_similarity < max(0.0, min(1.0, float(min_embedding_similarity)))
+                )
+            ):
+                continue
             embedding_match = (
                 embedding_similarity is not None
                 and embedding_similarity >= 0.35

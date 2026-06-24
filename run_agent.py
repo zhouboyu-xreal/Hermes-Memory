@@ -10357,6 +10357,16 @@ class AIAgent:
                     llm_api_key=self.api_key,
                 )
                 _mem_node_query = original_user_message if isinstance(original_user_message, str) else ""
+                try:
+                    self._memory_node_manager.analyze_feedback_for_pending_interpretations_async(
+                        _mem_node_query,
+                        llm_client=self.client,
+                        llm_model=self.model,
+                        llm_base_url=self.base_url,
+                        llm_api_key=self.api_key,
+                    )
+                except Exception:
+                    pass
                 _mem_node_context = self._memory_node_manager.recall(_mem_node_query)
                 if _mem_node_context:
                     if _ext_prefetch_cache:

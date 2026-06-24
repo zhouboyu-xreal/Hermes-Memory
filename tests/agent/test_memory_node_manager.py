@@ -381,6 +381,175 @@ def test_memory_interpretations_store_current_agent_interpretations(db):
     assert results[0]["evidence_node_ids"] == [1, 2]
 
 
+def test_interpretation_recall_events_link_feedback_targets(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户希望先讨论设计再修改代码。",
+        target_text="memory workflow",
+        scope="memory-system-design",
+        interpretation_type="inferred_preference",
+        confidence=0.82,
+        action_implication="修改前先给出方案。",
+    )
+    interpretation = db.memory_get_interpretation_by_id(interpretation_id)
+
+    recall_event_id = db.memory_record_interpretation_recall_event(
+        query="我们怎么改反馈机制？",
+        interpretations=[{**interpretation, "_recall_score": 1.23}],
+    )
+    assert recall_event_id is not None
+    assert db.memory_attach_latest_recall_event_response(
+        query="我们怎么改反馈机制？",
+        assistant_response="我建议先讨论方案。",
+    )
+
+    event = db.memory_latest_pending_recall_event()
+
+    assert event["id"] == recall_event_id
+    assert event["assistant_response"] == "我建议先讨论方案。"
+    assert event["interpretations"][0]["id"] == interpretation_id
+    assert event["interpretations"][0]["recall_score"] == pytest.approx(1.23)
+
+
+def test_analyze_feedback_for_pending_interpretations_uses_llm(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户的健康问题主要来自工作压力。",
+        target_text="健康状态",
+        scope="health",
+        interpretation_type="insight",
+        confidence=0.74,
+        action_implication="后续围绕工作压力提供健康建议。",
+    )
+    interpretation = db.memory_get_interpretation_by_id(interpretation_id)
+    db.memory_record_interpretation_recall_event(
+        query="我最近身体不太好怎么办？",
+        interpretations=[interpretation],
+    )
+    db.memory_attach_latest_recall_event_response(
+        query="我最近身体不太好怎么办？",
+        assistant_response="看起来可能和工作压力有关。",
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        llm_outputs=[
+            json.dumps({
+                "has_feedback": True,
+                "feedback_items": [
+                    {
+                        "interpretation_id": interpretation_id,
+                        "feedback_type": "modify",
+                        "confidence": 0.91,
+                        "evidence_text": "不是工作压力，是睡眠问题。",
+                        "correction": "用户健康问题更偏向睡眠状态，而不是工作压力。",
+                    }
+                ],
+            }, ensure_ascii=False)
+        ],
+        enabled=True,
+    )
+
+    written = mgr.analyze_feedback_for_pending_interpretations(
+        "不是工作压力，是睡眠问题。"
+    )
+
+    assert written == 1
+    feedback = db.memory_pending_interpretation_feedback()
+    assert len(feedback) == 1
+    assert feedback[0]["interpretation_id"] == interpretation_id
+    assert feedback[0]["feedback_type"] == "modify"
+    assert feedback[0]["correction"] == "用户健康问题更偏向睡眠状态，而不是工作压力。"
+    event = db.memory_latest_pending_recall_event()
+    assert event is None
+
+
+def test_analyze_feedback_for_pending_interpretations_async_queues_target_event(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户希望先讨论设计再修改代码。",
+        target_text="memory workflow",
+        scope="memory-system-design",
+        interpretation_type="inferred_preference",
+        confidence=0.82,
+        action_implication="修改前先给出方案。",
+    )
+    interpretation = db.memory_get_interpretation_by_id(interpretation_id)
+    recall_event_id = db.memory_record_interpretation_recall_event(
+        query="我们怎么改反馈机制？",
+        interpretations=[interpretation],
+    )
+    mgr = _NoAsyncMemoryNodeManager(db, enabled=True)
+    calls = []
+
+    def _fake_analyze(user_message, *, recall_event_id=None):
+        calls.append((user_message, recall_event_id))
+        return 0
+
+    mgr.analyze_feedback_for_pending_interpretations = _fake_analyze
+
+    assert mgr.analyze_feedback_for_pending_interpretations_async("不是这个意思。")
+    assert mgr.flush_store_queue(timeout=2.0)
+    assert calls == [("不是这个意思。", recall_event_id)]
+
+
+def test_reflect_applies_pending_interpretation_feedback_first(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户的健康问题主要来自工作压力。",
+        target_text="健康状态",
+        scope="health",
+        interpretation_type="insight",
+        confidence=0.74,
+        action_implication="后续围绕工作压力提供健康建议。",
+    )
+    db.memory_add_interpretation_feedback(
+        recall_event_id=None,
+        interpretation_id=interpretation_id,
+        feedback_type="modify",
+        confidence=0.92,
+        user_message="不是工作压力，是睡眠问题。",
+        evidence_text="不是工作压力，是睡眠问题。",
+        correction="用户健康问题更偏向睡眠状态，而不是工作压力。",
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        llm_outputs=[
+            json.dumps({
+                "should_update": True,
+                "claim": "用户当前健康困扰更偏向睡眠状态，而不是工作压力。",
+                "target_text": "睡眠状态",
+                "scope": "health",
+                "interpretation_type": "insight",
+                "polarity": "negative",
+                "strength": 0.7,
+                "confidence": 0.86,
+                "status": "current",
+                "conflict_status": "resolved",
+                "resolution": "用户明确修正健康问题来源是睡眠而非工作压力。",
+                "action_implication": "后续健康建议应优先围绕睡眠状态展开。",
+                "metadata": {"source": "interpretation_feedback_update"},
+            }, ensure_ascii=False)
+        ],
+        enabled=True,
+    )
+
+    report = mgr.reflect(limit=10)
+
+    row = db._conn.execute(
+        "SELECT claim, target_text, confidence, status, conflict_status, action_implication, metadata "
+        "FROM memory_interpretations WHERE id = ?",
+        (interpretation_id,),
+    ).fetchone()
+    feedback_row = db._conn.execute(
+        "SELECT status FROM memory_interpretation_feedback"
+    ).fetchone()
+    metadata = json.loads(row["metadata"])
+    assert report["interpretation_feedback"]["applied"] == 1
+    assert row["claim"] == "用户当前健康困扰更偏向睡眠状态，而不是工作压力。"
+    assert row["target_text"] == "睡眠状态"
+    assert row["confidence"] == pytest.approx(0.86)
+    assert row["conflict_status"] == "resolved"
+    assert "睡眠状态" in row["action_implication"]
+    assert metadata["feedback"]["counts"]["modify"] == 1
+    assert feedback_row["status"] == "applied"
+
+
 def test_search_memory_interpretations_uses_embedding_similarity(db):
     matching_id = db.memory_upsert_interpretation(
         claim="Design calibration should happen before implementation.",
@@ -411,6 +580,109 @@ def test_search_memory_interpretations_uses_embedding_similarity(db):
 
     assert [item["id"] for item in results] == [matching_id]
     assert results[0]["embedding_similarity"] == pytest.approx(1.0)
+
+
+def test_search_memory_interpretations_filters_low_embedding_similarity(db):
+    matching_id = db.memory_upsert_interpretation(
+        claim="Feedback calibration should update memory interpretation.",
+        target_text="feedback calibration",
+        scope="memory",
+        interpretation_type="insight",
+        confidence=0.8,
+        action_implication="Use feedback when updating memory interpretation.",
+        embedding=np.array([[1.0, 0.0]], dtype=np.float32),
+        embedding_text="feedback calibration memory interpretation",
+    )
+    db.memory_upsert_interpretation(
+        claim="Feedback calibration is about calendar cleanup.",
+        target_text="feedback calibration",
+        scope="calendar",
+        interpretation_type="insight",
+        confidence=0.95,
+        action_implication="Use calendar context.",
+        embedding=np.array([[0.0, 1.0]], dtype=np.float32),
+        embedding_text="calendar cleanup",
+    )
+
+    results = db.search_memory_interpretations(
+        ["feedback", "calibration"],
+        top_k=5,
+        query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
+        min_embedding_similarity=0.5,
+    )
+
+    assert [item["id"] for item in results] == [matching_id]
+
+
+def test_search_memory_observations_filters_low_embedding_similarity(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    source_node_id = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice discussed feedback calibration.",
+        keywords=["feedback", "calibration"],
+    )
+    bundle_id = db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="feedback-calibration",
+        topic_label="feedback calibration",
+        bundle_type="entity_topic",
+        source_node_ids=[source_node_id],
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    db._conn.execute(
+        "INSERT INTO memory_observations "
+        "(evidence_bundle_id, entity_name, topic_key, observation_type, summary, "
+        "confidence, status, embedding, embedding_text, metadata, created_at, updated_at, last_supported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            bundle_id,
+            "Alice",
+            "feedback-calibration",
+            "context",
+            "Alice discussed feedback calibration for memory interpretation.",
+            0.8,
+            "active",
+            db._embedding_to_blob(np.array([[1.0, 0.0]], dtype=np.float32)),
+            "feedback calibration memory interpretation",
+            "{}",
+            now,
+            now,
+            now,
+        ),
+    )
+    db._conn.execute(
+        "INSERT INTO memory_observations "
+        "(evidence_bundle_id, entity_name, topic_key, observation_type, summary, "
+        "confidence, status, embedding, embedding_text, metadata, created_at, updated_at, last_supported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            bundle_id,
+            "Alice",
+            "feedback-calibration",
+            "context",
+            "Alice discussed feedback calibration for calendar cleanup.",
+            0.95,
+            "active",
+            db._embedding_to_blob(np.array([[0.0, 1.0]], dtype=np.float32)),
+            "calendar cleanup",
+            "{}",
+            now,
+            now,
+            now,
+        ),
+    )
+    db._conn.commit()
+
+    results = db.search_memory_observations(
+        ["feedback", "calibration"],
+        top_k=5,
+        query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
+        min_embedding_similarity=0.5,
+    )
+
+    assert len(results) == 1
+    assert "memory interpretation" in results[0]["summary"]
 
 
 def test_search_memory_interpretations_separates_content_and_entity_matches(db):

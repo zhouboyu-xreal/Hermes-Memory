@@ -124,6 +124,14 @@ class StoreFactExtractionManager(MemoryNodeManager):
             if "fact 提取模块" in prompt
             else "summary"
             if "对话摘要模块" in prompt
+            else "feedback_analysis"
+            if "interpretation feedback 分析模块" in prompt
+            else "feedback_update"
+            if "interpretation 反馈校准模块" in prompt
+            else "recall_analysis"
+            if "recall 查询分析器" in prompt
+            else "interpretation"
+            if "interpretation" in prompt
             else "other"
         )
         url = f"{self._llm_base_url.rstrip('/')}/chat/completions"
@@ -316,6 +324,37 @@ def iter_stored_nodes(db: SessionDB, start_id: int) -> Iterable[Dict[str, Any]]:
         yield item
 
 
+def count_pending_interpretation_feedback(db: SessionDB) -> int:
+    row = db._conn.execute(
+        "SELECT COUNT(*) AS count FROM memory_interpretation_feedback WHERE status = 'pending'"
+    ).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def count_interpretation_feedback(db: SessionDB) -> int:
+    row = db._conn.execute(
+        "SELECT COUNT(*) AS count FROM memory_interpretation_feedback"
+    ).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def latest_recall_event_summary(db: SessionDB) -> Dict[str, Any] | None:
+    event = db.memory_latest_pending_recall_event(limit_interpretations=8)
+    if not event:
+        return None
+    return {
+        "id": event.get("id"),
+        "query": event.get("query"),
+        "status": event.get("status"),
+        "created_at": event.get("created_at"),
+        "interpretation_ids": [
+            item.get("id")
+            for item in event.get("interpretations", [])
+        ],
+        "interpretation_count": len(event.get("interpretations", [])),
+    }
+
+
 def load_hermes_config() -> Dict[str, Any]:
     """Load general config merged with project-level memory.yaml."""
     loaded = load_config()
@@ -389,6 +428,15 @@ def parse_args() -> argparse.Namespace:
         "--enable-reflect",
         action="store_true",
         help='Enable reflect',
+    )
+    parser.add_argument(
+        "--enable-feedback-analysis",
+        action="store_true",
+        help=(
+            "Before each turn, analyze whether the user is giving feedback "
+            "on interpretations recalled for the previous turn; then recall "
+            "the current user query to create a feedback target for the next turn."
+        ),
     )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--manager-log-level", default="INFO")
@@ -548,8 +596,8 @@ def log_faiss_state(db: SessionDB, event: str) -> None:
 
 
 def main() -> int:
-    load_dotenv(REPO_ROOT / ".env")
-    load_dotenv(get_hermes_home() / ".env")
+    # load_dotenv(REPO_ROOT / ".env")
+    # load_dotenv(get_hermes_home() / ".env")
 
     args = parse_args()
     resolve_llm_args(args)
@@ -612,6 +660,10 @@ def main() -> int:
     stored_turns = 0
     stored_facts = 0
     reflect_runs = 0
+    feedback_analysis_runs = 0
+    feedback_items_stored = 0
+    recall_runs = 0
+    recall_events_created = 0
     base_turn_timestamp = datetime.now().astimezone()
     try:
         with report_path.open("w", encoding="utf-8") as report:
@@ -622,6 +674,77 @@ def main() -> int:
                 # does not collide on "#00" across turns in the same sample.
                 turn_timestamp = base_turn_timestamp + timedelta(hours=hour_offset, seconds=turn_index)
                 before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_nodes").fetchone()["max_id"]
+                if args.enable_feedback_analysis:
+                    feedback_before = count_interpretation_feedback(db)
+                    pending_before_feedback = count_pending_interpretation_feedback(db)
+                    feedback_count = manager.analyze_feedback_for_pending_interpretations(user)
+                    feedback_after = count_interpretation_feedback(db)
+                    feedback_analysis_runs += 1
+                    feedback_items_stored += max(0, feedback_after - feedback_before)
+                    feedback_row = {
+                        "event": "feedback_analysis",
+                        "flat_index": flat_index,
+                        "sample_id": sample_id,
+                        "turn_index": turn_index,
+                        "turn_timestamp": turn_timestamp.isoformat(),
+                        "pending_before": pending_before_feedback,
+                        "feedback_items_written": feedback_count,
+                        "feedback_rows_added": max(0, feedback_after - feedback_before),
+                        "pending_after": count_pending_interpretation_feedback(db),
+                        "user": user,
+                    }
+                    report.write(json.dumps(feedback_row, ensure_ascii=False, default=str) + "\n")
+                    report.flush()
+                    logging.info(
+                        "[%s/%s] %s turn=%s feedback_analysis written=%s pending_before=%s",
+                        flat_index - args.start + 1,
+                        len(turns),
+                        sample_id,
+                        turn_index,
+                        feedback_count,
+                        pending_before_feedback,
+                    )
+
+                    recall_before = db._conn.execute(
+                        "SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_recall_events"
+                    ).fetchone()["max_id"]
+                    memory_context = manager.recall(user)
+                    recall_after = db._conn.execute(
+                        "SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_recall_events"
+                    ).fetchone()["max_id"]
+                    recall_runs += 1
+                    if recall_after > recall_before:
+                        recall_events_created += 1
+                    latest_recall_event = latest_recall_event_summary(db)
+                    if latest_recall_event:
+                        db.memory_attach_latest_recall_event_response(
+                            query=str(latest_recall_event.get("query") or ""),
+                            assistant_response=assistant,
+                        )
+                        latest_recall_event = latest_recall_event_summary(db)
+                    recall_row = {
+                        "event": "recall_for_feedback_target",
+                        "flat_index": flat_index,
+                        "sample_id": sample_id,
+                        "turn_index": turn_index,
+                        "turn_timestamp": turn_timestamp.isoformat(),
+                        "context_chars": len(memory_context or ""),
+                        "recall_event_created": recall_after > recall_before,
+                        "latest_recall_event": latest_recall_event,
+                        "user": user,
+                    }
+                    report.write(json.dumps(recall_row, ensure_ascii=False, default=str) + "\n")
+                    report.flush()
+                    logging.info(
+                        "[%s/%s] %s turn=%s recall_for_feedback context_chars=%s event_created=%s",
+                        flat_index - args.start + 1,
+                        len(turns),
+                        sample_id,
+                        turn_index,
+                        len(memory_context or ""),
+                        recall_after > recall_before,
+                    )
+
                 pending_before = list(manager._pending_store_turns)
                 pending_with_current = pending_before + [{
                     "user_message": user,
@@ -724,6 +847,11 @@ def main() -> int:
         "fact_extraction_max_chars": manager._max_chars_before_store,
         "pending_turns": len(manager._pending_store_turns),
         "reflect_runs": reflect_runs,
+        "feedback_analysis_enabled": args.enable_feedback_analysis,
+        "feedback_analysis_runs": feedback_analysis_runs,
+        "feedback_items_stored": feedback_items_stored,
+        "recall_runs": recall_runs,
+        "recall_events_created": recall_events_created,
         "llm_model": args.llm_model,
         "llm_base_url": args.llm_base_url,
         "llm_max_tokens": args.llm_max_tokens,

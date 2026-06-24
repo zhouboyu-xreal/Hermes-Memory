@@ -915,6 +915,93 @@ supporting facts:
   "metadata": {{"source": "interpretation_batch_update"}}
 }}"""
 
+INTERPRETATION_FEEDBACK_ANALYSIS_PROMPT = """你是长期记忆系统的 interpretation feedback 分析模块。
+
+你需要判断 current_user_message 是否在反馈上一轮 assistant 回答中召回的 interpretations。
+
+重要边界：
+- 只处理用户明确确认、否认、修正、延期或表示过时的信息。
+- 用户开启新话题、提出新任务、普通追问或没有明显指向这些 interpretations 时，has_feedback=false。
+- 不要把沉默、换话题或没有接话当作负反馈。
+- feedback 必须绑定到输入中的 interpretation_id。
+
+previous_user_query:
+{previous_user_query}
+
+previous_assistant_response:
+{previous_assistant_response}
+
+recalled_interpretations:
+{interpretations}
+
+current_user_message:
+{current_user_message}
+
+feedback_type 定义：
+- accept：用户明确确认 interpretation 成立。
+- reject：用户明确否认 interpretation。
+- modify：用户修正 interpretation 的对象、原因、范围、状态或行动含义。
+- defer：用户表示现在不想处理、以后再说；不代表 interpretation 错误。
+- outdated：用户表示该 interpretation 已不适用或已经结束。
+- none：没有可用反馈。
+
+只返回合法 JSON，不要 markdown，不要额外解释：
+{{
+  "has_feedback": true,
+  "feedback_items": [
+    {{
+      "interpretation_id": 1,
+      "feedback_type": "accept | reject | modify | defer | outdated | none",
+      "confidence": 0.0,
+      "evidence_text": "用户原文中支持该判断的短句",
+      "correction": "如果 feedback_type=modify，写出用户修正后的含义；否则可为空"
+    }}
+  ]
+}}"""
+
+INTERPRETATION_UPDATE_USING_FEEDBACK_PROMPT = """你是长期记忆 interpretation 反馈校准模块。
+
+你需要根据用户对 interpretation 的明确反馈，更新这条 interpretation。
+反馈是直接来自用户的校准信号，优先级高于一般 observation，但仍然不能编造用户没有表达的新事实。
+
+existing_interpretation:
+{interpretation}
+
+user_feedback:
+{feedback}
+
+更新要求：
+- accept：通常只小幅提高 confidence/strength，claim/action_implication 可保持不变。
+- reject：降低 confidence；如果用户明确否认核心判断，可将 status 设为 conflicted 或 archived，并在 resolution 中说明用户否认点。
+- modify：吸收用户 correction，更新 claim/action_implication/scope/resolution；不要保留已被用户纠正的错误推断。
+- defer：不改变真假判断，主要在 metadata 中体现暂缓，通常不必改 claim。
+- outdated：如果用户表示已不适用，可将 status 设为 archived 或 superseded。
+
+字段约束：
+- status 只能是 current、conflicted、archived、superseded。
+- conflict_status 只能是 none、resolved、unresolved。
+- polarity 只能是 positive、negative、mixed、neutral。
+- strength/confidence 必须是 0.0-1.0。
+- metadata 应包含 source="interpretation_feedback_update"。
+- 如果不需要更新内容，只输出 {{"should_update": false}}。
+
+只返回合法 JSON，不要 markdown，不要额外解释：
+{{
+  "should_update": true,
+  "claim": "更新后的 Agent 当前解释",
+  "target_text": "解释对象",
+  "scope": "适用范围",
+  "interpretation_type": "insight | task | explicit_preference | explicit_instruction | inferred_preference | behavior_pattern | project_state | task_risk | constraint | conflict_resolution | strategy | other",
+  "polarity": "positive | negative | mixed | neutral",
+  "strength": 0.0,
+  "confidence": 0.0,
+  "status": "current | conflicted | archived | superseded",
+  "conflict_status": "none | resolved | unresolved",
+  "resolution": "反馈如何改变或确认这条解释",
+  "action_implication": "未来 Agent 应如何使用这个解释",
+  "metadata": {{"source": "interpretation_feedback_update"}}
+}}"""
+
 # ── Reflect prompt template ───────────────────────────────────────────────
 
 # ── Memory node context block template ───────────────────────────────────
@@ -1170,6 +1257,10 @@ class MemoryNodeManager:
 
         # Retrieval config
         self._top_k = int(memory_cfg.get("retrieval_top_k", 8))
+        self._recall_min_embedding_similarity = self._clip_unit_float(
+            memory_cfg.get("recall_min_embedding_similarity"),
+            0.35,
+        )
         self._min_turns_before_store = max(
             1,
             int(memory_cfg.get("min_turns_before_store", 1) or 1),
@@ -6639,9 +6730,12 @@ class MemoryNodeManager:
                     candidates = self._db.get_unprocessed_facts_for_evidence_bundle(
                         limit=1,
                     )
-                    if not candidates:
+                    pending_feedback = self._db.memory_pending_interpretation_feedback(
+                        limit=1,
+                    )
+                    if not candidates and not pending_feedback:
                         logger.debug(
-                            "Memory reflect due but skipped: no unobserved facts",
+                            "Memory reflect due but skipped: no unobserved facts or pending feedback",
                         )
                         continue
                     report = self.reflect(
@@ -6663,6 +6757,15 @@ class MemoryNodeManager:
                                 exc,
                             )
                     logger.debug("MemoryNodeManager reflect report: %s", report)
+                elif task_kind == "feedback":
+                    count = self.analyze_feedback_for_pending_interpretations(
+                        task.get("user_message", ""),
+                        recall_event_id=task.get("recall_event_id"),
+                    )
+                    logger.debug(
+                        "MemoryNodeManager feedback analysis stored %d item(s)",
+                        count,
+                    )
                 else:
                     self.store_turn(
                         user_message=task["user_message"],
@@ -6704,6 +6807,223 @@ class MemoryNodeManager:
             ),
         }
 
+    @staticmethod
+    def _normalize_interpretation_feedback_type(value: Any) -> str:
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {"accept", "reject", "modify", "defer", "outdated", "none"}
+        return text if text in allowed else "none"
+
+    @classmethod
+    def _feedback_interpretation_payload(
+        cls,
+        interpretations: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        payload: List[Dict[str, Any]] = []
+        for item in interpretations or []:
+            try:
+                interpretation_id = int(item.get("id"))
+            except (TypeError, ValueError):
+                continue
+            metadata = cls._json_dict(item.get("metadata", {}))
+            payload.append({
+                "id": interpretation_id,
+                "claim": item.get("claim"),
+                "interpretation_type": item.get("interpretation_type"),
+                "status": item.get("status"),
+                "confidence": item.get("confidence"),
+                "scope": item.get("scope"),
+                "target_text": item.get("target_text"),
+                "action_implication": item.get("action_implication"),
+                "resolution": item.get("resolution"),
+                "entity_name": item.get("entity_name") or metadata.get("entity_name"),
+                "recall_rank": item.get("recall_rank"),
+                "recall_score": item.get("recall_score"),
+            })
+        return payload
+
+    def analyze_feedback_for_pending_interpretations(
+        self,
+        user_message: str,
+        *,
+        recall_event_id: Optional[int] = None,
+    ) -> int:
+        """Analyze whether a new user message gives feedback on recalled interpretations."""
+        if not self._enabled or not self._db or not str(user_message or "").strip():
+            return 0
+        try:
+            if recall_event_id is not None:
+                event = self._db.memory_recall_event_by_id(
+                    int(recall_event_id),
+                    limit_interpretations=8,
+                )
+            else:
+                event = self._db.memory_latest_pending_recall_event(
+                    limit_interpretations=8,
+                )
+        except Exception as exc:
+            logger.debug("Memory interpretation feedback lookup failed: %s", exc)
+            return 0
+        if not event or not event.get("interpretations"):
+            return 0
+
+        interpretations = event.get("interpretations") or []
+        interpretation_payload = self._feedback_interpretation_payload(interpretations)
+        if not interpretation_payload:
+            try:
+                self._db.memory_mark_recall_event_status(
+                    int(event["id"]),
+                    "feedback_analyzed",
+                )
+            except Exception:
+                pass
+            return 0
+
+        prompt = INTERPRETATION_FEEDBACK_ANALYSIS_PROMPT.format(
+            previous_user_query=self._reflect_log_text(event.get("query"), limit=1200),
+            previous_assistant_response=self._reflect_log_text(
+                event.get("assistant_response"),
+                limit=2400,
+            ),
+            interpretations=json.dumps(
+                interpretation_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+            current_user_message=self._reflect_log_text(user_message, limit=1600),
+        )
+        data = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "")
+        if not data:
+            self._log_info(
+                "memory_feedback",
+                "analysis_failed",
+                {
+                    "recall_event_id": event.get("id"),
+                    "reason": "llm_json_empty",
+                },
+            )
+            return 0
+
+        by_id = {
+            int(item["id"]): item
+            for item in interpretation_payload
+            if item.get("id") is not None
+        }
+        feedback_items = data.get("feedback_items")
+        if not isinstance(feedback_items, list):
+            feedback_items = []
+        written = 0
+        for raw_item in feedback_items:
+            if not isinstance(raw_item, dict):
+                continue
+            try:
+                interpretation_id = int(raw_item.get("interpretation_id"))
+            except (TypeError, ValueError):
+                continue
+            if interpretation_id not in by_id:
+                continue
+            feedback_type = self._normalize_interpretation_feedback_type(
+                raw_item.get("feedback_type")
+            )
+            if feedback_type == "none":
+                continue
+            confidence = self._clip_unit_float(raw_item.get("confidence"), 0.0)
+            if confidence < 0.4:
+                continue
+            try:
+                self._log_info(
+                    "memory_feedback",
+                    "analysis_finished",
+                    {
+                        "interpretation_id": interpretation_id,
+                        "feedback_type": feedback_type,
+                        **by_id[interpretation_id]
+                    }
+                )
+                self._db.memory_add_interpretation_feedback(
+                    recall_event_id=int(event["id"]),
+                    interpretation_id=interpretation_id,
+                    feedback_type=feedback_type,
+                    confidence=confidence,
+                    user_message=str(user_message or ""),
+                    evidence_text=str(raw_item.get("evidence_text") or "").strip(),
+                    correction=str(raw_item.get("correction") or "").strip(),
+                    metadata={
+                        "source": "feedback_analysis",
+                        "previous_query": event.get("query"),
+                        "analysis_has_feedback": bool(data.get("has_feedback")),
+                    },
+                )
+                written += 1
+            except Exception as exc:
+                logger.debug("Could not store interpretation feedback: %s", exc)
+
+        try:
+            self._db.memory_mark_recall_event_status(
+                int(event["id"]),
+                "feedback_analyzed",
+            )
+        except Exception:
+            pass
+        self._log_info(
+            "memory_feedback",
+            "analysis_finished",
+            {
+                "recall_event_id": event.get("id"),
+                "has_feedback": bool(data.get("has_feedback")),
+                "feedback_items": written,
+            },
+        )
+        return written
+
+    def analyze_feedback_for_pending_interpretations_async(
+        self,
+        user_message: str,
+        *,
+        llm_client: Any = None,
+        llm_model: Optional[str] = None,
+        llm_base_url: Optional[str] = None,
+        llm_api_key: Optional[str] = None,
+    ) -> bool:
+        """Queue interpretation feedback analysis without blocking the current turn."""
+        if not self._enabled or not str(user_message or "").strip():
+            return False
+        if not self._db:
+            return False
+        try:
+            event = self._db.memory_latest_pending_recall_event(
+                limit_interpretations=1,
+            )
+        except Exception as exc:
+            logger.debug("Memory interpretation feedback async lookup failed: %s", exc)
+            return False
+        if not event:
+            return False
+        task = {
+            "kind": "feedback",
+            "user_message": str(user_message),
+            "recall_event_id": int(event["id"]),
+            "llm_config": self._llm_config_snapshot(
+                llm_client=llm_client,
+                llm_model=llm_model,
+                llm_base_url=llm_base_url,
+                llm_api_key=llm_api_key,
+            ),
+        }
+        with self._store_worker_lock:
+            if self._store_shutdown_event.is_set():
+                return False
+            try:
+                self._store_queue.put_nowait(task)
+            except queue.Full:
+                logger.warning(
+                    "Memory store queue is full; dropping feedback analysis (maxsize=%d)",
+                    self._store_queue_maxsize,
+                )
+                return False
+            self._ensure_store_worker_locked()
+        return True
+
     def _ensure_store_worker_locked(self) -> None:
         if self._store_worker_thread and self._store_worker_thread.is_alive():
             return
@@ -6732,6 +7052,15 @@ class MemoryNodeManager:
         """
         if not self._enabled or not user_message or not assistant_response:
             return False
+
+        if self._db:
+            try:
+                self._db.memory_attach_latest_recall_event_response(
+                    query=str(user_message),
+                    assistant_response=str(assistant_response),
+                )
+            except Exception as exc:
+                logger.debug("Could not attach response to memory recall event: %s", exc)
 
         task = {
             "kind": "store",
@@ -7311,6 +7640,298 @@ class MemoryNodeManager:
         }
 
     @staticmethod
+    def _normalize_feedback_update_status(value: Any, fallback: str = "current") -> str:
+        text = str(value or fallback).strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {"current", "conflicted", "archived", "superseded"}
+        return text if text in allowed else fallback
+
+    def _update_interpretation_using_feedback(
+        self,
+        *,
+        interpretation: Dict[str, Any],
+        feedback: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        interpretation_payload = {
+            key: interpretation.get(key)
+            for key in (
+                "id",
+                "claim",
+                "target_text",
+                "scope",
+                "interpretation_type",
+                "polarity",
+                "strength",
+                "confidence",
+                "status",
+                "conflict_status",
+                "resolution",
+                "action_implication",
+                "metadata",
+            )
+        }
+        feedback_payload = {
+            "id": feedback.get("id"),
+            "feedback_type": feedback.get("feedback_type"),
+            "confidence": feedback.get("confidence"),
+            "user_message": feedback.get("user_message"),
+            "evidence_text": feedback.get("evidence_text"),
+            "correction": feedback.get("correction"),
+            "created_at": feedback.get("created_at"),
+        }
+        prompt = INTERPRETATION_UPDATE_USING_FEEDBACK_PROMPT.format(
+            interpretation=json.dumps(
+                interpretation_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+            feedback=json.dumps(
+                feedback_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )
+        data = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "")
+        if not data or not bool(data.get("should_update")):
+            return None
+        allowed_types = {
+            "insight", "task",
+            "explicit_preference", "explicit_instruction", "inferred_preference",
+            "behavior_pattern", "project_state", "task_risk", "constraint",
+            "conflict_resolution", "strategy", "other",
+        }
+        existing_type = str(interpretation.get("interpretation_type") or "insight")
+        interpretation_type = str(
+            data.get("interpretation_type") or existing_type
+        ).strip().lower().replace("-", "_").replace(" ", "_")
+        if interpretation_type not in allowed_types:
+            interpretation_type = existing_type if existing_type in allowed_types else "insight"
+        conflict_status = str(
+            data.get("conflict_status") or interpretation.get("conflict_status") or "none"
+        ).strip().lower()
+        if conflict_status not in {"none", "resolved", "unresolved"}:
+            conflict_status = "none"
+        polarity = str(data.get("polarity") or interpretation.get("polarity") or "neutral").strip().lower()
+        if polarity not in {"positive", "negative", "mixed", "neutral"}:
+            polarity = "neutral"
+        return {
+            "claim": str(data.get("claim") or interpretation.get("claim") or "").strip(),
+            "target_text": str(data.get("target_text") or interpretation.get("target_text") or "").strip(),
+            "scope": str(data.get("scope") or interpretation.get("scope") or "general").strip() or "general",
+            "interpretation_type": interpretation_type,
+            "polarity": polarity,
+            "strength": self._clip_unit_float(data.get("strength"), float(interpretation.get("strength") or 0.5)),
+            "confidence": self._clip_unit_float(data.get("confidence"), float(interpretation.get("confidence") or 0.5)),
+            "status": self._normalize_feedback_update_status(
+                data.get("status"),
+                str(interpretation.get("status") or "current"),
+            ),
+            "conflict_status": conflict_status,
+            "resolution": str(data.get("resolution") or interpretation.get("resolution") or "").strip(),
+            "action_implication": str(
+                data.get("action_implication")
+                or interpretation.get("action_implication")
+                or ""
+            ).strip(),
+            "metadata": self._json_dict(data.get("metadata", {})),
+        }
+
+    def _fallback_update_interpretation_using_feedback(
+        self,
+        *,
+        interpretation: Dict[str, Any],
+        feedback: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        feedback_type = self._normalize_interpretation_feedback_type(
+            feedback.get("feedback_type")
+        )
+        confidence = self._clip_unit_float(interpretation.get("confidence"), 0.5)
+        strength = self._clip_unit_float(interpretation.get("strength"), 0.5)
+        status = str(interpretation.get("status") or "current")
+        conflict_status = str(interpretation.get("conflict_status") or "none")
+        resolution = str(interpretation.get("resolution") or "").strip()
+        if feedback_type == "accept":
+            confidence = min(1.0, confidence + 0.06)
+            strength = min(1.0, strength + 0.03)
+        elif feedback_type == "reject":
+            confidence = max(0.0, confidence - 0.25)
+            status = "conflicted" if confidence >= 0.25 else "archived"
+            conflict_status = "unresolved"
+            resolution = str(feedback.get("evidence_text") or "User rejected this interpretation.").strip()
+        elif feedback_type == "modify":
+            confidence = max(0.0, confidence - 0.08)
+            status = "conflicted"
+            conflict_status = "unresolved"
+            resolution = str(feedback.get("correction") or feedback.get("evidence_text") or "").strip()
+        elif feedback_type == "outdated":
+            status = "archived"
+            resolution = str(feedback.get("evidence_text") or "User indicated this interpretation is outdated.").strip()
+        elif feedback_type == "defer":
+            resolution = str(feedback.get("evidence_text") or "User deferred this interpretation.").strip()
+        return {
+            "claim": interpretation.get("claim", ""),
+            "target_text": interpretation.get("target_text", ""),
+            "scope": interpretation.get("scope", "general"),
+            "interpretation_type": interpretation.get("interpretation_type", "insight"),
+            "polarity": interpretation.get("polarity", "neutral"),
+            "strength": strength,
+            "confidence": confidence,
+            "status": status,
+            "conflict_status": conflict_status,
+            "resolution": resolution,
+            "action_implication": interpretation.get("action_implication", ""),
+            "metadata": {},
+        }
+
+    def _persist_interpretation_feedback_update(
+        self,
+        *,
+        interpretation: Dict[str, Any],
+        feedback: Dict[str, Any],
+        update: Dict[str, Any],
+    ) -> int:
+        metadata = {
+            **self._json_dict(interpretation.get("metadata", {})),
+            **self._json_dict(update.get("metadata", {})),
+        }
+        feedback_type = self._normalize_interpretation_feedback_type(
+            feedback.get("feedback_type")
+        )
+        feedback_meta = self._json_dict(metadata.get("feedback", {}))
+        counts = self._json_dict(feedback_meta.get("counts", {}))
+        counts[feedback_type] = int(counts.get(feedback_type, 0) or 0) + 1
+        feedback_meta.update({
+            "counts": counts,
+            "last_feedback_id": feedback.get("id"),
+            "last_feedback_type": feedback_type,
+            "last_feedback_confidence": feedback.get("confidence"),
+            "last_feedback_evidence": feedback.get("evidence_text"),
+            "last_feedback_correction": feedback.get("correction"),
+            "last_feedback_at": feedback.get("created_at"),
+        })
+        metadata["feedback"] = feedback_meta
+        metadata["source"] = metadata.get("source") or "interpretation_feedback_update"
+
+        claim = str(update.get("claim") or interpretation.get("claim") or "").strip()
+        action_implication = str(
+            update.get("action_implication")
+            or interpretation.get("action_implication")
+            or ""
+        ).strip()
+        target_text = str(update.get("target_text") or interpretation.get("target_text") or "").strip()
+        scope = str(update.get("scope") or interpretation.get("scope") or "general").strip() or "general"
+        interpretation_type = str(
+            update.get("interpretation_type")
+            or interpretation.get("interpretation_type")
+            or "insight"
+        )
+        resolution = str(update.get("resolution") or interpretation.get("resolution") or "").strip()
+        embedding_text = self._build_interpretation_embedding_text(
+            entity_name=interpretation.get("entity_name") or metadata.get("entity_name") or "",
+            target_text=target_text,
+            scope=scope,
+            interpretation_type=interpretation_type,
+            claim=claim,
+            action_implication=action_implication,
+            resolution=resolution,
+        )
+        return self._db.memory_upsert_interpretation(
+            interpretation_id=int(interpretation["id"]),
+            claim=claim,
+            entity_id=interpretation.get("entity_id") or metadata.get("entity_id"),
+            subject_text=interpretation.get("subject_text", ""),
+            target_text=target_text,
+            scope=scope,
+            interpretation_type=interpretation_type,
+            polarity=update.get("polarity", interpretation.get("polarity", "neutral")),
+            strength=update.get("strength", interpretation.get("strength", 0.5)),
+            confidence=update.get("confidence", interpretation.get("confidence", 0.5)),
+            status=update.get("status", interpretation.get("status", "current")),
+            conflict_status=update.get(
+                "conflict_status",
+                interpretation.get("conflict_status", "none"),
+            ),
+            resolution=resolution,
+            action_implication=action_implication,
+            evidence_node_ids=interpretation.get("evidence_node_ids", []),
+            evidence_observation_ids=interpretation.get("evidence_observation_ids", []),
+            counter_evidence_node_ids=interpretation.get("counter_evidence_node_ids", []),
+            counter_evidence_observation_ids=interpretation.get(
+                "counter_evidence_observation_ids",
+                [],
+            ),
+            embedding=self._embed_memory_layer_text(embedding_text),
+            embedding_text=embedding_text,
+            metadata=metadata,
+        )
+
+    def _reflect_apply_interpretation_feedback(
+        self,
+        *,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        if not self._db:
+            return {"processed": 0, "applied": 0, "ignored": 0}
+        try:
+            feedback_items = self._db.memory_pending_interpretation_feedback(
+                limit=limit,
+            )
+        except Exception as exc:
+            return {"processed": 0, "applied": 0, "ignored": 0, "error": str(exc)}
+        report = {"processed": 0, "applied": 0, "ignored": 0, "feedback_ids": []}
+        for feedback in feedback_items:
+            report["processed"] += 1
+            feedback_id = int(feedback.get("id"))
+            interpretation = feedback.get("interpretation")
+            if not interpretation:
+                self._db.memory_mark_interpretation_feedback_applied(
+                    feedback_id,
+                    status="ignored",
+                )
+                report["ignored"] += 1
+                continue
+            feedback_type = self._normalize_interpretation_feedback_type(
+                feedback.get("feedback_type")
+            )
+            update: Optional[Dict[str, Any]] = None
+            if feedback_type in {"reject", "modify", "outdated"}:
+                update = self._update_interpretation_using_feedback(
+                    interpretation=interpretation,
+                    feedback=feedback,
+                )
+            if update is None:
+                update = self._fallback_update_interpretation_using_feedback(
+                    interpretation=interpretation,
+                    feedback=feedback,
+                )
+            try:
+                interpretation_id = self._persist_interpretation_feedback_update(
+                    interpretation=interpretation,
+                    feedback=feedback,
+                    update=update,
+                )
+                self._db.memory_mark_interpretation_feedback_applied(
+                    feedback_id,
+                    status="applied",
+                )
+                report["applied"] += 1
+                report["feedback_ids"].append(feedback_id)
+                self._log_info(
+                    "memory_reflect",
+                    "interpretation_feedback_applied",
+                    {
+                        "feedback_id": feedback_id,
+                        "interpretation_id": interpretation_id,
+                        "feedback_type": feedback_type,
+                    },
+                )
+            except Exception as exc:
+                logger.debug("Could not apply interpretation feedback: %s", exc)
+                report["ignored"] += 1
+        return report
+
+    @staticmethod
     def _parse_reflect_timestamp(
         reflect_timestamp: Optional[Any] = None,
     ) -> datetime:
@@ -7378,6 +7999,10 @@ class MemoryNodeManager:
                 "task_stale_days": task_stale_days,
             })
 
+        feedback_report = self._reflect_apply_interpretation_feedback(
+            limit=limit,
+        )
+
         entity_merging_report = self._reflect_merging_duplicated_entities(
             limit=limit,
             date_key=reflect_date_key,
@@ -7393,6 +8018,7 @@ class MemoryNodeManager:
         )
         
         report = dict(entity_merging_report)
+        report["interpretation_feedback"] = feedback_report
         report["evidence_bundle_reflect"] = evidence_bundle_report
         report["evidence_bundles_consolidated"] = evidence_bundle_report.get("consolidated", 0)
         report["changed_evidence_bundle_ids"] = list(dict.fromkeys(
@@ -7434,6 +8060,7 @@ class MemoryNodeManager:
                 "evidence_bundle_groups_merged": report.get("evidence_bundle_groups_merged", 0),
                 "observations_updated": report.get("observations_updated", 0),
                 "interpretations_generated": report.get("interpretations_generated", 0),
+                "interpretation_feedback_applied": feedback_report.get("applied", 0),
                 "tasks_paused": report.get("tasks_paused", 0),
                 "tasks_stale": report.get("tasks_stale", 0),
             })
@@ -7992,6 +8619,7 @@ class MemoryNodeManager:
                 "needs_evidence": query_analysis.get("needs_evidence"),
                 "layer_limits": layer_limits,
                 "candidate_limits": candidate_limits,
+                "min_embedding_similarity": self._recall_min_embedding_similarity,
                 "embedding_text": self._reflect_log_text(query_embedding_text, limit=300),
             })
             interpretation_candidates = self._db.search_memory_interpretations(
@@ -7999,6 +8627,7 @@ class MemoryNodeManager:
                 entities=entities,
                 top_k=candidate_limits["interpretations"],
                 query_embedding=query_embedding,
+                min_embedding_similarity=self._recall_min_embedding_similarity,
             )
 
             observation_candidates = self._db.search_memory_observations(
@@ -8006,6 +8635,7 @@ class MemoryNodeManager:
                 entities=entities,
                 top_k=candidate_limits["observations"],
                 query_embedding=query_embedding,
+                min_embedding_similarity=self._recall_min_embedding_similarity,
             )
 
             fact_candidate_limit = max(
@@ -8209,6 +8839,33 @@ class MemoryNodeManager:
                 "output_chars": len(memory_text),
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
             })
+            if interpretation_nodes:
+                try:
+                    recall_event_id = self._db.memory_record_interpretation_recall_event(
+                        query=search_query,
+                        interpretations=interpretation_nodes,
+                        metadata={
+                            "source": "memory_recall",
+                            "resolved_intent": recall_intent,
+                            "query_analysis": {
+                                "keywords": keywords,
+                                "entities": self._recall_log_entities(entities),
+                                "needs_evidence": query_analysis.get("needs_evidence"),
+                            },
+                        },
+                    )
+                    self._log_info(
+                        "memory_recall",
+                        "interpretation_recall_event_recorded",
+                        {
+                            "recall_event_id": recall_event_id,
+                            "interpretation_ids": self._recall_log_item_ids(
+                                interpretation_nodes
+                            ),
+                        },
+                    )
+                except Exception as exc:
+                    logger.debug("Could not record interpretation recall event: %s", exc)
             return memory_text
 
         except Exception as e:
