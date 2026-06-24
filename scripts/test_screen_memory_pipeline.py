@@ -218,9 +218,7 @@ def prune_seed_database_for_phases(
                     "window_workstream_members",
                     "window_workstream",
                     "view_records",
-                    "view_segments",
                     "views",
-                    "segments",
                     "record_ax_events",
                     "openchronicle_events",
                     "records",
@@ -564,7 +562,6 @@ def main() -> int:
             "or pass --input-db/--seed-db."
         )
     if args.disable_llm:
-        manager_config["segment_generation"]["enable_LLM_summary"] = False
         manager_config["window_workstream_generation"][
             "enable_LLM_summary"
         ] = False
