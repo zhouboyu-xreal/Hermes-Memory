@@ -4930,6 +4930,7 @@ class SessionDB:
             "modify",
             "defer",
             "outdated",
+            "unrelated",
             "implicit_positive",
             "implicit_negative",
             "none",

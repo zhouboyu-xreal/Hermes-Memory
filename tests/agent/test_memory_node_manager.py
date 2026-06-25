@@ -461,6 +461,52 @@ def test_analyze_feedback_for_pending_interpretations_uses_llm(db):
     assert event is None
 
 
+def test_analyze_feedback_for_pending_interpretations_skips_unrelated(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户的健康问题主要来自工作压力。",
+        target_text="健康状态",
+        scope="health",
+        interpretation_type="insight",
+        confidence=0.74,
+        action_implication="后续围绕工作压力提供健康建议。",
+    )
+    interpretation = db.memory_get_interpretation_by_id(interpretation_id)
+    db.memory_record_interpretation_recall_event(
+        query="我最近身体不太好怎么办？",
+        interpretations=[interpretation],
+    )
+    db.memory_attach_latest_recall_event_response(
+        query="我最近身体不太好怎么办？",
+        assistant_response="看起来可能和工作压力有关。",
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        llm_outputs=[
+            json.dumps({
+                "has_feedback": False,
+                "feedback_items": [
+                    {
+                        "interpretation_id": interpretation_id,
+                        "feedback_type": "unrelated",
+                        "confidence": 0.95,
+                        "evidence_text": "我们继续讨论数据库 schema。",
+                        "correction": "",
+                    }
+                ],
+            }, ensure_ascii=False)
+        ],
+        enabled=True,
+    )
+
+    written = mgr.analyze_feedback_for_pending_interpretations(
+        "我们继续讨论数据库 schema。"
+    )
+
+    assert written == 0
+    assert db.memory_pending_interpretation_feedback() == []
+    assert db.memory_latest_pending_recall_event() is None
+
+
 def test_analyze_feedback_for_pending_interpretations_async_queues_target_event(db):
     interpretation_id = db.memory_upsert_interpretation(
         claim="用户希望先讨论设计再修改代码。",

@@ -924,6 +924,8 @@ INTERPRETATION_FEEDBACK_ANALYSIS_PROMPT = """你是长期记忆系统的 interpr
 - 用户开启新话题、提出新任务、普通追问或没有明显指向这些 interpretations 时，has_feedback=false。
 - 不要把沉默、换话题或没有接话当作负反馈。
 - feedback 必须绑定到输入中的 interpretation_id。
+- recall 只是候选召回，不代表每个 recalled_interpretation 都和 current_user_message 有关；如果某条 interpretation 与当前用户消息没有直接反馈关系，feedback_type=unrelated。
+- has_feedback=true 仅表示至少存在一条 accept/reject/modify/defer/outdated；如果全部是 unrelated 或 none，has_feedback=false。
 
 previous_user_query:
 {previous_user_query}
@@ -943,7 +945,8 @@ feedback_type 定义：
 - modify：用户修正 interpretation 的对象、原因、范围、状态或行动含义。
 - defer：用户表示现在不想处理、以后再说；不代表 interpretation 错误。
 - outdated：用户表示该 interpretation 已不适用或已经结束。
-- none：没有可用反馈。
+- unrelated：current_user_message 与该 interpretation 没有直接反馈关系，通常是误召回、新话题或只与其他 interpretation 有关。
+- none：无法判断是否有可用反馈，或没有足够证据归类。
 
 只返回合法 JSON，不要 markdown，不要额外解释：
 {{
@@ -951,7 +954,7 @@ feedback_type 定义：
   "feedback_items": [
     {{
       "interpretation_id": 1,
-      "feedback_type": "accept | reject | modify | defer | outdated | none",
+      "feedback_type": "accept | reject | modify | defer | outdated | unrelated | none",
       "confidence": 0.0,
       "evidence_text": "用户原文中支持该判断的短句",
       "correction": "如果 feedback_type=modify，写出用户修正后的含义；否则可为空"
@@ -1257,9 +1260,13 @@ class MemoryNodeManager:
 
         # Retrieval config
         self._top_k = int(memory_cfg.get("retrieval_top_k", 8))
-        self._recall_min_embedding_similarity = self._clip_unit_float(
-            memory_cfg.get("recall_min_embedding_similarity"),
+        self._recall_observation_min_embedding_similarity = self._clip_unit_float(
+            memory_cfg.get("recall_observation_min_embedding_similarity"),
             0.35,
+        )
+        self._recall_interpretation_min_embedding_similarity = self._clip_unit_float(
+            memory_cfg.get("recall_interpretation_min_embedding_similarity"),
+            0.45,
         )
         self._min_turns_before_store = max(
             1,
@@ -6824,7 +6831,7 @@ class MemoryNodeManager:
     @staticmethod
     def _normalize_interpretation_feedback_type(value: Any) -> str:
         text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-        allowed = {"accept", "reject", "modify", "defer", "outdated", "none"}
+        allowed = {"accept", "reject", "modify", "defer", "outdated", "unrelated", "none"}
         return text if text in allowed else "none"
 
     @classmethod
@@ -6891,7 +6898,19 @@ class MemoryNodeManager:
             except Exception:
                 pass
             return 0
-
+        self._log_info(
+            "memory_feedback",
+            "raw_data_info",
+            {
+                "interpretations": json.dumps(
+                    interpretation_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+                "current_user_message": self._reflect_log_text(user_message, limit=1600),
+            }
+        )
         prompt = INTERPRETATION_FEEDBACK_ANALYSIS_PROMPT.format(
             previous_user_query=self._reflect_log_text(event.get("query"), limit=1200),
             previous_assistant_response=self._reflect_log_text(
@@ -6939,7 +6958,16 @@ class MemoryNodeManager:
             feedback_type = self._normalize_interpretation_feedback_type(
                 raw_item.get("feedback_type")
             )
-            if feedback_type == "none":
+            if feedback_type in {"none", "unrelated"}:
+                self._log_info(
+                    "memory_feedback",
+                    "analysis_skipped",
+                    {
+                        "interpretation_id": interpretation_id,
+                        "feedback_type": feedback_type,
+                        "confidence": raw_item.get("confidence"),
+                    },
+                )
                 continue
             confidence = self._clip_unit_float(raw_item.get("confidence"), 0.0)
             if confidence < 0.4:
@@ -7908,6 +7936,13 @@ class MemoryNodeManager:
             feedback_type = self._normalize_interpretation_feedback_type(
                 feedback.get("feedback_type")
             )
+            if feedback_type in {"none", "unrelated"}:
+                self._db.memory_mark_interpretation_feedback_applied(
+                    feedback_id,
+                    status="ignored",
+                )
+                report["ignored"] += 1
+                continue
             update: Optional[Dict[str, Any]] = None
             if feedback_type in {"reject", "modify", "outdated"}:
                 update = self._update_interpretation_using_feedback(
@@ -8842,7 +8877,6 @@ class MemoryNodeManager:
                 "layer_limits": layer_limits,
                 "candidate_limits": candidate_limits,
                 "raw_candidate_limits": raw_candidate_limits,
-                "min_embedding_similarity": self._recall_min_embedding_similarity,
                 "embedding_text": self._reflect_log_text(query_embedding_text, limit=300),
             })
             raw_interpretation_candidates = self._db.search_memory_interpretations(
@@ -8854,7 +8888,7 @@ class MemoryNodeManager:
                 entities=entities,
                 top_k=candidate_limits["interpretations"],
                 query_embedding=query_embedding,
-                min_embedding_similarity=self._recall_min_embedding_similarity,
+                min_embedding_similarity=self._recall_interpretation_min_embedding_similarity,
             )
 
             raw_observation_candidates = self._db.search_memory_observations(
@@ -8866,7 +8900,7 @@ class MemoryNodeManager:
                 entities=entities,
                 top_k=candidate_limits["observations"],
                 query_embedding=query_embedding,
-                min_embedding_similarity=self._recall_min_embedding_similarity,
+                min_embedding_similarity=self._recall_observation_min_embedding_similarity,
             )
 
             fact_candidate_limit = max(
