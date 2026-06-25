@@ -4820,7 +4820,10 @@ class SessionDB:
 
     def search_memory_interpretations(
         self,
+        keyword: Any = None,
         *,
+        entities: Optional[List[Any]] = None,
+        entity_ids: Optional[List[int]] = None,
         top_k: int = 3,
         statuses: Optional[List[str]] = None,
         min_confidence: float = 0.4,
@@ -4832,12 +4835,47 @@ class SessionDB:
         ]
         normalized_statuses = list(dict.fromkeys(normalized_statuses))
         placeholders = ",".join("?" for _ in normalized_statuses)
+        clean_entity_ids = self._json_int_list(entity_ids or [])
+        entity_names: List[str] = []
+        for entity in entities or []:
+            if isinstance(entity, dict):
+                entity_id = self._coerce_int_or_none(entity.get("id"))
+                if entity_id is not None:
+                    clean_entity_ids.append(entity_id)
+                name = str(entity.get("name") or "").strip()
+            else:
+                name = str(entity or "").strip()
+            if name:
+                entity_names.append(name)
+        if entity_names:
+            name_placeholders = ",".join("?" for _ in entity_names)
+            entity_rows = self._conn.execute(
+                "SELECT id FROM entity_nodes "
+                f"WHERE lower(trim(name)) IN ({name_placeholders})",
+                [name.lower().strip() for name in entity_names],
+            ).fetchall()
+            clean_entity_ids.extend(int(row["id"]) for row in entity_rows)
+        clean_entity_ids = list(dict.fromkeys(clean_entity_ids))
+        if (entities or entity_ids) and not clean_entity_ids:
+            return []
+        params: List[Any] = [
+            *normalized_statuses,
+            max(0.0, min(1.0, float(min_confidence or 0.0))),
+        ]
+        where = [
+            f"mo.status IN ({placeholders})",
+            "mo.confidence >= ?",
+        ]
+        if clean_entity_ids:
+            entity_placeholders = ",".join("?" for _ in clean_entity_ids)
+            where.append(f"mo.entity_id IN ({entity_placeholders})")
+            params.extend(clean_entity_ids)
         rows = self._conn.execute(
             "SELECT mo.*, en.name AS entity_name "
             "FROM memory_interpretations mo "
             "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
-            f"WHERE mo.status IN ({placeholders}) AND mo.confidence >= ?",
-            [*normalized_statuses, max(0.0, min(1.0, float(min_confidence or 0.0)))],
+            f"WHERE {' AND '.join(where)}",
+            params,
         ).fetchall()
         items = [self._memory_interpretation_from_row(row) for row in rows]
         items.sort(
@@ -5678,16 +5716,42 @@ class SessionDB:
 
     def search_memory_observations(
         self,
+        keyword: Any = None,
+        *,
+        entities: Optional[List[Any]] = None,
         top_k: int = 3,
         entity_ids: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch active observations for manager-side recall ranking."""
         params: List[Any] = []
         where = ["obs.status = 'active'"]
-        if entity_ids:
-            placeholders = ",".join("?" for _ in entity_ids)
+        clean_entity_ids = self._json_int_list(entity_ids or [])
+        entity_names: List[str] = []
+        for entity in entities or []:
+            if isinstance(entity, dict):
+                entity_id = self._coerce_int_or_none(entity.get("id"))
+                if entity_id is not None:
+                    clean_entity_ids.append(entity_id)
+                name = str(entity.get("name") or "").strip()
+            else:
+                name = str(entity or "").strip()
+            if name:
+                entity_names.append(name)
+        if entity_names:
+            name_placeholders = ",".join("?" for _ in entity_names)
+            entity_rows = self._conn.execute(
+                "SELECT id FROM entity_nodes "
+                f"WHERE lower(trim(name)) IN ({name_placeholders})",
+                [name.lower().strip() for name in entity_names],
+            ).fetchall()
+            clean_entity_ids.extend(int(row["id"]) for row in entity_rows)
+        clean_entity_ids = list(dict.fromkeys(clean_entity_ids))
+        if (entities or entity_ids) and not clean_entity_ids:
+            return []
+        if clean_entity_ids:
+            placeholders = ",".join("?" for _ in clean_entity_ids)
             where.append(f"bundle.entity_id IN ({placeholders})")
-            params.extend(entity_ids)
+            params.extend(clean_entity_ids)
         rows = self._conn.execute(
             "SELECT obs.*, bundle.entity_id, bundle.topic_key, bundle.topic_label, "
             "en.name AS entity_name "

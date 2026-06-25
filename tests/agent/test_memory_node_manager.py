@@ -797,6 +797,140 @@ def test_search_memory_interpretations_separates_content_and_entity_matches(db):
     assert entity_results[0]["id"] == entity_only
 
 
+def test_search_memory_interpretations_filters_by_entity_id(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    bob = db.entity_add_entity("Bob", "PERSON")
+    alice_interpretation = db.memory_upsert_interpretation(
+        claim="Alice prefers lightweight health suggestions.",
+        entity_id=alice,
+        target_text="health suggestions",
+        scope="health",
+        interpretation_type="explicit_preference",
+        confidence=0.82,
+        action_implication="Use concise health suggestions for Alice.",
+    )
+    bob_interpretation = db.memory_upsert_interpretation(
+        claim="Bob prefers detailed health plans.",
+        entity_id=bob,
+        target_text="health suggestions",
+        scope="health",
+        interpretation_type="explicit_preference",
+        confidence=0.83,
+        action_implication="Use detailed health plans for Bob.",
+    )
+
+    alice_results = db.search_memory_interpretations(
+        "health",
+        entities=[{"name": "Alice"}],
+        top_k=5,
+    )
+    bob_results = db.search_memory_interpretations(
+        "health",
+        entity_ids=[bob],
+        top_k=5,
+    )
+    missing_results = db.search_memory_interpretations(
+        "health",
+        entities=[{"name": "Charlie"}],
+        top_k=5,
+    )
+
+    assert [item["id"] for item in alice_results] == [alice_interpretation]
+    assert [item["id"] for item in bob_results] == [bob_interpretation]
+    assert missing_results == []
+
+
+def test_search_memory_observations_filters_by_entity_id(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    bob = db.entity_add_entity("Bob", "PERSON")
+    alice_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice discussed health suggestions.",
+        keywords=["health", "suggestions"],
+    )
+    bob_node = _add_memory_node(
+        db,
+        time_key="2026-05-01 11:00:00",
+        summary="Bob discussed health suggestions.",
+        keywords=["health", "suggestions"],
+    )
+    alice_bundle = db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="health",
+        topic_label="health",
+        bundle_type="entity_topic",
+        source_node_ids=[alice_node],
+    )
+    bob_bundle = db.memory_upsert_evidence_bundle(
+        entity_id=bob,
+        topic_key="health",
+        topic_label="health",
+        bundle_type="entity_topic",
+        source_node_ids=[bob_node],
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    alice_cursor = db._conn.execute(
+        "INSERT INTO memory_observations "
+        "(evidence_bundle_id, entity_name, topic_key, observation_type, summary, "
+        "confidence, status, metadata, created_at, updated_at, last_supported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            alice_bundle,
+            "Alice",
+            "health",
+            "preference_signal",
+            "Alice prefers lightweight health suggestions.",
+            0.82,
+            "active",
+            "{}",
+            now,
+            now,
+            now,
+        ),
+    )
+    bob_cursor = db._conn.execute(
+        "INSERT INTO memory_observations "
+        "(evidence_bundle_id, entity_name, topic_key, observation_type, summary, "
+        "confidence, status, metadata, created_at, updated_at, last_supported_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            bob_bundle,
+            "Bob",
+            "health",
+            "preference_signal",
+            "Bob prefers detailed health plans.",
+            0.83,
+            "active",
+            "{}",
+            now,
+            now,
+            now,
+        ),
+    )
+    db._conn.commit()
+
+    alice_results = db.search_memory_observations(
+        "health",
+        entities=[{"name": "Alice"}],
+        top_k=5,
+    )
+    bob_results = db.search_memory_observations(
+        "health",
+        entity_ids=[bob],
+        top_k=5,
+    )
+    missing_results = db.search_memory_observations(
+        "health",
+        entities=[{"name": "Charlie"}],
+        top_k=5,
+    )
+
+    assert [item["id"] for item in alice_results] == [alice_cursor.lastrowid]
+    assert [item["id"] for item in bob_results] == [bob_cursor.lastrowid]
+    assert missing_results == []
+
+
 def test_store_turn_falls_back_to_summary_when_retain_json_is_bad(db):
     summary_payload = {
         "summary": "The user decided to use PostgreSQL 16 for the project.",
@@ -3247,6 +3381,8 @@ def test_recall_expands_interpretation_to_evidence_observations(db, monkeypatch)
         interpretation_type="preference",
         confidence=0.8,
         evidence_observation_ids=[observation_id],
+        embedding=np.ones((1, 1536), dtype=np.float32),
+        embedding_text="calibration implementation",
     )
     monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
     mgr = _NoAsyncMemoryNodeManager(
@@ -3277,6 +3413,8 @@ def test_recall_formats_interpretation_direct_evidence_once(db, monkeypatch):
         interpretation_type="insight",
         confidence=0.82,
         evidence_node_ids=[evidence_id],
+        embedding=np.ones((1, 1536), dtype=np.float32),
+        embedding_text="recall router evidence",
     )
     monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
     mgr = _NoAsyncMemoryNodeManager(

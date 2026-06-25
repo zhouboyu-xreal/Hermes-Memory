@@ -1299,6 +1299,10 @@ class MemoryNodeManager:
             1.0,
             float(memory_cfg.get("reflect_interval_seconds", 3600) or 3600),
         )
+        self._reflect_observation_interpretation_min_embedding_similarity = self._clip_unit_float(
+            memory_cfg.get("reflect_observation_interpretation_min_embedding_similarity"),
+            0.45,
+        )
         self._store_queue: queue.Queue[Dict[str, Any]] = queue.Queue(
             maxsize=self._store_queue_maxsize,
         )
@@ -8251,6 +8255,24 @@ class MemoryNodeManager:
         return text or str(query or "")
 
     @staticmethod
+    def _recall_log_interpretation_items(items: List[Dict[str, Any]], *, limit: int = 20) -> Dict[str, str]:
+        items_info: Dict[str, str] = {}
+        for item in items or []:
+            item_id = item.get("id")
+            items_info[str(item_id)] = item.get("claim")
+
+        return items_info
+
+    @staticmethod
+    def _recall_log_observation_items(items: List[Dict[str, Any]], *, limit: int = 20) -> Dict[str, str]:
+        items_info: Dict[str, str] = {}
+        for item in items or []:
+            item_id = item.get("id")
+            items_info[str(item_id)] = item.get("summary")
+
+        return items_info
+
+    @staticmethod
     def _recall_log_item_ids(items: List[Dict[str, Any]], *, limit: int = 20) -> List[Any]:
         ids: List[Any] = []
         for item in items or []:
@@ -8653,7 +8675,7 @@ class MemoryNodeManager:
         return [item for _, item in scored[:max(1, int(top_k or 3))]]
 
     @classmethod
-    def _rank_recall_candidates(
+    def _rank_recall_raw_candidates(
         cls,
         *,
         interpretations: List[Dict[str, Any]],
@@ -8717,7 +8739,269 @@ class MemoryNodeManager:
         for items in selected.values():
             items.sort(key=lambda item: int(item.get("_recall_rank") or 0))
         return selected
-    
+
+    @classmethod
+    def _rank_recall_candidates(cls, **kwargs: Any) -> Dict[str, List[Dict[str, Any]]]:
+        return cls._rank_recall_raw_candidates(**kwargs)
+
+    def _retrieve_recall_raw_candidates(
+        self,
+        *,
+        keywords: List[str],
+        entities: List[Any],
+        query_embedding: np.ndarray,
+        candidate_limits: Dict[str, int],
+        raw_candidate_limits: Dict[str, int],
+        layer_limits: Dict[str, int],
+        fact_type_preference: str,
+        budget: str,
+        time_start: Optional[str],
+        time_end: Optional[str],
+        tags: Optional[List[str]],
+    ) -> Tuple[
+        List[Dict[str, Any]],
+        List[Dict[str, Any]],
+        List[Dict[str, Any]],
+        List[Dict[str, Any]],
+    ]:
+        """Retrieve and rank first-pass recall candidates for each memory layer."""
+        raw_interpretation_candidates = self._db.search_memory_interpretations(
+            entities=entities,
+            top_k=raw_candidate_limits["interpretations"],
+        )
+        interpretation_candidates = self._rank_interpretation_search_candidates(
+            raw_interpretation_candidates,
+            keyword=keywords,
+            entities=entities,
+            top_k=candidate_limits["interpretations"],
+            query_embedding=query_embedding,
+            min_embedding_similarity=self._recall_interpretation_min_embedding_similarity,
+        )
+
+        raw_observation_candidates = self._db.search_memory_observations(
+            entities=entities,
+            top_k=raw_candidate_limits["observations"],
+        )
+        observation_candidates = self._rank_observation_search_candidates(
+            raw_observation_candidates,
+            keyword=keywords,
+            entities=entities,
+            top_k=candidate_limits["observations"],
+            query_embedding=query_embedding,
+            min_embedding_similarity=self._recall_observation_min_embedding_similarity,
+        )
+
+        fact_candidate_limit = max(
+            candidate_limits["facts"],
+            layer_limits["facts"] * 3,
+            layer_limits["facts"] + 4,
+        )
+        semantic_candidate_limit = max(1, fact_candidate_limit)
+        episodic_candidate_limit = max(1, fact_candidate_limit)
+        if fact_type_preference == "semantic":
+            episodic_candidate_limit = max(1, layer_limits["facts"])
+        elif fact_type_preference == "episodic":
+            semantic_candidate_limit = max(1, layer_limits["facts"])
+        semantic_candidates = self._db.search_memory_facts(
+            keywords,
+            query_embedding,
+            top_k=semantic_candidate_limit,
+            budget=budget,
+            time_start=time_start, time_end=time_end,
+            tags=tags,
+            fact_types=["semantic"],
+        )
+
+        episodic_candidates = self._db.search_memory_facts(
+            keywords,
+            query_embedding,
+            top_k=episodic_candidate_limit,
+            budget=budget,
+            time_start=time_start, time_end=time_end,
+            tags=tags,
+            fact_types=["episodic"],
+        )
+        self._log_info("memory_recall", "candidates_found", {
+            "interpretations": {
+                **self._recall_log_interpretation_items(interpretation_candidates)
+            },
+            "observations": {
+                **self._recall_log_observation_items(observation_candidates)
+            },
+            "semantic_facts": {
+                **self._recall_log_observation_items(semantic_candidates, limit=semantic_candidate_limit),
+                "top_k": semantic_candidate_limit,
+            },
+            "episodic_facts": {
+                **self._recall_log_observation_items(episodic_candidates, limit=episodic_candidate_limit),
+                "top_k": episodic_candidate_limit,
+            },
+        })
+        return interpretation_candidates, observation_candidates, semantic_candidates, episodic_candidates
+
+    def _retrieve_recall_support_candidates(
+        self,
+        interpretation_candidates: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Collect ranked linked observations and facts for interpretation candidates."""
+        candidate_observation_ids_from_interpretation: List[int] = []
+        candidate_fact_ids_from_interpretation: List[int] = []
+        interpretation_observation_ids: Dict[int, List[int]] = {}
+        interpretation_fact_ids: Dict[int, List[int]] = {}
+        interpretation_by_id: Dict[int, Dict[str, Any]] = {}
+        for interpretation in interpretation_candidates:
+            try:
+                interpretation_id = int(interpretation.get("id"))
+            except (TypeError, ValueError):
+                continue
+            interpretation_by_id[interpretation_id] = interpretation
+            observation_ids: List[int] = []
+            for value in (
+                interpretation.get("evidence_observation_ids", []) or []
+            ) + (
+                interpretation.get("counter_evidence_observation_ids", []) or []
+            ):
+                try:
+                    observation_ids.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            fact_ids: List[int] = []
+            for value in (
+                interpretation.get("evidence_node_ids", []) or []
+            ) + (
+                interpretation.get("counter_evidence_node_ids", []) or []
+            ):
+                try:
+                    fact_ids.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            observation_ids = list(dict.fromkeys(observation_ids))
+            fact_ids = list(dict.fromkeys(fact_ids))
+            interpretation_observation_ids[interpretation_id] = observation_ids
+            interpretation_fact_ids[interpretation_id] = fact_ids
+            candidate_observation_ids_from_interpretation.extend(observation_ids)
+            candidate_fact_ids_from_interpretation.extend(fact_ids)
+        candidate_observation_ids_from_interpretation = list(
+            dict.fromkeys(candidate_observation_ids_from_interpretation)
+        )
+        candidate_fact_ids_from_interpretation = list(
+            dict.fromkeys(candidate_fact_ids_from_interpretation)
+        )
+        candidate_observations_from_interpretation = self._db.get_observations_by_ids(
+            candidate_observation_ids_from_interpretation
+        )
+        candidate_observations_by_id = {
+            int(observation["id"]): observation
+            for observation in candidate_observations_from_interpretation
+            if observation.get("id") is not None
+        }
+        candidate_facts_by_id = {
+            int(node["id"]): node
+            for node in self._db.memory_nodes_by_ids(
+                candidate_fact_ids_from_interpretation
+            )
+            if node.get("id") is not None
+        }
+        facts_by_observation = self._db.get_observation_supporting_nodes(
+            candidate_observation_ids_from_interpretation,
+            per_observation=3,
+        ) if candidate_observation_ids_from_interpretation else {}
+
+        linked_observations: List[Dict[str, Any]] = []
+        linked_facts: List[Dict[str, Any]] = []
+        seen_fact_ids = set()
+        max_observations_per_interpretation = 2
+        max_facts_per_interpretation = 3
+        max_facts_per_observation = 2
+
+        def _fact_sort_key(item: Dict[str, Any]) -> Tuple[float, str, int]:
+            return (
+                float(item.get("_recall_support_score") or 0.0),
+                item.get("time_key") or item.get("updated_at") or "",
+                int(item.get("id") or 0),
+            )
+
+        for interpretation_id, interpretation in interpretation_by_id.items():
+            parent_score = float(interpretation.get("_recall_score") or 0.0)
+            ranked_observations: List[Dict[str, Any]] = []
+            for observation_id in interpretation_observation_ids.get(interpretation_id, []):
+                observation = candidate_observations_by_id.get(int(observation_id))
+                if not observation:
+                    continue
+                support_item = dict(observation)
+                support_item["_recall_support_parent_layer"] = "interpretation"
+                support_item["_recall_support_parent_id"] = interpretation_id
+                support_item["_recall_support_score"] = round(
+                    (parent_score * 0.75)
+                    + (float(support_item.get("confidence") or 0.0) * 0.2),
+                    4,
+                )
+                ranked_observations.append(support_item)
+            ranked_observations.sort(
+                key=lambda item: (
+                    float(item.get("_recall_support_score") or 0.0),
+                    item.get("last_supported_at")
+                    or item.get("updated_at")
+                    or "",
+                ),
+                reverse=True,
+            )
+            selected_observations = ranked_observations[:max_observations_per_interpretation]
+            linked_observations.extend(selected_observations)
+
+            direct_facts: List[Dict[str, Any]] = []
+            for fact_id in interpretation_fact_ids.get(interpretation_id, []):
+                fact = candidate_facts_by_id.get(int(fact_id))
+                if not fact:
+                    continue
+                support_item = dict(fact)
+                support_item["_recall_support_parent_layer"] = "interpretation"
+                support_item["_recall_support_parent_id"] = interpretation_id
+                support_item["_recall_support_score"] = round(parent_score * 0.8, 4)
+                direct_facts.append(support_item)
+            direct_facts.sort(key=_fact_sort_key, reverse=True)
+            for fact in direct_facts[:max_facts_per_interpretation]:
+                fact_id = fact.get("id")
+                if fact_id in seen_fact_ids:
+                    continue
+                seen_fact_ids.add(fact_id)
+                linked_facts.append(fact)
+
+            for observation in selected_observations:
+                observation_id = int(observation["id"])
+                observation_score = float(observation.get("_recall_support_score") or 0.0)
+                observation_facts: List[Dict[str, Any]] = []
+                for fact in facts_by_observation.get(observation_id, []):
+                    support_item = dict(fact)
+                    support_item["_recall_support_parent_layer"] = "observation"
+                    support_item["_recall_support_parent_id"] = observation_id
+                    support_item["_recall_support_score"] = round(observation_score * 0.85, 4)
+                    observation_facts.append(support_item)
+                observation_facts.sort(key=_fact_sort_key, reverse=True)
+                for fact in observation_facts[:max_facts_per_observation]:
+                    fact_id = fact.get("id")
+                    if fact_id in seen_fact_ids:
+                        continue
+                    seen_fact_ids.add(fact_id)
+                    linked_facts.append(fact)
+
+        self._log_info("memory_recall", "support_candidates_built", {
+            "interpretation_observation_ids": candidate_observation_ids_from_interpretation,
+            "interpretation_fact_ids": candidate_fact_ids_from_interpretation,
+            "linked_observations": {
+                "count": len(linked_observations),
+                "ids": self._recall_log_item_ids(linked_observations),
+            },
+            "linked_facts": {
+                "count": len(linked_facts),
+                "ids": self._recall_log_item_ids(linked_facts),
+            },
+        })
+        return {
+            "linked_observations": linked_observations,
+            "linked_facts": linked_facts,
+        }
+
     def recall(
         self,
         query: str,
@@ -8879,77 +9163,27 @@ class MemoryNodeManager:
                 "raw_candidate_limits": raw_candidate_limits,
                 "embedding_text": self._reflect_log_text(query_embedding_text, limit=300),
             })
-            raw_interpretation_candidates = self._db.search_memory_interpretations(
-                top_k=raw_candidate_limits["interpretations"],
-            )
-            interpretation_candidates = self._rank_interpretation_search_candidates(
-                raw_interpretation_candidates,
-                keyword=keywords,
+
+            (
+                interpretation_candidates,
+                observation_candidates,
+                semantic_candidates,
+                episodic_candidates,
+            ) = self._retrieve_recall_raw_candidates(
+                keywords=keywords,
                 entities=entities,
-                top_k=candidate_limits["interpretations"],
                 query_embedding=query_embedding,
-                min_embedding_similarity=self._recall_interpretation_min_embedding_similarity,
-            )
-
-            raw_observation_candidates = self._db.search_memory_observations(
-                top_k=raw_candidate_limits["observations"],
-            )
-            observation_candidates = self._rank_observation_search_candidates(
-                raw_observation_candidates,
-                keyword=keywords,
-                entities=entities,
-                top_k=candidate_limits["observations"],
-                query_embedding=query_embedding,
-                min_embedding_similarity=self._recall_observation_min_embedding_similarity,
-            )
-
-            fact_candidate_limit = max(
-                candidate_limits["facts"],
-                layer_limits["facts"] * 3,
-                layer_limits["facts"] + 4,
-            )
-            fact_type_preference = query_analysis.get("fact_type_preference", "both")
-            semantic_candidate_limit = max(1, fact_candidate_limit)
-            episodic_candidate_limit = max(1, fact_candidate_limit)
-            if fact_type_preference == "semantic":
-                episodic_candidate_limit = max(1, layer_limits["facts"])
-            elif fact_type_preference == "episodic":
-                semantic_candidate_limit = max(1, layer_limits["facts"])
-            semantic_candidates = self._db.search_memory_facts(
-                keywords, query_embedding, top_k=semantic_candidate_limit, budget=b,
-                time_start=ts, time_end=te,
+                candidate_limits=candidate_limits,
+                raw_candidate_limits=raw_candidate_limits,
+                layer_limits=layer_limits,
+                fact_type_preference=query_analysis.get("fact_type_preference", "both"),
+                budget=b,
+                time_start=ts,
+                time_end=te,
                 tags=tags,
-                fact_types=["semantic"],
             )
 
-            episodic_candidates = self._db.search_memory_facts(
-                keywords, query_embedding, top_k=episodic_candidate_limit, budget=b,
-                time_start=ts, time_end=te,
-                tags=tags,
-                fact_types=["episodic"],
-            )
-            self._log_info("memory_recall", "candidates_found", {
-                "interpretations": {
-                    "count": len(interpretation_candidates),
-                    "ids": self._recall_log_item_ids(interpretation_candidates),
-                },
-                "observations": {
-                    "count": len(observation_candidates),
-                    "ids": self._recall_log_item_ids(observation_candidates),
-                },
-                "semantic_facts": {
-                    "count": len(semantic_candidates),
-                    "ids": self._recall_log_item_ids(semantic_candidates),
-                    "top_k": semantic_candidate_limit,
-                },
-                "episodic_facts": {
-                    "count": len(episodic_candidates),
-                    "ids": self._recall_log_item_ids(episodic_candidates),
-                    "top_k": episodic_candidate_limit,
-                },
-            })
-
-            ranked_recall = self._rank_recall_candidates(
+            ranked_recall = self._rank_recall_raw_candidates(
                 interpretations=interpretation_candidates,
                 observations=observation_candidates,
                 semantic_facts=semantic_candidates,
@@ -8958,10 +9192,12 @@ class MemoryNodeManager:
                 intent=recall_intent,
                 layer_limits=layer_limits,
             )
+
             interpretation_nodes = ranked_recall["interpretations"]
             observation_nodes = ranked_recall["observations"]
             semantic_nodes = ranked_recall["semantic_facts"]
             episodic_nodes = ranked_recall["episodic_facts"]
+
             self._log_info("memory_recall", "ranked", {
                 "interpretations": {
                     "count": len(interpretation_nodes),
@@ -8981,22 +9217,11 @@ class MemoryNodeManager:
                 },
             })
 
-            observation_ids_from_interpretation: List[int] = []
-            fact_ids_from_interpretation: List[int] = []
-            for interpretation in interpretation_nodes:
-                observation_ids_from_interpretation.extend(
-                    interpretation.get("evidence_observation_ids", []) or []
-                )
-                observation_ids_from_interpretation.extend(
-                    interpretation.get("counter_evidence_observation_ids", []) or []
-                )
-                fact_ids_from_interpretation.extend(interpretation.get("evidence_node_ids", []) or [])
-                fact_ids_from_interpretation.extend(
-                    interpretation.get("counter_evidence_node_ids", []) or []
-                )
-            observation_nodes_from_interpretation = self._db.get_observations_by_ids(
-                observation_ids_from_interpretation
+            support_candidates = self._retrieve_recall_support_candidates(
+                interpretation_nodes
             )
+            observation_nodes_from_interpretation = support_candidates["linked_observations"]
+            fact_nodes_from_interpretation = support_candidates["linked_facts"]
             observation_nodes = self._merge_recall_items(
                 observation_nodes,
                 observation_nodes_from_interpretation,
@@ -9005,9 +9230,6 @@ class MemoryNodeManager:
                 [int(obs["id"]) for obs in observation_nodes],
                 per_observation=2,
             ) if observation_nodes else {}
-            fact_nodes_from_interpretation = self._db.memory_nodes_by_ids(
-                fact_ids_from_interpretation
-            )
 
             fact_ids_from_observation = {
                 node["id"]
@@ -9017,9 +9239,14 @@ class MemoryNodeManager:
             fact_ids_from_observation.update(node["id"] for node in fact_nodes_from_interpretation)
             semantic_nodes = [node for node in semantic_nodes if node.get("id") not in fact_ids_from_observation]
             episodic_nodes = [node for node in episodic_nodes if node.get("id") not in fact_ids_from_observation]
+
             self._log_info("memory_recall", "evidence_expanded", {
-                "observation_ids_from_interpretations": observation_ids_from_interpretation,
-                "fact_ids_from_interpretations": fact_ids_from_interpretation,
+                "observation_ids_from_interpretations": [
+                    item.get("id") for item in observation_nodes_from_interpretation
+                ],
+                "fact_ids_from_interpretations": [
+                    item.get("id") for item in fact_nodes_from_interpretation
+                ],
                 "observations_from_interpretations": {
                     "count": len(observation_nodes_from_interpretation),
                     "ids": self._recall_log_item_ids(observation_nodes_from_interpretation),
