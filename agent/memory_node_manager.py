@@ -7354,14 +7354,6 @@ class MemoryNodeManager:
             return False
 
         source_turns = list(self._pending_store_turns)
-        batch_user_message = "\n\n".join(
-            str(turn.get("user_message") or "")
-            for turn in source_turns
-        )
-        batch_assistant_response = "\n\n".join(
-            str(turn.get("assistant_response") or "")
-            for turn in source_turns
-        )
         batch_tags = list(dict.fromkeys(
             tag
             for turn in source_turns
@@ -7414,8 +7406,11 @@ class MemoryNodeManager:
                         "memory_store",
                         "extract_facts",
                         {
-                            "user_message": batch_user_message,
-                            "assistant_response": batch_assistant_response,
+                            "raw_dialogue": "\n\n".join(
+                                str(turn.get("user_message") or "") + "\n" + 
+                                str(turn.get("assistant_response") or "")
+                                for turn in source_turns
+                            ),
                             "source_turn_count": len(source_turns),
                         },
                     )
