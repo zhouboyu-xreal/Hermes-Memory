@@ -8088,20 +8088,13 @@ class MemoryNodeManager:
             report["changed_evidence_bundle_ids"]
         )
         
+        # time decay
         node_decay_report = self._db.memory_reflect_node_decay(
             fact_half_life_days=MEMORY_SEMANTIC_FACT_HALF_LIFE_DAYS,
             experience_half_life_days=MEMORY_EPISODIC_FACT_HALF_LIFE_DAYS,
             now=reflect_now,
         )
-        task_inactivity_report = self._db.memory_reflect_task_inactivity(
-            active_to_paused_days=task_active_to_paused_days,
-            stale_days=task_stale_days,
-            now=reflect_now,
-        )
         report["node_decay"] = node_decay_report
-        report["task_inactivity"] = task_inactivity_report
-        report["tasks_paused"] = task_inactivity_report.get("paused", 0)
-        report["tasks_stale"] = task_inactivity_report.get("stale", 0)
         self._log_info(
             "memory_reflect",
             "finish", 
