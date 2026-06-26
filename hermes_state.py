@@ -182,10 +182,10 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON message
 END;
 """
 
-# ── Memory Nodes Schema (summarized event storage with vector search) ──
+# ── Memory Fact Nodes Schema (summarized event storage with vector search) ──
 
-MEMORY_NODES_SQL = """
-CREATE TABLE IF NOT EXISTS memory_nodes (
+MEMORY_FACTS_SQL = """
+CREATE TABLE IF NOT EXISTS memory_facts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     time_key TEXT UNIQUE NOT NULL,
     summary TEXT NOT NULL,
@@ -207,25 +207,25 @@ CREATE TABLE IF NOT EXISTS memory_nodes (
 );
 """
 
-MEMORY_NODES_FTS_SQL = """
-CREATE VIRTUAL TABLE IF NOT EXISTS memory_nodes_fts USING fts5(
+MEMORY_FACTS_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_facts_fts USING fts5(
     summary,
     keywords,
-    content='memory_nodes',
+    content='memory_facts',
     content_rowid='id'
 );
 
-CREATE TRIGGER IF NOT EXISTS memory_nodes_ai AFTER INSERT ON memory_nodes BEGIN
-    INSERT INTO memory_nodes_fts(rowid, summary, keywords)
+CREATE TRIGGER IF NOT EXISTS memory_facts_ai AFTER INSERT ON memory_facts BEGIN
+    INSERT INTO memory_facts_fts(rowid, summary, keywords)
     VALUES (new.id, new.summary, new.keywords);
 END;
 
-CREATE TRIGGER IF NOT EXISTS memory_nodes_ad AFTER DELETE ON memory_nodes BEGIN
-    DELETE FROM memory_nodes_fts WHERE rowid = old.id;
+CREATE TRIGGER IF NOT EXISTS memory_facts_ad AFTER DELETE ON memory_facts BEGIN
+    DELETE FROM memory_facts_fts WHERE rowid = old.id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS memory_nodes_au AFTER UPDATE ON memory_nodes BEGIN
-    UPDATE memory_nodes_fts
+CREATE TRIGGER IF NOT EXISTS memory_facts_au AFTER UPDATE ON memory_facts BEGIN
+    UPDATE memory_facts_fts
     SET summary = new.summary,
         keywords = new.keywords
     WHERE rowid = new.id;
@@ -257,18 +257,18 @@ CREATE TABLE IF NOT EXISTS entity_edges (
     UNIQUE(source_entity_id, target_entity_id, relation_type)
 );
 
-CREATE TABLE IF NOT EXISTS memory_node_entities (
-    node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
+CREATE TABLE IF NOT EXISTS memory_fact_entities (
+    fact_id INTEGER NOT NULL REFERENCES memory_facts(id),
     entity_id INTEGER NOT NULL REFERENCES entity_nodes(id),
     mention_count INTEGER DEFAULT 1,
-    PRIMARY KEY (node_id, entity_id)
+    PRIMARY KEY (fact_id, entity_id)
 );
 
 -- Normalized memory node relation table
-CREATE TABLE IF NOT EXISTS memory_node_relations (
+CREATE TABLE IF NOT EXISTS memory_fact_relations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
-    target_node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
+    source_fact_id INTEGER NOT NULL REFERENCES memory_facts(id),
+    target_fact_id INTEGER NOT NULL REFERENCES memory_facts(id),
     relation_type TEXT NOT NULL,
     confidence REAL DEFAULT 1.0,
     semantic_score REAL DEFAULT 0.0,
@@ -278,16 +278,16 @@ CREATE TABLE IF NOT EXISTS memory_node_relations (
     weight REAL DEFAULT 1.0,
     metadata TEXT DEFAULT '{}',
     created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
-    UNIQUE(source_node_id, target_node_id, relation_type)
+    UNIQUE(source_fact_id, target_fact_id, relation_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_entity_edges_source ON entity_edges(source_entity_id);
 CREATE INDEX IF NOT EXISTS idx_entity_edges_target ON entity_edges(target_entity_id);
 CREATE INDEX IF NOT EXISTS idx_entity_edges_type ON entity_edges(relation_type);
-CREATE INDEX IF NOT EXISTS idx_memory_node_entities_node ON memory_node_entities(node_id);
-CREATE INDEX IF NOT EXISTS idx_memory_node_entities_entity ON memory_node_entities(entity_id);
-CREATE INDEX IF NOT EXISTS idx_memory_node_relations_source ON memory_node_relations(source_node_id);
-CREATE INDEX IF NOT EXISTS idx_memory_node_relations_target ON memory_node_relations(target_node_id);
+CREATE INDEX IF NOT EXISTS idx_memory_fact_entities_node ON memory_fact_entities(fact_id);
+CREATE INDEX IF NOT EXISTS idx_memory_fact_entities_entity ON memory_fact_entities(entity_id);
+CREATE INDEX IF NOT EXISTS idx_memory_fact_relations_source ON memory_fact_relations(source_fact_id);
+CREATE INDEX IF NOT EXISTS idx_memory_fact_relations_target ON memory_fact_relations(target_fact_id);
 """
 
 ENTITY_FTS_SQL = """
@@ -333,18 +333,18 @@ CREATE TABLE IF NOT EXISTS memory_evidence_bundles (
 
 CREATE TABLE IF NOT EXISTS memory_evidence_bundle_sources (
     evidence_bundle_id INTEGER NOT NULL REFERENCES memory_evidence_bundles(id),
-    node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
+    fact_id INTEGER NOT NULL REFERENCES memory_facts(id),
     role TEXT NOT NULL DEFAULT 'initial',
     confidence REAL DEFAULT 1.0,
     pending_observation INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (evidence_bundle_id, node_id)
+    PRIMARY KEY (evidence_bundle_id, fact_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_evidence_bundles_entity_topic
 ON memory_evidence_bundles(entity_id, topic_key, bundle_type);
 
 CREATE INDEX IF NOT EXISTS idx_memory_evidence_bundle_sources_node
-ON memory_evidence_bundle_sources(node_id);
+ON memory_evidence_bundle_sources(fact_id);
 """
 
 MEMORY_OBSERVATIONS_SQL = """
@@ -369,10 +369,10 @@ CREATE TABLE IF NOT EXISTS memory_observations (
 
 CREATE TABLE IF NOT EXISTS memory_observation_sources (
     observation_id INTEGER NOT NULL REFERENCES memory_observations(id) ON DELETE CASCADE,
-    node_id INTEGER NOT NULL REFERENCES memory_nodes(id),
+    fact_id INTEGER NOT NULL REFERENCES memory_facts(id),
     relation TEXT NOT NULL DEFAULT 'support',
     confidence REAL DEFAULT 1.0,
-    PRIMARY KEY (observation_id, node_id)
+    PRIMARY KEY (observation_id, fact_id)
 );
 
 CREATE TABLE IF NOT EXISTS memory_interpretation_observations (
@@ -390,7 +390,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_observations_type
 ON memory_observations(observation_type, status);
 
 CREATE INDEX IF NOT EXISTS idx_memory_observation_sources_node
-ON memory_observation_sources(node_id);
+ON memory_observation_sources(fact_id);
 
 CREATE INDEX IF NOT EXISTS idx_memory_interpretation_observations_observation
 ON memory_interpretation_observations(observation_id);
@@ -412,9 +412,9 @@ CREATE TABLE IF NOT EXISTS memory_interpretations (
     conflict_status TEXT NOT NULL DEFAULT 'none',
     resolution TEXT NOT NULL DEFAULT '',
     action_implication TEXT NOT NULL DEFAULT '',
-    evidence_node_ids TEXT DEFAULT '[]',
+    evidence_fact_ids TEXT DEFAULT '[]',
     evidence_observation_ids TEXT DEFAULT '[]',
-    counter_evidence_node_ids TEXT DEFAULT '[]',
+    counter_evidence_fact_ids TEXT DEFAULT '[]',
     counter_evidence_observation_ids TEXT DEFAULT '[]',
     embedding BLOB,
     embedding_text TEXT NOT NULL DEFAULT '',
@@ -534,7 +534,7 @@ class SessionDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
 
-        # ── Memory Nodes: FAISS index for vector search ──
+        # ── Memory Fact Nodes: FAISS index for vector search ──
         self._memory_faiss_index = None
         self._memory_faiss_id_map: List[int] = []
         self._memory_faiss_save_path = self.db_path.with_suffix('.faiss')
@@ -864,19 +864,19 @@ class SessionDB:
         except sqlite3.OperationalError:
             cursor.executescript(FTS_TRIGRAM_SQL)
 
-        # ── Memory Nodes tables ──
-        cursor.executescript(MEMORY_NODES_SQL)
+        # ── Memory Fact Nodes tables ──
+        cursor.executescript(MEMORY_FACTS_SQL)
 
-        # Rebuild memory-node FTS after all memory_nodes migrations below.
+        # Rebuild memory-node FTS after all memory_facts migrations below.
         # Existing triggers would fire while we move legacy detail columns onto
-        # memory_nodes, so drop them first and recreate/backfill at the end.
-        for _trig in ("memory_nodes_ai", "memory_nodes_ad", "memory_nodes_au"):
+        # memory_facts, so drop them first and recreate/backfill at the end.
+        for _trig in ("memory_facts_ai", "memory_facts_ad", "memory_facts_au"):
             try:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {_trig}")
             except sqlite3.OperationalError:
                 pass
         try:
-            cursor.execute("DROP TABLE IF EXISTS memory_nodes_fts")
+            cursor.execute("DROP TABLE IF EXISTS memory_facts_fts")
         except sqlite3.OperationalError:
             pass
 
@@ -901,7 +901,7 @@ class SessionDB:
         }.items():
             try:
                 cursor.execute(
-                    f"ALTER TABLE memory_node_relations ADD COLUMN {col_name} {col_type}"
+                    f"ALTER TABLE memory_fact_relations ADD COLUMN {col_name} {col_type}"
                 )
             except sqlite3.OperationalError:
                 pass
@@ -964,33 +964,33 @@ class SessionDB:
         self._migrate_memory_opinions_to_interpretations(cursor)
         self._repair_graph_created_at_placeholders(cursor)
 
-        # ── Add tags column to memory_nodes if missing ──
+        # ── Add tags column to memory_facts if missing ──
         try:
-            cursor.execute("ALTER TABLE memory_nodes ADD COLUMN tags TEXT DEFAULT '[]'")
+            cursor.execute("ALTER TABLE memory_facts ADD COLUMN tags TEXT DEFAULT '[]'")
         except sqlite3.OperationalError:
             pass  # Column already exists
 
-        # ── Add explicit fact_type column to memory_nodes if missing ──
+        # ── Add explicit fact_type column to memory_facts if missing ──
         try:
-            cursor.execute("ALTER TABLE memory_nodes ADD COLUMN fact_type TEXT NOT NULL DEFAULT 'semantic'")
+            cursor.execute("ALTER TABLE memory_facts ADD COLUMN fact_type TEXT NOT NULL DEFAULT 'semantic'")
         except sqlite3.OperationalError:
             pass  # Column already exists
 
-        # ── Add explicit fact_subject column to memory_nodes if missing ──
+        # ── Add explicit fact_subject column to memory_facts if missing ──
         try:
-            cursor.execute("ALTER TABLE memory_nodes ADD COLUMN fact_subject TEXT NOT NULL DEFAULT 'other'")
+            cursor.execute("ALTER TABLE memory_facts ADD COLUMN fact_subject TEXT NOT NULL DEFAULT 'other'")
         except sqlite3.OperationalError:
             pass  # Column already exists
 
-        # ── Add explicit fact_kind column to memory_nodes if missing ──
+        # ── Add explicit fact_kind column to memory_facts if missing ──
         try:
-            cursor.execute("ALTER TABLE memory_nodes ADD COLUMN fact_kind TEXT NOT NULL DEFAULT 'other'")
+            cursor.execute("ALTER TABLE memory_facts ADD COLUMN fact_kind TEXT NOT NULL DEFAULT 'other'")
         except sqlite3.OperationalError:
             pass  # Column already exists
 
-        # ── Memory node detail fields live directly on memory_nodes ──
+        # ── Memory node detail fields live directly on memory_facts ──
         try:
-            cursor.execute("ALTER TABLE memory_nodes ADD COLUMN original_dialog TEXT")
+            cursor.execute("ALTER TABLE memory_facts ADD COLUMN original_dialog TEXT")
         except sqlite3.OperationalError:
             pass  # Column already exists
 
@@ -1007,37 +1007,37 @@ class SessionDB:
         }.items():
             try:
                 cursor.execute(
-                    f"ALTER TABLE memory_nodes ADD COLUMN {col_name} {col_type}"
+                    f"ALTER TABLE memory_facts ADD COLUMN {col_name} {col_type}"
                 )
             except sqlite3.OperationalError:
                 pass
         cursor.execute(
-            "UPDATE memory_nodes SET primary_topic = "
+            "UPDATE memory_facts SET primary_topic = "
             "CASE WHEN instr(trim(topic), ' ') > 0 "
             "THEN substr(trim(topic), 1, instr(trim(topic), ' ') - 1) "
             "ELSE COALESCE(NULLIF(trim(topic), ''), 'general') END "
             "WHERE primary_topic IS NULL OR primary_topic = '' OR primary_topic = 'general'"
         )
         cursor.execute(
-            "UPDATE memory_nodes SET primary_entity_id = ("
-            "  SELECT MIN(mne.entity_id) FROM memory_node_entities mne "
-            "  WHERE mne.node_id = memory_nodes.id"
+            "UPDATE memory_facts SET primary_entity_id = ("
+            "  SELECT MIN(mne.entity_id) FROM memory_fact_entities mne "
+            "  WHERE mne.fact_id = memory_facts.id"
             ") WHERE primary_entity_id IS NULL"
         )
 
         # Backfill fact_type from legacy tags for existing retain facts.
         try:
             cursor.execute(
-                "UPDATE memory_nodes SET fact_type = 'episodic' "
+                "UPDATE memory_facts SET fact_type = 'episodic' "
                 "WHERE tags LIKE ?",
                 ('%"fact_type:experience"%',),
             )
             cursor.execute(
-                "UPDATE memory_nodes SET fact_type = 'episodic' "
+                "UPDATE memory_facts SET fact_type = 'episodic' "
                 "WHERE fact_type = 'experience'"
             )
             cursor.execute(
-                "UPDATE memory_nodes SET fact_type = 'semantic' "
+                "UPDATE memory_facts SET fact_type = 'semantic' "
                 "WHERE fact_type IS NULL OR fact_type = '' OR fact_type NOT IN ('semantic', 'episodic')"
             )
         except sqlite3.OperationalError:
@@ -1047,16 +1047,16 @@ class SessionDB:
         try:
             for fact_subject in ("user", "assistant", "world", "project", "system", "other"):
                 cursor.execute(
-                    "UPDATE memory_nodes SET fact_subject = ? WHERE tags LIKE ?",
+                    "UPDATE memory_facts SET fact_subject = ? WHERE tags LIKE ?",
                     (fact_subject, f'%"fact_subject:{fact_subject}"%'),
                 )
             cursor.execute(
-                "UPDATE memory_nodes SET fact_subject = 'assistant' "
+                "UPDATE memory_facts SET fact_subject = 'assistant' "
                 "WHERE fact_subject = 'other' AND tags LIKE ?",
                 ('%"fact_type:experience"%',),
             )
             cursor.execute(
-                "UPDATE memory_nodes SET fact_subject = 'other' "
+                "UPDATE memory_facts SET fact_subject = 'other' "
                 "WHERE fact_subject IS NULL OR fact_subject = '' "
                 "OR fact_subject NOT IN ('user', 'assistant', 'world', 'project', 'system', 'other')"
             )
@@ -1071,11 +1071,11 @@ class SessionDB:
                 "conversation_summary", "other",
             ):
                 cursor.execute(
-                    "UPDATE memory_nodes SET fact_kind = ? WHERE tags LIKE ?",
+                    "UPDATE memory_facts SET fact_kind = ? WHERE tags LIKE ?",
                     (fact_kind, f'%"fact_kind:{fact_kind}"%'),
                 )
             cursor.execute(
-                "UPDATE memory_nodes SET fact_kind = 'other' "
+                "UPDATE memory_facts SET fact_kind = 'other' "
                 "WHERE fact_kind IS NULL OR fact_kind = ''"
             )
         except sqlite3.OperationalError:
@@ -1084,8 +1084,8 @@ class SessionDB:
         # ── Index on time_key for time-range search ──
         try:
             cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_memory_nodes_time "
-                "ON memory_nodes(time_key)"
+                "CREATE INDEX IF NOT EXISTS idx_memory_fact_time "
+                "ON memory_facts(time_key)"
             )
         except sqlite3.OperationalError:
             pass
@@ -1093,8 +1093,8 @@ class SessionDB:
         # ── Index on fact_type for typed memory recall ──
         try:
             cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_memory_nodes_fact_type "
-                "ON memory_nodes(fact_type)"
+                "CREATE INDEX IF NOT EXISTS idx_memory_fact_type "
+                "ON memory_facts(fact_type)"
             )
         except sqlite3.OperationalError:
             pass
@@ -1102,8 +1102,8 @@ class SessionDB:
         # ── Index on fact_kind for future kind-aware recall / observation ──
         try:
             cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_memory_nodes_fact_kind "
-                "ON memory_nodes(fact_kind)"
+                "CREATE INDEX IF NOT EXISTS idx_memory_fact_kind "
+                "ON memory_facts(fact_kind)"
             )
         except sqlite3.OperationalError:
             pass
@@ -1111,18 +1111,18 @@ class SessionDB:
         # ── Index on fact_subject for actor/source-aware recall ──
         try:
             cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_memory_nodes_fact_subject "
-                "ON memory_nodes(fact_subject)"
+                "CREATE INDEX IF NOT EXISTS idx_memory_fact_subject "
+                "ON memory_facts(fact_subject)"
             )
         except sqlite3.OperationalError:
             pass
 
-        # ── Memory Nodes FTS5 ──
+        # ── Memory Fact Nodes FTS5 ──
         try:
-            cursor.executescript(MEMORY_NODES_FTS_SQL)
+            cursor.executescript(MEMORY_FACTS_FTS_SQL)
             cursor.execute(
-                "INSERT INTO memory_nodes_fts(rowid, summary, keywords) "
-                "SELECT id, summary, keywords FROM memory_nodes"
+                "INSERT INTO memory_facts_fts(rowid, summary, keywords) "
+                "SELECT id, summary, keywords FROM memory_facts"
             )
         except sqlite3.OperationalError as _fts_err:
             logger.debug("Memory node FTS setup skipped: %s", _fts_err)
@@ -1137,8 +1137,8 @@ class SessionDB:
                    SET created_at = COALESCE(
                        (
                            SELECT MIN(CAST(strftime('%s', substr(mn.time_key, 1, 19)) AS REAL))
-                           FROM memory_node_entities mne
-                           JOIN memory_nodes mn ON mn.id = mne.node_id
+                           FROM memory_fact_entities mne
+                           JOIN memory_facts mn ON mn.id = mne.fact_id
                            WHERE mne.entity_id = entity_nodes.id
                        ),
                        CAST(strftime('%s','now') AS REAL)
@@ -1151,12 +1151,12 @@ class SessionDB:
                    WHERE created_at = '%s'"""
             )
             cursor.execute(
-                """UPDATE memory_node_relations
+                """UPDATE memory_fact_relations
                    SET created_at = COALESCE(
                        (
                            SELECT CAST(strftime('%s', substr(mn.time_key, 1, 19)) AS REAL)
-                           FROM memory_nodes mn
-                           WHERE mn.id = memory_node_relations.source_node_id
+                           FROM memory_facts mn
+                           WHERE mn.id = memory_fact_relations.source_fact_id
                        ),
                        CAST(strftime('%s','now') AS REAL)
                    )
@@ -1260,14 +1260,14 @@ class SessionDB:
                 "(id, entity_id, subject_text, target_text, "
                 "scope, interpretation_type, claim, polarity, strength, confidence, "
                 "status, conflict_status, resolution, action_implication, "
-                "evidence_node_ids, evidence_observation_ids, "
-                "counter_evidence_node_ids, counter_evidence_observation_ids, "
+                "evidence_fact_ids, evidence_observation_ids, "
+                "counter_evidence_fact_ids, counter_evidence_observation_ids, "
                 "metadata, created_at, updated_at, last_supported_at) "
                 f"SELECT id, {entity_expr}, subject_text, target_text, "
                 "scope, interpretation_type, claim, polarity, strength, confidence, "
                 "status, conflict_status, resolution, action_implication, "
-                "evidence_node_ids, evidence_observation_ids, "
-                "counter_evidence_node_ids, counter_evidence_observation_ids, "
+                "evidence_fact_ids, evidence_observation_ids, "
+                "counter_evidence_fact_ids, counter_evidence_observation_ids, "
                 "metadata, created_at, updated_at, last_supported_at "
                 "FROM memory_opinions "
                 "WHERE id NOT IN (SELECT id FROM memory_interpretations)"
@@ -2705,9 +2705,9 @@ class SessionDB:
             item.get("conflict_status")
         )
         for key in (
-            "evidence_node_ids",
+            "evidence_fact_ids",
             "evidence_observation_ids",
-            "counter_evidence_node_ids",
+            "counter_evidence_fact_ids",
             "counter_evidence_observation_ids",
         ):
             item[key] = self._json_int_list(item.get(key))
@@ -2722,30 +2722,30 @@ class SessionDB:
             item["entity_id"] = self._coerce_int_or_none(item["metadata"].get("entity_id"))
         return item
 
-    def _memory_get_node(self, node_id: int) -> Optional[Dict[str, Any]]:
+    def _memory_get_fact(self, fact_id: int) -> Optional[Dict[str, Any]]:
         """Fetch a single memory node with tags and relations."""
         cursor = self._conn.execute(
             """SELECT id, time_key, summary, keywords, topic, original_dialog,
                       tags, fact_type, fact_subject, fact_kind, decay_score, decay_updated_at,
                       decay_half_life_days, task_event_like, task_event_subject,
                       task_relevance, entity_names
-               FROM memory_nodes
+               FROM memory_facts
                WHERE id = ?""",
-            (node_id,),
+            (fact_id,),
         )
         r = cursor.fetchone()
         if not r:
             return None
         # Fetch relations from normalized table
         rel_cursor = self._conn.execute(
-            """SELECT target_node_id, relation_type, confidence
-               FROM memory_node_relations
-               WHERE source_node_id = ?""",
-            (node_id,),
+            """SELECT target_fact_id, relation_type, confidence
+               FROM memory_fact_relations
+               WHERE source_fact_id = ?""",
+            (fact_id,),
         )
-        node_relations = {}
+        fact_relations = {}
         for rel_row in rel_cursor.fetchall():
-            node_relations[str(rel_row[0])] = rel_row[1]
+            fact_relations[str(rel_row[0])] = rel_row[1]
         tags = json.loads(r[6]) if r[6] else []
         fact_type = self._normalize_memory_fact_type(r[7] or self._memory_fact_type_from_tags(tags))
         fact_subject = self._normalize_memory_fact_subject(
@@ -2770,23 +2770,23 @@ class SessionDB:
             "task_event_subject": r[14] or "",
             "task_relevance": r[15] or "",
             "entity_names": json.loads(r[16] or "[]"),
-            "node_relations": node_relations,
+            "fact_relations": fact_relations,
         }
 
-    def memory_nodes_by_ids(self, node_ids: List[int]) -> List[Dict[str, Any]]:
+    def memory_facts_by_ids(self, fact_ids: List[int]) -> List[Dict[str, Any]]:
         """Fetch memory fact nodes by id, preserving caller order."""
-        clean_ids = self._json_int_list(node_ids)
+        clean_ids = self._json_int_list(fact_ids)
         if not clean_ids:
             return []
         out: List[Dict[str, Any]] = []
-        for node_id in clean_ids:
-            node = self._memory_get_node(node_id)
-            if node:
-                out.append(node)
+        for fact_id in clean_ids:
+            fact = self._memory_get_fact(fact_id)
+            if fact:
+                out.append(fact)
         return out
 
     @staticmethod
-    def _memory_node_filter_sql(
+    def _memory_fact_filter_sql(
         *,
         table_alias: str = "",
         allowed_ids: Optional[set] = None,
@@ -2804,7 +2804,7 @@ class SessionDB:
             clauses.append(f"{prefix}time_key <= ?")
             params.append(time_end)
         if allowed_ids is not None:
-            ids = sorted(int(node_id) for node_id in allowed_ids)
+            ids = sorted(int(fact_id) for fact_id in allowed_ids)
             if not ids:
                 clauses.append("0")
             else:
@@ -2853,7 +2853,7 @@ class SessionDB:
             if not terms:
                 return {}
 
-            filter_sql, filter_params = self._memory_node_filter_sql(
+            filter_sql, filter_params = self._memory_fact_filter_sql(
                 allowed_ids=allowed_ids,
                 time_start=time_start,
                 time_end=time_end,
@@ -2869,11 +2869,11 @@ class SessionDB:
                 escaped = t.replace(bs, bs + bs).replace("%", bs + "%").replace("_", bs + "_")
                 pattern = f"%{escaped}%"
                 selects.append(
-                    f"SELECT id FROM memory_nodes WHERE summary LIKE ? ESCAPE '{bs}'{filter_sql}"
+                    f"SELECT id FROM memory_facts WHERE summary LIKE ? ESCAPE '{bs}'{filter_sql}"
                 )
                 params.extend([pattern] + filter_params)
                 selects.append(
-                    f"SELECT id FROM memory_nodes WHERE keywords LIKE ? ESCAPE '{bs}'{filter_sql}"
+                    f"SELECT id FROM memory_facts WHERE keywords LIKE ? ESCAPE '{bs}'{filter_sql}"
                 )
                 params.extend([pattern] + filter_params)
 
@@ -2911,7 +2911,7 @@ class SessionDB:
                     )
                     fallback_params.extend([pattern, bs, pattern, bs])
                 fallback_selects.append(
-                    f"SELECT id, {len(cjk_chars)} AS score FROM memory_nodes "
+                    f"SELECT id, {len(cjk_chars)} AS score FROM memory_facts "
                     f"WHERE {' AND '.join(term_clauses)}{filter_sql}"
                 )
                 fallback_params.extend(filter_params)
@@ -2929,17 +2929,17 @@ class SessionDB:
             return {row[0]: max(0.0, len(terms) * 2 - row[1]) for row in fallback_cursor.fetchall()}
 
         # Non-CJK: use FTS5 BM25
-        filter_sql, filter_params = self._memory_node_filter_sql(
+        filter_sql, filter_params = self._memory_fact_filter_sql(
             table_alias="mn",
             allowed_ids=allowed_ids,
             time_start=time_start,
             time_end=time_end,
         )
         cursor = self._conn.execute(
-            f"""SELECT memory_nodes_fts.rowid, bm25(memory_nodes_fts) AS score
-               FROM memory_nodes_fts
-               JOIN memory_nodes mn ON mn.id = memory_nodes_fts.rowid
-               WHERE memory_nodes_fts MATCH ?
+            f"""SELECT memory_facts_fts.rowid, bm25(memory_facts_fts) AS score
+               FROM memory_facts_fts
+               JOIN memory_facts mn ON mn.id = memory_facts_fts.rowid
+               WHERE memory_facts_fts MATCH ?
                {filter_sql}
                ORDER BY score
                LIMIT ?""",
@@ -2954,7 +2954,7 @@ class SessionDB:
         *,
         allowed_ids: Optional[set] = None,
     ) -> Dict[int, float]:
-        """FAISS vector search over memory nodes. Returns {node_id: similarity} (higher = better).
+        """FAISS vector search over memory nodes. Returns {fact_id: similarity} (higher = better).
 
         When a bounded candidate set is supplied, small windows are scored
         directly by reconstructing only those vectors from the flat FAISS index.
@@ -2965,7 +2965,7 @@ class SessionDB:
             return {}
         ntotal = int(self._memory_faiss_index.ntotal)
         if allowed_ids is not None:
-            allowed = {int(node_id) for node_id in allowed_ids}
+            allowed = {int(fact_id) for fact_id in allowed_ids}
             max_pos = min(ntotal, len(self._memory_faiss_id_map))
             allowed_positions = [
                 (idx, self._memory_faiss_id_map[idx])
@@ -2977,7 +2977,7 @@ class SessionDB:
             if len(allowed_positions) <= self._MEMORY_VECTOR_FILTER_BRUTE_FORCE_LIMIT:
                 query_vec = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
                 scored: List[Tuple[int, float]] = []
-                for idx, node_id in allowed_positions:
+                for idx, fact_id in allowed_positions:
                     try:
                         vector = self._memory_faiss_index.reconstruct(int(idx))
                     except TypeError:
@@ -2990,7 +2990,7 @@ class SessionDB:
                     candidate = np.asarray(vector, dtype=np.float32).reshape(-1)
                     if candidate.shape != query_vec.shape:
                         continue
-                    scored.append((node_id, float(np.dot(query_vec, candidate))))
+                    scored.append((fact_id, float(np.dot(query_vec, candidate))))
                 scored.sort(key=lambda item: item[1], reverse=True)
                 return dict(scored[:top_k])
 
@@ -3004,22 +3004,22 @@ class SessionDB:
         for sim, idx in zip(sims[0], indices[0]):
             if idx == -1:
                 continue
-            node_id = self._memory_faiss_id_map[idx]
-            if allowed_ids is not None and node_id not in allowed_ids:
+            fact_id = self._memory_faiss_id_map[idx]
+            if allowed_ids is not None and fact_id not in allowed_ids:
                 continue
-            results[node_id] = sim
+            results[fact_id] = sim
             if len(results) >= top_k:
                 break
         return results
 
-    def memory_node_embeddings(self, node_ids: List[int]) -> Dict[int, np.ndarray]:
+    def memory_fact_embeddings(self, fact_ids: List[int]) -> Dict[int, np.ndarray]:
         """Reconstruct stored FAISS vectors for the requested memory nodes."""
         if not _HAS_FAISS or self._memory_faiss_index is None or self._memory_faiss_index.ntotal == 0:
             return {}
         requested = {
-            int(node_id)
-            for node_id in node_ids
-            if node_id is not None
+            int(fact_id)
+            for fact_id in fact_ids
+            if fact_id is not None
         }
         if not requested:
             return {}
@@ -3029,8 +3029,8 @@ class SessionDB:
             len(self._memory_faiss_id_map),
         )
         for idx in range(max_pos - 1, -1, -1):
-            node_id = int(self._memory_faiss_id_map[idx])
-            if node_id not in requested:
+            fact_id = int(self._memory_faiss_id_map[idx])
+            if fact_id not in requested:
                 continue
             try:
                 vector = self._memory_faiss_index.reconstruct(idx)
@@ -3041,7 +3041,7 @@ class SessionDB:
                 continue
             candidate = np.asarray(vector, dtype=np.float32).reshape(-1)
             if candidate.size:
-                vectors[node_id] = candidate
+                vectors[fact_id] = candidate
             if len(vectors) >= len(requested):
                 break
         return vectors
@@ -3050,7 +3050,7 @@ class SessionDB:
         self,
         query_embedding: np.ndarray,
         *,
-        exclude_node_id: Optional[int] = None,
+        exclude_fact_id: Optional[int] = None,
         allowed_ids: Optional[set] = None,
         threshold: float = 0.82,
     ) -> Dict[int, float]:
@@ -3067,17 +3067,17 @@ class SessionDB:
             return {}
         scores = self._search_memory_vector(query_embedding, top_k=top_k)
         out: Dict[int, float] = {}
-        for node_id, score in scores.items():
-            if exclude_node_id is not None and node_id == exclude_node_id:
+        for fact_id, score in scores.items():
+            if exclude_fact_id is not None and fact_id == exclude_fact_id:
                 continue
-            if allowed_ids is not None and node_id not in allowed_ids:
+            if allowed_ids is not None and fact_id not in allowed_ids:
                 continue
             try:
                 similarity = float(score)
             except (TypeError, ValueError):
                 continue
             if similarity >= threshold:
-                out[node_id] = similarity
+                out[fact_id] = similarity
         return out
 
     def _memory_save_faiss(self) -> None:
@@ -3160,8 +3160,8 @@ class SessionDB:
     ) -> List[int]:
         """Return node IDs sorted by a single retrieval channel."""
         return [
-            node_id
-            for node_id, _ in sorted(
+            fact_id
+            for fact_id, _ in sorted(
                 scores.items(),
                 key=lambda item: item[1],
                 reverse=higher_is_better,
@@ -3178,7 +3178,7 @@ class SessionDB:
         fused, first_seen = self._memory_rrf_scores(rankings, rrf_k=rrf_k)
         return sorted(
             fused,
-            key=lambda node_id: (-fused[node_id], first_seen.get(node_id, 0)),
+            key=lambda fact_id: (-fused[fact_id], first_seen.get(fact_id, 0)),
         )
 
     def _memory_rrf_scores(
@@ -3192,11 +3192,11 @@ class SessionDB:
         first_seen: Dict[int, int] = {}
         order = 0
         for ranking, weight in rankings:
-            for rank, node_id in enumerate(ranking, 1):
-                if node_id not in first_seen:
-                    first_seen[node_id] = order
+            for rank, fact_id in enumerate(ranking, 1):
+                if fact_id not in first_seen:
+                    first_seen[fact_id] = order
                     order += 1
-                fused[node_id] = fused.get(node_id, 0.0) + weight / (rrf_k + rank)
+                fused[fact_id] = fused.get(fact_id, 0.0) + weight / (rrf_k + rank)
         return fused, first_seen
 
     def _memory_decay_rerank(
@@ -3213,7 +3213,7 @@ class SessionDB:
             return []
         placeholders = ",".join("?" for _ in candidate_ids)
         rows = self._conn.execute(
-            f"SELECT id, decay_score FROM memory_nodes WHERE id IN ({placeholders})",
+            f"SELECT id, decay_score FROM memory_facts WHERE id IN ({placeholders})",
             candidate_ids,
         ).fetchall()
         decay_by_id: Dict[int, float] = {}
@@ -3226,14 +3226,14 @@ class SessionDB:
 
         floor = max(0.0, min(1.0, self._MEMORY_RECALL_DECAY_FLOOR))
         scored: List[Tuple[float, int, int]] = []
-        for fallback_rank, node_id in enumerate(candidate_ids):
-            base_score = rrf_scores.get(node_id, 1.0 / (60 + fallback_rank + 1))
-            decay = decay_by_id.get(node_id, 1.0)
+        for fallback_rank, fact_id in enumerate(candidate_ids):
+            base_score = rrf_scores.get(fact_id, 1.0 / (60 + fallback_rank + 1))
+            decay = decay_by_id.get(fact_id, 1.0)
             recency_factor = floor + ((1.0 - floor) * decay)
             adjusted = base_score * recency_factor
-            scored.append((adjusted, first_seen.get(node_id, fallback_rank), node_id))
+            scored.append((adjusted, first_seen.get(fact_id, fallback_rank), fact_id))
         scored.sort(key=lambda item: (-item[0], item[1]))
-        return [node_id for _, _, node_id in scored]
+        return [fact_id for _, _, fact_id in scored]
 
     def _memory_filter_ranked_ids(
         self,
@@ -3244,13 +3244,13 @@ class SessionDB:
         """Apply an optional allow-list while preserving rank and uniqueness."""
         out: List[int] = []
         seen = set()
-        for node_id in ranked_ids:
-            if node_id in seen:
+        for fact_id in ranked_ids:
+            if fact_id in seen:
                 continue
-            if allowed_ids is not None and node_id not in allowed_ids:
+            if allowed_ids is not None and fact_id not in allowed_ids:
                 continue
-            seen.add(node_id)
-            out.append(node_id)
+            seen.add(fact_id)
+            out.append(fact_id)
         return out
 
     def _memory_graph_expand_ranked(
@@ -3293,17 +3293,17 @@ class SessionDB:
 
         beam_size = max(limit * 2, len(seed_ids) * 4, 8)
         while frontier and len(ranked) < limit:
-            neg_score, node_depth, _, node_id = heapq.heappop(frontier)
+            neg_score, node_depth, _, fact_id = heapq.heappop(frontier)
             score = -neg_score
-            if node_id in visited:
+            if fact_id in visited:
                 continue
-            visited.add(node_id)
-            if allowed_ids is None or node_id in allowed_ids:
-                ranked.append(node_id)
+            visited.add(fact_id)
+            if allowed_ids is None or fact_id in allowed_ids:
+                ranked.append(fact_id)
 
             if node_depth >= depth:
                 continue
-            for neighbor_id, edge_score in self._memory_graph_neighbors(node_id, allowed_ids=allowed_ids):
+            for neighbor_id, edge_score in self._memory_graph_neighbors(fact_id, allowed_ids=allowed_ids):
                 if neighbor_id in visited or neighbor_id in seed_set:
                     continue
                 next_depth = node_depth + 1
@@ -3363,7 +3363,7 @@ class SessionDB:
 
     def _memory_graph_neighbors(
         self,
-        node_id: int,
+        fact_id: int,
         *,
         allowed_ids: Optional[set] = None,
     ) -> List[Tuple[int, float]]:
@@ -3371,14 +3371,14 @@ class SessionDB:
         scores: Dict[int, float] = {}
 
         rel_cursor = self._conn.execute(
-            "SELECT target_node_id, confidence, semantic_score, causal_score, "
+            "SELECT target_fact_id, confidence, semantic_score, causal_score, "
             "temporal_score, entity_score, weight "
-            "FROM memory_node_relations WHERE source_node_id = ? "
+            "FROM memory_fact_relations WHERE source_fact_id = ? "
             "UNION ALL "
-            "SELECT source_node_id, confidence, semantic_score, causal_score, "
+            "SELECT source_fact_id, confidence, semantic_score, causal_score, "
             "temporal_score, entity_score, weight "
-            "FROM memory_node_relations WHERE target_node_id = ?",
-            (node_id, node_id),
+            "FROM memory_fact_relations WHERE target_fact_id = ?",
+            (fact_id, fact_id),
         )
         for row in rel_cursor.fetchall():
             neighbor_id = row[0]
@@ -3390,7 +3390,7 @@ class SessionDB:
             except (TypeError, ValueError):
                 entity_value = 0.0
             if entity_value <= 0.0:
-                entity_score = self._memory_relation_entity_score(node_id, neighbor_id)
+                entity_score = self._memory_relation_entity_score(fact_id, neighbor_id)
             edge_score = self._memory_relation_edge_score(
                 confidence=row[1],
                 semantic_score=row[2],
@@ -3405,28 +3405,28 @@ class SessionDB:
 
     def _memory_entity_overlap_ranked(
         self,
-        node_id: int,
+        fact_id: int,
         *,
         allowed_ids: Optional[set] = None,
         limit: int = 20,
     ) -> List[int]:
-        """Rank prior nodes that mention entities from *node_id*."""
+        """Rank prior nodes that mention entities from *fact_id*."""
         ent_cursor = self._conn.execute(
-            "SELECT entity_id FROM memory_node_entities WHERE node_id = ?",
-            (node_id,),
+            "SELECT entity_id FROM memory_fact_entities WHERE fact_id = ?",
+            (fact_id,),
         )
         entity_ids = [row[0] for row in ent_cursor.fetchall()]
         if not entity_ids:
             return []
         placeholders = ",".join("?" for _ in entity_ids)
         cursor = self._conn.execute(
-            "SELECT node_id, COUNT(*) AS overlap_count "
-            "FROM memory_node_entities "
-            f"WHERE entity_id IN ({placeholders}) AND node_id != ? "
-            "GROUP BY node_id "
-            "ORDER BY overlap_count DESC, node_id DESC "
+            "SELECT fact_id, COUNT(*) AS overlap_count "
+            "FROM memory_fact_entities "
+            f"WHERE entity_id IN ({placeholders}) AND fact_id != ? "
+            "GROUP BY fact_id "
+            "ORDER BY overlap_count DESC, fact_id DESC "
             "LIMIT ?",
-            tuple(entity_ids) + (node_id, limit),
+            tuple(entity_ids) + (fact_id, limit),
         )
         return self._memory_filter_ranked_ids(
             [row[0] for row in cursor.fetchall()],
@@ -3435,55 +3435,55 @@ class SessionDB:
 
     def _memory_temporal_near_ranked(
         self,
-        node_id: int,
+        fact_id: int,
         *,
         allowed_ids: Optional[set] = None,
         limit: int = 20,
     ) -> List[int]:
         """Rank nearest prior memory nodes by timestamp."""
         row = self._conn.execute(
-            "SELECT time_key FROM memory_nodes WHERE id = ?",
-            (node_id,),
+            "SELECT time_key FROM memory_facts WHERE id = ?",
+            (fact_id,),
         ).fetchone()
         if not row:
             return []
         cursor = self._conn.execute(
-            "SELECT id FROM memory_nodes "
+            "SELECT id FROM memory_facts "
             "WHERE id != ? AND time_key <= ? "
             "ORDER BY time_key DESC, id DESC "
             "LIMIT ?",
-            (node_id, row[0], limit),
+            (fact_id, row[0], limit),
         )
         return self._memory_filter_ranked_ids(
             [r[0] for r in cursor.fetchall()],
             allowed_ids=allowed_ids,
         )
 
-    def memory_prior_node_ids(
+    def memory_prior_fact_ids(
         self,
-        node_id: int,
+        fact_id: int,
         *,
         same_day: bool = False,
     ) -> List[int]:
         """Return prior memory node ids for relation graph construction."""
-        current = self._memory_get_node(node_id)
+        current = self._memory_get_fact(fact_id)
         if not current:
             return []
         current_time = str(current.get("time_key", ""))
-        params: List[Any] = [node_id, current_time]
+        params: List[Any] = [fact_id, current_time]
         where = "id != ? AND time_key <= ?"
         if same_day and len(current_time) >= 10:
             where += " AND substr(time_key, 1, 10) = ?"
             params.append(current_time[:10])
         cursor = self._conn.execute(
-            f"SELECT id FROM memory_nodes WHERE {where} ORDER BY time_key DESC, id DESC",
+            f"SELECT id FROM memory_facts WHERE {where} ORDER BY time_key DESC, id DESC",
             params,
         )
         return [row[0] for row in cursor.fetchall()]
 
     # ── Public API ────────────────────────────────────────────────────────
 
-    def memory_add_node(
+    def memory_add_fact(
         self,
         time_key: str,
         summary: str,
@@ -3502,7 +3502,7 @@ class SessionDB:
         primary_entity_id: Optional[int] = None,
         primary_topic: Optional[str] = None,
     ) -> int:
-        """Insert a new memory node (SQLite + FAISS). Returns the node ID.
+        """Insert a new memory fact (SQLite + FAISS). Returns the fact ID.
 
         *time_key* must be a unique timestamp string (e.g. ``"2026-04-20 10:00"``).
         *query_embedding* should be a (1, EMBEDDING_DIM) float32 numpy array.
@@ -3541,7 +3541,7 @@ class SessionDB:
                 primary_topic_value = str(primary_topic or "").strip()
             primary_topic_value = primary_topic_value or "general"
             cursor = conn.execute(
-                """INSERT INTO memory_nodes
+                """INSERT INTO memory_facts
                    (time_key, summary, keywords, topic, tags, fact_type, fact_subject, fact_kind,
                     task_event_like, task_event_subject, task_relevance, entity_names,
                     primary_entity_id, primary_topic, original_dialog)
@@ -3564,29 +3564,29 @@ class SessionDB:
                     original_dialog,
                 ),
             )
-            node_id = cursor.lastrowid
-            return node_id
+            fact_id = cursor.lastrowid
+            return fact_id
 
-        node_id = self._execute_write(_do)
+        fact_id = self._execute_write(_do)
 
         # Insert FAISS vector (outside the write transaction)
         if _HAS_FAISS and self._memory_faiss_index is not None:
             with self._lock:
                 self._memory_faiss_index.add(query_embedding)
-                self._memory_faiss_id_map.append(node_id)
+                self._memory_faiss_id_map.append(fact_id)
             self._memory_save_faiss()
 
-        return node_id
+        return fact_id
         
     def memory_relation_candidates(
         self,
-        node_id: int,
+        fact_id: int,
         query_embedding: np.ndarray,
         keywords: Optional[List[str]] = None,
         top_k: int = None,
         budget: str = "mid",
     ) -> tuple[List[Dict[str, Any]], List[int]]:
-        """Find candidate prior nodes for cross-fact causal relation extraction.
+        """Find candidate prior facts for cross-fact causal relation extraction.
 
         Uses HindSight-style multi-signal candidate generation instead of only
         vector cosine similarity:
@@ -3594,7 +3594,7 @@ class SessionDB:
         - keyword / BM25 matches from fact keywords
         - entity overlap
         - nearby prior memories in time
-        - graph neighbors from explicit node relations and entity edges
+        - graph neighbors from explicit fact relations and entity edges
 
         The final candidate order is fused with Reciprocal Rank Fusion, then
         the LLM relation classifier decides whether a real relation exists.
@@ -3602,7 +3602,7 @@ class SessionDB:
         if top_k is None:
             top_k = self.MEMORY_TOP_K_CAUSAL
 
-        current = self._memory_get_node(node_id)
+        current = self._memory_get_fact(fact_id)
         if not current:
             return [], []
 
@@ -3610,8 +3610,8 @@ class SessionDB:
         current_time = current.get("time_key", "")
         current_fact_type = self._normalize_memory_fact_type(current.get("fact_type", "semantic"))
         allowed_rows = self._conn.execute(
-            "SELECT id FROM memory_nodes WHERE id != ? AND time_key <= ? AND fact_type = ?",
-            (node_id, current_time, current_fact_type),
+            "SELECT id FROM memory_facts WHERE id != ? AND time_key <= ? AND fact_type = ?",
+            (fact_id, current_time, current_fact_type),
         ).fetchall()
         allowed_ids = {row[0] for row in allowed_rows}
         if not allowed_ids:
@@ -3638,12 +3638,12 @@ class SessionDB:
         )
 
         entity_ranking = self._memory_entity_overlap_ranked(
-            node_id,
+            fact_id,
             allowed_ids=allowed_ids,
             limit=search_limit,
         )
         temporal_ranking = self._memory_temporal_near_ranked(
-            node_id,
+            fact_id,
             allowed_ids=allowed_ids,
             limit=search_limit,
         )
@@ -3673,15 +3673,15 @@ class SessionDB:
             rankings.append((graph_ranking, 0.7))
 
         ranked_ids = self._memory_rrf(rankings)[:top_k] if rankings else []
-        nodes: List[Dict[str, Any]] = []
-        node_ids: List[int] = []
+        facts: List[Dict[str, Any]] = []
+        fact_ids: List[int] = []
         for candidate_id in ranked_ids:
-            node = self._memory_get_node(candidate_id)
-            if not node:
+            fact = self._memory_get_fact(candidate_id)
+            if not fact:
                 continue
-            nodes.append(node)
-            node_ids.append(candidate_id)
-        return nodes, node_ids
+            facts.append(fact)
+            fact_ids.append(candidate_id)
+        return facts, fact_ids
 
     def search_memory_facts(
         self, keyword: str, query_embedding: np.ndarray, top_k: int = None,
@@ -3700,13 +3700,13 @@ class SessionDB:
         *top_k* overrides ``MEMORY_QUERY_TOP_K`` (default).
         *budget* controls graph traversal depth only when ``include_graph`` is true.
         *time_start*, *time_end*: optional ISO timestamp strings (``"2026-04-20 10:00:00"``).
-            When specified, time range is the PRIMARY filter — all nodes in range
-            are candidates, and the pool is padded with newest nodes if semantic
+            When specified, time range is the PRIMARY filter — all facts in range
+            are candidates, and the pool is padded with newest facts if semantic
             search returns too few results.
         *tags*: optional list of tags to filter by (matches against JSON array in ``tags`` column).
-        *tags_match*: ``"any"`` (default, node has at least one) or ``"all"`` (node has all).
+        *tags_match*: ``"any"`` (default, fact has at least one) or ``"all"`` (fact has all).
         *fact_types*: optional list of normalized fact buckets (``semantic``/``episodic``).
-        *include_graph*: when true, expand from direct matches through memory-node
+        *include_graph*: when true, expand from direct matches through memory-fact
             relations. Defaults to false so fact recall stays evidence-focused in
             the fact/observation/interpretation memory architecture.
         """
@@ -3730,14 +3730,14 @@ class SessionDB:
                 _time_params.append(time_end)
             _time_sql = " AND ".join(_time_conditions)
             _tc = self._conn.execute(
-                "SELECT id FROM memory_nodes WHERE {} ORDER BY time_key DESC".format(_time_sql),
+                "SELECT id FROM memory_facts WHERE {} ORDER BY time_key DESC".format(_time_sql),
                 _time_params,
             )
-            _temporal_ranking = [r[0] for r in _tc.fetchall()] # latest nodes will have larger weight
+            _temporal_ranking = [r[0] for r in _tc.fetchall()] # latest facts will have larger weight
             _time_ids = set(_temporal_ranking)
             if not _time_ids:
-                return []  # No nodes in the requested time range
-            # Actual top-k is at most the number of nodes in time range
+                return []  # No facts in the requested time range
+            # Actual top-k is at most the number of facts in time range
             top_k = min(top_k, len(_time_ids))
 
         _tag_ids: Optional[set] = None
@@ -3750,7 +3750,7 @@ class SessionDB:
             _tag_connector = " OR " if tags_match == "any" else " AND "
             _tag_sql = _tag_connector.join(_tag_conditions)
             _tag_cursor = self._conn.execute(
-                "SELECT id FROM memory_nodes WHERE {}".format(_tag_sql),
+                "SELECT id FROM memory_facts WHERE {}".format(_tag_sql),
                 _tag_params,
             )
             _tag_ids = {r[0] for r in _tag_cursor.fetchall()}
@@ -3767,7 +3767,7 @@ class SessionDB:
             if normalized_types:
                 placeholders = ",".join("?" for _ in normalized_types)
                 _type_cursor = self._conn.execute(
-                    f"SELECT id FROM memory_nodes WHERE fact_type IN ({placeholders})",
+                    f"SELECT id FROM memory_facts WHERE fact_type IN ({placeholders})",
                     normalized_types,
                 )
                 _fact_type_ids = {r[0] for r in _type_cursor.fetchall()}
@@ -3851,18 +3851,18 @@ class SessionDB:
         rrf_scores, first_seen = self._memory_rrf_scores(rankings) if rankings else ({}, {})
         ranked_ids = sorted(
             rrf_scores,
-            key=lambda node_id: (-rrf_scores[node_id], first_seen.get(node_id, 0)),
+            key=lambda fact_id: (-rrf_scores[fact_id], first_seen.get(fact_id, 0)),
         ) if rrf_scores else []
 
         # Time-filtered recall should still return memories in the requested
         # interval even when semantic/keyword channels are sparse.
         if _time_ids is not None and len(ranked_ids) < top_k:
             existing = set(ranked_ids)
-            for node_id in temporal_ranking:
-                if node_id in existing:
+            for fact_id in temporal_ranking:
+                if fact_id in existing:
                     continue
-                ranked_ids.append(node_id)
-                existing.add(node_id)
+                ranked_ids.append(fact_id)
+                existing.add(fact_id)
                 if len(ranked_ids) >= top_k:
                     break
 
@@ -3873,26 +3873,26 @@ class SessionDB:
             limit=max(top_k * 3, top_k),
         )
 
-        nodes: List[Dict[str, Any]] = []
-        for node_id in ranked_ids[:top_k]:
-            node = self._memory_get_node(node_id)
-            if node:
-                node["embedding_similarity"] = float(vec_results.get(node_id, 0.0) or 0.0)
-                node["keyword_score"] = (
-                    None if node_id not in fts_results else float(fts_results[node_id])
+        facts: List[Dict[str, Any]] = []
+        for fact_id in ranked_ids[:top_k]:
+            fact = self._memory_get_fact(fact_id)
+            if fact:
+                fact["embedding_similarity"] = float(vec_results.get(fact_id, 0.0) or 0.0)
+                fact["keyword_score"] = (
+                    None if fact_id not in fts_results else float(fts_results[fact_id])
                 )
-                node["temporal_rank"] = (
-                    temporal_ranking.index(node_id) + 1
-                    if node_id in temporal_ranking else None
+                fact["temporal_rank"] = (
+                    temporal_ranking.index(fact_id) + 1
+                    if fact_id in temporal_ranking else None
                 )
-                node["retrieval_score"] = float(rrf_scores.get(node_id, 0.0) or 0.0)
+                fact["retrieval_score"] = float(rrf_scores.get(fact_id, 0.0) or 0.0)
                 if graph_ranking:
-                    node["graph_rank"] = (
-                        graph_ranking.index(node_id) + 1
-                        if node_id in graph_ranking else None
+                    fact["graph_rank"] = (
+                        graph_ranking.index(fact_id) + 1
+                        if fact_id in graph_ranking else None
                     )
-                nodes.append(node)
-        return nodes
+                facts.append(fact)
+        return facts
 
     # ── Entity / Knowledge Graph methods ──────────────────────────────────
 
@@ -3988,22 +3988,22 @@ class SessionDB:
             (json.dumps(co_entities, ensure_ascii=False, sort_keys=True), entity_id),
         )
 
-    def entity_link_node(self, node_id: int, entity_id: int, mention_count: int = 1) -> None:
-        """Link a memory node to an entity (upsert)."""
+    def entity_link_fact(self, fact_id: int, entity_id: int, mention_count: int = 1) -> None:
+        """Link a memory fact to an entity (upsert)."""
         def _do(conn):
             cursor = conn.execute(
-                "INSERT OR IGNORE INTO memory_node_entities (node_id, entity_id, mention_count) "
+                "INSERT OR IGNORE INTO memory_fact_entities (fact_id, entity_id, mention_count) "
                 "VALUES (?, ?, ?)",
-                (node_id, entity_id, mention_count),
+                (fact_id, entity_id, mention_count),
             )
             if not cursor.rowcount:
                 return
             rows = conn.execute(
                 "SELECT en.id, en.name, en.type "
-                "FROM memory_node_entities mne "
+                "FROM memory_fact_entities mne "
                 "JOIN entity_nodes en ON en.id = mne.entity_id "
-                "WHERE mne.node_id = ?",
-                (node_id,),
+                "WHERE mne.fact_id = ?",
+                (fact_id,),
             ).fetchall()
             by_id = {int(row["id"]): row for row in rows}
             linked = by_id.get(int(entity_id))
@@ -4354,12 +4354,12 @@ class SessionDB:
                         (json.dumps(co_entities, ensure_ascii=False, sort_keys=True), entity_id),
                     )
             conn.execute(
-                "UPDATE OR IGNORE memory_node_entities SET entity_id = ? WHERE entity_id = ?",
+                "UPDATE OR IGNORE memory_fact_entities SET entity_id = ? WHERE entity_id = ?",
                 (canonical_id, duplicate_id),
             )
-            conn.execute("DELETE FROM memory_node_entities WHERE entity_id = ?", (duplicate_id,))
+            conn.execute("DELETE FROM memory_fact_entities WHERE entity_id = ?", (duplicate_id,))
             conn.execute(
-                "UPDATE memory_nodes SET primary_entity_id = ? WHERE primary_entity_id = ?",
+                "UPDATE memory_facts SET primary_entity_id = ? WHERE primary_entity_id = ?",
                 (canonical_id, duplicate_id),
             )
             conn.execute(
@@ -4396,8 +4396,8 @@ class SessionDB:
 
     # ── Normalized memory node relations ─────────────────────────────────
 
-    def memory_add_node_relation(
-        self, source_node_id: int, target_node_id: int,
+    def memory_add_fact_relation(
+        self, source_fact_id: int, target_fact_id: int,
         relation_type: str, confidence: float = 1.0,
         semantic_score: Optional[float] = None,
         causal_score: Optional[float] = None,
@@ -4406,7 +4406,7 @@ class SessionDB:
         weight: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Add a normalized relation between two memory nodes."""
+        """Add a normalized relation between two memory facts."""
         relation_text = str(relation_type or "")
         relation_key = relation_text.strip().lower()
         confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
@@ -4416,11 +4416,11 @@ class SessionDB:
         if causal_score is None:
             causal_score = 0.0 if relation_key in {"semantic", "temporal"} else confidence_value
         if temporal_score is None:
-            temporal_score = self._memory_relation_temporal_score(source_node_id, target_node_id)
+            temporal_score = self._memory_relation_temporal_score(source_fact_id, target_fact_id)
             if relation_key != "temporal":
                 temporal_score *= 0.5
         if entity_score is None:
-            entity_score = self._memory_relation_entity_score(source_node_id, target_node_id)
+            entity_score = self._memory_relation_entity_score(source_fact_id, target_fact_id)
 
         semantic_value = max(0.0, min(1.0, float(semantic_score or 0.0)))
         causal_value = max(0.0, min(1.0, float(causal_score or 0.0)))
@@ -4443,13 +4443,13 @@ class SessionDB:
         def _do(conn):
             created_at = time.time()
             conn.execute(
-                "INSERT OR IGNORE INTO memory_node_relations "
-                "(source_node_id, target_node_id, relation_type, confidence, "
+                "INSERT OR IGNORE INTO memory_fact_relations "
+                "(source_fact_id, target_fact_id, relation_type, confidence, "
                 "semantic_score, causal_score, temporal_score, entity_score, weight, metadata, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    source_node_id,
-                    target_node_id,
+                    source_fact_id,
+                    target_fact_id,
                     relation_text,
                     confidence_value,
                     semantic_value,
@@ -4463,15 +4463,15 @@ class SessionDB:
             )
         self._execute_write(_do)
 
-    def _memory_relation_temporal_score(self, source_node_id: int, target_node_id: int) -> float:
-        """Score two memory nodes by timestamp proximity."""
+    def _memory_relation_temporal_score(self, source_fact_id: int, target_fact_id: int) -> float:
+        """Score two memory facts by timestamp proximity."""
         rows = self._conn.execute(
-            "SELECT id, time_key FROM memory_nodes WHERE id IN (?, ?)",
-            (source_node_id, target_node_id),
+            "SELECT id, time_key FROM memory_facts WHERE id IN (?, ?)",
+            (source_fact_id, target_fact_id),
         ).fetchall()
         by_id = {row[0]: row[1] for row in rows}
-        source_time = self._parse_memory_time_key(by_id.get(source_node_id))
-        target_time = self._parse_memory_time_key(by_id.get(target_node_id))
+        source_time = self._parse_memory_time_key(by_id.get(source_fact_id))
+        target_time = self._parse_memory_time_key(by_id.get(target_fact_id))
         if source_time is None or target_time is None:
             return 0.0
         delta_days = abs((source_time - target_time).total_seconds()) / 86400.0
@@ -4503,17 +4503,17 @@ class SessionDB:
             value = confidence
         return max(0.0, min(1.0, value))
 
-    def _memory_relation_entity_score(self, source_node_id: int, target_node_id: int) -> float:
-        """Score two memory nodes by normalized entity overlap."""
+    def _memory_relation_entity_score(self, source_fact_id: int, target_fact_id: int) -> float:
+        """Score two memory facts by normalized entity overlap."""
         cursor = self._conn.execute(
-            "SELECT node_id, entity_id FROM memory_node_entities WHERE node_id IN (?, ?)",
-            (source_node_id, target_node_id),
+            "SELECT fact_id, entity_id FROM memory_fact_entities WHERE fact_id IN (?, ?)",
+            (source_fact_id, target_fact_id),
         )
         entities: Dict[int, set] = {}
         for row in cursor.fetchall():
             entities.setdefault(row[0], set()).add(row[1])
-        source_entities = entities.get(source_node_id, set())
-        target_entities = entities.get(target_node_id, set())
+        source_entities = entities.get(source_fact_id, set())
+        target_entities = entities.get(target_fact_id, set())
         if not source_entities or not target_entities:
             return 0.0
         return len(source_entities & target_entities) / len(source_entities | target_entities)
@@ -4616,9 +4616,9 @@ class SessionDB:
         conflict_status: str = "none",
         resolution: str = "",
         action_implication: str = "",
-        evidence_node_ids: Optional[List[int]] = None,
+        evidence_fact_ids: Optional[List[int]] = None,
         evidence_observation_ids: Optional[List[int]] = None,
-        counter_evidence_node_ids: Optional[List[int]] = None,
+        counter_evidence_fact_ids: Optional[List[int]] = None,
         counter_evidence_observation_ids: Optional[List[int]] = None,
         embedding: Optional[np.ndarray] = None,
         embedding_text: Optional[str] = None,
@@ -4644,16 +4644,16 @@ class SessionDB:
         clean_polarity = str(polarity or "neutral").strip().lower() or "neutral"
         strength_value = max(0.0, min(1.0, float(strength or 0.0)))
         confidence_value = max(0.0, min(1.0, float(confidence or 0.0)))
-        evidence_nodes = None if evidence_node_ids is None else self._json_int_list(evidence_node_ids)
+        evidence_facts = None if evidence_fact_ids is None else self._json_int_list(evidence_fact_ids)
         evidence_observations = (
             None
             if evidence_observation_ids is None
             else self._json_int_list(evidence_observation_ids)
         )
-        counter_nodes = (
+        counter_facts = (
             None
-            if counter_evidence_node_ids is None
-            else self._json_int_list(counter_evidence_node_ids)
+            if counter_evidence_fact_ids is None
+            else self._json_int_list(counter_evidence_fact_ids)
         )
         counter_observations = (
             None
@@ -4690,14 +4690,14 @@ class SessionDB:
                     existing_id = existing["id"] if isinstance(existing, sqlite3.Row) else existing[0]
             if existing_id is not None:
                 existing_row = conn.execute(
-                    "SELECT evidence_node_ids, evidence_observation_ids, "
-                    "counter_evidence_node_ids, counter_evidence_observation_ids, "
+                    "SELECT evidence_fact_ids, evidence_observation_ids, "
+                    "counter_evidence_fact_ids, counter_evidence_observation_ids, "
                     "embedding, embedding_text, embedding_updated_at "
                     "FROM memory_interpretations WHERE id = ?",
                     (existing_id,),
                 ).fetchone()
-                stored_evidence_nodes = (
-                    self._json_int_list(existing_row["evidence_node_ids"])
+                stored_evidence_facts = (
+                    self._json_int_list(existing_row["evidence_fact_ids"])
                     if existing_row
                     else []
                 )
@@ -4706,8 +4706,8 @@ class SessionDB:
                     if existing_row
                     else []
                 )
-                stored_counter_nodes = (
-                    self._json_int_list(existing_row["counter_evidence_node_ids"])
+                stored_counter_facts = (
+                    self._json_int_list(existing_row["counter_evidence_fact_ids"])
                     if existing_row
                     else []
                 )
@@ -4736,8 +4736,8 @@ class SessionDB:
                     "scope = ?, interpretation_type = ?, claim = ?, "
                     "polarity = ?, strength = ?, confidence = ?, status = ?, "
                     "conflict_status = ?, resolution = ?, action_implication = ?, "
-                    "evidence_node_ids = ?, evidence_observation_ids = ?, "
-                    "counter_evidence_node_ids = ?, counter_evidence_observation_ids = ?, "
+                    "evidence_fact_ids = ?, evidence_observation_ids = ?, "
+                    "counter_evidence_fact_ids = ?, counter_evidence_observation_ids = ?, "
                     "embedding = ?, embedding_text = ?, embedding_updated_at = ?, "
                     "metadata = ?, updated_at = ?, last_supported_at = ? "
                     "WHERE id = ?",
@@ -4755,13 +4755,13 @@ class SessionDB:
                         normalized_conflict,
                         str(resolution or "").strip(),
                         str(action_implication or "").strip(),
-                        json.dumps(evidence_nodes if evidence_nodes is not None else stored_evidence_nodes),
+                        json.dumps(evidence_facts if evidence_facts is not None else stored_evidence_facts),
                         json.dumps(
                             evidence_observations
                             if evidence_observations is not None
                             else stored_evidence_observations
                         ),
-                        json.dumps(counter_nodes if counter_nodes is not None else stored_counter_nodes),
+                        json.dumps(counter_facts if counter_facts is not None else stored_counter_facts),
                         json.dumps(
                             counter_observations
                             if counter_observations is not None
@@ -4782,8 +4782,8 @@ class SessionDB:
                 "(entity_id, subject_text, target_text, "
                 "scope, interpretation_type, claim, polarity, strength, confidence, "
                 "status, conflict_status, resolution, action_implication, "
-                "evidence_node_ids, evidence_observation_ids, "
-                "counter_evidence_node_ids, counter_evidence_observation_ids, "
+                "evidence_fact_ids, evidence_observation_ids, "
+                "counter_evidence_fact_ids, counter_evidence_observation_ids, "
                 "embedding, embedding_text, embedding_updated_at, "
                 "metadata, created_at, updated_at, last_supported_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -4801,9 +4801,9 @@ class SessionDB:
                     normalized_conflict,
                     str(resolution or "").strip(),
                     str(action_implication or "").strip(),
-                    json.dumps(evidence_nodes or []),
+                    json.dumps(evidence_facts or []),
                     json.dumps(evidence_observations or []),
-                    json.dumps(counter_nodes or []),
+                    json.dumps(counter_facts or []),
                     json.dumps(counter_observations or []),
                     embedding_blob,
                     clean_embedding_text or "",
@@ -5280,8 +5280,8 @@ class SessionDB:
         rows = self._conn.execute(
             "SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, mn.fact_type, mn.fact_subject, mn.fact_kind, "
             "mn.task_event_like, mn.task_event_subject, mn.task_relevance "
-            "FROM memory_nodes mn "
-            "JOIN memory_node_entities mne ON mne.node_id = mn.id "
+            "FROM memory_facts mn "
+            "JOIN memory_fact_entities mne ON mne.fact_id = mn.id "
             "WHERE mne.entity_id = ? "
             "ORDER BY mn.time_key DESC, mn.id DESC "
             "LIMIT ?",
@@ -5328,23 +5328,23 @@ class SessionDB:
             "  SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.topic, "
             "  mn.primary_entity_id, mn.primary_topic, mn.fact_type, mn.fact_subject, mn.fact_kind, "
             "  mn.task_event_like, mn.task_event_subject, mn.task_relevance "
-            "  FROM memory_nodes mn "
+            "  FROM memory_facts mn "
             "  WHERE substr(mn.time_key, 1, 10) = ? "
             "  AND mn.fact_type IN ('semantic', 'episodic') "
             "  AND NOT EXISTS ("
-            "    SELECT 1 FROM memory_evidence_bundle_sources mos WHERE mos.node_id = mn.id"
+            "    SELECT 1 FROM memory_evidence_bundle_sources mos WHERE mos.fact_id = mn.id"
             "  ) "
             "  ORDER BY mn.time_key ASC, mn.id ASC "
             "  LIMIT ?"
             ") "
-            "SELECT cn.id AS node_id, cn.time_key, cn.summary, cn.keywords, cn.topic, "
+            "SELECT cn.id AS fact_id, cn.time_key, cn.summary, cn.keywords, cn.topic, "
             "cn.primary_entity_id, cn.primary_topic, cn.fact_type, cn.fact_subject, cn.fact_kind, "
             "cn.task_event_like, cn.task_event_subject, cn.task_relevance, "
             "en.id AS entity_id, en.name AS entity_name "
             "FROM candidate_nodes cn "
             "JOIN entity_nodes en ON en.id = COALESCE("
             "  cn.primary_entity_id, "
-            "  (SELECT MIN(mne.entity_id) FROM memory_node_entities mne WHERE mne.node_id = cn.id)"
+            "  (SELECT MIN(mne.entity_id) FROM memory_fact_entities mne WHERE mne.fact_id = cn.id)"
             ") "
             "ORDER BY cn.time_key ASC, cn.id ASC, en.name ASC",
             (day, max(1, int(limit or 100))),
@@ -5352,11 +5352,11 @@ class SessionDB:
 
         grouped: Dict[int, Dict[str, Any]] = {}
         for row in rows:
-            node_id = int(row["node_id"])
+            fact_id = int(row["fact_id"])
             item = grouped.setdefault(
-                node_id,
+                fact_id,
                 {
-                    "node_id": node_id,
+                    "fact_id": fact_id,
                     "time_key": row["time_key"],
                     "summary": row["summary"],
                     "keywords": [
@@ -5400,21 +5400,21 @@ class SessionDB:
     def memory_evidence_bundle_source_ids(self, evidence_bundle_id: int) -> List[int]:
         """Return all source fact ids for an evidence bundle."""
         rows = self._conn.execute(
-            "SELECT node_id FROM memory_evidence_bundle_sources "
-            "WHERE evidence_bundle_id = ? ORDER BY node_id",
+            "SELECT fact_id FROM memory_evidence_bundle_sources "
+            "WHERE evidence_bundle_id = ? ORDER BY fact_id",
             (int(evidence_bundle_id),),
         ).fetchall()
-        return [int(row["node_id"]) for row in rows]
+        return [int(row["fact_id"]) for row in rows]
 
     def memory_set_evidence_bundle_sources_pending_observation(
         self,
         evidence_bundle_id: int,
-        node_ids: List[int],
+        fact_ids: List[int],
         *,
         pending: bool,
     ) -> None:
         """Mark bundle facts as waiting for a viable observation cluster."""
-        clean_ids = self._json_int_list(node_ids)
+        clean_ids = self._json_int_list(fact_ids)
         if not clean_ids:
             return
         placeholders = ",".join("?" for _ in clean_ids)
@@ -5423,7 +5423,7 @@ class SessionDB:
             conn.execute(
                 "UPDATE memory_evidence_bundle_sources "
                 "SET pending_observation = ? "
-                f"WHERE evidence_bundle_id = ? AND node_id IN ({placeholders})",
+                f"WHERE evidence_bundle_id = ? AND fact_id IN ({placeholders})",
                 [1 if pending else 0, int(evidence_bundle_id), *clean_ids],
             )
 
@@ -5435,25 +5435,12 @@ class SessionDB:
     ) -> List[int]:
         """Return facts deferred until more evidence reaches the bundle."""
         rows = self._conn.execute(
-            "SELECT node_id FROM memory_evidence_bundle_sources "
+            "SELECT fact_id FROM memory_evidence_bundle_sources "
             "WHERE evidence_bundle_id = ? AND pending_observation = 1 "
-            "ORDER BY node_id",
+            "ORDER BY fact_id",
             (int(evidence_bundle_id),),
         ).fetchall()
-        return [int(row["node_id"]) for row in rows]
-
-    def find_bundled_source_node_ids(self, node_ids: List[int]) -> List[int]:
-        """Return node ids that already belong to an evidence bundle."""
-        clean_ids = self._json_int_list(node_ids)
-        if not clean_ids:
-            return []
-        placeholders = ",".join("?" for _ in clean_ids)
-        rows = self._conn.execute(
-            f"SELECT DISTINCT node_id FROM memory_evidence_bundle_sources "
-            f"WHERE node_id IN ({placeholders}) ORDER BY node_id",
-            clean_ids,
-        ).fetchall()
-        return [int(row["node_id"]) for row in rows]
+        return [int(row["fact_id"]) for row in rows]
 
     def get_evidence_bundles_by_ids(self, evidence_bundle_ids: List[int]) -> List[Dict[str, Any]]:
         """Return evidence bundle containers by id, including entity names."""
@@ -5503,125 +5490,7 @@ class SessionDB:
             )
 
         self._execute_write(_do)
-
-    def memory_replace_observations_for_evidence_bundle(
-        self,
-        evidence_bundle_id: int,
-        observations: List[Dict[str, Any]],
-    ) -> List[int]:
-        """Replace one evidence bundle's observations and their fact evidence."""
-        clean_bundle_id = int(evidence_bundle_id)
-        now_text = datetime.now().astimezone().isoformat()
-
-        def _do(conn):
-            bundle_context = conn.execute(
-                "SELECT bundle.topic_key, en.name AS entity_name "
-                "FROM memory_evidence_bundles bundle "
-                "LEFT JOIN entity_nodes en ON en.id = bundle.entity_id "
-                "WHERE bundle.id = ?",
-                (clean_bundle_id,),
-            ).fetchone()
-            entity_name = (
-                str(bundle_context["entity_name"] or "")
-                if bundle_context
-                else ""
-            )
-            topic_key = (
-                str(bundle_context["topic_key"] or "")
-                if bundle_context
-                else ""
-            )
-            existing_rows = conn.execute(
-                "SELECT id FROM memory_observations WHERE evidence_bundle_id = ?",
-                (clean_bundle_id,),
-            ).fetchall()
-            existing_ids = [
-                int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
-                for row in existing_rows
-            ]
-            if existing_ids:
-                placeholders = ",".join("?" for _ in existing_ids)
-                conn.execute(
-                    f"DELETE FROM memory_interpretation_observations "
-                    f"WHERE observation_id IN ({placeholders})",
-                    existing_ids,
-                )
-                conn.execute(
-                    f"DELETE FROM memory_observation_sources "
-                    f"WHERE observation_id IN ({placeholders})",
-                    existing_ids,
-                )
-            conn.execute(
-                "DELETE FROM memory_observations WHERE evidence_bundle_id = ?",
-                (clean_bundle_id,),
-            )
-
-            inserted_ids: List[int] = []
-            for observation in observations:
-                summary = str(observation.get("summary") or "").strip()
-                source_node_ids = self._json_int_list(
-                    observation.get("source_node_ids", [])
-                )
-                if not summary or not source_node_ids:
-                    continue
-                observation_type = str(
-                    observation.get("observation_type") or "context"
-                ).strip().lower()
-                evidence_mode = str(
-                    observation.get("evidence_mode") or "aggregated"
-                ).strip().lower()
-                confidence = max(
-                    0.0,
-                    min(1.0, float(observation.get("confidence", 0.5) or 0.5)),
-                )
-                metadata = observation.get("metadata") or {}
-                if not isinstance(metadata, dict):
-                    metadata = {}
-                embedding = self._embedding_to_blob(observation.get("embedding"))
-                embedding_text = str(
-                    observation.get("embedding_text") or summary
-                ).strip()
-                evidence_centroid_embedding = self._embedding_to_blob(
-                    observation.get("evidence_centroid_embedding")
-                )
-                cursor = conn.execute(
-                    "INSERT INTO memory_observations "
-                    "(evidence_bundle_id, entity_name, topic_key, "
-                    "observation_type, summary, evidence_mode, "
-                    "confidence, status, embedding, embedding_text, "
-                    "evidence_centroid_embedding, metadata, created_at, updated_at, "
-                    "last_supported_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        clean_bundle_id,
-                        entity_name,
-                        topic_key,
-                        observation_type,
-                        summary,
-                        evidence_mode,
-                        confidence,
-                        embedding,
-                        embedding_text,
-                        evidence_centroid_embedding,
-                        json.dumps(metadata, ensure_ascii=False),
-                        now_text,
-                        now_text,
-                        now_text,
-                    ),
-                )
-                observation_id = int(cursor.lastrowid)
-                inserted_ids.append(observation_id)
-                for node_id in source_node_ids:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO memory_observation_sources "
-                        "(observation_id, node_id, relation, confidence) "
-                        "VALUES (?, ?, 'support', ?)",
-                        (observation_id, node_id, confidence),
-                    )
-            return inserted_ids
-
-        return self._execute_write(_do)
-
+    
     def get_observations_for_evidence_bundles(
         self,
         evidence_bundle_ids: List[int],
@@ -5646,13 +5515,13 @@ class SessionDB:
         for row in rows:
             item = dict(row)
             source_rows = self._conn.execute(
-                "SELECT node_id FROM memory_observation_sources "
+                "SELECT fact_id FROM memory_observation_sources "
                 "WHERE observation_id = ? AND relation = 'support' "
-                "ORDER BY node_id",
+                "ORDER BY fact_id",
                 (int(item["id"]),),
             ).fetchall()
-            item["source_node_ids"] = [
-                int(source_row["node_id"]) for source_row in source_rows
+            item["source_fact_ids"] = [
+                int(source_row["fact_id"]) for source_row in source_rows
             ]
             try:
                 item["metadata"] = json.loads(item.get("metadata") or "{}")
@@ -5782,7 +5651,7 @@ class SessionDB:
         )
         return items[:max(1, int(top_k or 3))]
 
-    def get_observation_supporting_nodes(
+    def get_observation_supporting_facts(
         self,
         observation_ids: List[int],
         *,
@@ -5797,14 +5666,14 @@ class SessionDB:
                 "mn.fact_kind, mn.task_event_like, mn.task_event_subject, "
                 "mn.task_relevance "
                 "FROM memory_observation_sources source "
-                "JOIN memory_nodes mn ON mn.id = source.node_id "
+                "JOIN memory_facts mn ON mn.id = source.fact_id "
                 "WHERE source.observation_id = ? AND source.relation = 'support' "
                 "ORDER BY mn.time_key DESC, mn.id DESC LIMIT ?",
                 (observation_id, max(1, int(per_observation))),
             ).fetchall()
-            nodes: List[Dict[str, Any]] = []
+            facts: List[Dict[str, Any]] = []
             for row in rows:
-                nodes.append({
+                facts.append({
                     "id": row["id"],
                     "time_key": row["time_key"],
                     "summary": row["summary"],
@@ -5825,9 +5694,9 @@ class SessionDB:
                     ),
                     "task_event_subject": row["task_event_subject"] or "",
                     "task_relevance": row["task_relevance"] or "",
-                    "node_relations": {},
+                    "fact_relations": {},
                 })
-            out[observation_id] = nodes
+            out[observation_id] = facts
         return out
 
     def get_deferred_observations_for_interpretation(
@@ -5868,13 +5737,13 @@ class SessionDB:
             if item["metadata"].get("interpretation_status") != "deferred":
                 continue
             source_rows = self._conn.execute(
-                "SELECT node_id FROM memory_observation_sources "
+                "SELECT fact_id FROM memory_observation_sources "
                 "WHERE observation_id = ? AND relation = 'support' "
-                "ORDER BY node_id",
+                "ORDER BY fact_id",
                 (observation_id,),
             ).fetchall()
-            item["source_node_ids"] = [
-                int(source_row["node_id"]) for source_row in source_rows
+            item["source_fact_ids"] = [
+                int(source_row["fact_id"]) for source_row in source_rows
             ]
             stored_embedding = item.get("embedding")
             if stored_embedding is not None:
@@ -5906,10 +5775,10 @@ class SessionDB:
     ) -> Optional[int]:
         """Create one persistent observation and attach its fact evidence."""
         summary = str(observation.get("summary") or "").strip()
-        source_node_ids = self._json_int_list(
-            observation.get("source_node_ids", [])
+        source_fact_ids = self._json_int_list(
+            observation.get("source_fact_ids", [])
         )
-        if not summary or not source_node_ids:
+        if not summary or not source_fact_ids:
             return None
         now_text = datetime.now().astimezone().isoformat()
         observation_type = str(
@@ -5977,12 +5846,12 @@ class SessionDB:
                 ),
             )
             observation_id = int(cursor.lastrowid)
-            for node_id in source_node_ids:
+            for fact_id in source_fact_ids:
                 conn.execute(
                     "INSERT OR IGNORE INTO memory_observation_sources "
-                    "(observation_id, node_id, relation, confidence) "
+                    "(observation_id, fact_id, relation, confidence) "
                     "VALUES (?, ?, 'support', ?)",
-                    (observation_id, node_id, confidence),
+                    (observation_id, fact_id, confidence),
                 )
             return observation_id
 
@@ -5995,14 +5864,14 @@ class SessionDB:
         summary: str,
         evidence_mode: str,
         confidence: float,
-        source_node_ids: List[int],
+        source_fact_ids: List[int],
         embedding: Optional[np.ndarray],
         embedding_text: str,
         evidence_centroid_embedding: Optional[np.ndarray],
         metadata: Dict[str, Any],
     ) -> None:
         """Update an observation in place while preserving its stable identity."""
-        clean_source_ids = self._json_int_list(source_node_ids)
+        clean_source_ids = self._json_int_list(source_fact_ids)
         now_text = datetime.now().astimezone().isoformat()
         embedding_blob = self._embedding_to_blob(embedding)
         evidence_centroid_blob = self._embedding_to_blob(
@@ -6056,12 +5925,12 @@ class SessionDB:
                     int(observation_id),
                 ),
             )
-            for node_id in clean_source_ids:
+            for fact_id in clean_source_ids:
                 conn.execute(
                     "INSERT OR IGNORE INTO memory_observation_sources "
-                    "(observation_id, node_id, relation, confidence) "
+                    "(observation_id, fact_id, relation, confidence) "
                     "VALUES (?, ?, 'support', ?)",
-                    (int(observation_id), node_id, confidence_value),
+                    (int(observation_id), fact_id, confidence_value),
                 )
 
         self._execute_write(_do)
@@ -6124,7 +5993,7 @@ class SessionDB:
         entity_id: int,
         topic_key: str,
         topic_label: str,
-        source_node_ids: List[int],
+        source_fact_ids: List[int],
         canonical_topic_embedding: Optional[np.ndarray] = None,
         bundle_type: str = "entity_topic",
         metadata: Optional[Dict[str, Any]] = None,
@@ -6136,17 +6005,17 @@ class SessionDB:
             clean_source_role = "initial"
         clean_source_ids = []
         seen = set()
-        for node_id in source_node_ids:
-            if node_id in seen:
+        for fact_id in source_fact_ids:
+            if fact_id in seen:
                 continue
-            seen.add(node_id)
-            clean_source_ids.append(node_id)
+            seen.add(fact_id)
+            clean_source_ids.append(fact_id)
         if not clean_source_ids:
-            raise ValueError("memory evidence bundle requires at least one source node")
+            raise ValueError("memory evidence bundle requires at least one source fact")
 
         placeholders = ",".join("?" for _ in clean_source_ids)
         time_rows = self._conn.execute(
-            f"SELECT MIN(time_key) AS start_time, MAX(time_key) AS end_time FROM memory_nodes "
+            f"SELECT MIN(time_key) AS start_time, MAX(time_key) AS end_time FROM memory_facts "
             f"WHERE id IN ({placeholders})",
             clean_source_ids,
         ).fetchone()
@@ -6207,11 +6076,11 @@ class SessionDB:
                     ),
                 )
                 evidence_bundle_id = cursor.lastrowid
-            for node_id in clean_source_ids:
+            for fact_id in clean_source_ids:
                 conn.execute(
                     "INSERT OR IGNORE INTO memory_evidence_bundle_sources "
-                    "(evidence_bundle_id, node_id, role, confidence) VALUES (?, ?, ?, ?)",
-                    (evidence_bundle_id, node_id, clean_source_role, 1.0),
+                    "(evidence_bundle_id, fact_id, role, confidence) VALUES (?, ?, ?, ?)",
+                    (evidence_bundle_id, fact_id, clean_source_role, 1.0),
                 )
             return evidence_bundle_id
 
@@ -6223,10 +6092,10 @@ class SessionDB:
         entity_id: int,
         topic_key: str,
         bundle_type: Optional[str] = None,
-        candidate_node_ids: List[int],
+        candidate_fact_ids: List[int],
     ) -> Tuple[Optional[Dict[str, Any]], List[int]]:
         """Return an active evidence bundle and unattached candidate fact ids."""
-        if not candidate_node_ids:
+        if not candidate_fact_ids:
             return None, []
         if bundle_type:
             evidence_bundle = self._conn.execute(
@@ -6243,17 +6112,17 @@ class SessionDB:
                 (entity_id, topic_key),
             ).fetchone()
         if not evidence_bundle:
-            return None, list(dict.fromkeys(candidate_node_ids))
+            return None, list(dict.fromkeys(candidate_fact_ids))
         bundle_dict = dict(evidence_bundle)
         evidence_bundle_id = bundle_dict["id"]
-        placeholders = ",".join("?" for _ in candidate_node_ids)
+        placeholders = ",".join("?" for _ in candidate_fact_ids)
         rows = self._conn.execute(
-            f"SELECT node_id FROM memory_evidence_bundle_sources "
-            f"WHERE evidence_bundle_id = ? AND node_id IN ({placeholders})",
-            [evidence_bundle_id] + candidate_node_ids,
+            f"SELECT fact_id FROM memory_evidence_bundle_sources "
+            f"WHERE evidence_bundle_id = ? AND fact_id IN ({placeholders})",
+            [evidence_bundle_id] + candidate_fact_ids,
         ).fetchall()
-        attached = {row["node_id"] for row in rows}
-        pending = [node_id for node_id in dict.fromkeys(candidate_node_ids) if node_id not in attached]
+        attached = {row["fact_id"] for row in rows}
+        pending = [fact_id for fact_id in dict.fromkeys(candidate_fact_ids) if fact_id not in attached]
         return bundle_dict, pending
 
     def memory_evidence_bundle_pending_source_count(
@@ -6262,14 +6131,14 @@ class SessionDB:
         entity_id: int,
         topic_key: str,
         bundle_type: Optional[str] = None,
-        candidate_node_ids: List[int],
+        candidate_fact_ids: List[int],
     ) -> Tuple[Optional[int], int]:
         """Return active bundle id and candidate source count not yet attached."""
         evidence_bundle, pending = self.memory_evidence_bundle_pending_sources(
             entity_id=entity_id,
             topic_key=topic_key,
             bundle_type=bundle_type,
-            candidate_node_ids=candidate_node_ids,
+            candidate_fact_ids=candidate_fact_ids,
         )
         return (evidence_bundle["id"] if evidence_bundle else None), len(pending)
 
@@ -6341,29 +6210,29 @@ class SessionDB:
 
         self._execute_write(_do)
 
-    def get_evidence_bundle_supporting_nodes(
+    def get_evidence_bundle_supporting_facts(
         self,
         evidence_bundle_ids: List[int],
         *,
         per_evidence_bundle: int = 2,
     ) -> Dict[int, List[Dict[str, Any]]]:
-        """Fetch supporting fact nodes for evidence bundle ids."""
+        """Fetch supporting fact facts for evidence bundle ids."""
         out: Dict[int, List[Dict[str, Any]]] = {}
         for evidence_bundle_id in evidence_bundle_ids:
             rows = self._conn.execute(
                 "SELECT mn.id, mn.time_key, mn.summary, mn.keywords, mn.original_dialog, "
                 "mn.tags, mn.fact_type, mn.fact_subject, mn.fact_kind, mn.task_event_like, mn.task_event_subject, mn.task_relevance "
                 "FROM memory_evidence_bundle_sources mos "
-                "JOIN memory_nodes mn ON mn.id = mos.node_id "
+                "JOIN memory_facts mn ON mn.id = mos.fact_id "
                 "WHERE mos.evidence_bundle_id = ? "
                 "ORDER BY mn.time_key DESC, mn.id DESC "
                 "LIMIT ?",
                 (evidence_bundle_id, per_evidence_bundle),
             ).fetchall()
-            nodes = []
+            facts = []
             for row in rows:
                 tags = json.loads(row["tags"]) if row["tags"] else []
-                nodes.append({
+                facts.append({
                     "id": row["id"],
                     "time_key": row["time_key"],
                     "summary": row["summary"],
@@ -6380,9 +6249,9 @@ class SessionDB:
                     ),
                     "task_event_subject": row["task_event_subject"] or "",
                     "task_relevance": row["task_relevance"] or "",
-                    "node_relations": {},
+                    "fact_relations": {},
                 })
-            out[evidence_bundle_id] = nodes
+            out[evidence_bundle_id] = facts
         return out
 
     def find_duplicated_evidence_bundle_groups(
@@ -6424,7 +6293,7 @@ class SessionDB:
                 "SELECT DISTINCT mn.id, mn.time_key, mn.summary, mn.keywords, mn.fact_type, mn.fact_subject, mn.fact_kind, "
                 "mn.task_event_like, mn.task_event_subject, mn.task_relevance "
                 "FROM memory_evidence_bundle_sources mos "
-                "JOIN memory_nodes mn ON mn.id = mos.node_id "
+                "JOIN memory_facts mn ON mn.id = mos.fact_id "
                 f"WHERE mos.evidence_bundle_id IN ({','.join('?' for _ in evidence_bundle_ids)}) "
                 "ORDER BY mn.time_key DESC, mn.id DESC",
                 evidence_bundle_ids,
@@ -6436,7 +6305,7 @@ class SessionDB:
                 "topic_label": evidence_bundles[0]["topic_label"],
                 "bundle_type": evidence_bundles[0]["bundle_type"],
                 "evidence_bundles": evidence_bundles,
-                "source_nodes": [
+                "source_facts": [
                     {
                         **dict(row),
                         "fact_type": self._normalize_memory_fact_type(row["fact_type"]),
@@ -6465,12 +6334,12 @@ class SessionDB:
         now_dt = now or datetime.now().astimezone()
         evaluated_at = now_dt.isoformat()
         rows = self._conn.execute(
-            "SELECT id, time_key, fact_type FROM memory_nodes "
+            "SELECT id, time_key, fact_type FROM memory_facts "
             "WHERE fact_type IN ('semantic', 'episodic') "
             "ORDER BY time_key DESC, id DESC"
         ).fetchall()
 
-        nodes: List[Dict[str, Any]] = []
+        facts: List[Dict[str, Any]] = []
         for row in rows:
             fact_type = self._normalize_memory_fact_type(row["fact_type"])
             half_life = experience_half_life if fact_type == "episodic" else fact_half_life
@@ -6479,18 +6348,18 @@ class SessionDB:
                 now=now_dt,
                 half_life_days=half_life,
             )
-            nodes.append({
+            facts.append({
                 "id": int(row["id"]),
                 "fact_type": fact_type,
                 "score": score,
                 "half_life_days": half_life,
             })
 
-        if nodes:
+        if facts:
             def _do(conn):
-                for item in nodes:
+                for item in facts:
                     conn.execute(
-                        "UPDATE memory_nodes SET decay_score = ?, decay_updated_at = ?, "
+                        "UPDATE memory_facts SET decay_score = ?, decay_updated_at = ?, "
                         "decay_half_life_days = ? WHERE id = ?",
                         (
                             item["score"],
@@ -6503,12 +6372,12 @@ class SessionDB:
             self._execute_write(_do)
 
         return {
-            "evaluated": len(nodes),
-            "updated": len(nodes),
+            "evaluated": len(facts),
+            "updated": len(facts),
             "fact_half_life_days": fact_half_life,
             "experience_half_life_days": experience_half_life,
             "evaluated_at": evaluated_at,
-            "nodes": nodes,
+            "facts": facts,
         }
     
     def memory_replace_evidence_bundle_group(
@@ -6516,7 +6385,7 @@ class SessionDB:
         *,
         keep_evidence_bundle_id: int,
         remove_evidence_bundle_ids: List[int],
-        source_node_ids: List[int],
+        source_fact_ids: List[int],
         bundle_type: str = "entity_topic",
         metadata: Optional[Dict[str, Any]] = None,
         source_roles: Optional[Dict[int, str]] = None,
@@ -6527,21 +6396,21 @@ class SessionDB:
             for bundle_id in dict.fromkeys(remove_evidence_bundle_ids)
             if int(bundle_id) != keep_evidence_bundle_id
         ]
-        clean_source_ids = [int(node_id) for node_id in dict.fromkeys(source_node_ids)]
+        clean_source_ids = [int(fact_id) for fact_id in dict.fromkeys(source_fact_ids)]
         if not clean_source_ids:
-            raise ValueError("reflected evidence bundle requires at least one source node")
+            raise ValueError("reflected evidence bundle requires at least one source fact")
         clean_source_roles: Dict[int, str] = {}
-        for node_id, role in (source_roles or {}).items():
+        for fact_id, role in (source_roles or {}).items():
             try:
-                clean_node_id = int(node_id)
+                clean_fact_id = int(fact_id)
             except (TypeError, ValueError):
                 continue
             clean_role = str(role or "").strip().lower()
             if clean_role in {"initial", "matched", "supporting"}:
-                clean_source_roles[clean_node_id] = clean_role
+                clean_source_roles[clean_fact_id] = clean_role
         placeholders = ",".join("?" for _ in clean_source_ids)
         time_rows = self._conn.execute(
-            f"SELECT MIN(time_key) AS start_time, MAX(time_key) AS end_time FROM memory_nodes "
+            f"SELECT MIN(time_key) AS start_time, MAX(time_key) AS end_time FROM memory_facts "
             f"WHERE id IN ({placeholders})",
             clean_source_ids,
         ).fetchone()
@@ -6554,7 +6423,7 @@ class SessionDB:
             source_bundle_ids = [keep_evidence_bundle_id, *clean_remove_ids]
             source_bundle_placeholders = ",".join("?" for _ in source_bundle_ids)
             existing_source_rows = conn.execute(
-                "SELECT node_id, role, pending_observation "
+                "SELECT fact_id, role, pending_observation "
                 "FROM memory_evidence_bundle_sources "
                 f"WHERE evidence_bundle_id IN ({source_bundle_placeholders})",
                 source_bundle_ids,
@@ -6563,15 +6432,15 @@ class SessionDB:
             existing_source_roles: Dict[int, str] = {}
             existing_pending_observation: Dict[int, bool] = {}
             for row in existing_source_rows:
-                node_id = int(row["node_id"])
+                fact_id = int(row["fact_id"])
                 role = str(row["role"] or "supporting").strip().lower()
                 if role not in role_priority:
                     role = "supporting"
-                previous = existing_source_roles.get(node_id)
+                previous = existing_source_roles.get(fact_id)
                 if previous is None or role_priority[role] > role_priority[previous]:
-                    existing_source_roles[node_id] = role
-                existing_pending_observation[node_id] = (
-                    existing_pending_observation.get(node_id, False)
+                    existing_source_roles[fact_id] = role
+                existing_pending_observation[fact_id] = (
+                    existing_pending_observation.get(fact_id, False)
                     or bool(row["pending_observation"])
                 )
             conn.execute(
@@ -6631,21 +6500,21 @@ class SessionDB:
                 "DELETE FROM memory_evidence_bundle_sources WHERE evidence_bundle_id = ?",
                 (keep_evidence_bundle_id,),
             )
-            for node_id in clean_source_ids:
+            for fact_id in clean_source_ids:
                 role = clean_source_roles.get(
-                    node_id,
-                    existing_source_roles.get(node_id, "supporting"),
+                    fact_id,
+                    existing_source_roles.get(fact_id, "supporting"),
                 )
                 conn.execute(
                     "INSERT OR IGNORE INTO memory_evidence_bundle_sources "
-                    "(evidence_bundle_id, node_id, role, confidence, "
+                    "(evidence_bundle_id, fact_id, role, confidence, "
                     "pending_observation) VALUES (?, ?, ?, ?, ?)",
                     (
                         keep_evidence_bundle_id,
-                        node_id,
+                        fact_id,
                         role,
                         1.0,
-                        1 if existing_pending_observation.get(node_id) else 0,
+                        1 if existing_pending_observation.get(fact_id) else 0,
                     ),
                 )
 

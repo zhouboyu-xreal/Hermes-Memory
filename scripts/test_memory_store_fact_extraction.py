@@ -302,7 +302,7 @@ def iter_stored_nodes(db: SessionDB, start_id: int) -> Iterable[Dict[str, Any]]:
     rows = db._conn.execute(
         """SELECT id, time_key, summary, keywords, topic, tags, fact_type, fact_kind, entity_names,
                   task_event_like, task_event_subject, task_relevance, original_dialog
-             FROM memory_nodes
+             FROM memory_facts
             WHERE id > ?
             ORDER BY id""",
         (start_id,),
@@ -673,7 +673,7 @@ def main() -> int:
                 # giving each turn a unique timestamp so memory_nodes.time_key
                 # does not collide on "#00" across turns in the same sample.
                 turn_timestamp = base_turn_timestamp + timedelta(hours=hour_offset, seconds=turn_index)
-                before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_nodes").fetchone()["max_id"]
+                before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_facts").fetchone()["max_id"]
                 if args.enable_feedback_analysis:
                     feedback_before = count_interpretation_feedback(db)
                     pending_before_feedback = count_pending_interpretation_feedback(db)

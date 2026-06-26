@@ -10,7 +10,7 @@ Lifecycle (enhanced with HindSight-inspired features):
      - Store each fact as a memory node in SessionDB (SQLite + FAISS)
      - Build temporal + semantic relation graph edges to prior nodes
      - Extract entities and relations -> knowledge graph
-     - Store in memory_node_relations + entity_nodes/edges
+     - Store in memory_fact_relations + entity_nodes/edges
 
   2. Before each new turn:
      - Embed the user's query
@@ -704,9 +704,9 @@ supporting facts:
 - scope 是这条解释适用的范围，尽量短，如 "memory-system-design"。
 - target_text 是解释指向的对象、方案、习惯、项目状态或风险。
 - action_implication 描述这条解释未来如何影响 Agent 行为；如果没有明确行动含义，应 should_create=false。
-- evidence_node_ids 是直接支持该 interpretation 的底层 fact id，表示“为什么 Agent 相信这个解释”；只能使用 supporting facts 中出现的 id。
+- evidence_fact_ids 是直接支持该 interpretation 的底层 fact id，表示“为什么 Agent 相信这个解释”；只能使用 supporting facts 中出现的 id。
 - evidence_observation_ids 是支持该 interpretation 的 observation id，表示“哪些中层归纳支撑这个解释”；只能使用输入 observation 的 id。
-- counter_evidence_node_ids 是反驳、削弱、限定或造成冲突的底层 fact id；只有存在明确反证、例外、边界条件或 unresolved conflict 时填写。
+- counter_evidence_fact_ids 是反驳、削弱、限定或造成冲突的底层 fact id；只有存在明确反证、例外、边界条件或 unresolved conflict 时填写。
 - counter_evidence_observation_ids 是反驳、削弱、限定或造成冲突的 observation id；只有存在明确反证、例外、边界条件或 unresolved conflict 时填写。
 - 如果只是证据不足，不要把无关事实放入 counter_evidence_*；应降低 confidence 或 should_create=false。
 
@@ -724,9 +724,9 @@ supporting facts:
   "conflict_status": "none | resolved | unresolved",
   "resolution": "可选，冲突如何被解决",
   "action_implication": "未来 Agent 应如何使用这个解释",
-  "evidence_node_ids": [1, 2],
+  "evidence_fact_ids": [1, 2],
   "evidence_observation_ids": [3],
-  "counter_evidence_node_ids": [],
+  "counter_evidence_fact_ids": [],
   "counter_evidence_observation_ids": [],
   "metadata": {{"source": "interpretation_generation"}}
 }}"""
@@ -825,9 +825,9 @@ supporting facts:
 - 不要改变 interpretation_type，除非原类型明显错误；若必须改变，只能使用合法类型。
 - 新输入 metadata 如果包含 allowed_interpretation_types，更新后的 interpretation_type 必须位于该列表；不兼容时输出 {{"should_update": false}}。
 - 不要编造没有证据支持的新目标、偏好或风险。
-- evidence_node_ids 是直接支持更新后 interpretation 的底层 fact id，表示“为什么 Agent 现在仍然相信这个解释”；只能使用 supporting facts 中出现的 id。
+- evidence_fact_ids 是直接支持更新后 interpretation 的底层 fact id，表示“为什么 Agent 现在仍然相信这个解释”；只能使用 supporting facts 中出现的 id。
 - evidence_observation_ids 是支持更新后 interpretation 的 observation id，表示“哪些中层归纳支撑这个解释”；通常应包含新的 observation id，只能使用输入 observation 的 id。
-- counter_evidence_node_ids 是反驳、削弱、限定或造成冲突的底层 fact id；只有新 observation 或 supporting facts 提供明确反证、例外、边界条件或 unresolved conflict 时填写。
+- counter_evidence_fact_ids 是反驳、削弱、限定或造成冲突的底层 fact id；只有新 observation 或 supporting facts 提供明确反证、例外、边界条件或 unresolved conflict 时填写。
 - counter_evidence_observation_ids 是反驳、削弱、限定或造成冲突的 observation id；只有存在明确反证、例外、边界条件或 unresolved conflict 时填写。
 - 如果新 evidence 只是范围变窄或条件更明确，可以更新 claim/action_implication/resolution，不必一定放入 counter_evidence_*。
 - 如果没有任何内容需要更新，只输出 {{"should_update": false}}。
@@ -855,9 +855,9 @@ supporting facts:
   "conflict_status": "none | resolved | unresolved",
   "resolution": "可选，冲突如何被解决",
   "action_implication": "未来 Agent 应如何使用这个解释",
-  "evidence_node_ids": [1, 2],
+  "evidence_fact_ids": [1, 2],
   "evidence_observation_ids": [3],
-  "counter_evidence_node_ids": [],
+  "counter_evidence_fact_ids": [],
   "counter_evidence_observation_ids": [],
   "metadata": {{"source": "interpretation_update"}}
 }}"""
@@ -881,7 +881,7 @@ supporting facts:
 - support 可以增强证据；extend 应吸收新进展或条件；revise 应修正原解释；contradict 应体现冲突或明确的新结论。
 - 明确支持当前解释的 observation id 放入 evidence_observation_ids。
 - 明确反驳、削弱或限制当前解释的 observation id 放入 counter_evidence_observation_ids。
-- 对应的底层 fact id 分别放入 evidence_node_ids 或 counter_evidence_node_ids。
+- 对应的底层 fact id 分别放入 evidence_fact_ids 或 counter_evidence_fact_ids。
 - 如果 interpretation_type=task，metadata 中填写 task_status、task_source、goal、evidence、steps；task_source 固定为 inferred_from_interpretation。
 - 不要编造输入中没有的目标、偏好、风险或结论。
 - 如果综合后内容不需要改变，只输出 {{"should_update": false}}。
@@ -908,9 +908,9 @@ supporting facts:
   "conflict_status": "none | resolved | unresolved",
   "resolution": "可选，冲突如何被解决",
   "action_implication": "未来 Agent 应如何使用这个解释",
-  "evidence_node_ids": [1, 2],
+  "evidence_fact_ids": [1, 2],
   "evidence_observation_ids": [3],
-  "counter_evidence_node_ids": [],
+  "counter_evidence_fact_ids": [],
   "counter_evidence_observation_ids": [],
   "metadata": {{"source": "interpretation_batch_update"}}
 }}"""
@@ -2279,7 +2279,7 @@ class MemoryNodeManager:
                 out.append(tag)
         return out
 
-    def _link_fact_entities(self, node_id: int, entities: List[Dict[str, str]]) -> List[Tuple[int, str]]:
+    def _link_fact_entities(self, fact_id: int, entities: List[Dict[str, str]]) -> List[Tuple[int, str]]:
         linked_entities: List[Tuple[int, str]] = []
         if not entities or not self._db:
             return linked_entities
@@ -2290,10 +2290,10 @@ class MemoryNodeManager:
             etype = entity.get("type", "CONCEPT").strip().upper() or "CONCEPT"
             try:
                 entity_id = self._db.entity_add_entity(name=name, entity_type=etype)
-                self._db.entity_link_node(node_id, entity_id)
+                self._db.entity_link_fact(fact_id, entity_id)
                 linked_entities.append((entity_id, name))
             except Exception as exc:
-                logger.debug("Failed to link retain entity %r to node %d: %s", name, node_id, exc)
+                logger.debug("Failed to link retain entity %r to fact %d: %s", name, fact_id, exc)
         return linked_entities
 
     @staticmethod
@@ -2588,7 +2588,7 @@ class MemoryNodeManager:
         items: List[Dict[str, Any]] = []
         for fact in facts[:limit]:
             items.append({
-                "node_id": fact.get("node_id", fact.get("id")),
+                "fact_id": fact.get("fact_id", fact.get("id")),
                 "time_key": fact.get("time_key"),
                 "fact_type": fact.get("fact_type"),
                 "fact_subject": fact.get("fact_subject"),
@@ -2844,14 +2844,14 @@ class MemoryNodeManager:
 
     def _evidence_centroid_for_sources(
         self,
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
     ) -> Optional[np.ndarray]:
         source_ids = [
-            int(self._node_id(node))
-            for node in source_nodes
-            if self._node_id(node) is not None
+            int(self._fact_id(fact))
+            for fact in source_facts
+            if self._fact_id(fact) is not None
         ]
-        embeddings = self._db.memory_node_embeddings(source_ids)
+        embeddings = self._db.memory_fact_embeddings(source_ids)
         return self._embedding_centroid(
             embeddings.get(source_id)
             for source_id in source_ids
@@ -2860,15 +2860,15 @@ class MemoryNodeManager:
     @classmethod
     def _score_fact_cluster_against_observation_evidence(
         cls,
-        cluster_source_node_ids: List[int],
+        cluster_source_fact_ids: List[int],
         cluster_centroid: Any,
         observation: Dict[str, Any],
         fact_embeddings: Dict[int, np.ndarray],
     ) -> Tuple[float, float, float, float]:
         """Score how completely one fact cluster supports an observation."""
         cluster_embeddings = [
-            fact_embeddings.get(int(source_node_id))
-            for source_node_id in cluster_source_node_ids
+            fact_embeddings.get(int(source_fact_id))
+            for source_fact_id in cluster_source_fact_ids
         ]
         cluster_embeddings = [
             embedding
@@ -2876,8 +2876,8 @@ class MemoryNodeManager:
             if cls._as_embedding_vector(embedding) is not None
         ]
         observation_source_embeddings = [
-            fact_embeddings.get(int(source_node_id))
-            for source_node_id in observation.get("source_node_ids", [])
+            fact_embeddings.get(int(source_fact_id))
+            for source_fact_id in observation.get("source_fact_ids", [])
         ]
         observation_source_embeddings = [
             embedding
@@ -2972,8 +2972,8 @@ class MemoryNodeManager:
         return fact_kind in {"preference", "instruction", "context", "other"}
 
     @staticmethod
-    def _node_id(value: Dict[str, Any]) -> Optional[int]:
-        raw = value.get("node_id", value.get("id"))
+    def _fact_id(value: Dict[str, Any]) -> Optional[int]:
+        raw = value.get("fact_id", value.get("id"))
         try:
             return int(raw)
         except (TypeError, ValueError):
@@ -3148,15 +3148,15 @@ class MemoryNodeManager:
     def _observation_evidence_mode(
         cls,
         observation_type: str,
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
     ) -> str:
         kinds = {
-            str(node.get("fact_kind") or "other").strip().lower()
-            for node in source_nodes
+            str(fact.get("fact_kind") or "other").strip().lower()
+            for fact in source_facts
         }
         fact_types = {
-            cls._normalize_fact_type(node.get("fact_type", "semantic"))
-            for node in source_nodes
+            cls._normalize_fact_type(fact.get("fact_type", "semantic"))
+            for fact in source_facts
         }
         if observation_type == "constraint" and "instruction" in kinds:
             return "explicit"
@@ -3168,11 +3168,11 @@ class MemoryNodeManager:
             return "explicit"
         if observation_type == "behavior_pattern" or (
             observation_type == "preference_signal"
-            and len(source_nodes) >= 2
+            and len(source_facts) >= 2
             and fact_types == {"episodic"}
         ):
             return "behavioral"
-        if len(source_nodes) >= 2:
+        if len(source_facts) >= 2:
             return "aggregated"
         if fact_types == {"episodic"}:
             return "episodic"
@@ -3180,24 +3180,24 @@ class MemoryNodeManager:
 
     def _cluster_evidence_bundle_facts_into_observations(
         self,
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """Build typed semantic fact clusters inside one evidence bundle."""
         facts = [
-            dict(node)
-            for node in source_nodes
-            if self._node_id(node) is not None
-            and str(node.get("summary") or "").strip()
+            dict(fact)
+            for fact in source_facts
+            if self._fact_id(fact) is not None
+            and str(fact.get("summary") or "").strip()
         ]
         if not facts:
             return []
-        fact_ids = [int(self._node_id(fact)) for fact in facts]
-        embeddings = self._db.memory_node_embeddings(fact_ids)
+        fact_ids = [int(self._fact_id(fact)) for fact in facts]
+        embeddings = self._db.memory_fact_embeddings(fact_ids)
         clusters: List[Dict[str, Any]] = []
         for fact in facts:
-            node_id = int(self._node_id(fact))
+            fact_id = int(self._fact_id(fact))
             implicit_observation_type = self._implicit_observation_type_for_fact(fact)
-            fact_embedding_vector = self._as_embedding_vector(embeddings.get(node_id))
+            fact_embedding_vector = self._as_embedding_vector(embeddings.get(fact_id))
             best_cluster = None
             best_similarity = -1.0
             best_match_rule = "incompatible"
@@ -3253,14 +3253,14 @@ class MemoryNodeManager:
             if best_cluster is None:
                 clusters.append({
                     "observation_type": implicit_observation_type,
-                    "source_nodes": [fact],
+                    "source_facts": [fact],
                     "vectors": [fact_embedding_vector] if fact_embedding_vector is not None else [],
                     "centroid": fact_embedding_vector,
                     "pair_similarity_sum": 0.0,
                     "pair_count": 0,
                 })
                 continue
-            best_cluster["source_nodes"].append(fact)
+            best_cluster["source_facts"].append(fact)
             best_cluster["pair_similarity_sum"] = best_pair_similarity_sum
             best_cluster["pair_count"] = best_pair_count
             if fact_embedding_vector is not None:
@@ -3272,36 +3272,36 @@ class MemoryNodeManager:
                 best_cluster["centroid"] = self._as_embedding_vector(centroid)
             best_cluster["observation_type"] = (
                 self._observation_type_for_fact_cluster(
-                    best_cluster["source_nodes"]
+                    best_cluster["source_facts"]
                 )
             )
 
         candidate_fact_clusters: List[Dict[str, Any]] = []
         for cluster in clusters:
-            cluster_facts = cluster["source_nodes"]
+            cluster_facts = cluster["source_facts"]
             centroid = cluster.get("centroid")
             candidate_fact_clusters.append({
                 "observation_type": cluster["observation_type"],
-                "source_node_ids": [
-                    int(self._node_id(fact)) for fact in cluster_facts
+                "source_fact_ids": [
+                    int(self._fact_id(fact)) for fact in cluster_facts
                 ],
                 "evidence_centroid_embedding": centroid,
             })
         return candidate_fact_clusters
 
     @staticmethod
-    def _observation_fact_payload(source_nodes: List[Dict[str, Any]]) -> str:
+    def _observation_fact_payload(source_facts: List[Dict[str, Any]]) -> str:
         return json.dumps(
             [
                 {
-                    "fact_id": node.get("id", node.get("node_id")),
-                    "fact_type": node.get("fact_type", "semantic"),
-                    "fact_kind": node.get("fact_kind", "other"),
-                    "fact_text": str(node.get("summary") or "").strip(),
-                    "timestamp": node.get("time_key"),
+                    "fact_id": fact.get("id", fact.get("fact_id")),
+                    "fact_type": fact.get("fact_type", "semantic"),
+                    "fact_kind": fact.get("fact_kind", "other"),
+                    "fact_text": str(fact.get("summary") or "").strip(),
+                    "timestamp": fact.get("time_key"),
                 }
-                for node in source_nodes
-                if str(node.get("summary") or "").strip()
+                for fact in source_facts
+                if str(fact.get("summary") or "").strip()
             ],
             ensure_ascii=False,
             indent=2,
@@ -3312,11 +3312,11 @@ class MemoryNodeManager:
         *,
         evidence_bundle: Dict[str, Any],
         observation_type: str,
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
         existing_observation: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Create or incrementally revise one stable observation."""
-        if not source_nodes:
+        if not source_facts:
             return None
         if existing_observation:
             prompt = OBSERVATION_UPDATE_PROMPT.format(
@@ -3334,7 +3334,7 @@ class MemoryNodeManager:
                     ensure_ascii=False,
                     indent=2,
                 ),
-                new_facts=self._observation_fact_payload(source_nodes),
+                new_facts=self._observation_fact_payload(source_facts),
             )
         else:
             prompt = OBSERVATION_CREATE_PROMPT.format(
@@ -3352,7 +3352,7 @@ class MemoryNodeManager:
                     ensure_ascii=False,
                     indent=2,
                 ),
-                source_facts=self._observation_fact_payload(source_nodes),
+                source_facts=self._observation_fact_payload(source_facts),
             )
         data = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "")
         if not data:
@@ -3375,14 +3375,14 @@ class MemoryNodeManager:
 
     @staticmethod
     def _fallback_observation_text(
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
         *,
         existing_text: str = "",
     ) -> str:
         summaries = list(dict.fromkeys(
-            str(node.get("summary") or "").strip()
-            for node in source_nodes
-            if str(node.get("summary") or "").strip()
+            str(fact.get("summary") or "").strip()
+            for fact in source_facts
+            if str(fact.get("summary") or "").strip()
         ))
         existing = str(existing_text or "").strip()
         if existing:
@@ -3395,14 +3395,14 @@ class MemoryNodeManager:
         *,
         observation_type: str,
         summary: str,
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
         confidence: float,
         previous_metadata: Optional[Dict[str, Any]] = None,
         change_summary: str = "",
     ) -> Dict[str, Any]:
         evidence_mode = self._observation_evidence_mode(
             observation_type,
-            source_nodes,
+            source_facts,
         )
         metadata = dict(previous_metadata or {})
         metadata.update({
@@ -3417,13 +3417,13 @@ class MemoryNodeManager:
                 self._observation_candidate_families(observation_type)
             ),
             "fact_type_distribution": (
-                self._fact_type_distribution_from_facts(source_nodes)
+                self._fact_type_distribution_from_facts(source_facts)
             ),
             "fact_kind_distribution": dict(Counter(
-                str(node.get("fact_kind") or "other").strip().lower()
-                for node in source_nodes
+                str(fact.get("fact_kind") or "other").strip().lower()
+                for fact in source_facts
             )),
-            "source_count": len(source_nodes),
+            "source_count": len(source_facts),
             "revision": int(metadata.get("revision") or 0) + 1,
         })
         if change_summary:
@@ -3437,15 +3437,15 @@ class MemoryNodeManager:
             "summary": summary,
             "evidence_mode": evidence_mode,
             "confidence": confidence,
-            "source_node_ids": [
-                int(self._node_id(node))
-                for node in source_nodes
-                if self._node_id(node) is not None
+            "source_fact_ids": [
+                int(self._fact_id(fact))
+                for fact in source_facts
+                if self._fact_id(fact) is not None
             ],
             "embedding": self._embed_memory_layer_text(embedding_text),
             "embedding_text": embedding_text,
             "evidence_centroid_embedding": (
-                self._evidence_centroid_for_sources(source_nodes)
+                self._evidence_centroid_for_sources(source_facts)
             ),
             "metadata": metadata,
         }
@@ -3466,7 +3466,7 @@ class MemoryNodeManager:
             int(item["id"]): item
             for item in self._db.get_evidence_bundles_by_ids(clean_ids)
         }
-        supporting_nodes = self._db.get_evidence_bundle_supporting_nodes(
+        supporting_facts = self._db.get_evidence_bundle_supporting_facts(
             clean_ids,
             per_evidence_bundle=1000,
         )
@@ -3483,15 +3483,15 @@ class MemoryNodeManager:
             evidence_bundle = evidence_bundles.get(evidence_bundle_id)
             if not evidence_bundle:
                 continue
-            all_facts = supporting_nodes.get(evidence_bundle_id, [])
+            all_facts = supporting_facts.get(evidence_bundle_id, [])
             existing_observations = existing_by_bundle.get(
                 evidence_bundle_id,
                 [],
             )
             assigned_fact_ids = {
-                int(node_id)
+                int(fact_id)
                 for observation in existing_observations
-                for node_id in observation.get("source_node_ids", [])
+                for fact_id in observation.get("source_fact_ids", [])
             }
             self._db.memory_set_evidence_bundle_sources_pending_observation(
                 evidence_bundle_id,
@@ -3501,21 +3501,21 @@ class MemoryNodeManager:
             new_facts = [
                 fact for fact in all_facts
                 if (
-                    self._node_id(fact) is not None
-                    and int(self._node_id(fact)) not in assigned_fact_ids
+                    self._fact_id(fact) is not None
+                    and int(self._fact_id(fact)) not in assigned_fact_ids
                 )
             ]
             relevant_fact_ids = {
-                int(self._node_id(fact))
+                int(self._fact_id(fact))
                 for fact in new_facts
-                if self._node_id(fact) is not None
+                if self._fact_id(fact) is not None
             }
             relevant_fact_ids.update(
-                int(node_id)
+                int(fact_id)
                 for observation in existing_observations
-                for node_id in observation.get("source_node_ids", [])
+                for fact_id in observation.get("source_fact_ids", [])
             )
-            fact_embeddings = self._db.memory_node_embeddings(
+            fact_embeddings = self._db.memory_fact_embeddings(
                 sorted(relevant_fact_ids)
             )
             fact_clusters = (
@@ -3526,15 +3526,15 @@ class MemoryNodeManager:
             matched: Dict[int, List[Dict[str, Any]]] = {}
             unmatched_clusters: List[Dict[str, Any]] = []
             new_facts_by_id = {
-                int(self._node_id(fact)): fact
+                int(self._fact_id(fact)): fact
                 for fact in new_facts
-                if self._node_id(fact) is not None
+                if self._fact_id(fact) is not None
             }
             for cluster in fact_clusters:
                 cluster_source_ids = [
-                    int(node_id)
-                    for node_id in cluster.get("source_node_ids", [])
-                    if node_id is not None
+                    int(fact_id)
+                    for fact_id in cluster.get("source_fact_ids", [])
+                    if fact_id is not None
                 ]
                 cluster_observation_type = str(
                     cluster.get("observation_type") or "context"
@@ -3581,7 +3581,7 @@ class MemoryNodeManager:
                     "observation_cluster_evidence_similarity_scored",
                     {
                         "evidence_bundle_id": evidence_bundle_id,
-                        "cluster_source_node_ids": cluster_source_ids,
+                        "cluster_source_fact_ids": cluster_source_ids,
                         "cluster_source_count": len(cluster_source_ids),
                         "observation_type": cluster_observation_type,
                         "best_observation_id": (
@@ -3612,16 +3612,16 @@ class MemoryNodeManager:
                     observation_id = int(best_match[4]["id"])
                     matched_facts = matched.setdefault(observation_id, [])
                     matched_fact_ids = {
-                        int(self._node_id(fact))
+                        int(self._fact_id(fact))
                         for fact in matched_facts
-                        if self._node_id(fact) is not None
+                        if self._fact_id(fact) is not None
                     }
                     matched_facts.extend(
-                        new_facts_by_id[node_id]
-                        for node_id in cluster_source_ids
+                        new_facts_by_id[fact_id]
+                        for fact_id in cluster_source_ids
                         if (
-                            node_id in new_facts_by_id
-                            and node_id not in matched_fact_ids
+                            fact_id in new_facts_by_id
+                            and fact_id not in matched_fact_ids
                         )
                     )
                 else:
@@ -3633,14 +3633,14 @@ class MemoryNodeManager:
             }
             for observation_id, added_facts in matched.items():
                 existing = by_id[observation_id]
-                historical_facts = self._db.memory_nodes_by_ids(
-                    existing.get("source_node_ids", [])
+                historical_facts = self._db.memory_facts_by_ids(
+                    existing.get("source_fact_ids", [])
                 )
                 combined_facts = historical_facts + added_facts
                 generated = self._generate_observation_using_llm(
                     evidence_bundle=evidence_bundle,
                     observation_type=str(existing["observation_type"]),
-                    source_nodes=added_facts,
+                    source_facts=added_facts,
                     existing_observation=existing,
                 )
                 summary = (
@@ -3654,7 +3654,7 @@ class MemoryNodeManager:
                 record = self._observation_record_from_sources(
                     observation_type=str(existing["observation_type"]),
                     summary=summary,
-                    source_nodes=combined_facts,
+                    source_facts=combined_facts,
                     confidence=(
                         generated["confidence"]
                         if generated
@@ -3674,7 +3674,7 @@ class MemoryNodeManager:
                     summary=record["summary"],
                     evidence_mode=record["evidence_mode"],
                     confidence=record["confidence"],
-                    source_node_ids=record["source_node_ids"],
+                    source_fact_ids=record["source_fact_ids"],
                     embedding=record["embedding"],
                     embedding_text=record["embedding_text"],
                     evidence_centroid_embedding=record[
@@ -3685,9 +3685,9 @@ class MemoryNodeManager:
                 self._db.memory_set_evidence_bundle_sources_pending_observation(
                     evidence_bundle_id,
                     [
-                        int(self._node_id(fact))
+                        int(self._fact_id(fact))
                         for fact in added_facts
-                        if self._node_id(fact) is not None
+                        if self._fact_id(fact) is not None
                     ],
                     pending=False,
                 )
@@ -3696,9 +3696,9 @@ class MemoryNodeManager:
 
             for candidate in unmatched_clusters:
                 candidate_source_ids = [
-                    int(node_id)
-                    for node_id in candidate.get("source_node_ids", [])
-                    if node_id is not None
+                    int(fact_id)
+                    for fact_id in candidate.get("source_fact_ids", [])
+                    if fact_id is not None
                 ]
                 if (
                     len(candidate_source_ids)
@@ -3717,20 +3717,20 @@ class MemoryNodeManager:
                             "observation_type": candidate.get(
                                 "observation_type"
                             ),
-                            "source_node_ids": candidate_source_ids,
+                            "source_fact_ids": candidate_source_ids,
                             "minimum_fact_count": (
                                 OBSERVATION_MIN_FACTS_FOR_NEW_CLUSTER
                             ),
                         },
                     )
                     continue
-                candidate_facts = self._db.memory_nodes_by_ids(
+                candidate_facts = self._db.memory_facts_by_ids(
                     candidate_source_ids
                 )
                 generated = self._generate_observation_using_llm(
                     evidence_bundle=evidence_bundle,
                     observation_type=str(candidate["observation_type"]),
-                    source_nodes=candidate_facts,
+                    source_facts=candidate_facts,
                 )
                 summary = (
                     generated["summary"]
@@ -3740,7 +3740,7 @@ class MemoryNodeManager:
                 record = self._observation_record_from_sources(
                     observation_type=str(candidate["observation_type"]),
                     summary=summary,
-                    source_nodes=candidate_facts,
+                    source_facts=candidate_facts,
                     confidence=(
                         generated["confidence"]
                         if generated
@@ -3777,7 +3777,7 @@ class MemoryNodeManager:
                 {
                     "evidence_bundle_id": evidence_bundle_id,
                     "new_fact_ids": [
-                        int(self._node_id(fact)) for fact in new_facts
+                        int(self._fact_id(fact)) for fact in new_facts
                     ],
                     "touched_observation_ids": bundle_observation_ids,
                     "pending_observation_fact_ids": (
@@ -3871,27 +3871,27 @@ class MemoryNodeManager:
         self,
         *,
         observation: Dict[str, Any],
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
         observation_id: int,
         observation_ids: Optional[List[int]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Generate an optional current interpretation from an observation."""
         fact_lines = []
-        allowed_node_ids: set[int] = set()
-        for index, node in enumerate(source_nodes[:8], 1):
-            node_id = node.get("id", node.get("node_id"))
+        allowed_fact_ids: set[int] = set()
+        for index, fact in enumerate(source_facts[:8], 1):
+            fact_id = fact.get("id", fact.get("fact_id"))
             try:
-                int_node_id = int(node_id)
+                int_fact_id = int(fact_id)
             except (TypeError, ValueError):
                 continue
-            summary = str(node.get("summary") or "").strip()
+            summary = str(fact.get("summary") or "").strip()
             if not summary:
                 continue
-            allowed_node_ids.add(int_node_id)
-            fact_type = str(node.get("fact_type") or "semantic")
-            fact_subject = str(node.get("fact_subject") or "other")
-            fact_kind = str(node.get("fact_kind") or "other")
-            fact_lines.append(f"{index}. id={int_node_id} [{fact_type}/{fact_subject}/{fact_kind}] {summary}")
+            allowed_fact_ids.add(int_fact_id)
+            fact_type = str(fact.get("fact_type") or "semantic")
+            fact_subject = str(fact.get("fact_subject") or "other")
+            fact_kind = str(fact.get("fact_kind") or "other")
+            fact_lines.append(f"{index}. id={int_fact_id} [{fact_type}/{fact_subject}/{fact_kind}] {summary}")
         if not fact_lines:
             return None
 
@@ -3983,7 +3983,7 @@ class MemoryNodeManager:
         if len(evidence_observation_ids) == 1:
             allowed, single_reason = self._single_observation_generation_allowed(
                 observation=observation,
-                source_nodes=source_nodes,
+                source_facts=source_facts,
                 interpretation_family=self._interpretation_family(interpretation_type),
             )
             if not allowed:
@@ -4033,14 +4033,14 @@ class MemoryNodeManager:
             "conflict_status": conflict_status,
             "resolution": str(data.get("resolution") or "").strip(),
             "action_implication": action_implication,
-            "evidence_node_ids": self._filter_int_ids(
-                data.get("evidence_node_ids", []),
-                allowed_node_ids,
+            "evidence_fact_ids": self._filter_int_ids(
+                data.get("evidence_fact_ids", []),
+                allowed_fact_ids,
             ),
             "evidence_observation_ids": evidence_observation_ids,
-            "counter_evidence_node_ids": self._filter_int_ids(
-                data.get("counter_evidence_node_ids", []),
-                allowed_node_ids,
+            "counter_evidence_fact_ids": self._filter_int_ids(
+                data.get("counter_evidence_fact_ids", []),
+                allowed_fact_ids,
             ),
             "counter_evidence_observation_ids": self._filter_int_ids(
                 data.get("counter_evidence_observation_ids", []),
@@ -4054,26 +4054,26 @@ class MemoryNodeManager:
         *,
         interpretation: Dict[str, Any],
         observation: Dict[str, Any],
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
         observation_id: int,
     ) -> Optional[Dict[str, Any]]:
         """Update a matched current interpretation using a new observation."""
         fact_lines = []
-        allowed_node_ids: set[int] = set()
-        for index, node in enumerate(source_nodes[:8], 1):
-            node_id = node.get("id", node.get("node_id"))
+        allowed_fact_ids: set[int] = set()
+        for index, fact in enumerate(source_facts[:8], 1):
+            fact_id = fact.get("id", fact.get("fact_id"))
             try:
-                int_node_id = int(node_id)
+                int_fact_id = int(fact_id)
             except (TypeError, ValueError):
                 continue
-            summary = str(node.get("summary") or "").strip()
+            summary = str(fact.get("summary") or "").strip()
             if not summary:
                 continue
-            allowed_node_ids.add(int_node_id)
-            fact_type = str(node.get("fact_type") or "semantic")
-            fact_subject = str(node.get("fact_subject") or "other")
-            fact_kind = str(node.get("fact_kind") or "other")
-            fact_lines.append(f"{index}. id={int_node_id} [{fact_type}/{fact_subject}/{fact_kind}] {summary}")
+            allowed_fact_ids.add(int_fact_id)
+            fact_type = str(fact.get("fact_type") or "semantic")
+            fact_subject = str(fact.get("fact_subject") or "other")
+            fact_kind = str(fact.get("fact_kind") or "other")
+            fact_lines.append(f"{index}. id={int_fact_id} [{fact_type}/{fact_subject}/{fact_kind}] {summary}")
         if not fact_lines:
             return None
 
@@ -4190,17 +4190,17 @@ class MemoryNodeManager:
             "conflict_status": conflict_status,
             "resolution": str(data.get("resolution") or interpretation.get("resolution") or "").strip(),
             "action_implication": action_implication,
-            "evidence_node_ids": self._filter_int_ids(
-                data.get("evidence_node_ids", list(allowed_node_ids)),
-                allowed_node_ids,
+            "evidence_fact_ids": self._filter_int_ids(
+                data.get("evidence_fact_ids", list(allowed_fact_ids)),
+                allowed_fact_ids,
             ),
             "evidence_observation_ids": self._filter_int_ids(
                 data.get("evidence_observation_ids", [observation_id]),
                 allowed_observation_ids,
             ) or [int(observation_id)],
-            "counter_evidence_node_ids": self._filter_int_ids(
-                data.get("counter_evidence_node_ids", []),
-                allowed_node_ids,
+            "counter_evidence_fact_ids": self._filter_int_ids(
+                data.get("counter_evidence_fact_ids", []),
+                allowed_fact_ids,
             ),
             "counter_evidence_observation_ids": self._filter_int_ids(
                 data.get("counter_evidence_observation_ids", []),
@@ -4220,15 +4220,15 @@ class MemoryNodeManager:
             return None
 
         observation_payloads: List[Dict[str, Any]] = []
-        source_nodes = self._dedupe_source_nodes([
-            node
+        source_facts = self._dedupe_source_facts([
+            fact
             for assignment in assignments
-            for node in assignment.get("item", {}).get("source_nodes", [])
+            for fact in assignment.get("item", {}).get("source_facts", [])
         ])
-        allowed_node_ids = {
-            int(node["id"])
-            for node in source_nodes
-            if node.get("id") is not None
+        allowed_fact_ids = {
+            int(fact["id"])
+            for fact in source_facts
+            if fact.get("id") is not None
         }
         allowed_observation_ids = {
             int(assignment["item"]["observation_id"])
@@ -4249,16 +4249,16 @@ class MemoryNodeManager:
             })
 
         fact_lines = []
-        for index, node in enumerate(source_nodes[:24], 1):
-            node_id = int(node["id"])
-            summary = str(node.get("summary") or "").strip()
+        for index, fact in enumerate(source_facts[:24], 1):
+            fact_id = int(fact["id"])
+            summary = str(fact.get("summary") or "").strip()
             if not summary:
                 continue
             fact_lines.append(
-                f"{index}. id={node_id} "
-                f"[{node.get('fact_type', 'semantic')}/"
-                f"{node.get('fact_subject', 'other')}/"
-                f"{node.get('fact_kind', 'other')}] {summary}"
+                f"{index}. id={fact_id} "
+                f"[{fact.get('fact_type', 'semantic')}/"
+                f"{fact.get('fact_subject', 'other')}/"
+                f"{fact.get('fact_kind', 'other')}] {summary}"
             )
         if not fact_lines:
             return None
@@ -4269,8 +4269,8 @@ class MemoryNodeManager:
                 "id", "claim", "target_text", "scope", "interpretation_type",
                 "polarity", "strength", "confidence", "status",
                 "conflict_status", "resolution", "action_implication",
-                "evidence_node_ids", "evidence_observation_ids",
-                "counter_evidence_node_ids",
+                "evidence_fact_ids", "evidence_observation_ids",
+                "counter_evidence_fact_ids",
                 "counter_evidence_observation_ids", "metadata",
             )
         }
@@ -4416,9 +4416,9 @@ class MemoryNodeManager:
                 or ""
             ).strip(),
             "action_implication": action_implication,
-            "evidence_node_ids": self._filter_int_ids(
-                data.get("evidence_node_ids", sorted(allowed_node_ids)),
-                allowed_node_ids,
+            "evidence_fact_ids": self._filter_int_ids(
+                data.get("evidence_fact_ids", sorted(allowed_fact_ids)),
+                allowed_fact_ids,
             ),
             "evidence_observation_ids": self._filter_int_ids(
                 data.get(
@@ -4427,9 +4427,9 @@ class MemoryNodeManager:
                 ),
                 allowed_observation_ids,
             ),
-            "counter_evidence_node_ids": self._filter_int_ids(
-                data.get("counter_evidence_node_ids", []),
-                allowed_node_ids,
+            "counter_evidence_fact_ids": self._filter_int_ids(
+                data.get("counter_evidence_fact_ids", []),
+                allowed_fact_ids,
             ),
             "counter_evidence_observation_ids": self._filter_int_ids(
                 data.get("counter_evidence_observation_ids", []),
@@ -4448,23 +4448,23 @@ class MemoryNodeManager:
         return "insight"
 
     @staticmethod
-    def _unique_source_node_count(source_nodes: List[Dict[str, Any]]) -> int:
-        node_ids: set[int] = set()
+    def _unique_source_node_count(source_facts: List[Dict[str, Any]]) -> int:
+        fact_ids: set[int] = set()
         fallback_count = 0
-        for node in source_nodes:
-            node_id = node.get("id", node.get("node_id"))
+        for fact in source_facts:
+            fact_id = fact.get("id", fact.get("fact_id"))
             try:
-                node_ids.add(int(node_id))
+                fact_ids.add(int(fact_id))
             except (TypeError, ValueError):
                 fallback_count += 1
-        return len(node_ids) or fallback_count
+        return len(fact_ids) or fallback_count
 
     @classmethod
     def _single_observation_generation_allowed(
         cls,
         *,
         observation: Dict[str, Any],
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
         interpretation_family: str,
     ) -> Tuple[bool, str]:
         metadata = cls._json_dict(observation.get("metadata", {}))
@@ -4476,15 +4476,15 @@ class MemoryNodeManager:
         dominant_fact_type = str(metadata.get("dominant_fact_type") or "unknown").strip().lower()
         evidence_mixture = str(metadata.get("evidence_mixture") or "unknown").strip().lower()
         source_kinds = {
-            str(node.get("fact_kind") or "").strip().lower()
-            for node in source_nodes
+            str(fact.get("fact_kind") or "").strip().lower()
+            for fact in source_facts
         }
-        source_count = cls._unique_source_node_count(source_nodes)
+        source_count = cls._unique_source_node_count(source_facts)
 
         if interpretation_family == "task":
             if observation_type in {"task_state", "task_progress", "decision"}:
                 return True, "task_observation_type"
-            if any(cls._is_task_event_like_fact(node) for node in source_nodes):
+            if any(cls._is_task_event_like_fact(fact) for fact in source_facts):
                 return True, "task_event_evidence"
             if source_kinds & {"request", "action", "decision", "error", "recommendation"}:
                 return True, "task_fact_kind"
@@ -4532,7 +4532,7 @@ class MemoryNodeManager:
     def _candidate_interpretation_families(
         cls,
         observation: Dict[str, Any],
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
     ) -> List[str]:
         metadata = cls._json_dict(observation.get("metadata", {}))
         families = cls._metadata_candidate_types(metadata.get("candidate_interpretation_types"))
@@ -4543,17 +4543,17 @@ class MemoryNodeManager:
         return [family for family in ("insight", "task", "preference") if family in set(families)]
 
     @classmethod
-    def _observation_cluster_interpretation_family(cls, observation: Dict[str, Any], source_nodes: List[Dict[str, Any]]) -> str:
+    def _observation_cluster_interpretation_family(cls, observation: Dict[str, Any], source_facts: List[Dict[str, Any]]) -> str:
         observation_type = str(
             observation.get("observation_type") or "context"
         ).strip().lower()
-        candidate_families = cls._candidate_interpretation_families(observation, source_nodes)
+        candidate_families = cls._candidate_interpretation_families(observation, source_facts)
         source_kinds = {
-            str(node.get("fact_kind") or "").strip().lower()
-            for node in source_nodes
+            str(fact.get("fact_kind") or "").strip().lower()
+            for fact in source_facts
         }
         if "task" in candidate_families and (
-            any(cls._is_task_event_like_fact(node) for node in source_nodes)
+            any(cls._is_task_event_like_fact(fact) for fact in source_facts)
             or observation_type in {"task_state", "task_progress", "decision"}
         ):
             return "task"
@@ -4667,7 +4667,7 @@ class MemoryNodeManager:
         cls,
         *,
         observation: Dict[str, Any],
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
         interpretation: Dict[str, Any],
         interpretation_family: str,
         observation_terms: set[str],
@@ -4683,12 +4683,12 @@ class MemoryNodeManager:
         dominant_fact_type = str(observation_metadata.get("dominant_fact_type") or "").strip().lower()
         evidence_mixture = str(observation_metadata.get("evidence_mixture") or "").strip().lower()
         source_kinds = {
-            str(node.get("fact_kind") or "").strip().lower()
-            for node in source_nodes
+            str(fact.get("fact_kind") or "").strip().lower()
+            for fact in source_facts
         }
         source_subjects = {
-            str(node.get("fact_subject") or "").strip().lower()
-            for node in source_nodes
+            str(fact.get("fact_subject") or "").strip().lower()
+            for fact in source_facts
         }
 
         if interpretation_family == "preference":
@@ -4721,7 +4721,7 @@ class MemoryNodeManager:
             if observation_type in {"task_state", "task_progress", "decision"}:
                 score += 0.08
                 reasons.append("task_type")
-            if any(cls._is_task_event_like_fact(node) for node in source_nodes) or source_kinds & {
+            if any(cls._is_task_event_like_fact(fact) for fact in source_facts) or source_kinds & {
                 "request", "action", "decision", "error", "recommendation",
             }:
                 score += 0.10
@@ -4778,7 +4778,7 @@ class MemoryNodeManager:
         self,
         *,
         observation: Dict[str, Any],
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
         interpretation: Dict[str, Any],
         observation_id: int,
     ) -> Tuple[float, str]:
@@ -4817,8 +4817,8 @@ class MemoryNodeManager:
             and interpretation_type not in allowed_interpretation_types
         ):
             return 0.0, "observation_type_gate"
-        candidate_families = self._candidate_interpretation_families(observation, source_nodes)
-        observation_family = self._observation_cluster_interpretation_family(observation, source_nodes)
+        candidate_families = self._candidate_interpretation_families(observation, source_facts)
+        observation_family = self._observation_cluster_interpretation_family(observation, source_facts)
         interpretation_family = self._interpretation_family(interpretation.get("interpretation_type"))
         if candidate_families and interpretation_family not in candidate_families:
             return 0.0, "candidate_type_gate"
@@ -4867,7 +4867,7 @@ class MemoryNodeManager:
 
         type_score, type_reasons = self._interpretation_type_specific_score(
             observation=observation,
-            source_nodes=source_nodes,
+            source_facts=source_facts,
             interpretation=interpretation,
             interpretation_family=interpretation_family,
             observation_terms=observation_terms,
@@ -4954,7 +4954,7 @@ class MemoryNodeManager:
         """Judge one observation against existing interpretations."""
         observation = item["observation"]
         observation_id = int(item["observation_id"])
-        source_nodes = item.get("source_nodes", [])
+        source_facts = item.get("source_facts", [])
         interpretation_candidates = self._search_interpretation_candidates_for_observation(
             observation,
             observation_id,
@@ -4963,7 +4963,7 @@ class MemoryNodeManager:
         for candidate in interpretation_candidates:
             score, score_reason = self._calculate_interpretation_candidate_score_for_observation(
                 observation=observation,
-                source_nodes=source_nodes,
+                source_facts=source_facts,
                 interpretation=candidate,
                 observation_id=observation_id,
             )
@@ -5014,16 +5014,16 @@ class MemoryNodeManager:
             })
 
         fact_lines = []
-        for index, node in enumerate(source_nodes[:12], 1):
-            node_id = node.get("id", node.get("node_id"))
-            summary = str(node.get("summary") or "").strip()
-            if node_id is None or not summary:
+        for index, fact in enumerate(source_facts[:12], 1):
+            fact_id = fact.get("id", fact.get("fact_id"))
+            summary = str(fact.get("summary") or "").strip()
+            if fact_id is None or not summary:
                 continue
             fact_lines.append(
-                f"{index}. id={int(node_id)} "
-                f"[{node.get('fact_type', 'semantic')}/"
-                f"{node.get('fact_subject', 'other')}/"
-                f"{node.get('fact_kind', 'other')}] {summary}"
+                f"{index}. id={int(fact_id)} "
+                f"[{fact.get('fact_type', 'semantic')}/"
+                f"{fact.get('fact_subject', 'other')}/"
+                f"{fact.get('fact_kind', 'other')}] {summary}"
             )
         observation_payload = {
             "id": observation_id,
@@ -5144,40 +5144,40 @@ class MemoryNodeManager:
         updated_interpretation: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Persist links and optional content update for matched observations."""
-        support_node_ids: List[int] = []
+        support_fact_ids: List[int] = []
         support_observation_ids: List[int] = []
-        counter_node_ids: List[int] = []
+        counter_fact_ids: List[int] = []
         counter_observation_ids: List[int] = []
         for assignment in assignments:
             item = assignment["item"]
             observation_id = int(item["observation_id"])
-            source_node_ids = [
-                int(node_id)
-                for node_id in item.get("source_node_ids", [])
-                if node_id is not None
+            source_fact_ids = [
+                int(fact_id)
+                for fact_id in item.get("source_fact_ids", [])
+                if fact_id is not None
             ]
             if assignment.get("relationship") == "contradict":
-                counter_node_ids.extend(source_node_ids)
+                counter_fact_ids.extend(source_fact_ids)
                 counter_observation_ids.append(observation_id)
             else:
-                support_node_ids.extend(source_node_ids)
+                support_fact_ids.extend(source_fact_ids)
                 support_observation_ids.append(observation_id)
 
         updated = updated_interpretation or {}
-        evidence_node_ids = list(dict.fromkeys([
-            *interpretation.get("evidence_node_ids", []),
-            *support_node_ids,
-            *updated.get("evidence_node_ids", []),
+        evidence_fact_ids = list(dict.fromkeys([
+            *interpretation.get("evidence_fact_ids", []),
+            *support_fact_ids,
+            *updated.get("evidence_fact_ids", []),
         ]))
         evidence_observation_ids = list(dict.fromkeys([
             *interpretation.get("evidence_observation_ids", []),
             *support_observation_ids,
             *updated.get("evidence_observation_ids", []),
         ]))
-        counter_evidence_node_ids = list(dict.fromkeys([
-            *interpretation.get("counter_evidence_node_ids", []),
-            *counter_node_ids,
-            *updated.get("counter_evidence_node_ids", []),
+        counter_evidence_fact_ids = list(dict.fromkeys([
+            *interpretation.get("counter_evidence_fact_ids", []),
+            *counter_fact_ids,
+            *updated.get("counter_evidence_fact_ids", []),
         ]))
         counter_evidence_observation_ids = list(dict.fromkeys([
             *interpretation.get("counter_evidence_observation_ids", []),
@@ -5283,9 +5283,9 @@ class MemoryNodeManager:
             ),
             resolution=resolution,
             action_implication=action_implication,
-            evidence_node_ids=evidence_node_ids,
+            evidence_fact_ids=evidence_fact_ids,
             evidence_observation_ids=evidence_observation_ids,
-            counter_evidence_node_ids=counter_evidence_node_ids,
+            counter_evidence_fact_ids=counter_evidence_fact_ids,
             counter_evidence_observation_ids=counter_evidence_observation_ids,
             embedding=self._embed_memory_layer_text(embedding_text),
             embedding_text=embedding_text,
@@ -5310,15 +5310,15 @@ class MemoryNodeManager:
     def _interpretation_basis_hash(
         cls,
         observation: Dict[str, Any],
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
     ) -> str:
         """Hash the observation fields that matter for interpretation decisions."""
         normalized_metadata = cls._json_dict(observation.get("metadata", {}))
-        source_node_ids = []
-        for node in source_nodes:
-            node_id = node.get("id", node.get("node_id"))
+        source_fact_ids = []
+        for fact in source_facts:
+            fact_id = fact.get("id", fact.get("fact_id"))
             try:
-                source_node_ids.append(int(node_id))
+                source_fact_ids.append(int(fact_id))
             except (TypeError, ValueError):
                 continue
         basis = {
@@ -5337,7 +5337,7 @@ class MemoryNodeManager:
                 "dominant_fact_type": normalized_metadata.get("dominant_fact_type"),
                 "evidence_mixture": normalized_metadata.get("evidence_mixture"),
             },
-            "source_node_ids": sorted(set(source_node_ids)),
+            "source_fact_ids": sorted(set(source_fact_ids)),
         }
         payload = json.dumps(basis, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -5416,7 +5416,7 @@ class MemoryNodeManager:
     def _interpretation_generation_trigger_priority(
         cls,
         observation: Dict[str, Any],
-        source_nodes: List[Dict[str, Any]],
+        source_facts: List[Dict[str, Any]],
         family: str,
     ) -> Tuple[str, str]:
         metadata = cls._json_dict(observation.get("metadata", {}))
@@ -5428,8 +5428,8 @@ class MemoryNodeManager:
         dominant_fact_type = str(metadata.get("dominant_fact_type") or "unknown")
         evidence_mixture = str(metadata.get("evidence_mixture") or "unknown")
         source_kinds = {
-            str(node.get("fact_kind") or "").strip().lower()
-            for node in source_nodes
+            str(fact.get("fact_kind") or "").strip().lower()
+            for fact in source_facts
         }
         if family == "preference":
             if source_kinds & {"instruction"}:
@@ -5444,7 +5444,7 @@ class MemoryNodeManager:
         if family == "task":
             if observation_type in {"task_state", "task_progress", "decision"}:
                 return "high", "task_state_signal"
-            if any(cls._is_task_event_like_fact(node) for node in source_nodes):
+            if any(cls._is_task_event_like_fact(fact) for fact in source_facts):
                 return "high", "task_event_evidence"
             if dominant_fact_type == "episodic" or evidence_mixture in {"episodic_only", "episodic_dominant"}:
                 return "medium", "episodic_task_context"
@@ -5486,12 +5486,12 @@ class MemoryNodeManager:
             candidate_semantic_observation = self._build_semantic_observation(
                 candidate
             )
-            source_nodes = self._db.memory_nodes_by_ids(
-                candidate.get("source_node_ids", [])
+            source_facts = self._db.memory_facts_by_ids(
+                candidate.get("source_fact_ids", [])
             )
             family = self._observation_cluster_interpretation_family(
                 candidate_semantic_observation,
-                source_nodes,
+                source_facts,
             )
             if family != item.get("family"):
                 continue
@@ -5508,7 +5508,7 @@ class MemoryNodeManager:
             scored_candidates.append((similarity, {
                 "candidate": candidate,
                 "observation": candidate_semantic_observation,
-                "source_nodes": source_nodes,
+                "source_facts": source_facts,
                 "family": family,
             }))
 
@@ -5517,11 +5517,11 @@ class MemoryNodeManager:
             candidate = entry["candidate"]
             candidate_id = int(candidate["id"])
             semantic_candidate = entry["observation"]
-            source_nodes = entry["source_nodes"]
+            source_facts = entry["source_facts"]
             metadata = self._json_dict(semantic_candidate.get("metadata", {}))
             basis_hash = self._interpretation_basis_hash(
                 semantic_candidate,
-                source_nodes,
+                source_facts,
             )
             if str(metadata.get("interpretation_basis_hash") or "") != basis_hash:
                 continue
@@ -5530,8 +5530,8 @@ class MemoryNodeManager:
                 "observation": semantic_candidate,
                 "observation_id": candidate_id,
                 "evidence_bundle_id": int(candidate["evidence_bundle_id"]),
-                "source_nodes": source_nodes,
-                "source_node_ids": [int(node["id"]) for node in source_nodes if node.get("id") is not None],
+                "source_facts": source_facts,
+                "source_fact_ids": [int(fact["id"]) for fact in source_facts if fact.get("id") is not None],
                 "basis_hash": basis_hash,
                 "family": entry["family"],
                 "priority": "deferred",
@@ -5549,8 +5549,8 @@ class MemoryNodeManager:
         buckets: Dict[Tuple[str, Any, str], Dict[str, Any]] = {}
         for item in items:
             observation = item["observation"]
-            source_nodes = item.get("source_nodes", [])
-            family = self._observation_cluster_interpretation_family(observation, source_nodes)
+            source_facts = item.get("source_facts", [])
+            family = self._observation_cluster_interpretation_family(observation, source_facts)
             topic_key = self._topic_key(observation.get("topic_key") or observation.get("topic_label") or "general")
             cluster_topic = topic_key or "general"
             observation_type = str(
@@ -5576,19 +5576,19 @@ class MemoryNodeManager:
         return clusters
 
     @staticmethod
-    def _dedupe_source_nodes(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _dedupe_source_facts(facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         seen: set[int] = set()
-        for node in nodes:
-            node_id = node.get("id", node.get("node_id"))
+        for fact in facts:
+            fact_id = fact.get("id", fact.get("fact_id"))
             try:
-                int_node_id = int(node_id)
+                int_fact_id = int(fact_id)
             except (TypeError, ValueError):
                 continue
-            if int_node_id in seen:
+            if int_fact_id in seen:
                 continue
-            seen.add(int_node_id)
-            out.append(node)
+            seen.add(fact_id)
+            out.append(fact)
         return out
 
     def _generate_interpretation_from_observation_cluster(
@@ -5599,10 +5599,10 @@ class MemoryNodeManager:
         if not items:
             return None
         family = str(cluster.get("family") or "insight")
-        all_source_nodes = self._dedupe_source_nodes([
-            node
+        all_source_facts = self._dedupe_source_facts([
+            fact
             for item in items
-            for node in item.get("source_nodes", [])
+            for fact in item.get("source_facts", [])
         ])
         observation_ids = [
             int(item["observation_id"])
@@ -5617,7 +5617,7 @@ class MemoryNodeManager:
             observation = items[0]["observation"]
             interpretation = self._generate_interpretation(
                 observation=observation,
-                source_nodes=all_source_nodes,
+                source_facts=all_source_facts,
                 observation_id=observation_ids[0],
                 observation_ids=observation_ids,
             )
@@ -5641,14 +5641,14 @@ class MemoryNodeManager:
             }
             interpretation = self._generate_interpretation(
                 observation=representative,
-                source_nodes=all_source_nodes,
+                source_facts=all_source_facts,
                 observation_id=observation_ids[0],
                 observation_ids=observation_ids,
             )
         if not interpretation:
             return None
 
-        source_node_ids = [int(node["id"]) for node in all_source_nodes if node.get("id") is not None]
+        source_fact_ids = [int(fact["id"]) for fact in all_source_facts if fact.get("id") is not None]
         metadata = {
             **(interpretation["metadata"] or {}),
             "observation_id": int(observation_ids[0]),
@@ -5683,9 +5683,9 @@ class MemoryNodeManager:
             conflict_status=interpretation["conflict_status"],
             resolution=interpretation["resolution"],
             action_implication=interpretation["action_implication"],
-            evidence_node_ids=interpretation["evidence_node_ids"] or source_node_ids,
+            evidence_fact_ids=interpretation["evidence_fact_ids"] or source_fact_ids,
             evidence_observation_ids=interpretation["evidence_observation_ids"] or observation_ids,
-            counter_evidence_node_ids=interpretation["counter_evidence_node_ids"],
+            counter_evidence_fact_ids=interpretation["counter_evidence_fact_ids"],
             counter_evidence_observation_ids=interpretation["counter_evidence_observation_ids"],
             embedding=self._embed_memory_layer_text(embedding_text),
             embedding_text=embedding_text,
@@ -5703,7 +5703,7 @@ class MemoryNodeManager:
             {
                 "interpretation_id": interpretation_id,
                 "observation_ids": observation_ids,
-                "source_node_ids": source_node_ids,
+                "source_fact_ids": source_fact_ids,
                 "cluster_family": family,
                 "generated_interpretation": interpretation,
             }
@@ -5723,7 +5723,7 @@ class MemoryNodeManager:
             item = changed_items[0]
             return cls._single_observation_generation_allowed(
                 observation=item["observation"],
-                source_nodes=item.get("source_nodes", []),
+                source_facts=item.get("source_facts", []),
                 interpretation_family=str(item.get("family") or cluster.get("family") or "insight"),
             )
         if any(item.get("priority") == "high" for item in changed_items):
@@ -5746,7 +5746,7 @@ class MemoryNodeManager:
         source_count = max(
             1,
             int(metadata.get("source_count") or len(
-                observation.get("source_node_ids", [])
+                observation.get("source_fact_ids", [])
             ) or 1),
         )
         evidence_mode = str(
@@ -5799,9 +5799,9 @@ class MemoryNodeManager:
             "topic_key": observation.get("topic_key"),
             "topic_label": observation.get("topic_label"),
             "observation_type": observation_type,
-            "source_node_ids": [
-                int(node_id)
-                for node_id in observation.get("source_node_ids", [])
+            "source_fact_ids": [
+                int(fact_id)
+                for fact_id in observation.get("source_fact_ids", [])
             ],
             "summary": summary,
             "keywords": summary,
@@ -5847,20 +5847,20 @@ class MemoryNodeManager:
         ]
         for semantic_observation in semantic_observations:
             observation_id = int(semantic_observation["id"])
-            source_nodes = self._db.memory_nodes_by_ids(
-                semantic_observation.get("source_node_ids", [])
+            source_facts = self._db.memory_facts_by_ids(
+                semantic_observation.get("source_fact_ids", [])
             )
-            source_node_ids = [
-                int(node["id"])
-                for node in source_nodes
-                if node.get("id") is not None
+            source_fact_ids = [
+                int(fact["id"])
+                for fact in source_facts
+                if fact.get("id") is not None
             ]
             metadata = self._json_dict(
                 semantic_observation.get("metadata", {})
             )
             basis_hash = self._interpretation_basis_hash(
                 semantic_observation,
-                source_nodes,
+                source_facts,
             )
             if self._interpretation_state_is_final_for_basis(
                 metadata,
@@ -5894,20 +5894,20 @@ class MemoryNodeManager:
             semantic_observation["metadata"] = metadata
             family = self._observation_cluster_interpretation_family(
                 semantic_observation,
-                source_nodes,
+                source_facts,
             )
             priority, priority_reason = (
                 self._interpretation_generation_trigger_priority(
                     observation=semantic_observation,
-                    source_nodes=source_nodes,
+                    source_facts=source_facts,
                     family=family,
                 )
             )
             candidate_items.append({
                 "observation": semantic_observation,
                 "observation_id": int(semantic_observation["id"]),
-                "source_nodes": source_nodes,
-                "source_node_ids": source_node_ids,
+                "source_facts": source_facts,
+                "source_fact_ids": source_fact_ids,
                 "basis_hash": basis_hash,
                 "family": family,
                 "priority": priority,
@@ -6163,47 +6163,47 @@ class MemoryNodeManager:
             return None
         evidence_bundle = candidates[0]
         evidence_bundle_id = int(evidence_bundle["id"])
-        supporting_nodes = self._db.get_evidence_bundle_supporting_nodes(
+        supporting_facts = self._db.get_evidence_bundle_supporting_facts(
             [evidence_bundle_id],
             per_evidence_bundle=8,
         ).get(evidence_bundle_id, [])
-        return evidence_bundle, 1.0, "exact_entity_topic", supporting_nodes
+        return evidence_bundle, 1.0, "exact_entity_topic", supporting_facts
 
     def _update_existing_evidence_bundle_from_fact_cluster(
         self,
         cluster: Dict[str, Any],
         *,
-        consumed_node_ids: set[int],
+        consumed_fact_ids: set[int],
         changed_evidence_bundle_ids: Optional[List[int]] = None,
     ) -> Optional[int]:
         if not self._db:
             return None
-        source_nodes = list(cluster.get("source_nodes") or [])
-        source_node_ids = [
-            int(node_id)
-            for node_id in cluster.get("source_node_ids", [])
-            if node_id is not None
+        source_facts = list(cluster.get("source_facts") or [])
+        source_fact_ids = [
+            int(fact_id)
+            for fact_id in cluster.get("source_fact_ids", [])
+            if fact_id is not None
         ]
-        overlapping_node_ids = consumed_node_ids.intersection(source_node_ids)
+        overlapping_fact_ids = consumed_fact_ids.intersection(source_fact_ids)
         cluster_for_match = cluster
-        if overlapping_node_ids:
-            source_node_ids = [
-                node_id
-                for node_id in source_node_ids
-                if node_id not in overlapping_node_ids
+        if overlapping_fact_ids:
+            source_fact_ids = [
+                fact_id
+                for fact_id in source_fact_ids
+                if fact_id not in overlapping_fact_ids
             ]
-            remaining_node_ids = set(source_node_ids)
-            source_nodes = [
+            remaining_fact_ids = set(source_fact_ids)
+            source_facts = [
                 fact
-                for fact in source_nodes
-                if self._node_id(fact) in remaining_node_ids
+                for fact in source_facts
+                if self._fact_id(fact) in remaining_fact_ids
             ]
             cluster_for_match = {
                 **cluster,
-                "source_nodes": source_nodes,
-                "source_node_ids": source_node_ids,
+                "source_facts": source_facts,
+                "source_fact_ids": source_fact_ids,
             }
-        if not source_node_ids:
+        if not source_fact_ids:
             return None
         match = self._match_fact_cluster_to_existing_evidence_bundle(cluster_for_match)
         if not match:
@@ -6214,12 +6214,12 @@ class MemoryNodeManager:
             evidence_bundle_id
         )
         pending_source_ids = [
-            node_id
-            for node_id in source_node_ids
-            if node_id not in existing_source_ids
+            fact_id
+            for fact_id in source_fact_ids
+            if fact_id not in existing_source_ids
         ]
         if not pending_source_ids:
-            consumed_node_ids.update(source_node_ids)
+            consumed_fact_ids.update(source_fact_ids)
             return evidence_bundle_id
 
         metadata = self._json_dict(existing_bundle.get("metadata", {}))
@@ -6251,11 +6251,11 @@ class MemoryNodeManager:
             keep_evidence_bundle_id=evidence_bundle_id,
             remove_evidence_bundle_ids=[],
             bundle_type=str(existing_bundle.get("bundle_type") or "entity_topic"),
-            source_node_ids=stored_source_ids,
+            source_fact_ids=stored_source_ids,
             metadata=metadata,
             source_roles={
-                node_id: "matched"
-                for node_id in pending_source_ids
+                fact_id: "matched"
+                for fact_id in pending_source_ids
             },
         )
         canonical_topic_embedding = (
@@ -6270,7 +6270,7 @@ class MemoryNodeManager:
         )
         if changed_evidence_bundle_ids is not None:
             changed_evidence_bundle_ids.append(evidence_bundle_id)
-        consumed_node_ids.update(source_node_ids)
+        consumed_fact_ids.update(source_fact_ids)
         self._log_info(
             "memory_reflect",
             "fact_cluster_evidence_bundle_matched", {
@@ -6279,10 +6279,10 @@ class MemoryNodeManager:
             "topic_key": cluster.get("topic_key"),
             "topic_aliases": sorted(topic_aliases),
             "topic_match_reasons": cluster.get("topic_match_reasons", []),
-            "source_node_ids": source_node_ids,
+            "source_fact_ids": source_fact_ids,
             "score": score,
             "reason": reason,
-            "supporting_facts": self._reflect_fact_log_items(supporting_nodes + source_nodes),
+            "supporting_facts": self._reflect_fact_log_items(supporting_nodes + source_facts),
             "updated_evidence_bundle": {
                 **self._reflect_evidence_bundle_log_item(existing_bundle),
                 "metadata": metadata,
@@ -6294,14 +6294,14 @@ class MemoryNodeManager:
         self,
         facts: List[Dict[str, Any]],
         *,
-        excluded_node_ids: set[int],
+        excluded_fact_ids: set[int],
     ) -> List[Dict[str, Any]]:
         prepared_facts: List[Dict[str, Any]] = []
         topics_by_entity: Dict[int, List[str]] = {}
         embedding_cache: Dict[str, Optional[np.ndarray]] = {}
         for fact in facts:
-            node_id = self._node_id(fact)
-            if node_id is None or node_id in excluded_node_ids:
+            fact_id = self._fact_id(fact)
+            if fact_id is None or fact_id in excluded_fact_ids:
                 continue
             try:
                 entity_id = int(
@@ -6327,7 +6327,7 @@ class MemoryNodeManager:
             ).strip() or "general"
             prepared_facts.append({
                 "fact": fact,
-                "node_id": node_id,
+                "fact_id": fact_id,
                 "entity_id": entity_id,
                 "entity_name": entity_name,
                 "raw_topic": raw_topic,
@@ -6345,7 +6345,7 @@ class MemoryNodeManager:
         buckets: Dict[Tuple[int, str], Dict[str, Any]] = {}
         for prepared in prepared_facts:
             fact = prepared["fact"]
-            node_id = prepared["node_id"]
+            fact_id = prepared["fact_id"]
             entity_id = prepared["entity_id"]
             entity_name = prepared["entity_name"]
             raw_topic = prepared["raw_topic"]
@@ -6375,22 +6375,22 @@ class MemoryNodeManager:
                     "topic_aliases": set(),
                     "topic_match_reasons": set(),
                     "facts": [],
-                    "node_ids": set(),
+                    "fact_ids": set(),
                 },
             )
             bucket["topic_aliases"].add(str(resolution["topic_alias"]))
             bucket["topic_match_reasons"].add(
                 str(resolution["topic_match_reason"])
             )
-            if node_id not in bucket["node_ids"]:
-                bucket["node_ids"].add(node_id)
+            if fact_id not in bucket["fact_ids"]:
+                bucket["fact_ids"].add(fact_id)
                 bucket["facts"].append(fact)
 
         clusters: List[Dict[str, Any]] = []
         for bucket in buckets.values():
             facts_for_cluster = sorted(
                 bucket.get("facts", []),
-                key=lambda fact: (str(fact.get("time_key") or ""), self._node_id(fact) or 0),
+                key=lambda fact: (str(fact.get("time_key") or ""), self._fact_id(fact) or 0),
             )
             clusters.append({
                 **{
@@ -6398,7 +6398,7 @@ class MemoryNodeManager:
                     for key, value in bucket.items()
                     if key not in {
                         "facts",
-                        "node_ids",
+                        "fact_ids",
                         "topic_aliases",
                         "topic_match_reasons",
                     }
@@ -6407,11 +6407,11 @@ class MemoryNodeManager:
                 "topic_match_reasons": sorted(
                     bucket["topic_match_reasons"]
                 ),
-                "source_nodes": facts_for_cluster,
-                "source_node_ids": [
-                    self._node_id(fact)
+                "source_facts": facts_for_cluster,
+                "source_fact_ids": [
+                    self._fact_id(fact)
                     for fact in facts_for_cluster
-                    if self._node_id(fact) is not None
+                    if self._fact_id(fact) is not None
                 ],
                 "can_create_evidence_bundle": len(facts_for_cluster) >= MIN_FACTS_FOR_NEW_EVIDENCE_BUNDLE,
             })
@@ -6419,7 +6419,7 @@ class MemoryNodeManager:
         clusters.sort(
             key=lambda item: (
                 1 if item.get("can_create_evidence_bundle") else 0,
-                len(item.get("source_node_ids", [])),
+                len(item.get("source_fact_ids", [])),
                 str(item.get("topic_key") or ""),
             ),
             reverse=True,
@@ -6430,31 +6430,31 @@ class MemoryNodeManager:
         self,
         cluster: Dict[str, Any],
         *,
-        consumed_node_ids: set[int],
+        consumed_fact_ids: set[int],
         changed_evidence_bundle_ids: Optional[List[int]] = None,
     ) -> Optional[int]:
         if not self._db:
             return None
         if not cluster.get("can_create_evidence_bundle", True):
             return None
-        source_nodes = list(cluster.get("source_nodes") or [])
-        source_node_ids = [
-            int(node_id)
-            for node_id in cluster.get("source_node_ids", [])
-            if node_id is not None
+        source_facts = list(cluster.get("source_facts") or [])
+        source_fact_ids = [
+            int(fact_id)
+            for fact_id in cluster.get("source_fact_ids", [])
+            if fact_id is not None
         ]
-        overlapping_node_ids = consumed_node_ids.intersection(source_node_ids)
-        if overlapping_node_ids:
-            source_node_ids = [
-                node_id
-                for node_id in source_node_ids
-                if node_id not in overlapping_node_ids
+        overlapping_fact_ids = consumed_fact_ids.intersection(source_fact_ids)
+        if overlapping_fact_ids:
+            source_fact_ids = [
+                fact_id
+                for fact_id in source_fact_ids
+                if fact_id not in overlapping_fact_ids
             ]
-            remaining_node_ids = set(source_node_ids)
-            source_nodes = [
+            remaining_fact_ids = set(source_fact_ids)
+            source_facts = [
                 fact
-                for fact in source_nodes
-                if self._node_id(fact) in remaining_node_ids
+                for fact in source_facts
+                if self._fact_id(fact) in remaining_fact_ids
             ]
 
         entity_id = int(cluster["entity_id"])
@@ -6478,14 +6478,14 @@ class MemoryNodeManager:
             canonical_topic_embedding=cluster.get(
                 "canonical_topic_embedding"
             ),
-            source_node_ids=source_node_ids,
+            source_fact_ids=source_fact_ids,
             bundle_type="entity_topic",
             metadata=bundle_metadata,
             source_role="initial",
         )
         if changed_evidence_bundle_ids is not None:
             changed_evidence_bundle_ids.append(int(evidence_bundle_id))
-        consumed_node_ids.update(source_node_ids)
+        consumed_fact_ids.update(source_fact_ids)
         self._log_info(
             "memory_reflect",
             "fact_cluster_evidence_bundle_generated",
@@ -6499,8 +6499,8 @@ class MemoryNodeManager:
                     "topic_match_reasons",
                     [],
                 ),
-                "source_node_ids": source_node_ids,
-                "source_facts": self._reflect_fact_log_items(source_nodes),
+                "source_fact_ids": source_fact_ids,
+                "source_facts": self._reflect_fact_log_items(source_facts),
                 "generated_evidence_bundle": {
                     "bundle_type": "entity_topic",
                     "metadata": bundle_metadata,
@@ -6542,11 +6542,11 @@ class MemoryNodeManager:
         consolidated = 0
         entity_topic_updates = 0
         fact_cluster_evidence_bundle_matches = 0
-        fact_cluster_evidence_bundle_node_ids: set[int] = set()
+        fact_cluster_evidence_bundle_fact_ids: set[int] = set()
         fact_clusters_consolidated = 0
-        fact_cluster_node_ids: set[int] = set()
-        consumed_node_ids: set[int] = set()
-        entity_topic_node_ids: set[int] = set()
+        fact_cluster_fact_ids: set[int] = set()
+        consumed_fact_ids: set[int] = set()
+        entity_topic_fact_ids: set[int] = set()
         changed_ids = (
             changed_evidence_bundle_ids
             if changed_evidence_bundle_ids is not None
@@ -6554,7 +6554,7 @@ class MemoryNodeManager:
         )
         clusters = self._cluster_unprocessed_facts(
             unprocessed_fact_candidates,
-            excluded_node_ids=consumed_node_ids,
+            excluded_fact_ids=consumed_fact_ids,
         )
         self._log_info(
             "memory_reflect",
@@ -6567,17 +6567,17 @@ class MemoryNodeManager:
                         "entity_name": cluster.get("entity_name"),
                         "topic_key": cluster.get("topic_key"),
                         "can_create_evidence_bundle": cluster.get("can_create_evidence_bundle"),
-                        "source_node_ids": cluster.get("source_node_ids", []),
+                        "source_fact_ids": cluster.get("source_fact_ids", []),
                     }
                     for cluster in clusters
                 ],
             })
         for cluster in clusters:
-            before_cluster_consumed_node_ids = set(consumed_node_ids)
+            before_cluster_consumed_fact_ids = set(consumed_fact_ids)
             try:
                 matched_bundle_id = self._update_existing_evidence_bundle_from_fact_cluster(
                     cluster,
-                    consumed_node_ids=consumed_node_ids,
+                    consumed_fact_ids=consumed_fact_ids,
                     changed_evidence_bundle_ids=changed_ids,
                 )
             except Exception as exc:
@@ -6590,16 +6590,16 @@ class MemoryNodeManager:
                 matched_bundle_id = None
             if matched_bundle_id is not None:
                 consolidated += 1
-                current_consumed_node_ids = consumed_node_ids - before_cluster_consumed_node_ids
+                current_consumed_fact_ids = consumed_fact_ids - before_cluster_consumed_fact_ids
                 fact_cluster_evidence_bundle_matches += 1
-                fact_cluster_evidence_bundle_node_ids.update(current_consumed_node_ids)
-                entity_topic_node_ids.update(current_consumed_node_ids)
+                fact_cluster_evidence_bundle_fact_ids.update(current_consumed_fact_ids)
+                entity_topic_fact_ids.update(current_consumed_fact_ids)
                 continue
 
             try:
                 evidence_bundle_id = self._generate_evidence_bundle_using_unmatched_fact_clusters(
                     cluster,
-                    consumed_node_ids=consumed_node_ids,
+                    consumed_fact_ids=consumed_fact_ids,
                     changed_evidence_bundle_ids=changed_ids,
                 )
             except Exception as exc:
@@ -6615,59 +6615,59 @@ class MemoryNodeManager:
             consolidated += 1
             fact_clusters_consolidated += 1
 
-            current_consumed_node_ids = consumed_node_ids - before_cluster_consumed_node_ids
-            fact_cluster_node_ids.update(current_consumed_node_ids)
-            entity_topic_node_ids.update(current_consumed_node_ids)
+            current_consumed_fact_ids = consumed_fact_ids - before_cluster_consumed_fact_ids
+            fact_cluster_fact_ids.update(current_consumed_fact_ids)
+            entity_topic_fact_ids.update(current_consumed_fact_ids)
                 
         return {
             "candidate_count": len(unprocessed_fact_candidates),
             "consolidated": consolidated,
             "entity_topic_updates": entity_topic_updates,
-            "entity_topic_node_count": len(entity_topic_node_ids),
+            "entity_topic_node_count": len(entity_topic_fact_ids),
             "fact_cluster_evidence_bundle_matches": fact_cluster_evidence_bundle_matches,
             "fact_cluster_evidence_bundle_node_count": len(
-                fact_cluster_evidence_bundle_node_ids
+                fact_cluster_evidence_bundle_fact_ids
             ),
             "fact_evidence_bundle_matches": fact_cluster_evidence_bundle_matches,
             "fact_evidence_bundle_node_count": len(
-                fact_cluster_evidence_bundle_node_ids
+                fact_cluster_evidence_bundle_fact_ids
             ),
             "fact_clusters_considered": len(clusters),
             "fact_clusters_consolidated": fact_clusters_consolidated,
-            "fact_cluster_node_count": len(fact_cluster_node_ids),
+            "fact_cluster_node_count": len(fact_cluster_fact_ids),
             "changed_evidence_bundle_ids": list(dict.fromkeys(changed_ids)),
             "touched_entity_ids": touched_entity_ids,
         }
 
     def _link_fact_relations(
         self,
-        node_ids: List[int],
+        fact_ids: List[int],
         relations: List[Dict[str, Any]],
     ) -> None:
         for relation in relations:
             try:
-                source_id = node_ids[int(relation["source_index"])]
-                target_id = node_ids[int(relation["target_index"])]
+                source_id = fact_ids[int(relation["source_index"])]
+                target_id = fact_ids[int(relation["target_index"])]
                 relation_type = str(relation["relation"])
                 confidence = float(relation.get("confidence", 1.0) or 1.0)
-                self._db.memory_add_node_relation(
-                    source_node_id=source_id,
-                    target_node_id=target_id,
+                self._db.memory_add_fact_relation(
+                    source_fact_id=source_id,
+                    target_fact_id=target_id,
                     relation_type=relation_type,
                     confidence=confidence,
                 )
             except Exception as exc:
                 logger.debug("Failed to link retain relation %s: %s", relation, exc)
 
-    def _link_temporal_relations(self, node_id: int) -> int:
-        """Link the new node to all prior nodes from the same calendar day."""
-        prior_ids = self._db.memory_prior_node_ids(node_id, same_day=True)
+    def _link_temporal_relations(self, fact_id: int) -> int:
+        """Link the new fact node to all prior nodes from the same calendar day."""
+        prior_ids = self._db.memory_prior_fact_ids(fact_id, same_day=True)
         linked = 0
         for prior_id in prior_ids:
             try:
-                self._db.memory_add_node_relation(
-                    source_node_id=node_id,
-                    target_node_id=prior_id,
+                self._db.memory_add_fact_relation(
+                    source_fact_id=fact_id,
+                    target_fact_id=prior_id,
                     relation_type=TEMPORAL_RELATION_TYPE,
                     confidence=1.0,
                 )
@@ -6675,27 +6675,27 @@ class MemoryNodeManager:
             except Exception as exc:
                 logger.debug(
                     "Failed to link temporal relation %d -> %d: %s",
-                    node_id, prior_id, exc,
+                    fact_id, prior_id, exc,
                 )
         return linked
 
-    def _link_semantic_relations(self, node_id: int, embedding: np.ndarray) -> int:
+    def _link_semantic_relations(self, fact_id: int, embedding: np.ndarray) -> int:
         """Link the new node to all prior nodes above semantic similarity threshold."""
-        prior_ids = set(self._db.memory_prior_node_ids(node_id))
+        prior_ids = set(self._db.memory_prior_fact_ids(fact_id))
         if not prior_ids:
             return 0
         neighbors = self._db.memory_semantic_neighbors(
             embedding,
-            exclude_node_id=node_id,
+            exclude_fact_id=fact_id,
             allowed_ids=prior_ids,
             threshold=SEMANTIC_RELATION_THRESHOLD,
         )
         linked = 0
         for prior_id, similarity in neighbors.items():
             try:
-                self._db.memory_add_node_relation(
-                    source_node_id=node_id,
-                    target_node_id=prior_id,
+                self._db.memory_add_fact_relation(
+                    source_fact_id=fact_id,
+                    target_fact_id=prior_id,
                     relation_type=SEMANTIC_RELATION_TYPE,
                     confidence=float(similarity),
                 )
@@ -6703,13 +6703,13 @@ class MemoryNodeManager:
             except Exception as exc:
                 logger.debug(
                     "Failed to link semantic relation %d -> %d: %s",
-                    node_id, prior_id, exc,
+                    fact_id, prior_id, exc,
                 )
         return linked
 
     def _link_causal_relations(
         self,
-        node_id: int,
+        fact_id: int,
         summary: str,
         embedding: np.ndarray,
         keywords: Optional[List[str]] = None,
@@ -6724,22 +6724,22 @@ class MemoryNodeManager:
 
     def _build_relation_graph(
         self,
-        node_id: int,
+        fact_id: int,
         summary: str,
         embedding: np.ndarray,
         keywords: Optional[List[str]] = None,
     ) -> None:
-        temporal_count = self._link_temporal_relations(node_id)
-        semantic_count = self._link_semantic_relations(node_id, embedding)
+        temporal_count = self._link_temporal_relations(fact_id)
+        semantic_count = self._link_semantic_relations(fact_id, embedding)
         causal_count = self._link_causal_relations(
-            node_id=node_id,
+            fact_id=fact_id,
             summary=summary,
             embedding=embedding,
             keywords=keywords,
         )
         logger.debug(
             "Graph linked node %d temporal=%d semantic=%d causal=%d",
-            node_id, temporal_count, semantic_count, causal_count,
+            fact_id, temporal_count, semantic_count, causal_count,
         )
 
     def _store_worker_loop(self) -> None:
@@ -7219,7 +7219,7 @@ class MemoryNodeManager:
         worker.join(timeout=None if timeout is None else max(0.0, timeout))
         return not worker.is_alive() and not self._store_queue.unfinished_tasks
 
-    # ── Store turn as memory node ─────────────────────────────────────────
+    # ── Store turn as memory fact node ─────────────────────────────────────────
 
     @staticmethod
     def _cal_store_turns_character_count(source_turns: List[Dict[str, Any]]) -> int:
@@ -7297,12 +7297,12 @@ class MemoryNodeManager:
                 turn_timestamp=batch_timestamp,
             )
             if not retain_data:
-                logger.debug("Skipping memory node — retain extraction returned no data")
+                logger.debug("Skipping memory fact node — retain extraction returned no data")
                 return False
             self._pending_store_turns.clear()
             facts = retain_data.get("facts", [])
             stored_nodes: List[Tuple[int, str, np.ndarray, List[str]]] = []
-            node_ids: List[int] = []
+            fact_ids: List[int] = []
 
             for idx, fact in enumerate(facts):
                 summary = str(fact.get("text", "")).strip()
@@ -7368,8 +7368,8 @@ class MemoryNodeManager:
                     logger.info("Skipping memory fact — embedding generation failed")
                     continue
                 
-                # ── Step 3: Store the new node (SYNC) ──
-                node_id = self._db.memory_add_node(
+                # ── Step 3: Store the new fact node (SYNC) ──
+                fact_id = self._db.memory_add_fact(
                     time_key=self._memory_time_key(
                         idx,
                         turn_timestamp=batch_timestamp,
@@ -7401,35 +7401,35 @@ class MemoryNodeManager:
                 )
 
                 fact_entities = fact.get("entities", [])
-                linked_entities = self._link_fact_entities(node_id, fact_entities)
+                linked_entities = self._link_fact_entities(fact_id, fact_entities)
                 if primary_entity_id is not None and all(
                     entity_id != primary_entity_id
                     for entity_id, _entity_name in linked_entities
                 ):
-                    self._db.entity_link_node(node_id, primary_entity_id)
+                    self._db.entity_link_fact(fact_id, primary_entity_id)
                 
-                stored_nodes.append((node_id, summary, embedding, keywords))
-                node_ids.append(node_id)
+                stored_nodes.append((fact_id, summary, embedding, keywords))
+                fact_ids.append(fact_id)
 
             if not stored_nodes:
                 return False
 
             # ── Step 4: Link explicit relations between newly retained facts ──
-            self._link_fact_relations(node_ids, retain_data.get("causal_relations", []))
+            self._link_fact_relations(fact_ids, retain_data.get("causal_relations", []))
 
             # ── Step 5: Build cross-turn relation graph ──
-            for node_id, summary, embedding, keywords in stored_nodes:
+            for fact_id, summary, embedding, keywords in stored_nodes:
                 try:
                     self._build_relation_graph(
-                        node_id=node_id,
+                        fact_id=fact_id,
                         summary=summary,
                         embedding=embedding,
                         keywords=keywords,
                     )
                 except Exception as exc:
                     logger.debug(
-                        "Relation graph construction failed for node %d: %s",
-                        node_id,
+                        "Relation graph construction failed for fact node %d: %s",
+                        fact_id,
                         exc,
                     )
 
@@ -7459,39 +7459,39 @@ class MemoryNodeManager:
         if not topic_key:
             return group
 
-        group_source_nodes = [
-            dict(node)
-            for node in group.get("source_nodes", [])
-            if node.get("id") is not None
+        group_source_facts = [
+            dict(fact)
+            for fact in group.get("source_facts", [])
+            if fact.get("id") is not None
         ]
-        group_source_ids = {int(node["id"]) for node in group_source_nodes}
-        topic_source_nodes = self._db.get_fact_nodes_using_entity_topic(
+        group_source_ids = {int(fact["id"]) for fact in group_source_facts}
+        topic_source_facts = self._db.get_fact_nodes_using_entity_topic(
             entity_id=entity_id,
             topic_key=topic_key,
             limit=12,
         )
-        pending_source_nodes = [
-            dict(node)
-            for node in topic_source_nodes
-            if node.get("id") is not None and int(node["id"]) not in group_source_ids
+        pending_source_facts = [
+            dict(fact)
+            for fact in topic_source_facts
+            if fact.get("id") is not None and int(fact["id"]) not in group_source_ids
         ]
 
-        combined_source_nodes: List[Dict[str, Any]] = []
+        combined_source_facts: List[Dict[str, Any]] = []
         seen_source_ids: set[int] = set()
-        for node in pending_source_nodes + group_source_nodes + topic_source_nodes:
-            if node.get("id") is None:
+        for fact in pending_source_facts + group_source_facts + topic_source_facts:
+            if fact.get("id") is None:
                 continue
-            node_id = int(node["id"])
-            if node_id in seen_source_ids:
+            fact_id = int(fact["id"])
+            if fact_id in seen_source_ids:
                 continue
-            seen_source_ids.add(node_id)
-            combined_source_nodes.append(dict(node))
+            seen_source_ids.add(fact_id)
+            combined_source_facts.append(dict(fact))
 
         augmented = dict(group)
-        augmented["source_nodes"] = combined_source_nodes
-        augmented["pending_source_nodes"] = pending_source_nodes
-        augmented["pending_source_node_ids"] = [
-            int(node["id"]) for node in pending_source_nodes
+        augmented["source_facts"] = combined_source_facts
+        augmented["pending_source_facts"] = pending_source_facts
+        augmented["pending_source_fact_ids"] = [
+            int(fact["id"]) for fact in pending_source_facts
         ]
         return augmented
 
@@ -7502,10 +7502,10 @@ class MemoryNodeManager:
         changed_evidence_bundle_ids: Optional[List[int]] = None,
     ) -> bool:
         evidence_bundles = group.get("evidence_bundles") or []
-        source_nodes = group.get("source_nodes") or []
+        source_facts = group.get("source_facts") or []
         if len(evidence_bundles) < 2:
             return False
-        source_ids = [int(node["id"]) for node in source_nodes]
+        source_ids = [int(fact["id"]) for fact in source_facts]
         if not source_ids:
             return False
         keep_bundle = evidence_bundles[0]
@@ -7530,7 +7530,7 @@ class MemoryNodeManager:
                     self._reflect_evidence_bundle_log_item(evidence_bundle)
                     for evidence_bundle in evidence_bundles
                 ],
-                "supporting_facts": self._reflect_fact_log_items(source_nodes),
+                "supporting_facts": self._reflect_fact_log_items(source_facts),
                 "merged_evidence_bundle": {
                     "bundle_type": bundle_type,
                     "metadata": metadata,
@@ -7540,11 +7540,11 @@ class MemoryNodeManager:
             keep_evidence_bundle_id=int(keep_bundle["id"]),
             remove_evidence_bundle_ids=remove_ids,
             bundle_type=bundle_type,
-            source_node_ids=source_ids,
+            source_fact_ids=source_ids,
             metadata=metadata,
             source_roles={
-                int(node_id): "matched"
-                for node_id in group.get("pending_source_node_ids", [])
+                int(fact_id): "matched"
+                for fact_id in group.get("pending_source_fact_ids", [])
             },
         )
         if changed_evidence_bundle_ids is not None:
@@ -7646,12 +7646,12 @@ class MemoryNodeManager:
                             evidence_bundle.get("id")
                             for evidence_bundle in group.get("evidence_bundles", [])
                         ],
-                        "source_node_ids": [
-                            node.get("id")
-                            for node in group.get("source_nodes", [])
+                        "source_fact_ids": [
+                            fact.get("id")
+                            for fact in group.get("source_facts", [])
                         ],
-                        "pending_source_node_ids": group.get(
-                            "pending_source_node_ids",
+                        "pending_source_fact_ids": group.get(
+                            "pending_source_fact_ids",
                             [],
                         ),
                     }
@@ -7900,9 +7900,9 @@ class MemoryNodeManager:
             ),
             resolution=resolution,
             action_implication=action_implication,
-            evidence_node_ids=interpretation.get("evidence_node_ids", []),
+            evidence_fact_ids=interpretation.get("evidence_fact_ids", []),
             evidence_observation_ids=interpretation.get("evidence_observation_ids", []),
-            counter_evidence_node_ids=interpretation.get("counter_evidence_node_ids", []),
+            counter_evidence_fact_ids=interpretation.get("counter_evidence_fact_ids", []),
             counter_evidence_observation_ids=interpretation.get(
                 "counter_evidence_observation_ids",
                 [],
@@ -8856,9 +8856,9 @@ class MemoryNodeManager:
                     continue
             fact_ids: List[int] = []
             for value in (
-                interpretation.get("evidence_node_ids", []) or []
+                interpretation.get("evidence_fact_ids", []) or []
             ) + (
-                interpretation.get("counter_evidence_node_ids", []) or []
+                interpretation.get("counter_evidence_fact_ids", []) or []
             ):
                 try:
                     fact_ids.append(int(value))
@@ -8885,11 +8885,11 @@ class MemoryNodeManager:
             if observation.get("id") is not None
         }
         candidate_facts_by_id = {
-            int(node["id"]): node
-            for node in self._db.memory_nodes_by_ids(
+            int(fact["id"]): fact
+            for fact in self._db.memory_facts_by_ids(
                 candidate_fact_ids_from_interpretation
             )
-            if node.get("id") is not None
+            if fact.get("id") is not None
         }
         facts_by_observation = self._db.get_observation_supporting_nodes(
             candidate_observation_ids_from_interpretation,
@@ -9184,8 +9184,8 @@ class MemoryNodeManager:
 
             interpretation_nodes = ranked_recall["interpretations"]
             observation_nodes = ranked_recall["observations"]
-            semantic_nodes = ranked_recall["semantic_facts"]
-            episodic_nodes = ranked_recall["episodic_facts"]
+            semantic_fact_nodes = ranked_recall["semantic_facts"]
+            episodic_fact_nodes = ranked_recall["episodic_facts"]
 
             self._log_info("memory_recall", "ranked", {
                 "interpretations": {
@@ -9197,12 +9197,12 @@ class MemoryNodeManager:
                     "ids": self._recall_log_item_ids(observation_nodes),
                 },
                 "semantic_facts": {
-                    "count": len(semantic_nodes),
-                    "ids": self._recall_log_item_ids(semantic_nodes),
+                    "count": len(semantic_fact_nodes),
+                    "ids": self._recall_log_item_ids(semantic_fact_nodes),
                 },
                 "episodic_facts": {
-                    "count": len(episodic_nodes),
-                    "ids": self._recall_log_item_ids(episodic_nodes),
+                    "count": len(episodic_fact_nodes),
+                    "ids": self._recall_log_item_ids(episodic_fact_nodes),
                 },
             })
 
@@ -9221,13 +9221,13 @@ class MemoryNodeManager:
             ) if observation_nodes else {}
 
             fact_ids_from_observation = {
-                node["id"]
-                for nodes in fact_nodes_from_observation.values()
-                for node in nodes
+                fact["id"]
+                for facts in fact_nodes_from_observation.values()
+                for fact in facts
             }
-            fact_ids_from_observation.update(node["id"] for node in fact_nodes_from_interpretation)
-            semantic_nodes = [node for node in semantic_nodes if node.get("id") not in fact_ids_from_observation]
-            episodic_nodes = [node for node in episodic_nodes if node.get("id") not in fact_ids_from_observation]
+            fact_ids_from_observation.update(fact["id"] for fact in fact_nodes_from_interpretation)
+            semantic_fact_nodes = [fact for fact in semantic_fact_nodes if fact.get("id") not in fact_ids_from_observation]
+            episodic_fact_nodes = [fact for fact in episodic_fact_nodes if fact.get("id") not in fact_ids_from_observation]
 
             self._log_info("memory_recall", "evidence_expanded", {
                 "observation_ids_from_interpretations": [
@@ -9245,11 +9245,11 @@ class MemoryNodeManager:
                     "fact_count": sum(len(nodes) for nodes in fact_nodes_from_observation.values()),
                 },
                 "direct_facts_removed_as_support": len(fact_ids_from_observation),
-                "remaining_semantic_facts": len(semantic_nodes),
-                "remaining_episodic_facts": len(episodic_nodes),
+                "remaining_semantic_facts": len(semantic_fact_nodes),
+                "remaining_episodic_facts": len(episodic_fact_nodes),
             })
 
-            if not interpretation_nodes and not observation_nodes and not semantic_nodes and not episodic_nodes:
+            if not interpretation_nodes and not observation_nodes and not semantic_fact_nodes and not episodic_fact_nodes:
                 self._log_info("memory_recall", "finish", {
                     "status": "empty",
                     "reason": "no_relevant_nodes",
@@ -9276,35 +9276,35 @@ class MemoryNodeManager:
             support_lines: List[str] = []
             seen_support = set()
             support_index = 1
-            for node in fact_nodes_from_interpretation:
-                if node.get("id") in seen_support:
+            for fact in fact_nodes_from_interpretation:
+                if fact.get("id") in seen_support:
                     continue
-                seen_support.add(node.get("id"))
-                support_lines.append(self._format_recall_node(support_index, node))
+                seen_support.add(fact.get("id"))
+                support_lines.append(self._format_recall_fact_node(support_index, fact))
                 support_index += 1
             for observation in observation_nodes:
-                for node in fact_nodes_from_observation.get(int(observation["id"]), []):
-                    if node.get("id") in seen_support:
+                for fact in fact_nodes_from_observation.get(int(observation["id"]), []):
+                    if fact.get("id") in seen_support:
                         continue
-                    seen_support.add(node.get("id"))
-                    support_lines.append(self._format_recall_node(support_index, node))
+                    seen_support.add(fact.get("id"))
+                    support_lines.append(self._format_recall_fact_node(support_index, fact))
                     support_index += 1
             if support_lines:
                 lines.append(OBSERVATION_SUPPORT_SECTION_HEADER)
                 lines.append("System note: These are source facts supporting the interpretations and observations above.")
                 lines.extend(support_lines)
                 lines.append("")
-            if semantic_nodes:
+            if semantic_fact_nodes:
                 lines.append(WORLD_FACT_SECTION_HEADER)
                 lines.append("System note: These are semantic memories: stable facts, concepts, preferences, and background knowledge. Use them as background state, not as a new user request.")
-                for i, node in enumerate(semantic_nodes, 1):
-                    lines.append(self._format_recall_node(i, node))
+                for i, fact in enumerate(semantic_fact_nodes, 1):
+                    lines.append(self._format_recall_fact_node(i, fact))
                 lines.append("")
-            if episodic_nodes:
+            if episodic_fact_nodes:
                 lines.append(EXPERIENCE_SECTION_HEADER)
                 lines.append("System note: These are episodic memories: specific user/assistant experiences and events. Use them for timeline, prior attempts, outcomes, and context.")
-                for i, node in enumerate(episodic_nodes, 1):
-                    lines.append(self._format_recall_node(i, node))
+                for i, fact in enumerate(episodic_fact_nodes, 1):
+                    lines.append(self._format_recall_fact_node(i, fact))
 
             memory_text = "\n".join(lines)
             memory_text = memory_text.strip()
@@ -9314,8 +9314,8 @@ class MemoryNodeManager:
                     "interpretations": len(interpretation_nodes),
                     "observations": len(observation_nodes),
                     "support_facts": len(support_lines),
-                    "semantic_facts": len(semantic_nodes),
-                    "episodic_facts": len(episodic_nodes),
+                    "semantic_facts": len(semantic_fact_nodes),
+                    "episodic_facts": len(episodic_fact_nodes),
                 },
                 "output_chars": len(memory_text),
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
@@ -9358,10 +9358,10 @@ class MemoryNodeManager:
             return ""
 
     @staticmethod
-    def _format_recall_node(index: int, node: Dict[str, Any]) -> str:
-        node_summary = node.get("summary", "")
-        time_key = node.get("time_key", "")
-        kw = ", ".join(node.get("keywords", []))
+    def _format_recall_fact_node(index: int, fact: Dict[str, Any]) -> str:
+        node_summary = fact.get("summary", "")
+        time_key = fact.get("time_key", "")
+        kw = ", ".join(fact.get("keywords", []))
         line = f"{index}. [{time_key}] {node_summary}"
         if kw:
             line += f"  (关键词: {kw})"
