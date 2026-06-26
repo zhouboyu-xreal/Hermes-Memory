@@ -2194,8 +2194,6 @@ class MemoryNodeManager:
 
     @staticmethod
     def _build_original_dialog_payload(
-        user_message: str,
-        assistant_response: str,
         fact: Dict[str, Any],
         source_turns: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
@@ -2207,8 +2205,6 @@ class MemoryNodeManager:
         """
         payload = {
             "source_dialog": {
-                "user": user_message,
-                "assistant": assistant_response,
                 "turns": [
                     {
                         "user_message": str(turn.get("user_message") or ""),
@@ -7462,8 +7458,6 @@ class MemoryNodeManager:
                     keywords=keywords,
                     topic=topics,
                     original_dialog=self._build_original_dialog_payload(
-                        user_message=batch_user_message,
-                        assistant_response=batch_assistant_response,
                         fact=fact,
                         source_turns=source_turns,
                     ),
