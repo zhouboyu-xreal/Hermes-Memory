@@ -53,6 +53,7 @@ from agent.temporal_entities import is_temporal_entity
 
 logger = logging.getLogger(__name__)
 MEMORY_REFLECT_META_KEY = "memory_node_last_successful_reflect_at"
+MEMORY_DECAY_META_KEY = "memory_node_last_successful_decay_at"
 
 # ── Default LLM API endpoint ──────────────────────────────────────────────
 
@@ -181,6 +182,8 @@ OBSERVATION_TYPE_GUIDANCE = {
 # DECAY
 MEMORY_SEMANTIC_FACT_HALF_LIFE_DAYS = 365.0
 MEMORY_EPISODIC_FACT_HALF_LIFE_DAYS = 90.0
+MEMORY_OBSERVATION_HALF_LIFE_DAYS = 180.0
+MEMORY_INTERPRETATION_HALF_LIFE_DAYS = 365.0
 
 
 OBSERVATION_CREATE_PROMPT = """你是长期记忆系统的 observation 生成模块。observation 是 evidence_bundle 内由一组相似事实直接支持的、稳定且可独立演化的具体陈述。
@@ -1299,6 +1302,10 @@ class MemoryNodeManager:
             1.0,
             float(memory_cfg.get("reflect_interval_seconds", 3600) or 3600),
         )
+        self._decay_interval_seconds = max(
+            1.0,
+            float(memory_cfg.get("decay_interval_seconds", 86400) or 86400),
+        )
         self._reflect_observation_interpretation_min_embedding_similarity = self._clip_unit_float(
             memory_cfg.get("reflect_observation_interpretation_min_embedding_similarity"),
             0.45,
@@ -1311,12 +1318,19 @@ class MemoryNodeManager:
         self._store_shutdown_event = threading.Event()
         self._llm_thread_context = threading.local()
         self._reflect_queued_or_running = False
+        self._decay_queued_or_running = False
         try:
             self._last_successful_reflect_at = float(
                 self._db.get_meta(MEMORY_REFLECT_META_KEY) or 0.0
             )
         except Exception:
             self._last_successful_reflect_at = 0.0
+        try:
+            self._last_successful_decay_at = float(
+                self._db.get_meta(MEMORY_DECAY_META_KEY) or 0.0
+            )
+        except Exception:
+            self._last_successful_decay_at = 0.0
 
     def configure_llm(
         self,
@@ -6782,6 +6796,25 @@ class MemoryNodeManager:
                                 exc,
                             )
                     logger.debug("MemoryNodeManager reflect report: %s", report)
+                elif task_kind == "decay":
+                    report = self.decay(
+                        decay_timestamp=task.get("decay_timestamp"),
+                    )
+                    if not report.get("error"):
+                        completed_at = time.time()
+                        with self._store_worker_lock:
+                            self._last_successful_decay_at = completed_at
+                        try:
+                            self._db.set_meta(
+                                MEMORY_DECAY_META_KEY,
+                                str(completed_at),
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "Could not persist memory decay timestamp: %s",
+                                exc,
+                            )
+                    logger.debug("MemoryNodeManager decay report: %s", report)
                 elif task_kind == "feedback":
                     count = self.analyze_feedback_for_pending_interpretations(
                         task.get("user_message", ""),
@@ -6809,6 +6842,9 @@ class MemoryNodeManager:
                 if task_kind == "reflect":
                     with self._store_worker_lock:
                         self._reflect_queued_or_running = False
+                if task_kind == "decay":
+                    with self._store_worker_lock:
+                        self._decay_queued_or_running = False
                 self._store_queue.task_done()
 
     def _llm_config_snapshot(
@@ -7195,8 +7231,56 @@ class MemoryNodeManager:
             self._ensure_store_worker_locked()
         return True
 
+    def decay_if_due_async(
+        self,
+        *,
+        decay_timestamp: Optional[Any] = None,
+    ) -> bool:
+        """Queue time-decay maintenance after earlier memory tasks when due."""
+        if not self._enabled or not self._db:
+            return False
+        now = time.time()
+        with self._store_worker_lock:
+            if self._store_shutdown_event.is_set():
+                return False
+            if self._decay_queued_or_running:
+                return False
+            try:
+                persisted_last_decay = float(
+                    self._db.get_meta(MEMORY_DECAY_META_KEY) or 0.0
+                )
+                self._last_successful_decay_at = max(
+                    self._last_successful_decay_at,
+                    persisted_last_decay,
+                )
+            except Exception:
+                pass
+            if (
+                now - self._last_successful_decay_at
+                < self._decay_interval_seconds
+            ):
+                return False
+
+            task = {
+                "kind": "decay",
+                "decay_timestamp": decay_timestamp,
+                "llm_config": self._llm_config_snapshot(),
+            }
+            try:
+                self._store_queue.put_nowait(task)
+            except queue.Full:
+                logger.warning(
+                    "Memory store queue is full; decay was not queued "
+                    "(maxsize=%d)",
+                    self._store_queue_maxsize,
+                )
+                return False
+            self._decay_queued_or_running = True
+            self._ensure_store_worker_locked()
+        return True
+
     def flush_store_queue(self, timeout: Optional[float] = None) -> bool:
-        """Wait until all accepted store and reflect tasks finish."""
+        """Wait until all accepted background memory tasks finish."""
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         while self._store_queue.unfinished_tasks:
             if deadline is not None and time.monotonic() >= deadline:
@@ -7985,7 +8069,7 @@ class MemoryNodeManager:
         return report
 
     @staticmethod
-    def _parse_reflect_timestamp(
+    def _parse_timestamp(
         reflect_timestamp: Optional[Any] = None,
     ) -> datetime:
         if reflect_timestamp is None:
@@ -8014,6 +8098,50 @@ class MemoryNodeManager:
                 reflect_now = datetime.now().astimezone()
         return reflect_now
 
+    def decay(
+        self,
+        *,
+        decay_timestamp: Optional[Any] = None,
+        semantic_fact_half_life_days: Optional[float] = None,
+        episodic_fact_half_life_days: Optional[float] = None,
+        observation_half_life_days: Optional[float] = None,
+        interpretation_half_life_days: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Run memory time-decay maintenance independently from reflection."""
+        if not self._db:
+            return {
+                "error": "memory database unavailable",
+            }
+        decay_timestamp = self._parse_timestamp(decay_timestamp)
+        report = self._db.memory_reflect_node_decay(
+            semantic_fact_half_life_days=(
+                semantic_fact_half_life_days or MEMORY_SEMANTIC_FACT_HALF_LIFE_DAYS
+            ),
+            episodic_fact_half_life_days=(
+                episodic_fact_half_life_days or MEMORY_EPISODIC_FACT_HALF_LIFE_DAYS
+            ),
+            observation_half_life_days=(
+                observation_half_life_days or MEMORY_OBSERVATION_HALF_LIFE_DAYS
+            ),
+            interpretation_half_life_days=(
+                interpretation_half_life_days or MEMORY_INTERPRETATION_HALF_LIFE_DAYS
+            ),
+            decay_timestamp=decay_timestamp,
+        )
+        self._log_info(
+            "memory_decay",
+            "finish",
+            {
+                "evaluated": report.get("evaluated", 0),
+                "updated": report.get("updated", 0),
+                "facts": len(report.get("facts", [])),
+                "observations": len(report.get("observations", [])),
+                "interpretations": len(report.get("interpretations", [])),
+                "evaluated_at": report.get("evaluated_at"),
+            },
+        )
+        return report
+
     def reflect(
         self,
         *,
@@ -8025,11 +8153,11 @@ class MemoryNodeManager:
         """Run memory reflection maintenance.
 
         It selects unprocessed facts, merges newly introduced entities, updates
-        or creates observations, generates interpretations, and then applies
-        decay maintenance. ``run_agent.py`` schedules this method through the
+        or creates observations, and generates interpretations.
+        ``run_agent.py`` schedules this method through the
         ordered background queue when the configured time interval is due.
         ``reflect_timestamp`` selects the local calendar day to process and is
-        also used as the maintenance timestamp; it defaults to the current time.
+        defaults to the current time.
         """
         if not self._db:
             return {
@@ -8039,7 +8167,7 @@ class MemoryNodeManager:
                 "evidence_bundles_consolidated": 0,
                 "error": "memory database unavailable",
             }
-        reflect_now = self._parse_reflect_timestamp(reflect_timestamp)
+        reflect_now = self._parse_timestamp(reflect_timestamp)
         reflect_date_key = reflect_now.date().isoformat()
         self._log_info(
             "memory_reflect",
@@ -8088,13 +8216,6 @@ class MemoryNodeManager:
             report["changed_evidence_bundle_ids"]
         )
         
-        # time decay
-        node_decay_report = self._db.memory_reflect_node_decay(
-            fact_half_life_days=MEMORY_SEMANTIC_FACT_HALF_LIFE_DAYS,
-            experience_half_life_days=MEMORY_EPISODIC_FACT_HALF_LIFE_DAYS,
-            now=reflect_now,
-        )
-        report["node_decay"] = node_decay_report
         self._log_info(
             "memory_reflect",
             "finish", 
@@ -8450,9 +8571,11 @@ class MemoryNodeManager:
         rank_score = 1.0 / max(1, rank)
         embedding_score = max(0.0, float(item.get("embedding_similarity") or 0.0))
         if layer in {"interpretation", "observation"}:
-            reliability = max(0.0, min(1.0, float(item.get("confidence") or 0.0)))
+            confidence = cls._clip_unit_float(item.get("confidence"), 0.0)
+            decay_score = cls._clip_unit_float(item.get("decay_score"), 1.0)
+            reliability = (confidence * 0.75) + (decay_score * 0.25)
         else:
-            reliability = max(0.0, min(1.0, float(item.get("decay_score") or 1.0)))
+            reliability = cls._clip_unit_float(item.get("decay_score"), 1.0)
         score = (
             keyword_score
             + (rank_score * 0.9)
@@ -8562,11 +8685,14 @@ class MemoryNodeManager:
                 matched_terms = ["_"]
             keyword_score = (len(matched_terms) * 1.2) + (len(matched_entity_name_terms) * 0.6)
             embedding_score = max(0.0, float(embedding_similarity or 0.0))
+            confidence_score = cls._clip_unit_float(item.get("confidence"), 0.0)
+            decay_score = cls._clip_unit_float(item.get("decay_score"), 1.0)
             score = (
                 keyword_score
                 + (entity_matches * 1.5)
                 + (embedding_score * 1.4)
-                + float(item.get("confidence") or 0.0)
+                + confidence_score
+                + (decay_score * 0.4)
                 + (0.5 if item.get("status") == "current" else 0.0)
             )
             if embedding_similarity is not None:
@@ -8647,7 +8773,8 @@ class MemoryNodeManager:
                 len(matched_terms)
                 + (entity_matches * 1.5)
                 + (max(0.0, float(embedding_similarity or 0.0)) * 1.4)
-                + float(item.get("confidence") or 0.0)
+                + cls._clip_unit_float(item.get("confidence"), 0.0)
+                + (cls._clip_unit_float(item.get("decay_score"), 1.0) * 0.4)
             )
             if embedding_similarity is not None:
                 item["embedding_similarity"] = round(float(embedding_similarity), 4)
@@ -8732,7 +8859,11 @@ class MemoryNodeManager:
         for items in selected.values():
             items.sort(key=lambda item: int(item.get("_recall_rank") or 0))
         return selected
-    
+
+    @classmethod
+    def _rank_recall_candidates(cls, **kwargs: Any) -> Dict[str, List[Dict[str, Any]]]:
+        return cls._rank_recall_raw_candidates(**kwargs)
+
     def _retrieve_recall_raw_candidates(
         self,
         *,
@@ -8891,7 +9022,7 @@ class MemoryNodeManager:
             )
             if fact.get("id") is not None
         }
-        facts_by_observation = self._db.get_observation_supporting_nodes(
+        facts_by_observation = self._db.get_observation_supporting_facts(
             candidate_observation_ids_from_interpretation,
             per_observation=3,
         ) if candidate_observation_ids_from_interpretation else {}
@@ -9215,7 +9346,7 @@ class MemoryNodeManager:
                 observation_nodes,
                 observation_nodes_from_interpretation,
             )
-            fact_nodes_from_observation = self._db.get_observation_supporting_nodes(
+            fact_nodes_from_observation = self._db.get_observation_supporting_facts(
                 [int(obs["id"]) for obs in observation_nodes],
                 per_observation=2,
             ) if observation_nodes else {}

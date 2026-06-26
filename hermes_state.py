@@ -364,7 +364,10 @@ CREATE TABLE IF NOT EXISTS memory_observations (
     metadata TEXT DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    last_supported_at TEXT
+    last_supported_at TEXT,
+    decay_score REAL DEFAULT 1.0,
+    decay_updated_at TEXT,
+    decay_half_life_days REAL
 );
 
 CREATE TABLE IF NOT EXISTS memory_observation_sources (
@@ -422,7 +425,10 @@ CREATE TABLE IF NOT EXISTS memory_interpretations (
     metadata TEXT DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    last_supported_at TEXT
+    last_supported_at TEXT,
+    decay_score REAL DEFAULT 1.0,
+    decay_updated_at TEXT,
+    decay_half_life_days REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_interpretations_status
@@ -929,6 +935,18 @@ class SessionDB:
         cursor.executescript(MEMORY_INTERPRETATIONS_SQL)
         cursor.executescript(MEMORY_INTERPRETATION_FEEDBACK_SQL)
         cursor.executescript(MEMORY_OBSERVATIONS_SQL)
+        for table_name in ("memory_observations", "memory_interpretations"):
+            for col_name, col_type in {
+                "decay_score": "REAL DEFAULT 1.0",
+                "decay_updated_at": "TEXT",
+                "decay_half_life_days": "REAL",
+            }.items():
+                try:
+                    cursor.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
+                    )
+                except sqlite3.OperationalError:
+                    pass
         for col_name in ("entity_name", "topic_key"):
             try:
                 cursor.execute(
@@ -6320,19 +6338,29 @@ class SessionDB:
     def memory_reflect_node_decay(
         self,
         *,
-        fact_half_life_days: Optional[float] = None,
-        experience_half_life_days: Optional[float] = None,
-        now: Optional[datetime] = None,
+        semantic_fact_half_life_days: Optional[float] = None,
+        episodic_fact_half_life_days: Optional[float] = None,
+        observation_half_life_days: Optional[float] = None,
+        interpretation_half_life_days: Optional[float] = None,
+        decay_timestamp: Optional[datetime] = None,
     ) -> Dict[str, Any]:
-        """Recompute persisted recency decay scores for all memory nodes."""
-        fact_half_life = float(
-            fact_half_life_days or self._MEMORY_OBSERVATION_FACT_HALF_LIFE_DAYS
+        """Recompute persisted recency decay scores for all memory layers."""
+        semantic_fact_half_life_days = float(
+            semantic_fact_half_life_days
+            or self._MEMORY_OBSERVATION_FACT_HALF_LIFE_DAYS
         )
-        experience_half_life = float(
-            experience_half_life_days or self._MEMORY_OBSERVATION_EXPERIENCE_HALF_LIFE_DAYS
+        episodic_fact_half_life_days = float(
+            episodic_fact_half_life_days
+            or self._MEMORY_OBSERVATION_EXPERIENCE_HALF_LIFE_DAYS
         )
-        now_dt = now or datetime.now().astimezone()
-        evaluated_at = now_dt.isoformat()
+        observation_half_life_days = float(
+            observation_half_life_days or semantic_fact_half_life_days
+        )
+        interpretation_half_life_days = float(
+            interpretation_half_life_days or observation_half_life_days
+        )
+        decay_timestamp = decay_timestamp or datetime.now().astimezone()
+        evaluated_at = decay_timestamp.isoformat()
         rows = self._conn.execute(
             "SELECT id, time_key, fact_type FROM memory_facts "
             "WHERE fact_type IN ('semantic', 'episodic') "
@@ -6342,10 +6370,10 @@ class SessionDB:
         facts: List[Dict[str, Any]] = []
         for row in rows:
             fact_type = self._normalize_memory_fact_type(row["fact_type"])
-            half_life = experience_half_life if fact_type == "episodic" else fact_half_life
+            half_life = episodic_fact_half_life_days if fact_type == "episodic" else semantic_fact_half_life_days
             score = self._memory_decay_score(
                 self._parse_memory_time_key(row["time_key"]),
-                now=now_dt,
+                now=decay_timestamp,
                 half_life_days=half_life,
             )
             facts.append({
@@ -6355,7 +6383,55 @@ class SessionDB:
                 "half_life_days": half_life,
             })
 
-        if facts:
+        observation_rows = self._conn.execute(
+            "SELECT id, last_supported_at, updated_at, created_at "
+            "FROM memory_observations "
+            "WHERE status = 'active' "
+            "ORDER BY COALESCE(last_supported_at, updated_at, created_at) DESC, id DESC"
+        ).fetchall()
+        observations: List[Dict[str, Any]] = []
+        for row in observation_rows:
+            anchor_time = (
+                row["last_supported_at"]
+                or row["updated_at"]
+                or row["created_at"]
+            )
+            score = self._memory_decay_score(
+                self._parse_memory_time_key(anchor_time),
+                now=decay_timestamp,
+                half_life_days=observation_half_life_days,
+            )
+            observations.append({
+                "id": int(row["id"]),
+                "score": score,
+                "half_life_days": observation_half_life_days,
+            })
+
+        interpretation_rows = self._conn.execute(
+            "SELECT id, last_supported_at, updated_at, created_at "
+            "FROM memory_interpretations "
+            "WHERE status IN ('current', 'conflicted') "
+            "ORDER BY COALESCE(last_supported_at, updated_at, created_at) DESC, id DESC"
+        ).fetchall()
+        interpretations: List[Dict[str, Any]] = []
+        for row in interpretation_rows:
+            anchor_time = (
+                row["last_supported_at"]
+                or row["updated_at"]
+                or row["created_at"]
+            )
+            score = self._memory_decay_score(
+                self._parse_memory_time_key(anchor_time),
+                now=decay_timestamp,
+                half_life_days=interpretation_half_life_days,
+            )
+            interpretations.append({
+                "id": int(row["id"]),
+                "score": score,
+                "half_life_days": interpretation_half_life_days,
+            })
+
+        if facts or observations or interpretations:
             def _do(conn):
                 for item in facts:
                     conn.execute(
@@ -6368,18 +6444,44 @@ class SessionDB:
                             item["id"],
                         ),
                     )
+                for item in observations:
+                    conn.execute(
+                        "UPDATE memory_observations SET decay_score = ?, decay_updated_at = ?, "
+                        "decay_half_life_days = ? WHERE id = ?",
+                        (
+                            item["score"],
+                            evaluated_at,
+                            item["half_life_days"],
+                            item["id"],
+                        ),
+                    )
+                for item in interpretations:
+                    conn.execute(
+                        "UPDATE memory_interpretations SET decay_score = ?, decay_updated_at = ?, "
+                        "decay_half_life_days = ? WHERE id = ?",
+                        (
+                            item["score"],
+                            evaluated_at,
+                            item["half_life_days"],
+                            item["id"],
+                        ),
+                    )
 
             self._execute_write(_do)
 
         return {
-            "evaluated": len(facts),
-            "updated": len(facts),
-            "fact_half_life_days": fact_half_life,
-            "experience_half_life_days": experience_half_life,
+            "evaluated": len(facts) + len(observations) + len(interpretations),
+            "updated": len(facts) + len(observations) + len(interpretations),
+            "semantic_fact_half_life_days": semantic_fact_half_life_days,
+            "episodic_fact_half_life_days": episodic_fact_half_life_days,
+            "observation_half_life_days": observation_half_life_days,
+            "interpretation_half_life_days": interpretation_half_life_days,
             "evaluated_at": evaluated_at,
             "facts": facts,
+            "observations": observations,
+            "interpretations": interpretations,
         }
-    
+
     def memory_replace_evidence_bundle_group(
         self,
         *,

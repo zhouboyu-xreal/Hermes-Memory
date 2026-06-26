@@ -750,6 +750,78 @@ def test_memory_manager_filters_low_observation_embedding_similarity(db):
     assert "memory interpretation" in results[0]["summary"]
 
 
+def test_interpretation_search_ranking_uses_decay_score():
+    fresh = {
+        "id": 1,
+        "claim": "Alice prefers careful feedback calibration.",
+        "target_text": "feedback calibration",
+        "scope": "memory",
+        "interpretation_type": "inferred_preference",
+        "confidence": 0.7,
+        "decay_score": 1.0,
+        "status": "current",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+    stale = {
+        "id": 2,
+        "claim": "Alice prefers careful feedback calibration.",
+        "target_text": "feedback calibration",
+        "scope": "memory",
+        "interpretation_type": "inferred_preference",
+        "confidence": 0.7,
+        "decay_score": 0.0,
+        "status": "current",
+        "updated_at": "2026-06-01T00:00:00+00:00",
+    }
+
+    results = MemoryNodeManager._rank_interpretation_search_candidates(
+        [stale, fresh],
+        keyword=["feedback", "calibration"],
+        entities=[],
+        top_k=2,
+        query_embedding=None,
+        min_embedding_similarity=None,
+    )
+
+    assert [item["id"] for item in results] == [1, 2]
+
+
+def test_observation_search_ranking_uses_decay_score():
+    fresh = {
+        "id": 1,
+        "summary": "Alice prefers careful feedback calibration.",
+        "observation_type": "preference_signal",
+        "topic_label": "feedback calibration",
+        "entity_name": "Alice",
+        "confidence": 0.7,
+        "decay_score": 1.0,
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "metadata": {},
+    }
+    stale = {
+        "id": 2,
+        "summary": "Alice prefers careful feedback calibration.",
+        "observation_type": "preference_signal",
+        "topic_label": "feedback calibration",
+        "entity_name": "Alice",
+        "confidence": 0.7,
+        "decay_score": 0.0,
+        "updated_at": "2026-06-01T00:00:00+00:00",
+        "metadata": {},
+    }
+
+    results = MemoryNodeManager._rank_observation_search_candidates(
+        [stale, fresh],
+        keyword=["feedback", "calibration"],
+        entities=[],
+        top_k=2,
+        query_embedding=None,
+        min_embedding_similarity=None,
+    )
+
+    assert [item["id"] for item in results] == [1, 2]
+
+
 def test_search_memory_interpretations_separates_content_and_entity_matches(db):
     alice = db.entity_add_entity("Alice", "PERSON")
     content_match = db.memory_upsert_interpretation(
@@ -1401,6 +1473,62 @@ def test_reflect_if_due_async_runs_after_queued_store(db):
     assert float(db.get_meta("memory_node_last_successful_reflect_at")) > 0
 
 
+def test_decay_async_runs_after_queued_store(db):
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+    events = []
+    decay_calls = []
+    release_store = threading.Event()
+    store_started = threading.Event()
+    decay_timestamp = datetime(
+        2026,
+        6,
+        12,
+        9,
+        30,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+
+    def fake_store_turn(*_args, **_kwargs):
+        events.append("store-start")
+        store_started.set()
+        release_store.wait(timeout=2.0)
+        events.append("store-finish")
+        return True
+
+    def fake_decay(*_args, **kwargs):
+        events.append("decay")
+        decay_calls.append(kwargs)
+        return {"updated": 0}
+
+    mgr.store_turn = fake_store_turn
+    mgr.decay = fake_decay
+
+    assert mgr.store_turn_async("第一轮", "回答一") is True
+    assert store_started.wait(timeout=1.0)
+    assert mgr.decay_if_due_async(decay_timestamp=decay_timestamp) is True
+    release_store.set()
+    assert mgr.flush_store_queue(timeout=2.0) is True
+
+    assert events == ["store-start", "store-finish", "decay"]
+    assert decay_calls == [{"decay_timestamp": decay_timestamp}]
+
+
+def test_decay_async_waits_for_interval(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"decay_interval_seconds": 86400},
+    )
+    mgr._last_successful_decay_at = time.time()
+
+    assert mgr.decay_async() is False
+    assert mgr._store_queue.unfinished_tasks == 0
+
+    mgr._last_successful_decay_at = time.time() - 86401
+    assert mgr.decay_async() is True
+    assert mgr.flush_store_queue(timeout=2.0) is True
+
+
 def test_reflect_if_due_async_skips_full_reflect_without_new_facts(db):
     mgr = _NoAsyncMemoryNodeManager(
         db,
@@ -1522,7 +1650,7 @@ def _add_memory_node(
     task_event_subject="",
     task_relevance="",
 ):
-    return db.memory_add_node(
+    return db.memory_add_fact(
         time_key=time_key,
         summary=summary,
         keywords=keywords,
@@ -2826,7 +2954,7 @@ def test_memory_node_manager_reflect_uses_requested_timestamp_for_fact_day(db):
     report = mgr.reflect(limit=5, reflect_timestamp=requested_at)
 
     assert requested_date_keys == ["2031-04-05", "2031-04-05"]
-    assert report["node_decay"]["evaluated_at"] == requested_at.isoformat()
+    assert "node_decay" not in report
     assert report["evidence_bundle_reflect"]["candidate_count"] == 0
 
 
@@ -3052,12 +3180,77 @@ def test_reflect_node_decay_uses_fact_type_half_lives_without_mutating_bundles(d
     node_scores = {
         row["id"]: row["decay_score"]
         for row in db._conn.execute(
-            "SELECT id, decay_score FROM memory_nodes WHERE id IN (?, ?)",
+            "SELECT id, decay_score FROM memory_facts WHERE id IN (?, ?)",
             (world_node, experience_node),
         ).fetchall()
     }
     assert node_report["updated"] == 2
     assert node_scores[world_node] > node_scores[experience_node]
+
+
+def test_decay_updates_observation_and_interpretation_scores(db):
+    alice = db.entity_add_entity("Alice", "PERSON")
+    source_id = _add_memory_node(
+        db,
+        time_key="2026-01-01 10:00:00",
+        summary="Alice prefers feedback calibration.",
+        keywords=["Alice", "feedback"],
+    )
+    bundle_id = db.memory_upsert_evidence_bundle(
+        entity_id=alice,
+        topic_key="feedback-calibration",
+        topic_label="feedback calibration",
+        bundle_type="entity_topic",
+        source_fact_ids=[source_id],
+    )
+    observation_id = db.memory_create_observation(
+        bundle_id,
+        {
+            "observation_type": "preference_signal",
+            "summary": "Alice prefers feedback calibration.",
+            "source_fact_ids": [source_id],
+            "confidence": 0.8,
+        },
+    )
+    interpretation_id = db.memory_upsert_interpretation(
+        entity_id=alice,
+        claim="Alice benefits from feedback-aware calibration.",
+        target_text="feedback calibration",
+        scope="memory",
+        interpretation_type="inferred_preference",
+        confidence=0.8,
+        evidence_observation_ids=[observation_id],
+        evidence_fact_ids=[source_id],
+    )
+    old_anchor = "2026-01-01T00:00:00+00:00"
+    db._conn.execute(
+        "UPDATE memory_observations SET last_supported_at = ?, updated_at = ? WHERE id = ?",
+        (old_anchor, old_anchor, observation_id),
+    )
+    db._conn.execute(
+        "UPDATE memory_interpretations SET last_supported_at = ?, updated_at = ? WHERE id = ?",
+        (old_anchor, old_anchor, interpretation_id),
+    )
+    db._conn.commit()
+
+    report = db.memory_reflect_node_decay(
+        fact_half_life_days=365,
+        experience_half_life_days=90,
+        observation_half_life_days=30,
+        interpretation_half_life_days=60,
+        now=datetime(2026, 4, 1, 0, 0, 0, tzinfo=timezone.utc),
+    )
+    row = db._conn.execute(
+        "SELECT obs.decay_score AS observation_decay, "
+        "interp.decay_score AS interpretation_decay "
+        "FROM memory_observations obs, memory_interpretations interp "
+        "WHERE obs.id = ? AND interp.id = ?",
+        (observation_id, interpretation_id),
+    ).fetchone()
+
+    assert report["observations"][0]["id"] == observation_id
+    assert report["interpretations"][0]["id"] == interpretation_id
+    assert 0.0 < row["observation_decay"] < row["interpretation_decay"] < 1.0
 
 
 def test_task_inactivity_policy_pauses_and_stales_idle_tasks(db):
@@ -3353,13 +3546,13 @@ def test_recall_expands_interpretation_to_evidence_observations(db, monkeypatch)
         keywords=["architecture", "discussion"],
         fact_type="episodic",
     )
-    db.entity_link_node(source_id, alice)
+    db.entity_link_fact(source_id, alice)
     evidence_bundle_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="architecture-first",
         topic_label="Architecture-first workflow",
         bundle_type="entity_topic",
-        source_node_ids=[source_id],
+        source_fact_ids=[source_id],
     )
     observation_id = db.memory_create_observation(
         evidence_bundle_id,
@@ -3369,7 +3562,7 @@ def test_recall_expands_interpretation_to_evidence_observations(db, monkeypatch)
                 "Alice's workflow favors design discussion before implementation."
             ),
             "confidence": 0.8,
-            "source_node_ids": [source_id],
+            "source_fact_ids": [source_id],
         },
     )
     assert observation_id is not None
@@ -3412,7 +3605,7 @@ def test_recall_formats_interpretation_direct_evidence_once(db, monkeypatch):
         scope="memory-recall",
         interpretation_type="insight",
         confidence=0.82,
-        evidence_node_ids=[evidence_id],
+        evidence_fact_ids=[evidence_id],
         embedding=np.ones((1, 1536), dtype=np.float32),
         embedding_text="recall router evidence",
     )

@@ -2215,6 +2215,7 @@ class TestRunConversation:
         memory_node_manager.recall.return_value = ""
         memory_node_manager.store_turn_async.return_value = True
         memory_node_manager.reflect_if_due_async.return_value = False
+        memory_node_manager.decay_async.return_value = True
         agent._memory_node_manager = memory_node_manager
 
         with (
@@ -2229,14 +2230,17 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert memory_node_manager.store_turn_async.call_count == 5
         assert memory_node_manager.reflect_if_due_async.call_count == 5
-        for store_call, reflect_call in zip(
+        assert memory_node_manager.decay_async.call_count == 5
+        for store_call, reflect_call, decay_call in zip(
             memory_node_manager.store_turn_async.call_args_list,
             memory_node_manager.reflect_if_due_async.call_args_list,
+            memory_node_manager.decay_async.call_args_list,
         ):
             turn_timestamp = store_call.kwargs["turn_timestamp"]
             assert isinstance(turn_timestamp, datetime)
             assert turn_timestamp.tzinfo is not None
             assert reflect_call.kwargs["reflect_timestamp"] is turn_timestamp
+            assert decay_call.kwargs["decay_timestamp"] is turn_timestamp
         memory_node_manager.reflect.assert_not_called()
 
     def test_tool_calls_then_stop(self, agent):

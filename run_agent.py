@@ -13450,6 +13450,12 @@ class AIAgent:
                 )
             except Exception as exc:
                 logger.debug("MemoryNodeManager reflect scheduling skipped: %s", exc)
+            try:
+                self._memory_node_manager.decay_if_due_async(
+                    decay_timestamp=turn_timestamp,
+                )
+            except Exception as exc:
+                logger.debug("MemoryNodeManager decay scheduling skipped: %s", exc)
 
         # Background memory/skill review — runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.
