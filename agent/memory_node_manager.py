@@ -7517,57 +7517,6 @@ class MemoryNodeManager:
             logger.info("Failed to store memory node (non-fatal): %s", e)
             return False
 
-    def _augment_evidence_bundle_merge_group_with_pending_sources(
-        self,
-        group: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Add same entity/topic facts to a merge group so overlap updates use one LLM call."""
-        if not self._db:
-            return group
-        try:
-            entity_id = int(group.get("entity_id"))
-            topic_key = str(group.get("topic_key") or "")
-        except (TypeError, ValueError):
-            return group
-        if not topic_key:
-            return group
-
-        group_source_facts = [
-            dict(fact)
-            for fact in group.get("source_facts", [])
-            if fact.get("id") is not None
-        ]
-        group_source_ids = {int(fact["id"]) for fact in group_source_facts}
-        topic_source_facts = self._db.get_fact_nodes_using_entity_topic(
-            entity_id=entity_id,
-            topic_key=topic_key,
-            limit=12,
-        )
-        pending_source_facts = [
-            dict(fact)
-            for fact in topic_source_facts
-            if fact.get("id") is not None and int(fact["id"]) not in group_source_ids
-        ]
-
-        combined_source_facts: List[Dict[str, Any]] = []
-        seen_source_ids: set[int] = set()
-        for fact in pending_source_facts + group_source_facts + topic_source_facts:
-            if fact.get("id") is None:
-                continue
-            fact_id = int(fact["id"])
-            if fact_id in seen_source_ids:
-                continue
-            seen_source_ids.add(fact_id)
-            combined_source_facts.append(dict(fact))
-
-        augmented = dict(group)
-        augmented["source_facts"] = combined_source_facts
-        augmented["pending_source_facts"] = pending_source_facts
-        augmented["pending_source_fact_ids"] = [
-            int(fact["id"]) for fact in pending_source_facts
-        ]
-        return augmented
-
     def _merge_duplicated_evidence_bundle_group(
         self,
         group: Dict[str, Any],
@@ -7615,10 +7564,6 @@ class MemoryNodeManager:
             bundle_type=bundle_type,
             source_fact_ids=source_ids,
             metadata=metadata,
-            source_roles={
-                int(fact_id): "matched"
-                for fact_id in group.get("pending_source_fact_ids", [])
-            },
         )
         if changed_evidence_bundle_ids is not None:
             changed_evidence_bundle_ids.append(int(keep_bundle["id"]))
@@ -7629,16 +7574,14 @@ class MemoryNodeManager:
         *,
         limit: int,
         date_key: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Merge duplicate entities and repair observations affected by the merge."""
+    ) -> Tuple[Dict[str, Any], List[int]]:
+        """Merge duplicate entities and return canonical entity ids affected by the merge."""
         if not self._db:
             return {
                 "candidates": [],
                 "merged": 0,
                 "candidate_count": 0,
                 "merge_candidates": 0,
-                "evidence_bundle_groups_merged": 0,
-                "changed_evidence_bundle_ids": [],
             }
 
         unprocessed_fact_candidates = self._db.get_unprocessed_facts_for_evidence_bundle(
@@ -7651,10 +7594,39 @@ class MemoryNodeManager:
             for entity_id, _entity_name in item.get("linked_entities", [])
         ))
 
-        entity_report = self._db.merge_similar_entities(
+        candidates = self._db.find_entity_merging_candidates(
             limit=limit,
             anchor_entity_ids=anchor_entity_ids,
         )
+        merged: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            if candidate["action"] != "merge":
+                continue
+            did_merge = self._db.update_entity_after_merging(
+                canonical_id=candidate["canonical_id"],
+                duplicate_id=candidate["duplicate_id"],
+                reason=candidate["reason"],
+                confidence=float(candidate["confidence"]),
+            )
+            if did_merge:
+                merged.append(candidate)
+
+        entity_report = {
+            "candidates": candidates,
+            "merged": len(merged),
+            "merge_candidates": sum(1 for candidate in candidates if candidate["action"] == "merge"),
+            "candidate_count": len(candidates),
+            "anchor_entity_count": (
+                None
+                if anchor_entity_ids is None
+                else len({int(entity_id) for entity_id in anchor_entity_ids if str(entity_id or "").strip()})
+            ),
+            "rules": {
+                "auto_merge": "same/compatible type + normalized name match",
+                "candidate_only": "token subset or substring names, even with co-entity overlap",
+                "score_weights": {"name": 0.72, "type": 0.20, "co_entities": 0.08},
+            },
+        }
         self._log_info(
             "memory_reflect",
             "entity_merge_candidates",
@@ -7691,6 +7663,13 @@ class MemoryNodeManager:
             )
 
         merged_entity_ids = list(dict.fromkeys(merged_entity_ids))
+
+        return entity_report, merged_entity_ids
+
+    def _reflect_merging_duplicated_evidence_bundles(
+        self,
+        merged_entity_ids: Optional[List[int]] = None,
+    ):
         groups = (
             self._db.find_duplicated_evidence_bundle_groups(
                 entity_ids=merged_entity_ids,
@@ -7698,16 +7677,12 @@ class MemoryNodeManager:
             if merged_entity_ids
             else []
         )
-        augmented_groups = [
-            self._augment_evidence_bundle_merge_group_with_pending_sources(group)
-            for group in groups
-        ]
         self._log_info(
             "memory_reflect",
             "evidence_bundle_merge_candidates",
             {
                 "entity_ids": merged_entity_ids,
-                "group_count": len(augmented_groups),
+                "group_count": len(groups),
                 "groups": [
                     {
                         "entity_id": group.get("entity_id"),
@@ -7723,19 +7698,15 @@ class MemoryNodeManager:
                             fact.get("id")
                             for fact in group.get("source_facts", [])
                         ],
-                        "pending_source_fact_ids": group.get(
-                            "pending_source_fact_ids",
-                            [],
-                        ),
                     }
-                    for group in augmented_groups
+                    for group in groups
                 ],
             },
         )
 
         evidence_bundle_groups_merged = 0
         changed_evidence_bundle_ids: List[int] = []
-        for group in augmented_groups:
+        for group in groups:
             try:
                 if not self._merge_duplicated_evidence_bundle_group(
                     group,
@@ -7752,7 +7723,6 @@ class MemoryNodeManager:
                 )
 
         return {
-            **entity_report,
             "merged_entity_ids": merged_entity_ids,
             "evidence_bundle_groups_merged": evidence_bundle_groups_merged,
             "changed_evidence_bundle_ids": list(dict.fromkeys(changed_evidence_bundle_ids)),
@@ -8173,13 +8143,19 @@ class MemoryNodeManager:
             limit=limit,
         )
 
-        entity_merging_report = self._reflect_merging_duplicated_entities(
+        entity_merging_report, merged_entity_ids = self._reflect_merging_duplicated_entities(
             limit=limit,
             date_key=reflect_date_key,
         )
-        changed_evidence_bundle_ids = list(
-            entity_merging_report.get("changed_evidence_bundle_ids", [])
+
+        evidence_bundle_merging_report = self._reflect_merging_duplicated_evidence_bundles(
+            merged_entity_ids=merged_entity_ids
         )
+
+        changed_evidence_bundle_ids = list(
+            evidence_bundle_merging_report.get("changed_evidence_bundle_ids", [])
+        )
+
         # build fact-evidence_bundle matching
         evidence_bundle_report = self._reflect_generate_evidence_bundles_using_facts(
             limit=limit,
@@ -8188,6 +8164,7 @@ class MemoryNodeManager:
         )
         
         report = dict(entity_merging_report)
+        report.update(evidence_bundle_merging_report)
         report["interpretation_feedback"] = feedback_report
         report["evidence_bundle_reflect"] = evidence_bundle_report
         report["evidence_bundles_consolidated"] = evidence_bundle_report.get("consolidated", 0)

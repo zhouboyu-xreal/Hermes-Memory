@@ -3009,15 +3009,15 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         summary="Alice still discusses Slack alerts.",
         keywords=["alerts"],
     )
-    db.entity_link_node(first_node, alice)
-    db.entity_link_node(second_node, alice_spaced)
-    db.entity_link_node(touched_node, alice_spaced)
+    db.entity_link_fact(first_node, alice)
+    db.entity_link_fact(second_node, alice_spaced)
+    db.entity_link_fact(touched_node, alice_spaced)
     first_observation = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alerts",
         topic_label="alerts",
         bundle_type="entity_topic",
-        source_node_ids=[first_node],
+        source_fact_ids=[first_node],
         metadata={"observation_type": "context"},
     )
     second_observation = db.memory_upsert_evidence_bundle(
@@ -3025,86 +3025,47 @@ def test_reflect_merges_same_topic_observations_with_llm(db):
         topic_key="alerts",
         topic_label="alerts",
         bundle_type="entity_topic",
-        source_node_ids=[second_node],
+        source_fact_ids=[second_node],
         metadata={"observation_type": "context"},
     )
-    mgr = _NoAsyncMemoryNodeManager(
-        db,
-        embedding_config={},
-        llm_outputs=[
-            json.dumps({
-                "category": "observation",
-                "summary": "Alice consistently wants urgent and incident alerts routed through Slack.",
-                "keywords": ["Slack", "alerts", "notifications"],
-                "confidence": 0.9,
-                "metadata": {"observation_type": "context"},
-            }),
-            json.dumps({
-                "category": "observation",
-                "summary": "Alice consistently wants urgent and incident alerts routed through Slack.",
-                "keywords": ["Slack", "alerts", "notifications"],
-                "confidence": 0.9,
-                "metadata": {"observation_type": "context"},
-            }),
-            json.dumps({"should_create": False}),
-        ],
+    mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
+
+    entity_report, merged_entity_ids = mgr._reflect_merging_duplicated_entities(
+        limit=10,
+    )
+    report = mgr._reflect_merging_duplicated_evidence_bundles(
+        merged_entity_ids=merged_entity_ids,
     )
 
-    report = mgr.reflect(limit=10)
-
-    assert report["merged"] == 1
+    assert entity_report["merged"] == 1
     assert report["evidence_bundle_groups_merged"] == 1
-    merge_prompt = next(
-        prompt
-        for prompt in mgr.llm_prompts
-        if "相关既有 observation" in prompt
-        and "Alice routes incident notifications through Slack." in prompt
-    )
-    assert "已有 observation" in merge_prompt
-    assert "相关既有 observation" in merge_prompt
-    assert "Alice prefers Slack for urgent alerts." in merge_prompt
-    assert "Alice routes incident notifications through Slack." in merge_prompt
-    assert "Alice still discusses Slack alerts." in merge_prompt
-    source_facts_section = merge_prompt.split("新的来源事实：", 1)[1]
-    assert "Alice still discusses Slack alerts." in source_facts_section
-    assert "Alice prefers Slack for urgent alerts." not in source_facts_section
-    assert "Alice wants incident notifications in Slack." not in source_facts_section
-    observation_prompts = [
-        prompt
-        for prompt in mgr.llm_prompts
-        if "observation consolidation 模块" in prompt
-    ]
-    assert observation_prompts == [merge_prompt]
     rows = db._conn.execute(
-        "SELECT id, entity_id, topic_key, observation_type, summary, keywords "
+        "SELECT id, entity_id, topic_key, bundle_type "
         "FROM memory_evidence_bundles ORDER BY id"
     ).fetchall()
     assert len(rows) == 1
     assert rows[0]["id"] in {first_observation, second_observation}
     assert rows[0]["entity_id"] == alice
     assert rows[0]["topic_key"] == "alerts"
-    assert rows[0]["observation_type"] == "observation"
-    assert "urgent and incident alerts" in rows[0]["summary"]
-    assert "notifications" in rows[0]["keywords"]
+    assert rows[0]["bundle_type"] == "entity_topic"
     source_ids = {
-        row["node_id"]
+        row["fact_id"]
         for row in db._conn.execute(
-            "SELECT node_id FROM memory_evidence_bundle_sources WHERE observation_id = ?",
+            "SELECT fact_id FROM memory_evidence_bundle_sources WHERE evidence_bundle_id = ?",
             (rows[0]["id"],),
         ).fetchall()
     }
-    assert source_ids == {first_node, second_node, touched_node}
+    assert source_ids == {first_node, second_node}
     source_roles = {
-        row["node_id"]: row["role"]
+        row["fact_id"]: row["role"]
         for row in db._conn.execute(
-            "SELECT node_id, role FROM memory_evidence_bundle_sources WHERE observation_id = ?",
+            "SELECT fact_id, role FROM memory_evidence_bundle_sources WHERE evidence_bundle_id = ?",
             (rows[0]["id"],),
         ).fetchall()
     }
     assert source_roles == {
         first_node: "initial",
         second_node: "initial",
-        touched_node: "matched",
     }
 
 
@@ -3124,21 +3085,21 @@ def test_reflect_keeps_insight_and_task_observations_separate(db):
             summary=summary,
             keywords=["Slack", "alerts"],
         )
-        db.entity_link_node(node_id, alice)
+        db.entity_link_fact(node_id, alice)
         node_ids.append(node_id)
     insight_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alerts",
         topic_label="alerts",
         bundle_type="insight",
-        source_node_ids=[node_ids[0]],
+        source_fact_ids=[node_ids[0]],
     )
     task_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alerts",
         topic_label="alerts",
         bundle_type="task",
-        source_node_ids=[node_ids[1]],
+        source_fact_ids=[node_ids[1]],
         metadata={
             "task_status": "active",
             "task_source": "inferred_from_observation",
@@ -3149,9 +3110,9 @@ def test_reflect_keeps_insight_and_task_observations_separate(db):
 
     assert groups == []
     rows = db._conn.execute(
-        "SELECT id, observation_type FROM memory_evidence_bundles ORDER BY id"
+        "SELECT id, bundle_type FROM memory_evidence_bundles ORDER BY id"
     ).fetchall()
-    assert [(row["id"], row["observation_type"]) for row in rows] == [
+    assert [(row["id"], row["bundle_type"]) for row in rows] == [
         (insight_id, "insight"),
         (task_id, "task"),
     ]

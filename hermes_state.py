@@ -4162,7 +4162,7 @@ class SessionDB:
             "action": action,
         }
 
-    def _find_entity_merging_candidates(
+    def find_entity_merging_candidates(
         self,
         limit: int = 100,
         anchor_entity_ids: Optional[List[int]] = None,
@@ -4182,11 +4182,8 @@ class SessionDB:
 
         candidates: List[Dict[str, Any]] = []
         if anchor_ids is None:
-            pair_iter = (
-                (left, right)
-                for i, left in enumerate(rows)
-                for right in rows[i + 1:]
-            )
+            return []
+
         else:
             anchor_rows = [row for row in rows if int(row["id"]) in anchor_ids]
             seen_pairs: set[Tuple[int, int]] = set()
@@ -4233,63 +4230,17 @@ class SessionDB:
             return left, right
         return (left, right) if int(left["id"]) <= int(right["id"]) else (right, left)
 
-    def merge_similar_entities(
-        self,
-        *,
-        limit: int = 100,
-        anchor_entity_ids: Optional[List[int]] = None,
-    ) -> Dict[str, Any]:
-        """Reflect on the entity graph and merge high-confidence duplicate entities.
-
-        Entity merge confidence is driven by normalized name similarity, gated
-        by compatible entity types, and lightly adjusted by overlap in
-        co-occurring entity profiles. Only low-risk normalized-name matches are
-        merged automatically; other similar names are reported as candidates.
-        """
-        candidates = self._find_entity_merging_candidates(
-            limit=limit,
-            anchor_entity_ids=anchor_entity_ids,
-        )
-        merged: List[Dict[str, Any]] = []
-        for candidate in candidates:
-            if candidate["action"] != "merge":
-                continue
-            self.process_entity_merging(
-                canonical_id=candidate["canonical_id"],
-                duplicate_id=candidate["duplicate_id"],
-                reason=candidate["reason"],
-                confidence=float(candidate["confidence"]),
-            )
-            merged.append(candidate)
-        
-        return {
-            "candidates": candidates,
-            "merged": len(merged),
-            "merge_candidates": sum(1 for candidate in candidates if candidate["action"] == "merge"),
-            "candidate_count": len(candidates),
-            "anchor_entity_count": (
-                None
-                if anchor_entity_ids is None
-                else len({int(entity_id) for entity_id in anchor_entity_ids if str(entity_id or "").strip()})
-            ),
-            "rules": {
-                "auto_merge": "same/compatible type + normalized name match",
-                "candidate_only": "token subset or substring names, even with co-entity overlap",
-                "score_weights": {"name": 0.72, "type": 0.20, "co_entities": 0.08},
-            },
-        }
-
-    def process_entity_merging(
+    def update_entity_after_merging(
         self,
         *,
         canonical_id: int,
         duplicate_id: int,
         reason: str,
         confidence: float,
-    ) -> None:
+    ) -> bool:
         """Merge a duplicate entity into a canonical entity."""
         if canonical_id == duplicate_id:
-            return
+            return False
 
         def _do(conn):
             canonical = conn.execute(
@@ -4301,7 +4252,7 @@ class SessionDB:
                 (duplicate_id,),
             ).fetchone()
             if not canonical or not duplicate:
-                return
+                return False
 
             canonical_meta = json.loads(canonical["metadata"] or "{}")
             aliases = canonical_meta.get("aliases", [])
@@ -4409,8 +4360,9 @@ class SessionDB:
                 (canonical_id, duplicate_id),
             )
             conn.execute("DELETE FROM entity_nodes WHERE id = ?", (duplicate_id,))
+            return True
 
-        self._execute_write(_do)
+        return bool(self._execute_write(_do))
 
     # ── Normalized memory node relations ─────────────────────────────────
 
