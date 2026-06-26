@@ -8739,11 +8739,7 @@ class MemoryNodeManager:
         for items in selected.values():
             items.sort(key=lambda item: int(item.get("_recall_rank") or 0))
         return selected
-
-    @classmethod
-    def _rank_recall_candidates(cls, **kwargs: Any) -> Dict[str, List[Dict[str, Any]]]:
-        return cls._rank_recall_raw_candidates(**kwargs)
-
+    
     def _retrieve_recall_raw_candidates(
         self,
         *,
