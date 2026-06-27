@@ -40,6 +40,7 @@ import queue
 import re
 import threading
 import time
+import unicodedata
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -70,6 +71,9 @@ INTERPRETATION_MIN_OBSERVATIONS_FOR_BATCH = 3
 INTERPRETATION_MIN_CLUSTER_SIZE = 2
 INTERPRETATION_MAX_LLM_CALLS_PER_REFLECT = 30
 INTERPRETATION_SINGLE_OBSERVATION_CONFIDENCE_CAP = 0.75
+INTERPRETATION_FEEDBACK_MAX_CANDIDATES = 2
+INTERPRETATION_FEEDBACK_MIN_RECALL_SCORE = 2.0
+INTERPRETATION_FEEDBACK_MIN_TEXT_OVERLAP = 0.08
 
 MIN_FACTS_FOR_NEW_EVIDENCE_BUNDLE = 1
 OBSERVATION_EMBEDDING_SIMILARITY_THRESHOLD = 0.72
@@ -928,6 +932,9 @@ INTERPRETATION_FEEDBACK_ANALYSIS_PROMPT = """你是长期记忆系统的 interpr
 - 不要把沉默、换话题或没有接话当作负反馈。
 - feedback 必须绑定到输入中的 interpretation_id。
 - recall 只是候选召回，不代表每个 recalled_interpretation 都和 current_user_message 有关；如果某条 interpretation 与当前用户消息没有直接反馈关系，feedback_type=unrelated。
+- 用户经常反馈的是上一轮 assistant 的具体建议或行动方案，而不是否定 recalled_interpretation 本身；这类情况 feedback_target=assistant_response，不能更新 interpretation。
+- 只有当用户明确确认、否认、修正或表示过时的是 interpretation 的核心 claim/scope/action_implication 时，feedback_target 才能是 interpretation_claim 或 both。
+- reject 必须要求用户明确否认 interpretation 的核心判断；“这个建议不适合我”“计划太难执行”通常只是 assistant_response 反馈，除非它同时明确否认了 interpretation claim。
 - has_feedback=true 仅表示至少存在一条 accept/reject/modify/defer/outdated；如果全部是 unrelated 或 none，has_feedback=false。
 
 previous_user_query:
@@ -957,6 +964,8 @@ feedback_type 定义：
   "feedback_items": [
     {{
       "interpretation_id": 1,
+      "is_related_to_interpretation": true,
+      "feedback_target": "interpretation_claim | assistant_response | both | unrelated",
       "feedback_type": "accept | reject | modify | defer | outdated | unrelated | none",
       "confidence": 0.0,
       "evidence_text": "用户原文中支持该判断的短句",
@@ -1269,7 +1278,7 @@ class MemoryNodeManager:
         )
         self._recall_interpretation_min_embedding_similarity = self._clip_unit_float(
             memory_cfg.get("recall_interpretation_min_embedding_similarity"),
-            0.45,
+            0.60,
         )
         self._min_turns_before_store = max(
             1,
@@ -6870,6 +6879,124 @@ class MemoryNodeManager:
         allowed = {"accept", "reject", "modify", "defer", "outdated", "unrelated", "none"}
         return text if text in allowed else "none"
 
+    @staticmethod
+    def _normalize_interpretation_feedback_target(value: Any) -> str:
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        allowed = {"interpretation_claim", "assistant_response", "both", "unrelated"}
+        return text if text in allowed else "unrelated"
+
+    @staticmethod
+    def _bool_from_llm(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value or "").strip().lower()
+        if text in {"true", "yes", "1", "related"}:
+            return True
+        if text in {"false", "no", "0", "unrelated", "none"}:
+            return False
+        return False
+
+    @staticmethod
+    def _feedback_text_terms(value: Any) -> set[str]:
+        text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+        terms = {
+            token
+            for token in re.split(r"[^0-9a-zA-Z\u4e00-\u9fff]+", text)
+            if len(token) >= 2
+        }
+        for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+            max_size = min(4, len(chunk))
+            for size in range(2, max_size + 1):
+                terms.update(
+                    chunk[index:index + size]
+                    for index in range(0, len(chunk) - size + 1)
+                )
+        return terms
+
+    @classmethod
+    def _feedback_candidate_text_overlap(
+        cls,
+        *,
+        event: Dict[str, Any],
+        interpretation: Dict[str, Any],
+        user_message: str,
+    ) -> float:
+        query_analysis = cls._json_dict(event.get("metadata", {})).get("query_analysis", {})
+        query_keywords = " ".join(
+            cls._string_list(
+                query_analysis.get("keywords", []) if isinstance(query_analysis, dict) else [],
+                limit=12,
+            )
+        )
+        source_text = " ".join(
+            str(value or "")
+            for value in (
+                user_message,
+                event.get("query"),
+                query_keywords,
+            )
+        )
+        candidate_text = " ".join(
+            str(interpretation.get(key) or "")
+            for key in (
+                "claim",
+                "scope",
+                "target_text",
+                "interpretation_type",
+                "action_implication",
+                "resolution",
+            )
+        )
+        source_terms = cls._feedback_text_terms(source_text)
+        candidate_terms = cls._feedback_text_terms(candidate_text)
+        if not source_terms or not candidate_terms:
+            return 0.0
+        overlap = source_terms & candidate_terms
+        return len(overlap) / max(1, min(len(source_terms), len(candidate_terms), 24))
+
+    @classmethod
+    def _filter_feedback_interpretation_candidates(
+        cls,
+        *,
+        event: Dict[str, Any],
+        interpretations: List[Dict[str, Any]],
+        user_message: str,
+    ) -> List[Dict[str, Any]]:
+        """Keep only tight recall candidates for feedback analysis."""
+        filtered: List[Dict[str, Any]] = []
+        for item in interpretations or []:
+            try:
+                rank = int(item.get("recall_rank") or 0)
+            except (TypeError, ValueError):
+                rank = 0
+            if rank and rank > INTERPRETATION_FEEDBACK_MAX_CANDIDATES:
+                continue
+            try:
+                recall_score = float(item.get("recall_score") or 0.0)
+            except (TypeError, ValueError):
+                recall_score = 0.0
+            text_overlap = cls._feedback_candidate_text_overlap(
+                event=event,
+                interpretation=item,
+                user_message=user_message,
+            )
+            if recall_score > 0.0 and recall_score < INTERPRETATION_FEEDBACK_MIN_RECALL_SCORE:
+                continue
+            if (
+                recall_score > 0.0
+                and text_overlap < INTERPRETATION_FEEDBACK_MIN_TEXT_OVERLAP
+                and rank != 1
+            ):
+                continue
+            candidate = dict(item)
+            candidate["feedback_text_overlap"] = round(text_overlap, 4)
+            filtered.append(candidate)
+            if len(filtered) >= INTERPRETATION_FEEDBACK_MAX_CANDIDATES:
+                break
+        return filtered
+
     @classmethod
     def _feedback_interpretation_payload(
         cls,
@@ -6895,6 +7022,7 @@ class MemoryNodeManager:
                 "entity_name": item.get("entity_name") or metadata.get("entity_name"),
                 "recall_rank": item.get("recall_rank"),
                 "recall_score": item.get("recall_score"),
+                "feedback_text_overlap": item.get("feedback_text_overlap"),
             })
         return payload
 
@@ -6923,7 +7051,12 @@ class MemoryNodeManager:
         if not event or not event.get("interpretations"):
             return 0
 
-        interpretations = event.get("interpretations") or []
+        raw_interpretations = event.get("interpretations") or []
+        interpretations = self._filter_feedback_interpretation_candidates(
+            event=event,
+            interpretations=raw_interpretations,
+            user_message=user_message,
+        )
         interpretation_payload = self._feedback_interpretation_payload(interpretations)
         if not interpretation_payload:
             try:
@@ -6938,6 +7071,8 @@ class MemoryNodeManager:
             "memory_feedback",
             "raw_data_info",
             {
+                "raw_interpretation_count": len(raw_interpretations),
+                "filtered_interpretation_count": len(interpretation_payload),
                 "interpretations": json.dumps(
                     interpretation_payload,
                     ensure_ascii=False,
@@ -7005,6 +7140,25 @@ class MemoryNodeManager:
                     },
                 )
                 continue
+            feedback_target = self._normalize_interpretation_feedback_target(
+                raw_item.get("feedback_target")
+            )
+            is_related_to_interpretation = self._bool_from_llm(
+                raw_item.get("is_related_to_interpretation")
+            )
+            if feedback_target not in {"interpretation_claim", "both"} or not is_related_to_interpretation:
+                self._log_info(
+                    "memory_feedback",
+                    "analysis_skipped",
+                    {
+                        "interpretation_id": interpretation_id,
+                        "feedback_type": feedback_type,
+                        "feedback_target": feedback_target,
+                        "is_related_to_interpretation": is_related_to_interpretation,
+                        "confidence": raw_item.get("confidence"),
+                    },
+                )
+                continue
             confidence = self._clip_unit_float(raw_item.get("confidence"), 0.0)
             if confidence < 0.4:
                 continue
@@ -7030,6 +7184,11 @@ class MemoryNodeManager:
                         "source": "feedback_analysis",
                         "previous_query": event.get("query"),
                         "analysis_has_feedback": bool(data.get("has_feedback")),
+                        "feedback_target": feedback_target,
+                        "is_related_to_interpretation": is_related_to_interpretation,
+                        "feedback_text_overlap": by_id[interpretation_id].get(
+                            "feedback_text_overlap"
+                        ),
                     },
                 )
                 written += 1
@@ -8597,6 +8756,7 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         """Filter and rank interpretation rows fetched by SessionDB."""
         terms = cls._recall_keyword_terms(keyword)
+        query_text_terms = cls._feedback_text_terms(keyword)
         entity_terms = cls._recall_entity_terms(entities)
         threshold = (
             None
@@ -8613,6 +8773,14 @@ class MemoryNodeManager:
                     "scope", "interpretation_type", "resolution",
                 )
             ).lower()
+            boundary_text = " ".join(
+                str(item.get(key) or "")
+                for key in ("claim", "scope", "target_text", "action_implication")
+            )
+            if query_text_terms:
+                boundary_terms = cls._feedback_text_terms(boundary_text)
+                if not (query_text_terms & boundary_terms):
+                    continue
             entity_haystack = str(item.get("entity_name") or "").lower()
             matched_terms = [term for term in terms if term in content_haystack]
             matched_entity_name_terms = [

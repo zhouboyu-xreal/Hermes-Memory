@@ -436,6 +436,8 @@ def test_analyze_feedback_for_pending_interpretations_uses_llm(db):
                 "feedback_items": [
                     {
                         "interpretation_id": interpretation_id,
+                        "is_related_to_interpretation": True,
+                        "feedback_target": "interpretation_claim",
                         "feedback_type": "modify",
                         "confidence": 0.91,
                         "evidence_text": "不是工作压力，是睡眠问题。",
@@ -487,6 +489,8 @@ def test_analyze_feedback_for_pending_interpretations_skips_unrelated(db):
                 "feedback_items": [
                     {
                         "interpretation_id": interpretation_id,
+                        "is_related_to_interpretation": False,
+                        "feedback_target": "unrelated",
                         "feedback_type": "unrelated",
                         "confidence": 0.95,
                         "evidence_text": "我们继续讨论数据库 schema。",
@@ -500,6 +504,54 @@ def test_analyze_feedback_for_pending_interpretations_skips_unrelated(db):
 
     written = mgr.analyze_feedback_for_pending_interpretations(
         "我们继续讨论数据库 schema。"
+    )
+
+    assert written == 0
+    assert db.memory_pending_interpretation_feedback() == []
+    assert db.memory_latest_pending_recall_event() is None
+
+
+def test_analyze_feedback_for_pending_interpretations_skips_assistant_response_feedback(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户希望通过科学方法提升体能。",
+        target_text="体能提升",
+        scope="health",
+        interpretation_type="task",
+        confidence=0.82,
+        action_implication="后续优先提供体能提升建议。",
+    )
+    interpretation = db.memory_get_interpretation_by_id(interpretation_id)
+    db.memory_record_interpretation_recall_event(
+        query="我身体状态不太好，有什么建议？",
+        interpretations=[{**interpretation, "_recall_score": 3.4}],
+    )
+    db.memory_attach_latest_recall_event_response(
+        query="我身体状态不太好，有什么建议？",
+        assistant_response="你可以尝试固定时间进行高强度锻炼。",
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        llm_outputs=[
+            json.dumps({
+                "has_feedback": False,
+                "feedback_items": [
+                    {
+                        "interpretation_id": interpretation_id,
+                        "is_related_to_interpretation": False,
+                        "feedback_target": "assistant_response",
+                        "feedback_type": "reject",
+                        "confidence": 0.95,
+                        "evidence_text": "这个计划不适合我，没法固定时间高强度锻炼。",
+                        "correction": "",
+                    }
+                ],
+            }, ensure_ascii=False)
+        ],
+        enabled=True,
+    )
+
+    written = mgr.analyze_feedback_for_pending_interpretations(
+        "这个计划不适合我，没法固定时间高强度锻炼。"
     )
 
     assert written == 0
@@ -619,12 +671,12 @@ def test_memory_manager_ranks_interpretations_with_embedding_similarity(db):
     )
 
     raw_results = db.search_memory_interpretations(
-        ["alignment"],
+        ["design", "calibration"],
         top_k=5,
     )
     results = MemoryNodeManager._rank_interpretation_search_candidates(
         raw_results,
-        keyword=["alignment"],
+        keyword=["design", "calibration"],
         entities=[],
         top_k=5,
         query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
@@ -633,6 +685,30 @@ def test_memory_manager_ranks_interpretations_with_embedding_similarity(db):
 
     assert [item["id"] for item in results] == [matching_id]
     assert results[0]["embedding_similarity"] == pytest.approx(1.0)
+
+
+def test_memory_manager_filters_interpretations_without_query_text_overlap(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="User wants flexible family activities.",
+        target_text="family activities",
+        scope="family planning",
+        interpretation_type="task",
+        confidence=0.95,
+        action_implication="Recommend family activities that fit daily routines.",
+        embedding=np.array([[1.0, 0.0]], dtype=np.float32),
+        embedding_text="family activity planning",
+    )
+
+    results = MemoryNodeManager._rank_interpretation_search_candidates(
+        [db.memory_get_interpretation_by_id(interpretation_id)],
+        keyword=["health", "exercise"],
+        entities=[],
+        top_k=5,
+        query_embedding=np.array([[1.0, 0.0]], dtype=np.float32),
+        min_embedding_similarity=None,
+    )
+
+    assert results == []
 
 
 def test_memory_manager_filters_low_interpretation_embedding_similarity(db):
@@ -851,7 +927,7 @@ def test_search_memory_interpretations_separates_content_and_entity_matches(db):
         min_embedding_similarity=None,
     )
 
-    assert [item["id"] for item in keyword_results[:2]] == [content_match, entity_only]
+    assert [item["id"] for item in keyword_results] == [content_match]
 
     entity_results = MemoryNodeManager._rank_interpretation_search_candidates(
         db.search_memory_interpretations(
