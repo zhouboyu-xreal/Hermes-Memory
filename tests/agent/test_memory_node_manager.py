@@ -2225,7 +2225,7 @@ def test_incremental_observation_update_accepts_compatible_fact_type(
         task_event_like=True,
     )
     for node_id in (request_node, action_node):
-        db.entity_link_node(node_id, alice)
+        db.entity_link_fact(node_id, alice)
     evidence_bundle_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-routing",
@@ -2258,7 +2258,7 @@ def test_incremental_observation_update_accepts_compatible_fact_type(
     }
     monkeypatch.setattr(
         db,
-        "memory_node_embeddings",
+        "memory_fact_embeddings",
         lambda node_ids: {
             node_id: vectors[node_id]
             for node_id in node_ids
@@ -2323,7 +2323,7 @@ def test_fact_cluster_matches_observation_before_individual_facts(
         fact_kind="context",
     )
     for node_id in (historical_node, first_new_node, second_new_node):
-        db.entity_link_node(node_id, alice)
+        db.entity_link_fact(node_id, alice)
     evidence_bundle_id = db.memory_upsert_evidence_bundle(
         entity_id=alice,
         topic_key="alert-reliability",
@@ -2358,7 +2358,7 @@ def test_fact_cluster_matches_observation_before_individual_facts(
     }
     monkeypatch.setattr(
         db,
-        "memory_node_embeddings",
+        "memory_fact_embeddings",
         lambda node_ids: {
             node_id: vectors[node_id]
             for node_id in node_ids
@@ -4510,7 +4510,7 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
             fact_type="episodic" if idx == 3 else "semantic",
             fact_kind="recommendation" if idx == 3 else "preference",
         )
-        db.entity_link_node(node_id, alice)
+        db.entity_link_fact(node_id, alice)
         node_ids.append(node_id)
     mgr = _NoAsyncMemoryNodeManager(
         db,
@@ -4675,7 +4675,7 @@ def test_incremental_observation_update_preserves_identity_and_rebuilds_summary(
     }
     monkeypatch.setattr(
         db,
-        "memory_node_embeddings",
+        "memory_fact_embeddings",
         lambda node_ids: {
             node_id: fact_vectors[node_id]
             for node_id in node_ids
@@ -6633,11 +6633,11 @@ def test_observation_type_gate_rejects_incompatible_interpretation(
             fact_type="semantic",
             fact_kind="preference",
         )
-        db.entity_link_node(node_id, alice)
+        db.entity_link_fact(node_id, alice)
         node_ids.append(node_id)
     monkeypatch.setattr(
         db,
-        "memory_node_embeddings",
+        "memory_fact_embeddings",
         lambda requested_ids: {
             node_id: np.ones(1536, dtype=np.float32)
             for node_id in requested_ids
@@ -6649,7 +6649,7 @@ def test_observation_type_gate_rejects_incompatible_interpretation(
         topic_key="alert-routing",
         topic_label="alert routing",
         bundle_type="observation",
-        source_node_ids=node_ids,
+        source_fact_ids=node_ids,
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
     mgr._update_observations_for_evidence_bundles([observation_id])
@@ -6669,13 +6669,95 @@ def test_observation_type_gate_rejects_incompatible_interpretation(
 
     score, reason = mgr._calculate_interpretation_candidate_score_for_observation(
         observation=semantic_observation,
-        source_nodes=db.memory_nodes_by_ids(node_ids),
+        source_facts=db.memory_facts_by_ids(node_ids),
         interpretation=task_interpretation,
         observation_id=observation_id,
     )
 
     assert score == 0.0
     assert reason == "observation_type_gate"
+
+
+def test_observation_interpretation_candidate_score_uses_embedding_gate(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"reflect_observation_interpretation_min_embedding_similarity": 0.5},
+    )
+    observation = {
+        "id": 1,
+        "entity_id": 1,
+        "entity_name": "用户",
+        "topic_key": "时间管理",
+        "topic_label": "时间管理",
+        "observation_type": "context",
+        "summary": "用户需要灵活的时间管理方法。",
+        "metadata": {"allowed_interpretation_types": ["insight"]},
+        "embedding": np.array([1.0, 0.0], dtype=np.float32),
+    }
+    interpretation = {
+        "id": 1,
+        "entity_id": 1,
+        "interpretation_type": "insight",
+        "claim": "用户需要灵活的时间管理方法。",
+        "target_text": "时间管理",
+        "scope": "时间管理",
+        "confidence": 0.9,
+        "metadata": {},
+        "evidence_observation_ids": [],
+        "embedding": np.array([0.0, 1.0], dtype=np.float32),
+    }
+
+    score, reason = mgr._calculate_interpretation_candidate_score_for_observation(
+        observation=observation,
+        source_facts=[],
+        interpretation=interpretation,
+        observation_id=1,
+    )
+
+    assert score == 0.0
+    assert reason == "embedding_gate"
+
+
+def test_observation_interpretation_candidate_score_rewards_embedding_match(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"reflect_observation_interpretation_min_embedding_similarity": 0.5},
+    )
+    observation = {
+        "id": 1,
+        "entity_id": 1,
+        "entity_name": "用户",
+        "topic_key": "时间管理",
+        "topic_label": "时间管理",
+        "observation_type": "context",
+        "summary": "用户需要灵活的时间管理方法。",
+        "metadata": {"allowed_interpretation_types": ["insight"]},
+        "embedding": np.array([1.0, 0.0], dtype=np.float32),
+    }
+    interpretation = {
+        "id": 1,
+        "entity_id": 1,
+        "interpretation_type": "insight",
+        "claim": "用户需要灵活的时间管理方法。",
+        "target_text": "时间管理",
+        "scope": "时间管理",
+        "confidence": 0.9,
+        "metadata": {},
+        "evidence_observation_ids": [],
+        "embedding": np.array([1.0, 0.0], dtype=np.float32),
+    }
+
+    score, reason = mgr._calculate_interpretation_candidate_score_for_observation(
+        observation=observation,
+        source_facts=[],
+        interpretation=interpretation,
+        observation_id=1,
+    )
+
+    assert score > 0.0
+    assert "embedding:1.000" in reason
 
 
 def test_behavioral_preference_observation_only_allows_inferred_preference(
@@ -6693,11 +6775,11 @@ def test_behavioral_preference_observation_only_allows_inferred_preference(
             fact_type="episodic",
             fact_kind="preference",
         )
-        db.entity_link_node(node_id, alice)
+        db.entity_link_fact(node_id, alice)
         node_ids.append(node_id)
     monkeypatch.setattr(
         db,
-        "memory_node_embeddings",
+        "memory_fact_embeddings",
         lambda requested_ids: {
             node_id: np.ones(1536, dtype=np.float32)
             for node_id in requested_ids
@@ -6709,7 +6791,7 @@ def test_behavioral_preference_observation_only_allows_inferred_preference(
         topic_key="alert-routing",
         topic_label="alert routing",
         bundle_type="observation",
-        source_node_ids=node_ids,
+        source_fact_ids=node_ids,
     )
     mgr = _NoAsyncMemoryNodeManager(db, embedding_config={})
 

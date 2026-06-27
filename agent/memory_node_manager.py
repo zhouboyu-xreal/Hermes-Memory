@@ -4812,6 +4812,22 @@ class MemoryNodeManager:
             for value in metadata.get("observation_ids", [])
             if str(value).isdigit()
         }
+        embedding_similarity: Optional[float] = None
+        observation_embedding = observation.get("embedding")
+        interpretation_embedding = interpretation.get("embedding")
+        if observation_embedding is not None and interpretation_embedding is not None:
+            observation_vector = self._as_embedding_vector(observation_embedding)
+            interpretation_vector = self._as_embedding_vector(interpretation_embedding)
+            if (
+                observation_vector is not None
+                and interpretation_vector is not None
+                and observation_vector.shape == interpretation_vector.shape
+            ):
+                embedding_similarity = float(
+                    np.dot(observation_vector, interpretation_vector)
+                )
+                if embedding_similarity < self._reflect_observation_interpretation_min_embedding_similarity:
+                    return 0.0, "embedding_gate"
         if int(observation_id) in linked_observation_ids:
             return 1.0, "existing_observation_evidence"
         if (
@@ -4851,6 +4867,9 @@ class MemoryNodeManager:
         elif observation_family == "preference" and interpretation_family == "insight":
             score += 0.08
             reasons.append("preference_insight")
+        if embedding_similarity is not None:
+            score += min(0.24, max(0.0, embedding_similarity) * 0.24)
+            reasons.append(f"embedding:{embedding_similarity:.3f}")
 
         observation_entity_id = observation.get("entity_id")
         try:
