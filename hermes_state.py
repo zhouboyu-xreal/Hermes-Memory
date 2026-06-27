@@ -5055,6 +5055,7 @@ class SessionDB:
         self,
         *,
         limit_interpretations: int = 8,
+        max_age_seconds: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         """Return the newest recall event awaiting feedback and its interpretation snapshots."""
         event_row = self._conn.execute(
@@ -5065,6 +5066,23 @@ class SessionDB:
         if not event_row:
             return None
         event = dict(event_row)
+        if max_age_seconds is not None:
+            try:
+                max_age = max(0.0, float(max_age_seconds))
+                created_at = datetime.fromisoformat(str(event.get("created_at") or ""))
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                age_seconds = (
+                    datetime.now().astimezone() - created_at.astimezone()
+                ).total_seconds()
+            except Exception:
+                age_seconds = max_age + 1.0
+            if age_seconds > max_age:
+                try:
+                    self.memory_mark_recall_event_status(int(event["id"]), "expired")
+                except Exception:
+                    pass
+                return None
         event["metadata"] = self._json_object(event.get("metadata"))
         link_rows = self._conn.execute(
             "SELECT * FROM memory_recall_event_interpretations "

@@ -587,6 +587,36 @@ def test_analyze_feedback_for_pending_interpretations_async_queues_target_event(
     assert calls == [("不是这个意思。", recall_event_id)]
 
 
+def test_analyze_feedback_for_pending_interpretations_async_expires_stale_latest_event(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户希望先讨论设计再修改代码。",
+        target_text="memory workflow",
+        scope="memory-system-design",
+        interpretation_type="inferred_preference",
+        confidence=0.82,
+        action_implication="修改前先给出方案。",
+    )
+    interpretation = db.memory_get_interpretation_by_id(interpretation_id)
+    recall_event_id = db.memory_record_interpretation_recall_event(
+        query="我们怎么改反馈机制？",
+        interpretations=[interpretation],
+    )
+    stale_at = (datetime.now().astimezone() - timedelta(minutes=6)).isoformat()
+    db._conn.execute(
+        "UPDATE memory_recall_events SET created_at = ?, updated_at = ? WHERE id = ?",
+        (stale_at, stale_at, recall_event_id),
+    )
+    db._conn.commit()
+    mgr = _NoAsyncMemoryNodeManager(db, enabled=True)
+
+    assert not mgr.analyze_feedback_for_pending_interpretations_async("不是这个意思。")
+    row = db._conn.execute(
+        "SELECT status FROM memory_recall_events WHERE id = ?",
+        (recall_event_id,),
+    ).fetchone()
+    assert row["status"] == "expired"
+
+
 def test_reflect_applies_pending_interpretation_feedback_first(db):
     interpretation_id = db.memory_upsert_interpretation(
         claim="用户的健康问题主要来自工作压力。",
