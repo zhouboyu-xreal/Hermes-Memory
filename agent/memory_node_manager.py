@@ -1280,9 +1280,9 @@ class MemoryNodeManager:
             memory_cfg.get("recall_interpretation_min_embedding_similarity"),
             0.60,
         )
-        self._feedback_recall_event_max_age_seconds = max(
+        self._feedback_recall_event_max_interval_seconds = max(
             0.0,
-            float(memory_cfg.get("feedback_recall_event_max_age_seconds", 300) or 300),
+            float(memory_cfg.get("feedback_recall_event_max_interval_seconds", 300) or 300),
         )
         self._min_turns_before_store = max(
             1,
@@ -7057,7 +7057,7 @@ class MemoryNodeManager:
             else:
                 event = self._db.memory_latest_pending_recall_event(
                     limit_interpretations=8,
-                    max_age_seconds=self._feedback_recall_event_max_age_seconds,
+                    max_interval_seconds=self._feedback_recall_event_max_interval_seconds,
                 )
         except Exception as exc:
             logger.debug("Memory interpretation feedback lookup failed: %s", exc)
@@ -7244,7 +7244,7 @@ class MemoryNodeManager:
         try:
             event = self._db.memory_latest_pending_recall_event(
                 limit_interpretations=1,
-                max_age_seconds=self._feedback_recall_event_max_age_seconds,
+                max_interval_seconds=self._feedback_recall_event_max_interval_seconds,
             )
         except Exception as exc:
             logger.debug("Memory interpretation feedback async lookup failed: %s", exc)
