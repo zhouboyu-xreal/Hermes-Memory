@@ -955,6 +955,7 @@ feedback_type 定义：
 - modify：用户修正 interpretation 的对象、原因、范围、状态或行动含义。
 - defer：用户表示现在不想处理、以后再说；不代表 interpretation 错误。
 - outdated：用户表示该 interpretation 已不适用或已经结束。
+- related：current_user_message 与该 interpretation 话题相关，但不是对该 interpretation 的确认、否认、修正、延期或过时反馈。
 - unrelated：current_user_message 与该 interpretation 没有直接反馈关系，通常是误召回、新话题或只与其他 interpretation 有关。
 - none：无法判断是否有可用反馈，或没有足够证据归类。
 
@@ -966,7 +967,7 @@ feedback_type 定义：
       "interpretation_id": 1,
       "is_related_to_interpretation": true,
       "feedback_target": "interpretation_claim | assistant_response | both | unrelated",
-      "feedback_type": "accept | reject | modify | defer | outdated | unrelated | none",
+      "feedback_type": "accept | reject | modify | defer | outdated | related | unrelated | none",
       "confidence": 0.0,
       "evidence_text": "用户原文中支持该判断的短句",
       "correction": "如果 feedback_type=modify，写出用户修正后的含义；否则可为空"
@@ -986,14 +987,13 @@ user_feedback:
 {feedback}
 
 更新要求：
-- accept：通常只小幅提高 confidence/strength，claim/action_implication 可保持不变。
-- reject：降低 confidence；如果用户明确否认核心判断，可将 status 设为 conflicted 或 archived，并在 resolution 中说明用户否认点。
+- 只会为 feedback_type=modify 或 reject 调用本 prompt。
 - modify：吸收用户 correction，更新 claim/action_implication/scope/resolution；不要保留已被用户纠正的错误推断。
-- defer：不改变真假判断，主要在 metadata 中体现暂缓，通常不必改 claim。
-- outdated：如果用户表示已不适用，可将 status 设为 archived 或 superseded。
+- reject：用户明确否认原 interpretation 的核心 claim。不要简单地把原 claim 取反；如果用户提供了明确替代含义，围绕替代含义重写 claim；如果用户只是表达不接受但没有给出可校准的新含义，输出 {{"should_update": false}}。
+- accept/defer/outdated/none/related 不应由本 prompt 处理。
 
 字段约束：
-- status 只能是 current、conflicted、archived、superseded。
+- status 只能是 current、conflicted。
 - conflict_status 只能是 none、resolved、unresolved。
 - polarity 只能是 positive、negative、mixed、neutral。
 - strength/confidence 必须是 0.0-1.0。
@@ -1010,7 +1010,7 @@ user_feedback:
   "polarity": "positive | negative | mixed | neutral",
   "strength": 0.0,
   "confidence": 0.0,
-  "status": "current | conflicted | archived | superseded",
+  "status": "current | conflicted",
   "conflict_status": "none | resolved | unresolved",
   "resolution": "反馈如何改变或确认这条解释",
   "action_implication": "未来 Agent 应如何使用这个解释",
@@ -6876,7 +6876,16 @@ class MemoryNodeManager:
     @staticmethod
     def _normalize_interpretation_feedback_type(value: Any) -> str:
         text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-        allowed = {"accept", "reject", "modify", "defer", "outdated", "unrelated", "none"}
+        allowed = {
+            "accept",
+            "reject",
+            "modify",
+            "defer",
+            "outdated",
+            "related",
+            "unrelated",
+            "none",
+        }
         return text if text in allowed else "none"
 
     @staticmethod
@@ -7129,7 +7138,7 @@ class MemoryNodeManager:
             feedback_type = self._normalize_interpretation_feedback_type(
                 raw_item.get("feedback_type")
             )
-            if feedback_type in {"none", "unrelated"}:
+            if feedback_type in {"none", "related", "unrelated"}:
                 self._log_info(
                     "memory_feedback",
                     "analysis_skipped",
@@ -8032,16 +8041,16 @@ class MemoryNodeManager:
             "metadata": {},
         }
 
-    def _persist_interpretation_feedback_update(
+    def _interpretation_feedback_metadata(
         self,
         *,
         interpretation: Dict[str, Any],
         feedback: Dict[str, Any],
-        update: Dict[str, Any],
-    ) -> int:
+        update_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         metadata = {
             **self._json_dict(interpretation.get("metadata", {})),
-            **self._json_dict(update.get("metadata", {})),
+            **self._json_dict(update_metadata or {}),
         }
         feedback_type = self._normalize_interpretation_feedback_type(
             feedback.get("feedback_type")
@@ -8060,6 +8069,55 @@ class MemoryNodeManager:
         })
         metadata["feedback"] = feedback_meta
         metadata["source"] = metadata.get("source") or "interpretation_feedback_update"
+        return metadata
+
+    def _apply_interpretation_feedback_score_update(
+        self,
+        *,
+        interpretation: Dict[str, Any],
+        feedback: Dict[str, Any],
+    ) -> bool:
+        feedback_type = self._normalize_interpretation_feedback_type(
+            feedback.get("feedback_type")
+        )
+        metadata = self._interpretation_feedback_metadata(
+            interpretation=interpretation,
+            feedback=feedback,
+        )
+        if feedback_type == "accept":
+            confidence = min(
+                1.0,
+                self._clip_unit_float(interpretation.get("confidence"), 0.5) + 0.06,
+            )
+            return self._db.memory_update_interpretation_scores(
+                int(interpretation["id"]),
+                confidence=confidence,
+                metadata=metadata,
+            )
+        if feedback_type == "outdated":
+            decay_score = self._clip_unit_float(
+                interpretation.get("decay_score"),
+                1.0,
+            )
+            return self._db.memory_update_interpretation_scores(
+                int(interpretation["id"]),
+                decay_score=max(0.0, decay_score * 0.5),
+                metadata=metadata,
+            )
+        return False
+
+    def _persist_interpretation_feedback_update(
+        self,
+        *,
+        interpretation: Dict[str, Any],
+        feedback: Dict[str, Any],
+        update: Dict[str, Any],
+    ) -> int:
+        metadata = self._interpretation_feedback_metadata(
+            interpretation=interpretation,
+            feedback=feedback,
+            update_metadata=self._json_dict(update.get("metadata", {})),
+        )
 
         claim = str(update.get("claim") or interpretation.get("claim") or "").strip()
         action_implication = str(
@@ -8142,25 +8200,58 @@ class MemoryNodeManager:
             feedback_type = self._normalize_interpretation_feedback_type(
                 feedback.get("feedback_type")
             )
-            if feedback_type in {"none", "unrelated"}:
+            if feedback_type in {"none", "related", "unrelated", "defer"}:
                 self._db.memory_mark_interpretation_feedback_applied(
                     feedback_id,
                     status="ignored",
                 )
                 report["ignored"] += 1
                 continue
-            update: Optional[Dict[str, Any]] = None
-            if feedback_type in {"reject", "modify", "outdated"}:
+            try:
+                if feedback_type in {"accept", "outdated"}:
+                    applied_score_update = self._apply_interpretation_feedback_score_update(
+                        interpretation=interpretation,
+                        feedback=feedback,
+                    )
+                    self._db.memory_mark_interpretation_feedback_applied(
+                        feedback_id,
+                        status="applied" if applied_score_update else "ignored",
+                    )
+                    if applied_score_update:
+                        report["applied"] += 1
+                        report["feedback_ids"].append(feedback_id)
+                        self._log_info(
+                            "memory_reflect",
+                            "interpretation_feedback_score_applied",
+                            {
+                                "feedback_id": feedback_id,
+                                "interpretation_id": interpretation.get("id"),
+                                "feedback_type": feedback_type,
+                            },
+                        )
+                    else:
+                        report["ignored"] += 1
+                    continue
+
+                if feedback_type not in {"reject", "modify"}:
+                    self._db.memory_mark_interpretation_feedback_applied(
+                        feedback_id,
+                        status="ignored",
+                    )
+                    report["ignored"] += 1
+                    continue
+
                 update = self._update_interpretation_using_feedback(
                     interpretation=interpretation,
                     feedback=feedback,
                 )
-            if update is None:
-                update = self._fallback_update_interpretation_using_feedback(
-                    interpretation=interpretation,
-                    feedback=feedback,
-                )
-            try:
+                if update is None:
+                    self._db.memory_mark_interpretation_feedback_applied(
+                        feedback_id,
+                        status="ignored",
+                    )
+                    report["ignored"] += 1
+                    continue
                 interpretation_id = self._persist_interpretation_feedback_update(
                     interpretation=interpretation,
                     feedback=feedback,

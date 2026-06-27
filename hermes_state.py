@@ -4938,6 +4938,7 @@ class SessionDB:
             "modify",
             "defer",
             "outdated",
+            "related",
             "unrelated",
             "implicit_positive",
             "implicit_negative",
@@ -5194,6 +5195,46 @@ class SessionDB:
             return int(cursor.lastrowid)
 
         return self._execute_write(_do)
+
+    def memory_update_interpretation_scores(
+        self,
+        interpretation_id: int,
+        *,
+        confidence: Optional[float] = None,
+        decay_score: Optional[float] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        clean_id = self._coerce_int_or_none(interpretation_id)
+        if clean_id is None:
+            return False
+        updates: List[str] = []
+        params: List[Any] = []
+        if confidence is not None:
+            updates.append("confidence = ?")
+            params.append(max(0.0, min(1.0, float(confidence))))
+        if decay_score is not None:
+            updates.append("decay_score = ?")
+            params.append(max(0.0, min(1.0, float(decay_score))))
+            updates.append("decay_updated_at = ?")
+            params.append(datetime.now().astimezone().isoformat())
+        if metadata is not None:
+            updates.append("metadata = ?")
+            params.append(json.dumps(metadata or {}, ensure_ascii=False, default=str))
+        if not updates:
+            return False
+        now_text = datetime.now().astimezone().isoformat()
+        updates.append("updated_at = ?")
+        params.append(now_text)
+        params.append(clean_id)
+
+        def _do(conn):
+            cursor = conn.execute(
+                f"UPDATE memory_interpretations SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
 
     def memory_pending_interpretation_feedback(
         self,

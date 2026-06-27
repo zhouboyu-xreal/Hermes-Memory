@@ -648,6 +648,129 @@ def test_reflect_applies_pending_interpretation_feedback_first(db):
     assert feedback_row["status"] == "applied"
 
 
+def test_reflect_accept_feedback_only_increases_interpretation_confidence(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户偏好灵活的时间管理方法。",
+        target_text="时间管理偏好",
+        scope="time management",
+        interpretation_type="inferred_preference",
+        confidence=0.5,
+        action_implication="后续推荐灵活方案。",
+    )
+    db.memory_add_interpretation_feedback(
+        recall_event_id=None,
+        interpretation_id=interpretation_id,
+        feedback_type="accept",
+        confidence=0.9,
+        user_message="没错，我就是需要灵活一点。",
+        evidence_text="没错",
+    )
+    mgr = _NoAsyncMemoryNodeManager(db, enabled=True)
+
+    report = mgr.reflect(limit=10)
+
+    row = db._conn.execute(
+        "SELECT claim, confidence, status, decay_score, metadata "
+        "FROM memory_interpretations WHERE id = ?",
+        (interpretation_id,),
+    ).fetchone()
+    feedback_row = db._conn.execute(
+        "SELECT status FROM memory_interpretation_feedback"
+    ).fetchone()
+    metadata = json.loads(row["metadata"])
+    assert report["interpretation_feedback"]["applied"] == 1
+    assert row["claim"] == "用户偏好灵活的时间管理方法。"
+    assert row["confidence"] == pytest.approx(0.56)
+    assert row["status"] == "current"
+    assert row["decay_score"] == pytest.approx(1.0)
+    assert metadata["feedback"]["counts"]["accept"] == 1
+    assert feedback_row["status"] == "applied"
+    assert mgr.llm_prompts == []
+
+
+def test_reflect_outdated_feedback_only_reduces_interpretation_decay_score(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户正在准备固定晨练计划。",
+        target_text="晨练计划",
+        scope="fitness",
+        interpretation_type="task",
+        confidence=0.8,
+        action_implication="后续跟进晨练计划。",
+    )
+    db._conn.execute(
+        "UPDATE memory_interpretations SET decay_score = 0.8 WHERE id = ?",
+        (interpretation_id,),
+    )
+    db._conn.commit()
+    db.memory_add_interpretation_feedback(
+        recall_event_id=None,
+        interpretation_id=interpretation_id,
+        feedback_type="outdated",
+        confidence=0.88,
+        user_message="这个计划已经不适用了。",
+        evidence_text="已经不适用",
+    )
+    mgr = _NoAsyncMemoryNodeManager(db, enabled=True)
+
+    report = mgr.reflect(limit=10)
+
+    row = db._conn.execute(
+        "SELECT claim, confidence, status, decay_score, metadata "
+        "FROM memory_interpretations WHERE id = ?",
+        (interpretation_id,),
+    ).fetchone()
+    feedback_row = db._conn.execute(
+        "SELECT status FROM memory_interpretation_feedback"
+    ).fetchone()
+    metadata = json.loads(row["metadata"])
+    assert report["interpretation_feedback"]["applied"] == 1
+    assert row["claim"] == "用户正在准备固定晨练计划。"
+    assert row["confidence"] == pytest.approx(0.8)
+    assert row["status"] == "current"
+    assert row["decay_score"] == pytest.approx(0.4)
+    assert metadata["feedback"]["counts"]["outdated"] == 1
+    assert feedback_row["status"] == "applied"
+    assert mgr.llm_prompts == []
+
+
+def test_reflect_defer_feedback_does_not_update_interpretation(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户希望之后讨论家庭活动。",
+        target_text="家庭活动",
+        scope="family",
+        interpretation_type="task",
+        confidence=0.7,
+        action_implication="后续可继续家庭活动建议。",
+    )
+    db.memory_add_interpretation_feedback(
+        recall_event_id=None,
+        interpretation_id=interpretation_id,
+        feedback_type="defer",
+        confidence=0.9,
+        user_message="这个以后再说。",
+        evidence_text="以后再说",
+    )
+    mgr = _NoAsyncMemoryNodeManager(db, enabled=True)
+
+    report = mgr.reflect(limit=10)
+
+    row = db._conn.execute(
+        "SELECT claim, confidence, status, metadata FROM memory_interpretations WHERE id = ?",
+        (interpretation_id,),
+    ).fetchone()
+    feedback_row = db._conn.execute(
+        "SELECT status FROM memory_interpretation_feedback"
+    ).fetchone()
+    assert report["interpretation_feedback"]["applied"] == 0
+    assert report["interpretation_feedback"]["ignored"] == 1
+    assert row["claim"] == "用户希望之后讨论家庭活动。"
+    assert row["confidence"] == pytest.approx(0.7)
+    assert row["status"] == "current"
+    assert json.loads(row["metadata"]) == {}
+    assert feedback_row["status"] == "ignored"
+    assert mgr.llm_prompts == []
+
+
 def test_memory_manager_ranks_interpretations_with_embedding_similarity(db):
     matching_id = db.memory_upsert_interpretation(
         claim="Design calibration should happen before implementation.",
