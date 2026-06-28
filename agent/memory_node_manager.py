@@ -3421,7 +3421,7 @@ class MemoryNodeManager:
             "metadata": metadata,
         }
 
-    def _update_observations_for_evidence_bundles(
+    def _reflect_update_observations_within_evidence_bundles(
         self,
         evidence_bundle_ids: List[int],
     ) -> List[int]:
@@ -6499,7 +6499,7 @@ class MemoryNodeManager:
         )
         return int(evidence_bundle_id)
     
-    def _reflect_generate_evidence_bundles_using_facts(
+    def _reflect_assign_facts_into_evidence_bundles(
         self,
         *,
         limit: int,
@@ -8380,7 +8380,7 @@ class MemoryNodeManager:
         )
 
         # build fact-evidence_bundle matching
-        evidence_bundle_report = self._reflect_generate_evidence_bundles_using_facts(
+        evidence_bundle_report = self._reflect_assign_facts_into_evidence_bundles(
             limit=limit,
             date_key=reflect_date_key,
             changed_evidence_bundle_ids=changed_evidence_bundle_ids,
@@ -8395,7 +8395,7 @@ class MemoryNodeManager:
             changed_evidence_bundle_ids
         ))
         # Cluster facts inside each evidence bundle into semantic observations.
-        report["observation_ids"] = self._update_observations_for_evidence_bundles(
+        report["observation_ids"] = self._reflect_update_observations_within_evidence_bundles(
             report["changed_evidence_bundle_ids"]
         )
         report["observations_updated"] = len(report["observation_ids"])
@@ -8410,15 +8410,11 @@ class MemoryNodeManager:
             "finish", 
             {
                 "evidence_bundles_consolidated": report.get("evidence_bundles_consolidated", 0),
-                "task_matched": evidence_bundle_report.get("task_matched", 0),
-                "task_updates": evidence_bundle_report.get("task_updates", 0),
                 "entity_merged": report.get("merged", 0),
                 "evidence_bundle_groups_merged": report.get("evidence_bundle_groups_merged", 0),
                 "observations_updated": report.get("observations_updated", 0),
                 "interpretations_generated": report.get("interpretations_generated", 0),
                 "interpretation_feedback_applied": feedback_report.get("applied", 0),
-                "tasks_paused": report.get("tasks_paused", 0),
-                "tasks_stale": report.get("tasks_stale", 0),
             })
         return report
 
