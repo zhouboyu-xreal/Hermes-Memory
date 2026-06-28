@@ -4543,31 +4543,6 @@ class SessionDB:
             return None
         return vector.tobytes()
 
-    @staticmethod
-    def _embedding_similarity(
-        query_embedding: Optional[np.ndarray],
-        stored_embedding: Any,
-    ) -> Optional[float]:
-        if query_embedding is None or stored_embedding is None:
-            return None
-        try:
-            query = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
-            if isinstance(stored_embedding, np.ndarray):
-                candidate = np.asarray(stored_embedding, dtype=np.float32).reshape(-1)
-            else:
-                candidate = np.frombuffer(bytes(stored_embedding), dtype=np.float32)
-        except (TypeError, ValueError):
-            return None
-        if query.size == 0 or candidate.size == 0 or query.shape != candidate.shape:
-            return None
-        denom = float(np.linalg.norm(query) * np.linalg.norm(candidate))
-        if denom <= 0.0:
-            return None
-        score = float(np.dot(query, candidate) / denom)
-        if not math.isfinite(score):
-            return None
-        return max(-1.0, min(1.0, score))
-
     # ── Memory interpretations ──────────────────────────────────────────
 
     def memory_upsert_interpretation(

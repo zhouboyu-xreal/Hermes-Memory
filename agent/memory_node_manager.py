@@ -2779,44 +2779,6 @@ class MemoryNodeManager:
             return data if isinstance(data, dict) else {}
         return {}
 
-    @classmethod
-    def _task_status(cls, task: Dict[str, Any]) -> str:
-        metadata = cls._json_dict(task.get("metadata", {}))
-        status = str(metadata.get("task_status", "active") or "active").strip().lower()
-        if status not in {"active", "blocked", "paused", "stale"}:
-            status = "active"
-        return status
-
-    @classmethod
-    def _task_profile_text(cls, task: Dict[str, Any]) -> str:
-        metadata = cls._json_dict(task.get("metadata", {}))
-        lines = [
-            f"Task summary: {task.get('summary', '')}",
-            f"Goal: {metadata.get('goal', '')}",
-            f"Current status: {metadata.get('task_status', 'active')}",
-        ]
-        steps = metadata.get("steps", [])
-        if isinstance(steps, list) and steps:
-            lines.append("Steps:")
-            for step in steps[:12]:
-                if isinstance(step, dict):
-                    title = str(step.get("title") or "").strip()
-                    status = str(step.get("status") or "active").strip()
-                else:
-                    title = str(step or "").strip()
-                    status = "active"
-                if title:
-                    lines.append(f"- {status}: {title}")
-        next_action = str(metadata.get("next_action") or "").strip()
-        if next_action:
-            lines.append(f"Next action: {next_action}")
-        lines.extend([
-            f"Keywords: {task.get('keywords', '')}",
-            f"Entity: {task.get('entity_name', '')}",
-            f"Topic: {task.get('topic_label') or task.get('topic_key', '')}",
-        ])
-        return "\n".join(line for line in lines if str(line).strip())
-
     @staticmethod
     def _as_embedding_vector(value: Any) -> Optional[np.ndarray]:
         if value is None:
@@ -2974,20 +2936,6 @@ class MemoryNodeManager:
             max_source_similarity,
             coverage_similarity,
         )
-
-    @staticmethod
-    def _fact_match_text(fact: Dict[str, Any]) -> str:
-        keywords = fact.get("keywords", [])
-        topics = fact.get("topics", [])
-        if not isinstance(keywords, list):
-            keywords = [keywords]
-        if not isinstance(topics, list):
-            topics = [topics]
-        return "\n".join([
-            f"Fact: {fact.get('summary', '')}",
-            f"Keywords: {' '.join(str(item) for item in keywords if str(item or '').strip())}",
-            f"Topics: {' '.join(str(item) for item in topics if str(item or '').strip())}",
-        ])
 
     @staticmethod
     def _fact_kind_excluded_from_task(fact: Dict[str, Any]) -> bool:
