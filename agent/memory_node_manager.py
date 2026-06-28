@@ -3149,7 +3149,7 @@ class MemoryNodeManager:
             return "episodic"
         return "semantic"
 
-    def _cluster_evidence_bundle_facts_into_observations(
+    def _cluster_facts_for_observations_within_evidence_bundle(
         self,
         source_facts: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
@@ -3490,7 +3490,7 @@ class MemoryNodeManager:
                 sorted(relevant_fact_ids)
             )
             fact_clusters = (
-                self._cluster_evidence_bundle_facts_into_observations(
+                self._cluster_facts_for_observations_within_evidence_bundle(
                     new_facts
                 )
             )
@@ -6198,7 +6198,7 @@ class MemoryNodeManager:
         match = self._match_fact_cluster_to_existing_evidence_bundle(cluster_for_match)
         if not match:
             return None
-        existing_bundle, score, reason, supporting_nodes = match
+        existing_bundle, score, reason, supporting_facts = match
         evidence_bundle_id = int(existing_bundle["id"])
         existing_source_ids = self._db.memory_evidence_bundle_source_ids(
             evidence_bundle_id
@@ -6272,7 +6272,7 @@ class MemoryNodeManager:
             "source_fact_ids": source_fact_ids,
             "score": score,
             "reason": reason,
-            "supporting_facts": self._reflect_fact_log_items(supporting_nodes + source_facts),
+            "supporting_facts": self._reflect_fact_log_items(supporting_facts + source_facts),
             "updated_evidence_bundle": {
                 **self._reflect_evidence_bundle_log_item(existing_bundle),
                 "metadata": metadata,
@@ -6280,7 +6280,7 @@ class MemoryNodeManager:
         })
         return evidence_bundle_id
 
-    def _cluster_unprocessed_facts(
+    def _cluster_facts_for_evidence_bundle(
         self,
         facts: List[Dict[str, Any]],
         *,
@@ -6542,7 +6542,7 @@ class MemoryNodeManager:
             if changed_evidence_bundle_ids is not None
             else []
         )
-        clusters = self._cluster_unprocessed_facts(
+        clusters = self._cluster_facts_for_evidence_bundle(
             unprocessed_fact_candidates,
             excluded_fact_ids=consumed_fact_ids,
         )
