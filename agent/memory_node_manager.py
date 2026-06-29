@@ -7019,11 +7019,11 @@ class MemoryNodeManager:
             if recall_event_id is not None:
                 event = self._db.memory_recall_event_by_id(
                     int(recall_event_id),
-                    limit_interpretations=8,
+                    limit_interpretations=1,
                 )
             else:
                 event = self._db.memory_latest_pending_recall_event(
-                    limit_interpretations=8,
+                    limit_interpretations=1,
                     max_interval_seconds=self._feedback_recall_event_max_interval_seconds,
                 )
         except Exception as exc:

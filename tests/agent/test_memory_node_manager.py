@@ -397,6 +397,12 @@ def test_interpretation_recall_events_link_feedback_targets(db):
         interpretations=[{**interpretation, "_recall_score": 1.23}],
     )
     assert recall_event_id is not None
+    row = db._conn.execute(
+        "SELECT status FROM memory_recall_events WHERE id = ?",
+        (recall_event_id,),
+    ).fetchone()
+    assert row["status"] == "awaiting_response"
+    assert db.memory_latest_pending_recall_event() is None
     assert db.memory_attach_latest_recall_event_response(
         query="我们怎么改反馈机制？",
         assistant_response="我建议先讨论方案。",
@@ -573,6 +579,10 @@ def test_analyze_feedback_for_pending_interpretations_async_queues_target_event(
         query="我们怎么改反馈机制？",
         interpretations=[interpretation],
     )
+    assert db.memory_attach_latest_recall_event_response(
+        query="我们怎么改反馈机制？",
+        assistant_response="我建议先讨论方案。",
+    )
     mgr = _NoAsyncMemoryNodeManager(db, enabled=True)
     calls = []
 
@@ -600,6 +610,10 @@ def test_analyze_feedback_for_pending_interpretations_async_expires_stale_latest
     recall_event_id = db.memory_record_interpretation_recall_event(
         query="我们怎么改反馈机制？",
         interpretations=[interpretation],
+    )
+    assert db.memory_attach_latest_recall_event_response(
+        query="我们怎么改反馈机制？",
+        assistant_response="我建议先讨论方案。",
     )
     stale_at = (datetime.now().astimezone() - timedelta(minutes=6)).isoformat()
     db._conn.execute(

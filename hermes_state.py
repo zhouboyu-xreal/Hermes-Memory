@@ -446,7 +446,7 @@ CREATE TABLE IF NOT EXISTS memory_recall_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     query TEXT NOT NULL DEFAULT '',
     assistant_response TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'awaiting_feedback',
+    status TEXT NOT NULL DEFAULT 'awaiting_response',
     metadata TEXT DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -4835,39 +4835,6 @@ class SessionDB:
         )
         return items[:max(1, int(top_k or 3))]
 
-    def memory_active_task_interpretations(self, *, limit: int = 50) -> List[Dict[str, Any]]:
-        """Return current task interpretations for fact-to-task matching."""
-        rows = self._conn.execute(
-            "SELECT mi.*, en.name AS entity_name "
-            "FROM memory_interpretations mi "
-            "LEFT JOIN entity_nodes en ON en.id = mi.entity_id "
-            "WHERE mi.status IN ('current', 'conflicted') "
-            "AND mi.interpretation_type = 'task' "
-            "ORDER BY mi.updated_at DESC, mi.id DESC "
-            "LIMIT ?",
-            (max(1, int(limit or 50)),),
-        ).fetchall()
-        out: List[Dict[str, Any]] = []
-        for row in rows:
-            item = self._memory_interpretation_from_row(row)
-            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-            item["entity_id"] = item.get("entity_id") or metadata.get("entity_id")
-            item["entity_name"] = item.get("entity_name") or metadata.get("entity_name") or ""
-            item["topic_key"] = metadata.get("topic_key") or item.get("scope") or "general"
-            item["topic_label"] = metadata.get("topic_label") or item.get("target_text") or item.get("scope") or "general"
-            item["summary"] = item.get("claim") or ""
-            item["keywords"] = " ".join(
-                part
-                for part in [
-                    str(item.get("target_text") or ""),
-                    str(item.get("scope") or ""),
-                    str(item.get("claim") or ""),
-                ]
-                if part.strip()
-            )
-            out.append(item)
-        return out
-
     def get_interpretations_for_observation(
         self,
         observation_id: int,
@@ -4930,8 +4897,13 @@ class SessionDB:
     @staticmethod
     def _normalize_recall_event_status(value: Any) -> str:
         text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-        allowed = {"awaiting_feedback", "feedback_analyzed", "expired"}
-        return text if text in allowed else "awaiting_feedback"
+        allowed = {
+            "awaiting_response",
+            "awaiting_feedback",
+            "feedback_analyzed",
+            "expired",
+        }
+        return text if text in allowed else "awaiting_response"
 
     @staticmethod
     def _interpretation_recall_snapshot(interpretation: Dict[str, Any]) -> Dict[str, Any]:
@@ -4960,13 +4932,13 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 "UPDATE memory_recall_events SET status = 'expired', updated_at = ? "
-                "WHERE status = 'awaiting_feedback'",
+                "WHERE status IN ('awaiting_response', 'awaiting_feedback')",
                 (now_text,),
             )
             cursor = conn.execute(
                 "INSERT INTO memory_recall_events "
                 "(query, status, metadata, created_at, updated_at) "
-                "VALUES (?, 'awaiting_feedback', ?, ?, ?)",
+                "VALUES (?, 'awaiting_response', ?, ?, ?)",
                 (str(query or "").strip(), metadata_str, now_text, now_text),
             )
             recall_event_id = int(cursor.lastrowid)
@@ -5009,7 +4981,7 @@ class SessionDB:
         def _do(conn):
             row = conn.execute(
                 "SELECT id FROM memory_recall_events "
-                "WHERE status = 'awaiting_feedback' AND query = ? "
+                "WHERE status = 'awaiting_response' AND query = ? "
                 "ORDER BY created_at DESC, id DESC LIMIT 1",
                 (clean_query,),
             ).fetchone()
@@ -5018,7 +4990,7 @@ class SessionDB:
             event_id = int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
             conn.execute(
                 "UPDATE memory_recall_events "
-                "SET assistant_response = ?, updated_at = ? "
+                "SET assistant_response = ?, status = 'awaiting_feedback', updated_at = ? "
                 "WHERE id = ?",
                 (clean_response, now_text, event_id),
             )
