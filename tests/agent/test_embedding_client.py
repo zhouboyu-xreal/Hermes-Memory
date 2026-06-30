@@ -2,7 +2,7 @@ import logging
 
 import requests
 
-from agent.embedding_client import _OpenAIBackend
+from agent.embedding_client import _OpenAIBackend, _build_openai_embedding_url
 
 
 def test_openai_backend_resolves_configured_environment_reference(monkeypatch):
@@ -80,3 +80,17 @@ def test_openai_backend_logs_provider_error_response(monkeypatch, caplog):
         assert backend.embed("test") is None
 
     assert "User not found." in caplog.text
+
+
+def test_build_openai_embedding_url_preserves_explicit_endpoint():
+    assert (
+        _build_openai_embedding_url("https://api.z.ai/api/paas/v4/embeddings")
+        == "https://api.z.ai/api/paas/v4/embeddings"
+    )
+
+
+def test_build_openai_embedding_url_supports_zai_style_base():
+    assert (
+        _build_openai_embedding_url("https://api.z.ai/api/paas/v4")
+        == "https://api.z.ai/api/paas/v4/embeddings"
+    )

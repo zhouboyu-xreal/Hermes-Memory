@@ -53,6 +53,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 # ── Embedding dimension auto-detection table ──────────────────────────────
 
 KNOWN_MODEL_DIMS: Dict[str, int] = {
+    "embedding-3": 2048,
     "qwen3-embedding:8b": 4096,
     "qwen3-embedding": 4096,
     "text-embedding-3-small": 1536,
@@ -77,6 +78,17 @@ KNOWN_MODEL_DIMS: Dict[str, int] = {
 def _response_error_detail(response: requests.Response) -> str:
     detail = (response.text or "").strip().replace("\n", " ")
     return detail[:1000]
+
+
+def _build_openai_embedding_url(base_url: str) -> str:
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        base = "https://api.openai.com"
+    if base.endswith("/embeddings"):
+        return base
+    if base.endswith("/v1") or re.search(r"/api/paas/v\d+$", base):
+        return f"{base}/embeddings"
+    return f"{base}/v1/embeddings"
 
 # ── Config helpers ────────────────────────────────────────────────────────
 
@@ -175,10 +187,8 @@ class _OpenAIBackend:
     """
 
     def __init__(self, config: Dict[str, Any]) -> None:
-        base = config.get("base_url", "").rstrip("/")
-        if not base:
-            base = "https://api.openai.com"
-        self.url = f"{base}/v1/embeddings"
+        base = config.get("base_url", "")
+        self.url = _build_openai_embedding_url(base)
         self.model = config.get("model", "text-embedding-3-small")
         self.api_key = str(config.get("api_key") or "").strip()
         env_ref = re.fullmatch(r"\${([A-Za-z_][A-Za-z0-9_]*)}", self.api_key)
