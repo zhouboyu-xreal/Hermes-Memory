@@ -565,6 +565,45 @@ def test_analyze_feedback_for_pending_interpretations_skips_assistant_response_f
     assert db.memory_latest_pending_recall_event() is None
 
 
+def test_analyze_feedback_for_pending_interpretations_detects_language_from_user_message_only(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="User's health issue is mainly caused by work pressure.",
+        target_text="health status",
+        scope="health",
+        interpretation_type="insight",
+        confidence=0.74,
+        action_implication="Follow up with stress-management suggestions.",
+    )
+    interpretation = db.memory_get_interpretation_by_id(interpretation_id)
+    db.memory_record_interpretation_recall_event(
+        query="What should I do about my health lately?",
+        interpretations=[interpretation],
+    )
+    db.memory_attach_latest_recall_event_response(
+        query="What should I do about my health lately?",
+        assistant_response="This may be related to work pressure.",
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        llm_outputs=[
+            json.dumps({
+                "has_feedback": False,
+                "feedback_items": [],
+            }, ensure_ascii=False)
+        ],
+        enabled=True,
+    )
+
+    written = mgr.analyze_feedback_for_pending_interpretations(
+        "不是工作压力，是睡眠问题。"
+    )
+
+    assert written == 0
+    prompt = mgr.llm_prompts[0]
+    assert "所有自由文本字段必须使用中文输出" in prompt
+    assert "所有自由文本字段必须使用英语输出" not in prompt
+
+
 def test_analyze_feedback_for_pending_interpretations_async_queues_target_event(db):
     interpretation_id = db.memory_upsert_interpretation(
         claim="用户希望先讨论设计再修改代码。",
@@ -631,6 +670,69 @@ def test_analyze_feedback_for_pending_interpretations_async_expires_stale_latest
     assert row["status"] == "expired"
 
 
+def test_interpretation_feedback_switch_disables_async_analysis(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户希望先讨论设计再修改代码。",
+        target_text="memory workflow",
+        scope="memory-system-design",
+        interpretation_type="inferred_preference",
+        confidence=0.82,
+        action_implication="修改前先给出方案。",
+    )
+    interpretation = db.memory_get_interpretation_by_id(interpretation_id)
+    db.memory_record_interpretation_recall_event(
+        query="我们怎么改反馈机制？",
+        interpretations=[interpretation],
+    )
+    assert db.memory_attach_latest_recall_event_response(
+        query="我们怎么改反馈机制？",
+        assistant_response="我建议先讨论方案。",
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        enabled=True,
+        memory_config={"enable_interpretation_feedback": False},
+    )
+
+    assert not mgr.analyze_feedback_for_pending_interpretations_async("不是这个意思。")
+    assert mgr._store_queue.unfinished_tasks == 0
+    assert mgr.analyze_feedback_for_pending_interpretations("不是这个意思。") == 0
+    assert db.memory_pending_interpretation_feedback() == []
+
+
+def test_interpretation_feedback_switch_disables_store_response_link(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户希望先讨论设计再修改代码。",
+        target_text="memory workflow",
+        scope="memory-system-design",
+        interpretation_type="inferred_preference",
+        confidence=0.82,
+        action_implication="修改前先给出方案。",
+    )
+    interpretation = db.memory_get_interpretation_by_id(interpretation_id)
+    recall_event_id = db.memory_record_interpretation_recall_event(
+        query="我们怎么改反馈机制？",
+        interpretations=[interpretation],
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        enabled=True,
+        memory_config={"enable_interpretation_feedback": False},
+    )
+    mgr.store_turn = lambda *_args, **_kwargs: True
+
+    assert mgr.store_turn_async("我们怎么改反馈机制？", "我建议先讨论方案。")
+    assert mgr.flush_store_queue(timeout=2.0)
+
+    row = db._conn.execute(
+        "SELECT status, assistant_response FROM memory_recall_events WHERE id = ?",
+        (recall_event_id,),
+    ).fetchone()
+    assert row["status"] == "awaiting_response"
+    assert row["assistant_response"] in (None, "")
+    assert mgr.shutdown_store_worker(timeout=1.0) is True
+
+
 def test_reflect_applies_pending_interpretation_feedback_first(db):
     interpretation_id = db.memory_upsert_interpretation(
         claim="用户的健康问题主要来自工作压力。",
@@ -690,6 +792,45 @@ def test_reflect_applies_pending_interpretation_feedback_first(db):
     assert "睡眠状态" in row["action_implication"]
     assert metadata["feedback"]["counts"]["modify"] == 1
     assert feedback_row["status"] == "applied"
+
+
+def test_interpretation_feedback_switch_disables_reflect_application(db):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户的健康问题主要来自工作压力。",
+        target_text="健康状态",
+        scope="health",
+        interpretation_type="insight",
+        confidence=0.74,
+        action_implication="后续围绕工作压力提供健康建议。",
+    )
+    db.memory_add_interpretation_feedback(
+        recall_event_id=None,
+        interpretation_id=interpretation_id,
+        feedback_type="modify",
+        confidence=0.92,
+        user_message="不是工作压力，是睡眠问题。",
+        evidence_text="不是工作压力，是睡眠问题。",
+        correction="用户健康问题更偏向睡眠状态，而不是工作压力。",
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        enabled=True,
+        memory_config={"enable_interpretation_feedback": False},
+    )
+
+    report = mgr.reflect(limit=10)
+
+    feedback_row = db._conn.execute(
+        "SELECT status FROM memory_interpretation_feedback"
+    ).fetchone()
+    row = db._conn.execute(
+        "SELECT claim FROM memory_interpretations WHERE id = ?",
+        (interpretation_id,),
+    ).fetchone()
+    assert report["interpretation_feedback"]["disabled"] is True
+    assert report["interpretation_feedback"]["applied"] == 0
+    assert feedback_row["status"] == "pending"
+    assert row["claim"] == "用户的健康问题主要来自工作压力。"
 
 
 def test_reflect_accept_feedback_only_increases_interpretation_confidence(db):
@@ -813,6 +954,62 @@ def test_reflect_defer_feedback_does_not_update_interpretation(db):
     assert json.loads(row["metadata"]) == {}
     assert feedback_row["status"] == "ignored"
     assert mgr.llm_prompts == []
+
+
+def test_update_interpretation_using_feedback_detects_language_from_claim_only(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "should_update": True,
+                "claim": "User prefers a flexible sleep-recovery plan.",
+                "target_text": "sleep recovery",
+                "scope": "health",
+                "interpretation_type": "insight",
+                "polarity": "neutral",
+                "strength": 0.82,
+                "confidence": 0.79,
+                "status": "current",
+                "conflict_status": "none",
+                "resolution": "",
+                "action_implication": "Offer flexible recovery strategies.",
+                "metadata": {},
+            })
+        ],
+    )
+
+    updated = mgr._update_interpretation_using_feedback(
+        interpretation={
+            "id": 1,
+            "claim": "User prefers a flexible sleep-recovery plan.",
+            "target_text": "sleep recovery",
+            "scope": "health",
+            "interpretation_type": "insight",
+            "polarity": "neutral",
+            "strength": 0.7,
+            "confidence": 0.7,
+            "status": "current",
+            "conflict_status": "none",
+            "resolution": "",
+            "action_implication": "Offer flexible recovery strategies.",
+            "metadata": {},
+        },
+        feedback={
+            "id": 5,
+            "feedback_type": "modify",
+            "confidence": 0.91,
+            "user_message": "不是这个意思，我更想要实际一点的方法。",
+            "evidence_text": "不是这个意思，我更想要实际一点的方法。",
+            "correction": "用户更希望方案务实可执行。",
+            "created_at": datetime.now().astimezone().isoformat(),
+        },
+    )
+
+    assert updated is not None
+    prompt = mgr.llm_prompts[0]
+    assert "所有自由文本字段必须使用英语输出" in prompt
+    assert "所有自由文本字段必须使用中文输出" not in prompt
 
 
 def test_memory_manager_ranks_interpretations_with_embedding_similarity(db):
@@ -1540,6 +1737,272 @@ def test_store_turn_extracts_facts_when_pending_characters_exceed_limit(db):
     assert mgr._pending_store_turns == []
 
 
+def test_memory_output_language_force_en_changes_subject_entities_and_prompt(db):
+    retain_payload = {
+        "facts": [
+            {
+                "text": "Alice prefers Slack alerts for urgent updates.",
+                "keywords": ["Alice", "Slack alerts"],
+                "primary_entity": {"name": "Alice", "type": "PERSON"},
+                "primary_topic": "alert preference",
+                "fact_type": "semantic",
+                "fact_subject": "user",
+                "fact_kind": "preference",
+                "priority": 85,
+                "entities": [{"name": "Alice", "type": "PERSON"}],
+            },
+            {
+                "text": "Hermes recommended keeping Slack as the urgent channel.",
+                "keywords": ["Hermes", "Slack"],
+                "primary_entity": {"name": "Hermes", "type": "AGENT"},
+                "primary_topic": "assistant recommendation",
+                "fact_type": "episodic",
+                "fact_subject": "assistant",
+                "fact_kind": "recommendation",
+                "priority": 80,
+                "entities": [{"name": "Hermes", "type": "AGENT"}],
+            },
+        ],
+        "causal_relations": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"memory_output_language_mode": "force_en"},
+        llm_outputs=[json.dumps(retain_payload)],
+    )
+
+    assert mgr.store_turn("Alice wants Slack alerts.", "I recommend Slack for urgent updates.") is True
+
+    prompt = mgr.llm_prompts[0]
+    assert "所有自由文本字段必须使用英语输出" in prompt
+    entity_names = [
+        json.loads(row["entity_names"])
+        for row in db._conn.execute(
+            "SELECT entity_names FROM memory_facts ORDER BY id ASC"
+        ).fetchall()
+    ]
+    assert "user" in entity_names[0]
+    assert "assistant" in entity_names[1]
+    assert "用户" not in entity_names[0]
+    assert "助手" not in entity_names[1]
+
+
+def test_recall_query_analysis_prompt_uses_english_output_when_forced(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"memory_output_language_mode": "force_en"},
+        llm_outputs=[
+            json.dumps({
+                "needs_recall": True,
+                "recall_confidence": 0.9,
+                "recall_reason": "historical_context_required",
+                "search_text": "Alice Slack alert preference",
+                "keywords": ["Alice", "Slack", "alert preference"],
+                "entities": [{"name": "Alice", "type": "PERSON"}],
+                "recall_intent": "evidence",
+            })
+        ],
+    )
+
+    analysis = mgr._analyze_recall_query("What alert channel did Alice prefer?")
+
+    assert analysis is not None
+    assert "所有自由文本字段必须使用英语输出" in mgr.llm_prompts[0]
+
+
+def test_observation_generation_detects_language_from_fact_summaries_only(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "observation_type": "context",
+                "summary": "用户最近一直在调整作息，希望改善疲劳问题。",
+                "confidence": 0.8,
+            })
+        ],
+    )
+
+    facts = [{
+        "id": 1,
+        "summary": "用户最近一直在调整作息，希望改善疲劳问题。",
+        "fact_type": "semantic",
+        "fact_kind": "context",
+        "original_dialog": json.dumps(
+            {
+                "source_dialog": {
+                    "turns": [{
+                        "user_message": "最近总觉得累。",
+                        "assistant_response": "Let's build a better sleep routine.",
+                        "tags": ["sample:0000_sample3", "turn:0"],
+                    }]
+                }
+            },
+            ensure_ascii=False,
+        ),
+    }]
+
+    created = mgr._generate_observation_using_llm(
+        evidence_bundle={"id": 7, "entity_name": "用户", "topic_key": "疲劳恢复"},
+        observation_type="context",
+        source_facts=facts,
+    )
+
+    assert created is not None
+    prompt = mgr.llm_prompts[0]
+    assert "所有自由文本字段必须使用中文输出" in prompt
+    assert "所有自由文本字段必须使用英语输出" not in prompt
+
+
+def test_interpretation_generation_detects_language_from_observation_summary_only(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "should_create": True,
+                "claim": "用户当前在处理疲劳恢复任务，需要可执行的作息调整方案。",
+                "action_implication": "优先提供低负担、可持续的恢复建议。",
+                "interpretation_type": "task",
+                "status": "current",
+                "conflict_status": "none",
+                "polarity": "neutral",
+                "strength": 0.8,
+                "confidence": 0.8,
+                "evidence_fact_ids": [1],
+                "evidence_observation_ids": [11],
+                "metadata": {},
+            })
+        ],
+    )
+
+    observation = {
+        "id": 11,
+        "entity_name": "用户",
+        "topic_key": "疲劳恢复",
+        "topic_label": "疲劳恢复",
+        "observation_type": "task_state",
+        "summary": "用户希望改善疲劳状态，并寻找可执行的恢复方法。",
+        "metadata": {
+            "allowed_interpretation_types": ["task"],
+            "evidence_shape": "progression",
+            "temporal_scope": "recent",
+            "dominant_fact_type": "episodic",
+            "evidence_mixture": "episodic_only",
+        },
+    }
+    source_facts = [{
+        "id": 1,
+        "summary": "用户希望改善疲劳状态，并寻找可执行的恢复方法。",
+        "fact_type": "episodic",
+        "fact_subject": "user",
+        "fact_kind": "request",
+        "original_dialog": json.dumps(
+            {
+                "source_dialog": {
+                    "turns": [{
+                        "user_message": "我最近很累。",
+                        "assistant_response": "We can track energy with a simple routine.",
+                        "tags": ["sample:0000_sample4", "turn:1"],
+                    }]
+                }
+            },
+            ensure_ascii=False,
+        ),
+    }]
+
+    generated = mgr._generate_interpretation(
+        observation=observation,
+        source_facts=source_facts,
+        observation_id=11,
+    )
+
+    assert generated is not None
+    prompt = mgr.llm_prompts[0]
+    assert "所有自由文本字段必须使用中文输出" in prompt
+    assert "所有自由文本字段必须使用英语输出" not in prompt
+
+
+def test_interpretation_update_detects_language_from_observation_summary_only(db):
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "should_update": True,
+                "claim": "用户需要更灵活的时间安排方式，以减少熬夜并保持效率。",
+                "action_implication": "提供可碎片化执行的时间管理建议。",
+                "interpretation_type": "task",
+                "status": "current",
+                "conflict_status": "none",
+                "polarity": "neutral",
+                "strength": 0.85,
+                "confidence": 0.82,
+                "evidence_fact_ids": [1],
+                "evidence_observation_ids": [21],
+                "metadata": {},
+            })
+        ],
+    )
+
+    interpretation = {
+        "id": 5,
+        "claim": "User needs a flexible schedule.",
+        "action_implication": "Offer practical scheduling advice.",
+        "interpretation_type": "task",
+        "status": "current",
+        "conflict_status": "none",
+        "polarity": "neutral",
+        "strength": 0.6,
+        "confidence": 0.6,
+        "metadata": {"task_status": "active"},
+    }
+    observation = {
+        "id": 21,
+        "entity_name": "用户",
+        "topic_key": "时间管理需求",
+        "topic_label": "时间管理需求",
+        "observation_type": "task_state",
+        "summary": "用户希望找到更灵活的时间安排方法，以减少熬夜。",
+        "metadata": {
+            "allowed_interpretation_types": ["task"],
+        },
+    }
+    source_facts = [{
+        "id": 1,
+        "summary": "用户希望找到更灵活的时间安排方法，以减少熬夜。",
+        "fact_type": "episodic",
+        "fact_subject": "user",
+        "fact_kind": "request",
+        "original_dialog": json.dumps(
+            {
+                "source_dialog": {
+                    "turns": [{
+                        "user_message": "最近总是忙得抽不开身。",
+                        "assistant_response": "Try a weekly planning template first.",
+                        "tags": ["sample:0000_sample5", "turn:2"],
+                    }]
+                }
+            },
+            ensure_ascii=False,
+        ),
+    }]
+
+    updated = mgr._update_existing_interpretation_from_observation(
+        interpretation=interpretation,
+        observation=observation,
+        source_facts=source_facts,
+        observation_id=21,
+    )
+
+    assert updated is not None
+    prompt = mgr.llm_prompts[0]
+    assert "所有自由文本字段必须使用中文输出" in prompt
+    assert "所有自由文本字段必须使用英语输出" not in prompt
+
+
 def test_store_turn_keeps_pending_batch_when_extraction_fails(db):
     mgr = _NoAsyncMemoryNodeManager(
         db,
@@ -1551,6 +2014,41 @@ def test_store_turn_keeps_pending_batch_when_extraction_fails(db):
     assert mgr.store_turn("第一轮", "回答一") is False
     assert mgr.store_turn("第二轮", "回答二") is False
     assert len(mgr._pending_store_turns) == 2
+
+
+def test_flush_pending_store_turns_forces_final_batch(db):
+    retain_payload = {
+        "facts": [
+            {
+                "text": "用户确认要继续当前实现。",
+                "keywords": ["继续", "实现"],
+                "topic": ["实现推进"],
+                "fact_type": "episodic",
+                "fact_subject": "user",
+                "fact_kind": "action",
+                "priority": 72,
+                "entities": [],
+            }
+        ],
+        "causal_relations": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"min_turns_before_store": 3},
+        llm_outputs=[json.dumps(retain_payload)],
+    )
+
+    assert mgr.store_turn("第一轮需求", "第一轮回答") is False
+    assert mgr.store_turn("第二轮补充", "第二轮回答") is False
+    assert len(mgr._pending_store_turns) == 2
+    assert mgr.llm_prompts == []
+
+    assert mgr.flush_pending_store_turns() is True
+    assert len(mgr._pending_store_turns) == 0
+    assert len(mgr.llm_prompts) == 1
+    row = db._conn.execute("SELECT COUNT(*) AS count FROM memory_facts").fetchone()
+    assert int(row["count"]) == 1
 
 
 def test_store_turn_async_queues_and_processes_turns_in_order(db):
@@ -2017,12 +2515,12 @@ def test_observation_prompts_explain_type_specific_synthesis(db):
             "topic_key": "rollout",
         },
         observation_type="strategy",
-        source_nodes=facts,
+        source_facts=facts,
     )
     updated = mgr._generate_observation_using_llm(
         evidence_bundle={"id": 7},
         observation_type="task_progress",
-        source_nodes=facts,
+        source_facts=facts,
         existing_observation={
             "id": 11,
             "summary": "Alice is executing the staged rollout.",
@@ -2674,6 +3172,28 @@ def test_memory_keyword_search_applies_time_range_before_ranking(db):
     )
 
     assert list(results) == [in_range]
+
+
+def test_memory_keyword_search_escapes_fts_punctuation(db):
+    expected = _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="User attended Sunday mass at St. Mary's Church.",
+        keywords=["St. Mary's Church", "Sunday mass"],
+    )
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 11:00:00",
+        summary="User attended a service at the cathedral.",
+        keywords=["cathedral"],
+    )
+
+    results = db._search_memory_keyword(
+        "St. Mary's Church OR cathedral",
+        limit=10,
+    )
+
+    assert expected in results
 
 
 def test_memory_search_pushes_time_candidate_ids_to_vector_channel(db, monkeypatch):
@@ -3739,6 +4259,56 @@ def test_recall_formats_current_interpretations_before_evidence(db, monkeypatch)
     assert "用户当前倾向先用 heuristic 控制 task fact 选择" in context
     assert "action implication: 后续先讨论 heuristic/data-flow，再考虑 prompt guidance。" in context
     assert context.index(INTERPRETATION_SECTION_HEADER) < context.index(WORLD_FACT_SECTION_HEADER)
+
+
+def test_interpretation_feedback_switch_disables_recall_event_recording(db, monkeypatch):
+    interpretation_id = db.memory_upsert_interpretation(
+        claim="用户当前倾向先用 heuristic 控制 task fact 选择，再谨慎修改 prompt。",
+        subject_text="user",
+        target_text="memory task fact selection",
+        scope="memory-system-design",
+        interpretation_type="inferred_preference",
+        confidence=0.86,
+        action_implication="后续先讨论 heuristic/data-flow，再考虑 prompt guidance。",
+    )
+    interpretation = db.memory_get_interpretation_by_id(interpretation_id)
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[
+            json.dumps({
+                "summary": "heuristic task fact",
+                "keywords": ["heuristic", "task", "fact"],
+            })
+        ],
+        memory_config={"enable_interpretation_feedback": False},
+    )
+    monkeypatch.setattr(
+        mgr,
+        "_retrieve_recall_raw_candidates",
+        lambda **_kwargs: ([interpretation], [], [], []),
+    )
+    monkeypatch.setattr(
+        mgr,
+        "_rank_recall_raw_candidates",
+        lambda **_kwargs: {
+            "interpretations": [{**interpretation, "_recall_rank": 1, "_recall_score": 2.0}],
+            "observations": [],
+            "semantic_facts": [],
+            "episodic_facts": [],
+        },
+    )
+    monkeypatch.setattr(
+        db,
+        "memory_record_interpretation_recall_event",
+        lambda **_kwargs: pytest.fail("recall event should not be recorded"),
+    )
+
+    context = mgr.recall("heuristic task fact")
+
+    assert INTERPRETATION_SECTION_HEADER in context
+    assert "用户当前倾向先用 heuristic 控制 task fact 选择" in context
+    assert db._conn.execute("SELECT COUNT(*) FROM memory_recall_events").fetchone()[0] == 0
 
 
 def test_recall_expands_interpretation_to_evidence_observations(db, monkeypatch):

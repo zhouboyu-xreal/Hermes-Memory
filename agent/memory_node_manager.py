@@ -215,6 +215,7 @@ OBSERVATION_CREATE_PROMPT = """你是长期记忆系统的 observation 生成模
 7. 不要生成 interpretation、额外行动建议或用户画像。
 8. confidence 表示输入 facts 对该 summary 的直接支持程度，不表示内容的重要性。
 9. 只返回一个合法 JSON object，不要使用 Markdown。
+10. {output_language_instruction}
 
 输出格式：
 {{
@@ -257,6 +258,7 @@ OBSERVATION_UPDATE_PROMPT = """你是长期记忆系统的 observation 增量更
 9. 不要生成 interpretation、额外行动建议或用户画像。
 10. confidence 表示全部现有证据对更新后 summary 的直接支持程度。
 11. 只返回一个合法 JSON object，不要使用 Markdown。
+12. {output_language_instruction}
 
 输出格式：
 {{
@@ -359,6 +361,7 @@ SUMMARY_SYSTEM_PROMPT = """你是长期记忆系统的对话摘要模块。请�
 8. 提取 2-8 个关键词，优先保留关键实体、产品、技术、动作、错误、结果和约束；输出为 JSON string 数组
 9. 提取对召回有用的实体，遵守实体抽取规则；普通时间表达不要作为实体
 10. 最终只返回一个合法 JSON object，不要包含 Markdown、代码块或其他说明
+11. {output_language_instruction}
 
 详细程度示例：
 - 不合格："用户要求优化记忆提取逻辑。"
@@ -419,6 +422,7 @@ needs_recall 判断标准：
 8. needs_evidence 表示回答是否需要展开 observation/interpretation 背后的事实证据。
 9. time_sensitivity 只能是 specific、recent、long_term、none。
 10. 仅返回 JSON，不要包含其他内容。
+11. {output_language_instruction}
 
 """ + ENTITY_EXTRACTION_GUIDANCE + """
 
@@ -502,6 +506,7 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是长期记忆系统的 fact 提取模块
    - strong: 明确表示用户正在发起、推进、完成、阻塞、暂停、恢复或决策某个任务
 22. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
 23. 只返回 JSON，不要 markdown，不要额外解释
+24. {output_language_instruction}
 
 fact_kind 定义和判别边界：
 - preference：用户长期或反复表达的喜好、偏好、禁忌、习惯、倾向；不是一次性选择。
@@ -716,6 +721,7 @@ supporting facts:
 - counter_evidence_fact_ids 是反驳、削弱、限定或造成冲突的底层 fact id；只有存在明确反证、例外、边界条件或 unresolved conflict 时填写。
 - counter_evidence_observation_ids 是反驳、削弱、限定或造成冲突的 observation id；只有存在明确反证、例外、边界条件或 unresolved conflict 时填写。
 - 如果只是证据不足，不要把无关事实放入 counter_evidence_*；应降低 confidence 或 should_create=false。
+- {output_language_instruction}
 
 只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
@@ -774,6 +780,7 @@ relationship 定义：
 - 不要仅凭 entity/topic 相同认定匹配，必须判断命题、对象、范围和时间状态是否相关。
 - conflict_level 只能是 none、partial、strong。
 - intrinsic_value 只能是 low、medium、high。
+- {output_language_instruction}
 
 只返回合法 JSON，不要 markdown，不要额外解释：
 {{
@@ -847,6 +854,7 @@ supporting facts:
 - polarity 只能是 positive、negative、mixed、neutral。
 - strength/confidence 是 0.0-1.0。
 - action_implication 描述这条解释未来如何影响 Agent 行为；如果旧内容仍然准确，可以保留但应吸收新 observation 的变化。
+- {output_language_instruction}
 
 只返回合法 JSON，不要 markdown，不要额外解释。格式如下：
 {{
@@ -900,6 +908,7 @@ supporting facts:
 - polarity 只能是 positive、negative、mixed、neutral。
 - strength/confidence 必须是 0.0-1.0。
 - evidence_* 和 counter_evidence_* 只能引用输入中的 id。
+- {output_language_instruction}
 
 只返回合法 JSON，不要 markdown，不要额外解释：
 {{
@@ -928,6 +937,7 @@ INTERPRETATION_FEEDBACK_ANALYSIS_PROMPT = """你是长期记忆系统的 interpr
 
 重要边界：
 - 只处理用户明确确认、否认、修正、延期或表示过时的信息。
+- {output_language_instruction}
 - 用户开启新话题、提出新任务、普通追问或没有明显指向这些 interpretations 时，has_feedback=false。
 - 不要把沉默、换话题或没有接话当作负反馈。
 - feedback 必须绑定到输入中的 interpretation_id。
@@ -999,6 +1009,7 @@ user_feedback:
 - strength/confidence 必须是 0.0-1.0。
 - metadata 应包含 source="interpretation_feedback_update"。
 - 如果不需要更新内容，只输出 {{"should_update": false}}。
+- {output_language_instruction}
 
 只返回合法 JSON，不要 markdown，不要额外解释：
 {{
@@ -1269,6 +1280,19 @@ class MemoryNodeManager:
         # are supplied by the owning agent, not embedding_config.
         self._llm_base_url = str(llm_base_url or DEFAULT_LLM_BASE_URL)
         self._llm_api_key = "" if llm_api_key is None else str(llm_api_key)
+        self._memory_output_language_mode = self._normalize_memory_output_language_mode(
+            memory_cfg.get("memory_output_language_mode", "source")
+        )
+        self._enable_interpretation_feedback = self._config_bool(
+            memory_cfg.get(
+                "enable_interpretation_feedback",
+                memory_cfg.get(
+                    "use_feedback",
+                    memory_cfg.get("enable_feedback_analysis", True),
+                ),
+            ),
+            True,
+        )
 
         # Retrieval config
         self._top_k = int(memory_cfg.get("retrieval_top_k", 8))
@@ -1549,6 +1573,8 @@ class MemoryNodeManager:
     def _summarize_turn(
         self,
         source_turns: List[Dict[str, Any]],
+        *,
+        output_language: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Summarise a batch of paired conversation turns via LLM API call.
 
@@ -1556,9 +1582,14 @@ class MemoryNodeManager:
         """
         if not source_turns:
             return None
+        if output_language is None:
+            output_language = self._resolve_memory_output_language(source_turns)
         dialogue_batch = self._build_dialogue_batch_for_prompt(source_turns)
         prompt = SUMMARY_SYSTEM_PROMPT.format(
             dialogue_batch=dialogue_batch,
+            output_language_instruction=self._memory_output_language_instruction(
+                output_language
+            ),
         )
         
         for attempt in range(2):
@@ -1607,6 +1638,21 @@ class MemoryNodeManager:
         except (TypeError, ValueError):
             return default
         return max(0.0, min(1.0, number))
+
+    @staticmethod
+    def _config_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+        return default
 
     @classmethod
     def _normalize_recall_layer_preference(cls, value: Any) -> Dict[str, float]:
@@ -1724,7 +1770,13 @@ class MemoryNodeManager:
         compatibility fallback so recall remains best-effort if a model returns
         the previous summary schema.
         """
-        prompt = RECALL_QUERY_ANALYSIS_PROMPT.format(query=query)
+        output_language = self._resolve_memory_output_language(query, fallback="en")
+        prompt = RECALL_QUERY_ANALYSIS_PROMPT.format(
+            query=query,
+            output_language_instruction=self._memory_output_language_instruction(
+                output_language
+            ),
+        )
         for attempt in range(2):
             result = self._call_llm(prompt)
             if not result:
@@ -1813,6 +1865,132 @@ class MemoryNodeManager:
         return out
 
     @staticmethod
+    def _normalize_memory_output_language_mode(value: Any) -> str:
+        text = str(value or "source").strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "auto": "source",
+            "follow_source": "source",
+            "source_language": "source",
+            "english": "force_en",
+            "en": "force_en",
+            "zh": "force_zh",
+            "chinese": "force_zh",
+        }
+        text = aliases.get(text, text)
+        return text if text in {"source", "force_en", "force_zh"} else "source"
+
+    @staticmethod
+    def _normalize_memory_language_code(value: Any, default: str = "zh") -> str:
+        text = str(value or default).strip().lower().replace("-", "_").replace(" ", "_")
+        if text in {"en", "english"}:
+            return "en"
+        if text in {"zh", "zh_cn", "zh_hans", "chinese"}:
+            return "zh"
+        return default
+
+    @staticmethod
+    def _iter_memory_text_fragments(value: Any) -> Iterable[str]:
+        if value is None:
+            return
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                yield text
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                yield from MemoryNodeManager._iter_memory_text_fragments(item)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                yield from MemoryNodeManager._iter_memory_text_fragments(item)
+            return
+        text = str(value).strip()
+        if text:
+            yield text
+
+    @classmethod
+    def _detect_memory_text_language(cls, *values: Any) -> Optional[str]:
+        latin_letters = 0
+        cjk_chars = 0
+        for value in values:
+            for text in cls._iter_memory_text_fragments(value):
+                latin_letters += sum(1 for char in text if ("a" <= char.lower() <= "z"))
+                cjk_chars += sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+        if latin_letters <= 0 and cjk_chars <= 0:
+            return None
+        if cjk_chars > latin_letters * 0.8:
+            return "zh"
+        return "en"
+
+    def _resolve_memory_output_language(
+        self,
+        *values: Any,
+        fallback: str = "zh",
+    ) -> str:
+        mode = self._memory_output_language_mode
+        if mode == "force_en":
+            return "en"
+        if mode == "force_zh":
+            return "zh"
+        detected = self._detect_memory_text_language(*values)
+        if detected:
+            return detected
+        return self._normalize_memory_language_code(fallback, "zh")
+
+    @staticmethod
+    def _fact_summaries_for_language(*fact_groups: Any) -> List[str]:
+        summaries: List[str] = []
+        for group in fact_groups:
+            items: Iterable[Any]
+            if isinstance(group, dict):
+                items = [group]
+            elif isinstance(group, (list, tuple, set)):
+                items = group
+            else:
+                items = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                summary = str(item.get("summary") or "").strip()
+                if summary:
+                    summaries.append(summary)
+        return summaries
+
+    @staticmethod
+    def _observation_summaries_for_language(*observation_groups: Any) -> List[str]:
+        summaries: List[str] = []
+        for group in observation_groups:
+            items: Iterable[Any]
+            if isinstance(group, dict):
+                items = [group]
+            elif isinstance(group, (list, tuple, set)):
+                items = group
+            else:
+                items = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                summary = str(item.get("summary") or "").strip()
+                if summary:
+                    summaries.append(summary)
+        return summaries
+
+    @staticmethod
+    def _memory_output_language_instruction(language: str) -> str:
+        normalized = MemoryNodeManager._normalize_memory_language_code(language, "zh")
+        if normalized == "en":
+            return (
+                "所有自由文本字段必须使用英语输出；人名、产品名、文件路径、代码标识符、API 名称和引用短语保持原始表面形式，不要翻译技术标识符；"
+                "schema 约束的枚举字段仍使用既定 canonical 值；如果输入是英文，不要把 summary、keywords、topic、observation、claim 或 action_implication 改写成中文；"
+                "当 fact_subject 是 user 或 assistant 且需要补充主体实体时，分别使用 user 和 assistant。"
+            )
+        return (
+            "所有自由文本字段必须使用中文输出；人名、产品名、文件路径、代码标识符、API 名称和引用短语保持原始表面形式，不要翻译技术标识符；"
+            "schema 约束的枚举字段仍使用既定 canonical 值；当 fact_subject 是 user 或 assistant 且需要补充主体实体时，分别使用 用户 和 助手。"
+        )
+
+    @staticmethod
     def _normalize_fact_entities(value: Any) -> List[Dict[str, str]]:
         if not isinstance(value, list):
             return []
@@ -1837,22 +2015,30 @@ class MemoryNodeManager:
             entities.append({"name": name, "type": etype})
         return entities
 
-    @staticmethod
-    def _subject_entity_name(fact_subject: Any) -> str:
+    def _subject_entity_name(
+        self,
+        fact_subject: Any,
+        *,
+        output_language: str = "zh",
+    ) -> str:
         subject = MemoryNodeManager._normalize_fact_subject(fact_subject)
         if subject == "user":
-            return "用户"
+            return "user" if self._normalize_memory_language_code(output_language, "zh") == "en" else "用户"
         if subject == "assistant":
-            return "助手"
+            return "assistant" if self._normalize_memory_language_code(output_language, "zh") == "en" else "助手"
         return ""
 
-    @classmethod
     def _fact_entities_with_subject(
-        cls,
+        self,
         entities: List[Dict[str, str]],
         fact_subject: Any,
+        *,
+        output_language: str = "zh",
     ) -> List[Dict[str, str]]:
-        subject_name = cls._subject_entity_name(fact_subject)
+        subject_name = self._subject_entity_name(
+            fact_subject,
+            output_language=output_language,
+        )
         if not subject_name:
             return entities
         if any(str(entity.get("name") or "").strip() == subject_name for entity in entities):
@@ -1862,6 +2048,8 @@ class MemoryNodeManager:
     def _fallback_fact_from_summary(
         self,
         summary_data: Dict[str, Any],
+        *,
+        output_language: str = "zh",
     ) -> Dict[str, Any]:
         keywords = self._normalize_keywords(summary_data.get("keywords", []))
         entities = self._normalize_fact_entities(summary_data.get("entities", []))
@@ -1883,7 +2071,11 @@ class MemoryNodeManager:
             "occurred_end": "",
             "time_confidence": "unknown",
             "where": "",
-            "entities": entities,
+            "entities": self._fact_entities_with_subject(
+                entities,
+                "other",
+                output_language=output_language,
+            ),
         }
 
     @staticmethod
@@ -1949,8 +2141,12 @@ class MemoryNodeManager:
             source_turns,
             fallback_timestamp=turn_timestamp_text,
         )
+        output_language = self._resolve_memory_output_language(source_turns)
         prompt = RETAIN_FACT_EXTRACTION_PROMPT.format(
             dialogue_batch=dialogue_batch,
+            output_language_instruction=self._memory_output_language_instruction(
+                output_language
+            ),
         )
 
         data: Optional[Dict[str, Any]] = None
@@ -1980,6 +2176,7 @@ class MemoryNodeManager:
                 entities = self._fact_entities_with_subject(
                     self._normalize_fact_entities(raw_fact.get("entities", [])),
                     fact_subject,
+                    output_language=output_language,
                 )
                 primary_entity_candidates = self._normalize_fact_entities(
                     [raw_fact.get("primary_entity")]
@@ -1987,7 +2184,10 @@ class MemoryNodeManager:
                 if primary_entity_candidates:
                     primary_entity = primary_entity_candidates[0]
                 else:
-                    subject_name = self._subject_entity_name(fact_subject)
+                    subject_name = self._subject_entity_name(
+                        fact_subject,
+                        output_language=output_language,
+                    )
                     primary_entity = next(
                         (
                             entity
@@ -2065,10 +2265,16 @@ class MemoryNodeManager:
         if not facts:
             if skipped_low_priority:
                 return {"facts": [], "causal_relations": []}
-            summary_data = self._summarize_turn(source_turns)
+            summary_data = self._summarize_turn(
+                source_turns,
+                output_language=output_language,
+            )
             if not summary_data:
                 return None
-            fallback = self._fallback_fact_from_summary(summary_data)
+            fallback = self._fallback_fact_from_summary(
+                summary_data,
+                output_language=output_language,
+            )
             if not fallback["text"]:
                 return None
             facts = [fallback]
@@ -3289,6 +3495,9 @@ class MemoryNodeManager:
         """Create or incrementally revise one stable observation."""
         if not source_facts:
             return None
+        output_language = self._resolve_memory_output_language(
+            self._fact_summaries_for_language(source_facts),
+        )
         if existing_observation:
             prompt = OBSERVATION_UPDATE_PROMPT.format(
                 observation_type=observation_type,
@@ -3306,6 +3515,9 @@ class MemoryNodeManager:
                     indent=2,
                 ),
                 new_facts=self._observation_fact_payload(source_facts),
+                output_language_instruction=self._memory_output_language_instruction(
+                    output_language
+                ),
             )
         else:
             prompt = OBSERVATION_CREATE_PROMPT.format(
@@ -3324,6 +3536,9 @@ class MemoryNodeManager:
                     indent=2,
                 ),
                 source_facts=self._observation_fact_payload(source_facts),
+                output_language_instruction=self._memory_output_language_instruction(
+                    output_language
+                ),
             )
         data = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "")
         if not data:
@@ -3872,6 +4087,9 @@ class MemoryNodeManager:
                 metadata = json.loads(metadata or "{}")
             except (TypeError, ValueError):
                 metadata = {}
+        output_language = self._resolve_memory_output_language(
+            self._observation_summaries_for_language(observation),
+        )
         prompt = INTERPRETATION_GENERATION_PROMPT.format(
             entity_name=observation.get("entity_name", ""),
             topic_label=observation.get("topic_label") or observation.get("topic_key") or "",
@@ -3879,6 +4097,9 @@ class MemoryNodeManager:
             observation_summary=observation.get("summary", ""),
             observation_metadata=json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
             source_facts="\n".join(fact_lines),
+            output_language_instruction=self._memory_output_language_instruction(
+                output_language
+            ),
         )
         result = self._call_llm(prompt)
         data = self._parse_json_object_from_llm_text(result or "")
@@ -4050,6 +4271,9 @@ class MemoryNodeManager:
 
         interpretation_metadata = self._json_dict(interpretation.get("metadata", {}))
         observation_metadata = self._json_dict(observation.get("metadata", {}))
+        output_language = self._resolve_memory_output_language(
+            self._observation_summaries_for_language(observation),
+        )
         prompt = INTERPRETATION_UPDATE_PROMPT.format(
             entity_name=observation.get("entity_name", ""),
             topic_label=observation.get("topic_label") or observation.get("topic_key") or "",
@@ -4071,6 +4295,9 @@ class MemoryNodeManager:
             observation_summary=observation.get("summary", ""),
             observation_metadata=json.dumps(observation_metadata or {}, ensure_ascii=False, sort_keys=True),
             source_facts="\n".join(fact_lines),
+            output_language_instruction=self._memory_output_language_instruction(
+                output_language
+            ),
         )
         result = self._call_llm(prompt)
         data = self._parse_json_object_from_llm_text(result or "")
@@ -4245,6 +4472,9 @@ class MemoryNodeManager:
                 "counter_evidence_observation_ids", "metadata",
             )
         }
+        output_language = self._resolve_memory_output_language(
+            self._observation_summaries_for_language(observation_payloads),
+        )
         prompt = INTERPRETATION_BATCH_UPDATE_PROMPT.format(
             interpretation=json.dumps(
                 interpretation_payload,
@@ -4259,6 +4489,9 @@ class MemoryNodeManager:
                 default=str,
             ),
             source_facts="\n".join(fact_lines),
+            output_language_instruction=self._memory_output_language_instruction(
+                output_language
+            ),
         )
         data = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "")
         if not data or not bool(data.get("should_update")):
@@ -5025,6 +5258,11 @@ class MemoryNodeManager:
             "summary": observation.get("summary"),
             "metadata": self._json_dict(observation.get("metadata", {})),
         }
+        output_language = self._resolve_memory_output_language(
+            observation_payload,
+            source_facts,
+            candidate_payloads,
+        )
         prompt = INTERPRETATION_OBSERVATION_VALUE_PROMPT.format(
             observation=json.dumps(
                 observation_payload,
@@ -5038,6 +5276,9 @@ class MemoryNodeManager:
                 ensure_ascii=False,
                 sort_keys=True,
                 default=str,
+            ),
+            output_language_instruction=self._memory_output_language_instruction(
+                output_language
             ),
         )
         data = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "")
@@ -6745,9 +6986,11 @@ class MemoryNodeManager:
                     candidates = self._db.get_unprocessed_facts_for_evidence_bundle(
                         limit=1,
                     )
-                    pending_feedback = self._db.memory_pending_interpretation_feedback(
-                        limit=1,
-                    )
+                    pending_feedback = []
+                    if self._enable_interpretation_feedback:
+                        pending_feedback = self._db.memory_pending_interpretation_feedback(
+                            limit=1,
+                        )
                     if not candidates and not pending_feedback:
                         logger.debug(
                             "Memory reflect due but skipped: no unobserved facts or pending feedback",
@@ -7013,7 +7256,12 @@ class MemoryNodeManager:
         recall_event_id: Optional[int] = None,
     ) -> int:
         """Analyze whether a new user message gives feedback on recalled interpretations."""
-        if not self._enabled or not self._db or not str(user_message or "").strip():
+        if (
+            not self._enabled
+            or not self._enable_interpretation_feedback
+            or not self._db
+            or not str(user_message or "").strip()
+        ):
             return 0
         try:
             if recall_event_id is not None:
@@ -7063,6 +7311,10 @@ class MemoryNodeManager:
                 "current_user_message": self._reflect_log_text(user_message, limit=1600),
             }
         )
+        output_language = self._resolve_memory_output_language(
+            user_message,
+            fallback="en",
+        )
         prompt = INTERPRETATION_FEEDBACK_ANALYSIS_PROMPT.format(
             previous_user_query=self._reflect_log_text(event.get("query"), limit=1200),
             previous_assistant_response=self._reflect_log_text(
@@ -7076,6 +7328,9 @@ class MemoryNodeManager:
                 default=str,
             ),
             current_user_message=self._reflect_log_text(user_message, limit=1600),
+            output_language_instruction=self._memory_output_language_instruction(
+                output_language
+            ),
         )
         data = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "")
         if not data:
@@ -7204,7 +7459,11 @@ class MemoryNodeManager:
         llm_api_key: Optional[str] = None,
     ) -> bool:
         """Queue interpretation feedback analysis without blocking the current turn."""
-        if not self._enabled or not str(user_message or "").strip():
+        if (
+            not self._enabled
+            or not self._enable_interpretation_feedback
+            or not str(user_message or "").strip()
+        ):
             return False
         if not self._db:
             return False
@@ -7272,7 +7531,7 @@ class MemoryNodeManager:
         if not self._enabled or not user_message or not assistant_response:
             return False
 
-        if self._db:
+        if self._enable_interpretation_feedback and self._db:
             try:
                 self._db.memory_attach_latest_recall_event_response(
                     query=str(user_message),
@@ -7450,58 +7709,29 @@ class MemoryNodeManager:
             for turn in source_turns
         )
 
-    def store_turn(
-        self,
-        user_message: str,
-        assistant_response: str,
-        tags: Optional[List[str]] = None,
-        turn_timestamp: Optional[Any] = None,
-    ) -> bool:
-        """Retain a turn as one or more narrative memory nodes.
-
-        The work follows the HindSight retain shape:
-        extract narrative facts → embed each fact → store nodes → link
-        entities and explicit intra-retain causal relations → build the
-        cross-turn relation graph. Callers that need non-blocking behavior
-        should use store_turn_async().
-
-        Returns True if at least one fact was stored, False otherwise.
-        """
-        if not self._enabled:
-            return False
-        if not user_message or not assistant_response:
-            return False
-
-        self._turn_count += 1
-        self._pending_store_turns.append({
-            "user_message": user_message,
-            "assistant_response": assistant_response,
-            "turn_timestamp": turn_timestamp,
-            "tags": list(tags or []),
-        })
-        pending_character_count = self._cal_store_turns_character_count(
-            self._pending_store_turns,
-        )
-        turn_threshold_reached = (
-            len(self._pending_store_turns) >= self._min_turns_before_store
-        )
-        character_threshold_exceeded = (
-            pending_character_count >= self._max_chars_before_store
-        )
-        if not turn_threshold_reached and not character_threshold_exceeded:
-            return False
-
-        if not self._ensure_embedding_client():
-            return False
-
-        source_turns = list(self._pending_store_turns)
+    @staticmethod
+    def _collect_store_turn_batch_metadata(
+        source_turns: List[Dict[str, Any]],
+    ) -> Tuple[List[str], Optional[Any]]:
         batch_tags = list(dict.fromkeys(
             tag
             for turn in source_turns
             for tag in (turn.get("tags") or [])
             if tag
         ))
-        batch_timestamp = source_turns[-1].get("turn_timestamp")
+        batch_timestamp = source_turns[-1].get("turn_timestamp") if source_turns else None
+        return batch_tags, batch_timestamp
+
+    def _store_pending_turn_batch(
+        self,
+        source_turns: List[Dict[str, Any]],
+    ) -> bool:
+        if not source_turns:
+            return False
+
+        batch_tags, batch_timestamp = self._collect_store_turn_batch_metadata(
+            source_turns
+        )
 
         try:
             # ── Step 1: Extract narrative facts (SYNC) ──
@@ -7657,6 +7887,62 @@ class MemoryNodeManager:
         except Exception as e:
             logger.info("Failed to store memory node (non-fatal): %s", e)
             return False
+
+    def flush_pending_store_turns(self) -> bool:
+        """Force-store the current pending turn batch even below the normal threshold."""
+        if not self._enabled:
+            return False
+        if not self._pending_store_turns:
+            return False
+        if not self._ensure_embedding_client():
+            return False
+        return self._store_pending_turn_batch(list(self._pending_store_turns))
+
+    def store_turn(
+        self,
+        user_message: str,
+        assistant_response: str,
+        tags: Optional[List[str]] = None,
+        turn_timestamp: Optional[Any] = None,
+    ) -> bool:
+        """Retain a turn as one or more narrative memory nodes.
+
+        The work follows the HindSight retain shape:
+        extract narrative facts → embed each fact → store nodes → link
+        entities and explicit intra-retain causal relations → build the
+        cross-turn relation graph. Callers that need non-blocking behavior
+        should use store_turn_async().
+
+        Returns True if at least one fact was stored, False otherwise.
+        """
+        if not self._enabled:
+            return False
+        if not user_message or not assistant_response:
+            return False
+
+        self._turn_count += 1
+        self._pending_store_turns.append({
+            "user_message": user_message,
+            "assistant_response": assistant_response,
+            "turn_timestamp": turn_timestamp,
+            "tags": list(tags or []),
+        })
+        pending_character_count = self._cal_store_turns_character_count(
+            self._pending_store_turns,
+        )
+        turn_threshold_reached = (
+            len(self._pending_store_turns) >= self._min_turns_before_store
+        )
+        character_threshold_exceeded = (
+            pending_character_count >= self._max_chars_before_store
+        )
+        if not turn_threshold_reached and not character_threshold_exceeded:
+            return False
+
+        if not self._ensure_embedding_client():
+            return False
+
+        return self._store_pending_turn_batch(list(self._pending_store_turns))
 
     def _merge_duplicated_evidence_bundle_group(
         self,
@@ -7908,6 +8194,10 @@ class MemoryNodeManager:
             "correction": feedback.get("correction"),
             "created_at": feedback.get("created_at"),
         }
+        output_language = self._resolve_memory_output_language(
+            interpretation.get("claim"),
+            fallback="en",
+        )
         prompt = INTERPRETATION_UPDATE_USING_FEEDBACK_PROMPT.format(
             interpretation=json.dumps(
                 interpretation_payload,
@@ -7920,6 +8210,9 @@ class MemoryNodeManager:
                 ensure_ascii=False,
                 sort_keys=True,
                 default=str,
+            ),
+            output_language_instruction=self._memory_output_language_instruction(
+                output_language
             ),
         )
         data = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "")
@@ -8150,6 +8443,8 @@ class MemoryNodeManager:
         *,
         limit: int = 50,
     ) -> Dict[str, Any]:
+        if not self._enable_interpretation_feedback:
+            return {"processed": 0, "applied": 0, "ignored": 0, "disabled": True}
         if not self._db:
             return {"processed": 0, "applied": 0, "ignored": 0}
         try:
@@ -9645,7 +9940,7 @@ class MemoryNodeManager:
                 "output_chars": len(memory_text),
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
             })
-            if interpretation_nodes:
+            if self._enable_interpretation_feedback and interpretation_nodes:
                 try:
                     recall_event_id = self._db.memory_record_interpretation_recall_event(
                         query=search_query,
