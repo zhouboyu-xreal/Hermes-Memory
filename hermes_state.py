@@ -2833,6 +2833,24 @@ class SessionDB:
             return "", []
         return " AND " + " AND ".join(clauses), params
 
+    @staticmethod
+    def _memory_fts_safe_query(keyword: str) -> str:
+        text = str(keyword or "").strip()
+        if not text:
+            return ""
+
+        parts = re.split(r"\s+\bOR\b\s+", text, flags=re.IGNORECASE)
+        safe_parts: List[str] = []
+        for raw_part in parts:
+            part = str(raw_part or "").strip()
+            if not part:
+                continue
+            if re.search(r"[^0-9A-Za-z_\u4e00-\u9fff\s]", part):
+                safe_parts.append('"' + part.replace('"', '""') + '"')
+            else:
+                safe_parts.append(part)
+        return " OR ".join(safe_parts) if safe_parts else text
+
     def _search_memory_keyword(
         self,
         keyword: str,
@@ -2953,6 +2971,7 @@ class SessionDB:
             time_start=time_start,
             time_end=time_end,
         )
+        match_query = self._memory_fts_safe_query(keyword)
         cursor = self._conn.execute(
             f"""SELECT memory_facts_fts.rowid, bm25(memory_facts_fts) AS score
                FROM memory_facts_fts
@@ -2961,7 +2980,7 @@ class SessionDB:
                {filter_sql}
                ORDER BY score
                LIMIT ?""",
-            [keyword] + filter_params + [limit],
+            [match_query] + filter_params + [limit],
         )
         return {row[0]: row[1] for row in cursor.fetchall()}
 
