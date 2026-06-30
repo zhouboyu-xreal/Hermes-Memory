@@ -197,6 +197,10 @@ class _OpenAIBackend:
         if not self.api_key:
             self.api_key = os.environ.get("EMBEDDING_API_KEY", "").strip()
         self.timeout = config.get("timeout", 60)
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
+        if self.api_key:
+            self._session.headers["Authorization"] = f"Bearer {self.api_key}"
 
     def embed(self, text: str) -> Optional[List[float]]:
         """Generate embedding for a single text string."""
@@ -210,12 +214,13 @@ class _OpenAIBackend:
             "model": self.model,
             "input": text,
         }
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
 
         try:
-            resp = requests.post(self.url, json=data, headers=headers, timeout=self.timeout)
+            resp = self._session.post(
+                self.url,
+                json=data,
+                timeout=self.timeout,
+            )
             resp.raise_for_status()
             result = resp.json()
             items = result.get("data", [])
@@ -244,12 +249,13 @@ class _OpenAIBackend:
             "model": self.model,
             "input": texts,
         }
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
 
         try:
-            resp = requests.post(self.url, json=data, headers=headers, timeout=self.timeout * 2)
+            resp = self._session.post(
+                self.url,
+                json=data,
+                timeout=self.timeout * 2,
+            )
             resp.raise_for_status()
             result = resp.json()
             # Sort by index to preserve order
