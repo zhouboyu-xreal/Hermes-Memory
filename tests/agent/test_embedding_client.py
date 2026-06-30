@@ -52,13 +52,14 @@ def test_openai_backend_skips_request_without_embedding_key(
     monkeypatch, caplog
 ):
     monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
+    backend = _OpenAIBackend({"api_key": ""})
     monkeypatch.setattr(
-        "agent.embedding_client.requests.post",
+        backend._session,
+        "post",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("request should not be sent")
         ),
     )
-    backend = _OpenAIBackend({"api_key": ""})
 
     assert backend.embed("test") is None
     assert "EMBEDDING_API_KEY is not set" in caplog.text
@@ -70,16 +71,24 @@ def test_openai_backend_logs_provider_error_response(monkeypatch, caplog):
     response._content = b'{"error":{"message":"User not found.","code":401}}'
     response.url = "https://embedding.example/v1/embeddings"
 
+    backend = _OpenAIBackend({"api_key": "invalid-key"})
     monkeypatch.setattr(
-        "agent.embedding_client.requests.post",
+        backend._session,
+        "post",
         lambda *args, **kwargs: response,
     )
-    backend = _OpenAIBackend({"api_key": "invalid-key"})
 
     with caplog.at_level(logging.WARNING):
         assert backend.embed("test") is None
 
     assert "User not found." in caplog.text
+
+
+def test_openai_backend_uses_persistent_session_headers():
+    backend = _OpenAIBackend({"api_key": "test-key"})
+
+    assert backend._session.headers["Content-Type"] == "application/json"
+    assert backend._session.headers["Authorization"] == "Bearer test-key"
 
 
 def test_build_openai_embedding_url_preserves_explicit_endpoint():

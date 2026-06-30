@@ -1737,6 +1737,55 @@ def test_store_turn_extracts_facts_when_pending_characters_exceed_limit(db):
     assert mgr._pending_store_turns == []
 
 
+def test_store_turn_emits_timing_logs_for_batch_processing(db, monkeypatch):
+    retain_payload = {
+        "facts": [
+            {
+                "text": "用户确认需要记录 store_turn 的分阶段耗时。",
+                "keywords": ["store_turn", "耗时"],
+                "topic": ["性能统计"],
+                "fact_type": "episodic",
+                "fact_subject": "user",
+                "fact_kind": "request",
+                "priority": 75,
+                "entities": [],
+            }
+        ],
+        "causal_relations": [],
+    }
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        llm_outputs=[json.dumps(retain_payload)],
+    )
+    logs = []
+
+    monkeypatch.setattr(
+        mgr,
+        "_log_info",
+        lambda scope, event, payload: logs.append(
+            {"scope": scope, "event": event, "payload": payload}
+        ),
+    )
+
+    assert mgr.store_turn("请记录 store_turn 的耗时。", "好的，我会记录。") is True
+
+    events = [item["event"] for item in logs if item["scope"] == "memory_store"]
+    assert "turn_triggered" in events
+    assert "batch_start" in events
+    assert "retain_extracted" in events
+    assert "batch_finish" in events
+    finish_log = next(
+        item for item in logs
+        if item["scope"] == "memory_store" and item["event"] == "batch_finish"
+    )
+    assert finish_log["payload"]["status"] == "ok"
+    assert "stage_timings_ms" in finish_log["payload"]
+    assert "extract_retain_facts" in finish_log["payload"]["stage_timings_ms"]
+    assert "embed_facts_total" in finish_log["payload"]["stage_timings_ms"]
+    assert "elapsed_ms" in finish_log["payload"]
+
+
 def test_memory_output_language_force_en_changes_subject_entities_and_prompt(db):
     retain_payload = {
         "facts": [

@@ -7729,27 +7729,78 @@ class MemoryNodeManager:
         if not source_turns:
             return False
 
+        started_at = time.monotonic()
+        def _elapsed_ms(start: float) -> float:
+            return round((time.monotonic() - start) * 1000, 2)
+
         batch_tags, batch_timestamp = self._collect_store_turn_batch_metadata(
             source_turns
+        )
+        input_char_count = self._cal_store_turns_character_count(source_turns)
+        self._log_info(
+            "memory_store",
+            "batch_start",
+            {
+                "source_turn_count": len(source_turns),
+                "input_char_count": input_char_count,
+                "batch_tags": batch_tags,
+                "batch_timestamp": batch_timestamp,
+            },
         )
 
         try:
             # ── Step 1: Extract narrative facts (SYNC) ──
+            extract_started_at = time.monotonic()
             retain_data = self._extract_retain_facts(
                 source_turns,
                 turn_timestamp=batch_timestamp,
             )
             if not retain_data:
+                self._log_info(
+                    "memory_store",
+                    "batch_finish",
+                    {
+                        "status": "empty",
+                        "reason": "retain_extraction_empty",
+                        "source_turn_count": len(source_turns),
+                        "input_char_count": input_char_count,
+                        "stage_timings_ms": {
+                            "extract_retain_facts": _elapsed_ms(extract_started_at),
+                        },
+                        "elapsed_ms": _elapsed_ms(started_at),
+                    },
+                )
                 logger.debug("Skipping memory fact node — retain extraction returned no data")
                 return False
+            extract_elapsed_ms = _elapsed_ms(extract_started_at)
             self._pending_store_turns.clear()
             facts = retain_data.get("facts", [])
+            causal_relations = retain_data.get("causal_relations", [])
+            self._log_info(
+                "memory_store",
+                "retain_extracted",
+                {
+                    "source_turn_count": len(source_turns),
+                    "fact_count": len(facts),
+                    "causal_relation_count": len(causal_relations),
+                    "extract_elapsed_ms": extract_elapsed_ms,
+                },
+            )
             stored_nodes: List[Tuple[int, str, np.ndarray, List[str]]] = []
             fact_ids: List[int] = []
+            embedding_elapsed_ms = 0.0
+            fact_store_elapsed_ms = 0.0
+            entity_link_elapsed_ms = 0.0
+            relation_graph_elapsed_ms = 0.0
+            attempted_fact_count = 0
+            skipped_empty_summary_count = 0
+            skipped_embedding_failure_count = 0
 
             for idx, fact in enumerate(facts):
+                attempted_fact_count += 1
                 summary = str(fact.get("text", "")).strip()
                 if not summary:
+                    skipped_empty_summary_count += 1
                     continue
                 keywords = self._normalize_keywords(fact.get("keywords", []))
                 primary_topic = self._topic_key(
@@ -7806,15 +7857,21 @@ class MemoryNodeManager:
                         "task_event_like": fact.get("task_event_like"),
                         "task_event_subject": fact.get("task_event_subject", ""),
                         "task_relevance": fact.get("task_relevance", ""),
+                        "batch_fact_index": idx,
+                        "batch_fact_count": len(facts),
                     }
                 )
                 # ── Step 2: Generate embedding (SYNC) ──
+                embedding_started_at = time.monotonic()
                 embedding = self._embedding_client.embed_text(summary)
+                embedding_elapsed_ms += time.monotonic() - embedding_started_at
                 if embedding is None:
+                    skipped_embedding_failure_count += 1
                     logger.info("Skipping memory fact — embedding generation failed")
                     continue
                 
                 # ── Step 3: Store the new fact node (SYNC) ──
+                fact_store_started_at = time.monotonic()
                 fact_id = self._db.memory_add_fact(
                     time_key=self._memory_time_key(
                         idx,
@@ -7843,26 +7900,55 @@ class MemoryNodeManager:
                         if isinstance(entity, dict) and str(entity.get("name", "")).strip()
                     ],
                 )
+                fact_store_elapsed_ms += time.monotonic() - fact_store_started_at
 
                 fact_entities = fact.get("entities", [])
+                entity_link_started_at = time.monotonic()
                 linked_entities = self._link_fact_entities(fact_id, fact_entities)
                 if primary_entity_id is not None and all(
                     entity_id != primary_entity_id
                     for entity_id, _entity_name in linked_entities
                 ):
                     self._db.entity_link_fact(fact_id, primary_entity_id)
+                entity_link_elapsed_ms += time.monotonic() - entity_link_started_at
                 
                 stored_nodes.append((fact_id, summary, embedding, keywords))
                 fact_ids.append(fact_id)
 
             if not stored_nodes:
+                self._log_info(
+                    "memory_store",
+                    "batch_finish",
+                    {
+                        "status": "empty",
+                        "reason": "no_facts_stored",
+                        "source_turn_count": len(source_turns),
+                        "input_char_count": input_char_count,
+                        "fact_stats": {
+                            "attempted": attempted_fact_count,
+                            "stored": 0,
+                            "skipped_empty_summary": skipped_empty_summary_count,
+                            "skipped_embedding_failure": skipped_embedding_failure_count,
+                        },
+                        "stage_timings_ms": {
+                            "extract_retain_facts": extract_elapsed_ms,
+                            "embed_facts_total": round(embedding_elapsed_ms * 1000, 2),
+                            "store_facts_total": round(fact_store_elapsed_ms * 1000, 2),
+                            "link_entities_total": round(entity_link_elapsed_ms * 1000, 2),
+                        },
+                        "elapsed_ms": _elapsed_ms(started_at),
+                    },
+                )
                 return False
 
             # ── Step 4: Link explicit relations between newly retained facts ──
-            self._link_fact_relations(fact_ids, retain_data.get("causal_relations", []))
+            relation_link_started_at = time.monotonic()
+            self._link_fact_relations(fact_ids, causal_relations)
+            relation_link_elapsed_ms = _elapsed_ms(relation_link_started_at)
 
             # ── Step 5: Build cross-turn relation graph ──
             for fact_id, summary, embedding, keywords in stored_nodes:
+                relation_graph_started_at = time.monotonic()
                 try:
                     self._build_relation_graph(
                         fact_id=fact_id,
@@ -7876,15 +7962,64 @@ class MemoryNodeManager:
                         fact_id,
                         exc,
                     )
+                finally:
+                    relation_graph_elapsed_ms += time.monotonic() - relation_graph_started_at
 
             logger.debug(
                 "Retained %d memory fact node(s) from %d turn(s)",
                 len(stored_nodes),
                 len(source_turns),
             )
+            self._log_info(
+                "memory_store",
+                "batch_finish",
+                {
+                    "status": "ok",
+                    "source_turn_count": len(source_turns),
+                    "input_char_count": input_char_count,
+                    "fact_stats": {
+                        "attempted": attempted_fact_count,
+                        "stored": len(stored_nodes),
+                        "skipped_empty_summary": skipped_empty_summary_count,
+                        "skipped_embedding_failure": skipped_embedding_failure_count,
+                    },
+                    "relation_stats": {
+                        "explicit_relation_input_count": len(causal_relations),
+                        "stored_fact_ids": fact_ids,
+                    },
+                    "stage_timings_ms": {
+                        "extract_retain_facts": extract_elapsed_ms,
+                        "embed_facts_total": round(embedding_elapsed_ms * 1000, 2),
+                        "store_facts_total": round(fact_store_elapsed_ms * 1000, 2),
+                        "link_entities_total": round(entity_link_elapsed_ms * 1000, 2),
+                        "link_fact_relations": relation_link_elapsed_ms,
+                        "build_relation_graph_total": round(relation_graph_elapsed_ms * 1000, 2),
+                    },
+                    "avg_timings_ms_per_stored_fact": (
+                        {
+                            "embed": round((embedding_elapsed_ms * 1000) / len(stored_nodes), 2),
+                            "store": round((fact_store_elapsed_ms * 1000) / len(stored_nodes), 2),
+                            "link_entities": round((entity_link_elapsed_ms * 1000) / len(stored_nodes), 2),
+                            "build_relation_graph": round((relation_graph_elapsed_ms * 1000) / len(stored_nodes), 2),
+                        }
+                        if stored_nodes else {}
+                    ),
+                    "elapsed_ms": _elapsed_ms(started_at),
+                },
+            )
             return True
 
         except Exception as e:
+            self._log_info(
+                "memory_store",
+                "batch_error",
+                {
+                    "source_turn_count": len(source_turns),
+                    "input_char_count": input_char_count,
+                    "error": str(e),
+                    "elapsed_ms": _elapsed_ms(started_at),
+                },
+            )
             logger.info("Failed to store memory node (non-fatal): %s", e)
             return False
 
@@ -7919,6 +8054,7 @@ class MemoryNodeManager:
             return False
         if not user_message or not assistant_response:
             return False
+        started_at = time.monotonic()
 
         self._turn_count += 1
         self._pending_store_turns.append({
@@ -7937,10 +8073,51 @@ class MemoryNodeManager:
             pending_character_count >= self._max_chars_before_store
         )
         if not turn_threshold_reached and not character_threshold_exceeded:
+            self._log_info(
+                "memory_store",
+                "turn_buffered",
+                {
+                    "turn_count": self._turn_count,
+                    "pending_turn_count": len(self._pending_store_turns),
+                    "pending_character_count": pending_character_count,
+                    "min_turns_before_store": self._min_turns_before_store,
+                    "max_chars_before_store": self._max_chars_before_store,
+                    "turn_threshold_reached": turn_threshold_reached,
+                    "character_threshold_exceeded": character_threshold_exceeded,
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+                },
+            )
             return False
 
         if not self._ensure_embedding_client():
+            self._log_info(
+                "memory_store",
+                "turn_skipped",
+                {
+                    "reason": "embedding_client_unavailable",
+                    "turn_count": self._turn_count,
+                    "pending_turn_count": len(self._pending_store_turns),
+                    "pending_character_count": pending_character_count,
+                    "turn_threshold_reached": turn_threshold_reached,
+                    "character_threshold_exceeded": character_threshold_exceeded,
+                    "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+                },
+            )
             return False
+        self._log_info(
+            "memory_store",
+            "turn_triggered",
+            {
+                "turn_count": self._turn_count,
+                "pending_turn_count": len(self._pending_store_turns),
+                "pending_character_count": pending_character_count,
+                "min_turns_before_store": self._min_turns_before_store,
+                "max_chars_before_store": self._max_chars_before_store,
+                "turn_threshold_reached": turn_threshold_reached,
+                "character_threshold_exceeded": character_threshold_exceeded,
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+            },
+        )
 
         return self._store_pending_turn_batch(list(self._pending_store_turns))
 
