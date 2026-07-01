@@ -19,11 +19,14 @@ import logging
 import os
 import shutil
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -31,6 +34,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from agent.memory_node_manager import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, MemoryNodeManager
 from hermes_cli.config import load_config
+from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_constants import get_hermes_home
 import hermes_state
 from hermes_state import SessionDB
 
@@ -43,6 +48,10 @@ DEFAULT_STATE_DIR = REPO_ROOT / "tmp" / "locomo" / "state"
 DEFAULT_LOG_PATH = REPO_ROOT / "tmp" / "locomo" / "run_locomo_memory_eval.log"
 DEFAULT_CONTEXT_KEY = "hermes-memory_context_text"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_READER_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_PREDICTION_KEY = "hermes-memory_prediction"
+NO_INFORMATION_ANSWER = "No information available."
+_READER_HTTP_SESSION: Optional[requests.Session] = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
     parser.add_argument("--detail-output", type=Path, help="Optional per-QA detail JSON.")
     parser.add_argument("--context-key", default=DEFAULT_CONTEXT_KEY)
+    parser.add_argument("--prediction-key", default=DEFAULT_PREDICTION_KEY)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 means all samples.")
     parser.add_argument(
@@ -100,6 +110,18 @@ def parse_args() -> argparse.Namespace:
         help="Do not request provider-enforced JSON output for memory LLM calls.",
     )
     parser.set_defaults(llm_json_mode=True)
+    parser.add_argument("--reader-model")
+    parser.add_argument("--reader-base-url")
+    parser.add_argument("--reader-api-key")
+    parser.add_argument("--reader-timeout", type=int)
+    parser.add_argument("--reader-max-tokens", type=int, default=1024)
+    parser.add_argument("--reader-temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--reader-max-context-chars",
+        type=int,
+        default=16000,
+        help="Truncate recall context before sending it to the reader model.",
+    )
     parser.add_argument("--recall-top-k", type=int, default=8)
     parser.add_argument("--recall-budget", default="mid", choices=["low", "mid", "high"])
     parser.add_argument("--enable-reflect", action="store_true")
@@ -197,10 +219,26 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
         )
     )
 
+    args.reader_model = args.reader_model or args.llm_model
+    args.reader_base_url = args.reader_base_url or args.llm_base_url
+    args.reader_api_key = args.reader_api_key or args.llm_api_key
+    args.reader_timeout = args.reader_timeout or args.llm_timeout
+
+    if args.reader_base_url.rstrip("/") in [
+        DEEPSEEK_BASE_URL,
+        DEEPSEEK_BASE_URL + "/v1",
+    ]:
+        args.reader_base_url = DEEPSEEK_BASE_URL + "/v1"
+
     if not args.llm_api_key and args.llm_base_url.rstrip("/") == DEFAULT_LLM_BASE_URL:
         raise RuntimeError(
             "No OPENAI_API_KEY/HERMES_LLM_API_KEY found for memory LLM. "
             "Set one or pass --llm-base-url for a local compatible endpoint."
+        )
+    if not args.reader_api_key and args.reader_base_url.rstrip("/") == DEFAULT_READER_BASE_URL:
+        raise RuntimeError(
+            "No OPENAI_API_KEY/HERMES_LLM_API_KEY found for reader LLM. "
+            "Set one or pass --reader-base-url for a local compatible endpoint."
         )
 
 
@@ -411,6 +449,231 @@ def db_counts(db: SessionDB) -> Dict[str, int]:
         row = db._conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
         counts[key] = int(row["count"] if row else 0)
     return counts
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    keep = max(0, max_chars - 64)
+    return text[:keep] + "\n\n[truncated for reader]\n"
+
+
+def reader_http_session() -> requests.Session:
+    global _READER_HTTP_SESSION
+    if _READER_HTTP_SESSION is None:
+        _READER_HTTP_SESSION = requests.Session()
+    return _READER_HTTP_SESSION
+
+
+def log_snippet(value: Any, *, max_chars: int = 800) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "...[truncated]"
+
+
+def extract_chat_message_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif isinstance(text, dict) and isinstance(text.get("value"), str):
+                    parts.append(text["value"])
+        return "".join(parts)
+    return str(value)
+
+
+def call_chat_completion(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    prompt: str,
+    timeout: int,
+    max_tokens: int,
+    temperature: float,
+) -> str:
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    logging.info(
+        "Reader LLM request start: model=%s base_url=%s prompt_chars=%s max_tokens=%s "
+        "temperature=%s timeout=%s",
+        model,
+        base_url.rstrip("/"),
+        len(prompt),
+        max_tokens,
+        temperature,
+        timeout,
+    )
+    started = time.perf_counter()
+    try:
+        response = reader_http_session().post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logging.exception(
+            "Reader LLM request failed: model=%s elapsed_ms=%.2f error=%s",
+            model,
+            elapsed_ms,
+            exc,
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    logging.info(
+        "Reader LLM response received: model=%s status=%s elapsed_ms=%.2f response_chars=%s",
+        model,
+        response.status_code,
+        elapsed_ms,
+        len(response.text or ""),
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        logging.error(
+            "Reader LLM HTTP error: model=%s status=%s body=%s",
+            model,
+            response.status_code,
+            log_snippet(response.text),
+        )
+        raise
+
+    try:
+        response_data = response.json()
+    except ValueError:
+        logging.error(
+            "Reader LLM returned non-JSON response: model=%s body=%s",
+            model,
+            log_snippet(response.text),
+        )
+        raise
+
+    choices = response_data.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        logging.error(
+            "Reader LLM returned no choices: model=%s response_keys=%s usage=%s body=%s",
+            model,
+            sorted(response_data.keys()) if isinstance(response_data, dict) else [],
+            response_data.get("usage") if isinstance(response_data, dict) else None,
+            log_snippet(response_data),
+        )
+        raise RuntimeError(f"Reader LLM returned no choices: {log_snippet(response_data)}")
+
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    content = extract_chat_message_text(message.get("content")).strip()
+    fallback_text = extract_chat_message_text(choice.get("text")).strip()
+    if not content and fallback_text:
+        logging.warning(
+            "Reader LLM returned text outside message.content: model=%s finish_reason=%s text_chars=%s",
+            model,
+            choice.get("finish_reason"),
+            len(fallback_text),
+        )
+        content = fallback_text
+    reasoning = extract_chat_message_text(
+        message.get("reasoning_content") or message.get("reasoning")
+    )
+    usage = response_data.get("usage") if isinstance(response_data, dict) else None
+    finish_reason = choice.get("finish_reason")
+    logging.info(
+        "Reader LLM response parsed: model=%s finish_reason=%s content_chars=%s "
+        "reasoning_chars=%s message_keys=%s usage=%s",
+        model,
+        finish_reason,
+        len(content),
+        len(reasoning),
+        sorted(message.keys()),
+        usage,
+    )
+    if not content:
+        logging.warning(
+            "Reader LLM returned empty message.content: model=%s finish_reason=%s "
+            "reasoning_chars=%s message_keys=%s usage=%s",
+            model,
+            finish_reason,
+            len(reasoning),
+            sorted(message.keys()),
+            usage,
+        )
+        raise RuntimeError(
+            "Reader LLM returned empty message.content "
+            f"(model={model}, finish_reason={finish_reason}, usage={usage})"
+        )
+    return content
+
+
+def build_reader_prompt(
+    *,
+    question: str,
+    category: Any,
+    memory_context: str,
+) -> str:
+    return (
+        "You are answering a LoCoMo long-term conversational memory benchmark question.\n"
+        "Use only the retrieved Hermes memory context below.\n"
+        "Rules:\n"
+        "1. Answer with a short phrase, not a full explanation.\n"
+        "2. Use exact names, dates, places, and words from memory whenever possible.\n"
+        "3. If the question asks when something happened, answer with the best date or approximate date from memory.\n"
+        "4. If memory does not contain enough information, answer exactly: No information available.\n"
+        "5. Do not mention that you used memory.\n\n"
+        f"LoCoMo category: {category}\n"
+        f"Question: {question}\n\n"
+        "Retrieved Hermes memory:\n"
+        f"{memory_context or '[empty]'}\n\n"
+        "Short answer:"
+    )
+
+
+def answer_question_with_reader(
+    *,
+    args: argparse.Namespace,
+    question: str,
+    category: Any,
+    memory_context: str,
+) -> str:
+    if not str(memory_context or "").strip():
+        return NO_INFORMATION_ANSWER
+    prompt = build_reader_prompt(
+        question=question,
+        category=category,
+        memory_context=truncate_text(
+            str(memory_context),
+            int(args.reader_max_context_chars),
+        ),
+    )
+    return call_chat_completion(
+        base_url=args.reader_base_url,
+        api_key=args.reader_api_key,
+        model=args.reader_model,
+        prompt=prompt,
+        timeout=int(args.reader_timeout),
+        max_tokens=int(args.reader_max_tokens),
+        temperature=float(args.reader_temperature),
+    )
 
 
 def replay_sample_into_memory(
@@ -638,6 +901,91 @@ def run_sample_worker(
     return index, result, detail_rows
 
 
+def generate_reader_answers(
+    *,
+    args: argparse.Namespace,
+    outputs: List[Dict[str, Any]],
+    detail_rows: List[Dict[str, Any]],
+) -> Tuple[int, int]:
+    detail_by_sample_index: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for row in detail_rows:
+        if not isinstance(row, dict):
+            continue
+        if "qa_index" not in row:
+            continue
+        sample_id = str(row.get("sample_id") or "").strip()
+        if not sample_id:
+            continue
+        try:
+            qa_index = int(row["qa_index"])
+        except (TypeError, ValueError):
+            continue
+        detail_by_sample_index[(sample_id, qa_index)] = row
+
+    answer_success_count = 0
+    answer_failure_count = 0
+    for sample in outputs:
+        if not isinstance(sample, dict):
+            continue
+        sample_id = str(sample.get("sample_id") or "").strip()
+        if not sample_id:
+            continue
+        if isinstance(sample.get("_hermes_memory_eval"), dict) and sample["_hermes_memory_eval"].get("status") == "error":
+            continue
+        qas = sample.get("qa") if isinstance(sample.get("qa"), list) else []
+        for qa_index, qa in enumerate(qas):
+            if not isinstance(qa, dict):
+                continue
+            if "answer" not in qa and "adversarial_answer" in qa:
+                qa["answer"] = qa["adversarial_answer"]
+            detail_row = detail_by_sample_index.get((sample_id, qa_index))
+            memory_context = str(
+                qa.get(args.context_key)
+                or (detail_row or {}).get("recall_context")
+                or ""
+            )
+            question = str(qa.get("question") or "").strip()
+            category = qa.get("category")
+            try:
+                prediction = answer_question_with_reader(
+                    args=args,
+                    question=question,
+                    category=category,
+                    memory_context=memory_context,
+                )
+                answer_success_count += 1
+                logging.info(
+                    "Answered LoCoMo QA: sample_id=%s qa_index=%s context_chars=%s prediction_chars=%s",
+                    sample_id,
+                    qa_index,
+                    len(memory_context),
+                    len(prediction or ""),
+                )
+            except Exception as exc:
+                answer_failure_count += 1
+                prediction = NO_INFORMATION_ANSWER
+                logging.exception(
+                    "Failed to answer LoCoMo QA sample_id=%s qa_index=%s: %s",
+                    sample_id,
+                    qa_index,
+                    exc,
+                )
+                if detail_row is not None:
+                    detail_row["reader_status"] = "error"
+                    detail_row["reader_error"] = str(exc)
+
+            qa[args.prediction_key] = prediction
+            qa["hypothesis"] = prediction
+            if memory_context:
+                qa[f"{args.prediction_key}_context_text"] = memory_context
+            if detail_row is not None:
+                detail_row[args.prediction_key] = prediction
+                detail_row["hypothesis"] = prediction
+                detail_row["reader_model"] = args.reader_model
+                detail_row["reader_base_url"] = args.reader_base_url
+    return answer_success_count, answer_failure_count
+
+
 def write_output(path: Path, samples: Iterable[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -647,9 +995,20 @@ def write_output(path: Path, samples: Iterable[Dict[str, Any]]) -> None:
 
 
 def main() -> int:
+    loaded_env_paths = load_hermes_dotenv(
+        hermes_home=get_hermes_home(),
+        project_env=REPO_ROOT / ".env",
+    )
     args = parse_args()
     resolve_llm_args(args)
     configure_logging(args.log_path, args.log_level, args.manager_log_level)
+    if loaded_env_paths:
+        logging.info(
+            "Loaded environment variables from: %s",
+            ", ".join(str(path) for path in loaded_env_paths),
+        )
+    else:
+        logging.info("No Hermes .env file found; using system environment variables")
 
     detail_output = args.detail_output
     if detail_output is None:
@@ -788,6 +1147,12 @@ def main() -> int:
         detail_rows_output.extend(detail_rows_by_index.get(index, []))
         success_count += 1
 
+    answer_success_count, answer_failure_count = generate_reader_answers(
+        args=args,
+        outputs=outputs,
+        detail_rows=detail_rows_output,
+    )
+
     write_output(args.output, outputs)
     write_output(detail_output, detail_rows_output)
     summary = {
@@ -799,10 +1164,14 @@ def main() -> int:
         "samples_succeeded": success_count,
         "samples_failed": failure_count,
         "context_key": args.context_key,
+        "prediction_key": args.prediction_key,
         "llm_model": args.llm_model,
+        "reader_model": args.reader_model,
         "llm_thinking": args.llm_thinking,
         "llm_json_mode": args.llm_json_mode,
         "workers": workers,
+        "reader_answers_succeeded": answer_success_count,
+        "reader_answers_failed": answer_failure_count,
         "recall_top_k": args.recall_top_k,
         "recall_budget": args.recall_budget,
         "feedback_analysis_enabled": args.enable_feedback_analysis,
@@ -810,7 +1179,7 @@ def main() -> int:
         "fact_extraction_interval": args.fact_extraction_interval,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0 if failure_count == 0 else 1
+    return 0 if failure_count == 0 and answer_failure_count == 0 else 1
 
 
 if __name__ == "__main__":
