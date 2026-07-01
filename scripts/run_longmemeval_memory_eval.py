@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -63,6 +64,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--detail-output", type=Path, help="Optional per-instance detail JSONL.")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 means all instances.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of worker processes used to build per-question memory DBs "
+            "and recall contexts. Reader answering remains single-process."
+        ),
+    )
     parser.add_argument(
         "--question-id",
         action="append",
@@ -159,7 +169,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def configure_logging(log_path: Path, log_level: str, manager_log_level: str) -> None:
+def configure_logging(
+    log_path: Path,
+    log_level: str,
+    manager_log_level: str,
+    *,
+    stream: bool = True,
+) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     root = logging.getLogger()
     root.handlers.clear()
@@ -170,9 +186,10 @@ def configure_logging(log_path: Path, log_level: str, manager_log_level: str) ->
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    root.addHandler(stream_handler)
+    if stream:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        root.addHandler(stream_handler)
 
     logging.getLogger("agent.memory_node_manager").setLevel(
         getattr(logging, str(manager_log_level).upper(), logging.INFO)
@@ -655,7 +672,7 @@ def replay_sessions_into_memory(
     )
 
 
-def run_instance(
+def build_instance_memory_context(
     *,
     args: argparse.Namespace,
     item: Dict[str, Any],
@@ -702,13 +719,6 @@ def run_instance(
             budget=str(args.recall_budget),
             time_end=effective_question_date_text,
         )
-        hypothesis = answer_question_with_reader(
-            args=args,
-            question=question,
-            question_type=question_type,
-            question_date=effective_question_date_text,
-            memory_context=memory_context,
-        )
 
         return {
             "question_id": question_id,
@@ -727,10 +737,81 @@ def run_instance(
             "db_counts": counts,
             "recall_context_chars": len(memory_context or ""),
             "recall_context": memory_context,
-            "hypothesis": hypothesis,
         }
     finally:
         db.close()
+
+
+def answer_instance_from_memory_context(
+    *,
+    args: argparse.Namespace,
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    output = dict(result)
+    output["hypothesis"] = answer_question_with_reader(
+        args=args,
+        question=str(result.get("question") or ""),
+        question_type=str(result.get("question_type") or ""),
+        question_date=str(result.get("effective_question_date") or ""),
+        memory_context=str(result.get("recall_context") or ""),
+    )
+    return output
+
+
+def run_instance(
+    *,
+    args: argparse.Namespace,
+    item: Dict[str, Any],
+    embedding_config: Dict[str, Any],
+    memory_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    memory_result = build_instance_memory_context(
+        args=args,
+        item=item,
+        embedding_config=embedding_config,
+        memory_config=memory_config,
+    )
+    return answer_instance_from_memory_context(args=args, result=memory_result)
+
+
+def run_instance_memory_context_worker(
+    payload: Tuple[int, int, Dict[str, Any], argparse.Namespace, Dict[str, Any], Dict[str, Any]],
+) -> Tuple[int, Dict[str, Any]]:
+    index, total, item, args, embedding_config, memory_config = payload
+    question_id = str(item.get("question_id") or f"item_{index}")
+    question_state_dir = args.state_dir / question_id
+    question_state_dir.mkdir(parents=True, exist_ok=True)
+    configure_logging(
+        question_state_dir / "run_longmemeval_memory_eval.log",
+        args.log_level,
+        args.manager_log_level,
+        stream=False,
+    )
+    logging.info(
+        "[%s/%s] Running LongMemEval instance %s (%s)",
+        index,
+        total,
+        question_id,
+        item.get("question_type"),
+    )
+    result = build_instance_memory_context(
+        args=args,
+        item=item,
+        embedding_config=embedding_config,
+        memory_config=memory_config,
+    )
+    logging.info(
+        "[%s/%s] Finished %s: sessions=%s facts=%s observations=%s interpretations=%s recall_chars=%s",
+        index,
+        total,
+        question_id,
+        result["history_session_count"],
+        result["db_counts"]["facts"],
+        result["db_counts"]["observations"],
+        result["db_counts"]["interpretations"],
+        result["recall_context_chars"],
+    )
+    return index, result
 
 
 def write_jsonl_row(path: Path, row: Dict[str, Any]) -> None:
@@ -772,23 +853,111 @@ def main() -> int:
     embedding_config, memory_config = prepare_runtime_configs(args)
     success_count = 0
     failure_count = 0
+    memory_results_by_index: Dict[int, Dict[str, Any]] = {}
+    errors_by_index: Dict[int, Dict[str, str]] = {}
+
+    workers = max(1, int(args.workers or 1))
+    if workers > 1:
+        logging.info(
+            "Building memory contexts with %s worker processes; reader answers run in main process",
+            workers,
+        )
+        payloads = [
+            (index, len(selected), item, args, embedding_config, memory_config)
+            for index, item in enumerate(selected, 1)
+        ]
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(run_instance_memory_context_worker, payload): payload
+                for payload in payloads
+            }
+            for future in as_completed(futures):
+                index, _total, item, _args, _embedding_config, _memory_config = futures[future]
+                question_id = str(item.get("question_id") or f"item_{index}")
+                try:
+                    result_index, result = future.result()
+                    memory_results_by_index[result_index] = result
+                    logging.info(
+                        "[%s/%s] Memory context ready for %s: recall_chars=%s",
+                        result_index,
+                        len(selected),
+                        question_id,
+                        result.get("recall_context_chars"),
+                    )
+                except Exception as exc:
+                    failure_count += 1
+                    errors_by_index[index] = {
+                        "question_id": question_id,
+                        "status": "error",
+                        "stage": "memory_context",
+                        "error": str(exc),
+                    }
+                    logging.exception(
+                        "Failed to build memory context for LongMemEval instance %s: %s",
+                        question_id,
+                        exc,
+                    )
+    else:
+        for index, item in enumerate(selected, 1):
+            question_id = str(item.get("question_id") or f"item_{index}")
+            logging.info(
+                "[%s/%s] Running LongMemEval instance %s (%s)",
+                index,
+                len(selected),
+                question_id,
+                item.get("question_type"),
+            )
+            try:
+                memory_results_by_index[index] = build_instance_memory_context(
+                    args=args,
+                    item=item,
+                    embedding_config=embedding_config,
+                    memory_config=memory_config,
+                )
+                result = memory_results_by_index[index]
+                logging.info(
+                    "[%s/%s] Memory context ready for %s: sessions=%s facts=%s observations=%s interpretations=%s recall_chars=%s",
+                    index,
+                    len(selected),
+                    question_id,
+                    result["history_session_count"],
+                    result["db_counts"]["facts"],
+                    result["db_counts"]["observations"],
+                    result["db_counts"]["interpretations"],
+                    result["recall_context_chars"],
+                )
+            except Exception as exc:
+                failure_count += 1
+                errors_by_index[index] = {
+                    "question_id": question_id,
+                    "status": "error",
+                    "stage": "memory_context",
+                    "error": str(exc),
+                }
+                logging.exception(
+                    "Failed to build memory context for LongMemEval instance %s: %s",
+                    question_id,
+                    exc,
+                )
 
     for index, item in enumerate(selected, 1):
         question_id = str(item.get("question_id") or f"item_{index}")
-        logging.info(
-            "[%s/%s] Running LongMemEval instance %s (%s)",
-            index,
-            len(selected),
-            question_id,
-            item.get("question_type"),
-        )
+        if index in errors_by_index:
+            write_jsonl_row(detail_output, errors_by_index[index])
+            continue
+        result = memory_results_by_index.get(index)
+        if result is None:
+            failure_count += 1
+            error_row = {
+                "question_id": question_id,
+                "status": "error",
+                "stage": "memory_context",
+                "error": "Memory context worker returned no result",
+            }
+            write_jsonl_row(detail_output, error_row)
+            continue
         try:
-            result = run_instance(
-                args=args,
-                item=item,
-                embedding_config=embedding_config,
-                memory_config=memory_config,
-            )
+            result = answer_instance_from_memory_context(args=args, result=result)
             write_jsonl_row(
                 args.output,
                 {
@@ -799,25 +968,25 @@ def main() -> int:
             write_jsonl_row(detail_output, result)
             success_count += 1
             logging.info(
-                "[%s/%s] Finished %s: sessions=%s facts=%s observations=%s interpretations=%s recall_chars=%s",
+                "[%s/%s] Answered %s: recall_chars=%s hypothesis_chars=%s",
                 index,
                 len(selected),
                 question_id,
-                result["history_session_count"],
-                result["db_counts"]["facts"],
-                result["db_counts"]["observations"],
-                result["db_counts"]["interpretations"],
                 result["recall_context_chars"],
+                len(result.get("hypothesis") or ""),
             )
         except Exception as exc:
             failure_count += 1
-            logging.exception("Failed LongMemEval instance %s: %s", question_id, exc)
+            logging.exception("Failed to answer LongMemEval instance %s: %s", question_id, exc)
             write_jsonl_row(
                 detail_output,
                 {
                     "question_id": question_id,
                     "status": "error",
+                    "stage": "reader",
                     "error": str(exc),
+                    "recall_context": result.get("recall_context", ""),
+                    "recall_context_chars": result.get("recall_context_chars", 0),
                 },
             )
 
@@ -833,6 +1002,7 @@ def main() -> int:
         "reader_model": args.reader_model,
         "llm_thinking": args.llm_thinking,
         "llm_json_mode": args.llm_json_mode,
+        "workers": workers,
         "recall_top_k": args.recall_top_k,
         "recall_budget": args.recall_budget,
         "feedback_analysis_enabled": args.enable_feedback_analysis,
