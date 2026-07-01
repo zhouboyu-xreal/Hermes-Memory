@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -35,6 +36,9 @@ from agent.memory_node_manager import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, M
 from hermes_cli.config import load_config
 import hermes_state
 from hermes_state import SessionDB
+
+
+_READER_HTTP_SESSION: Optional[requests.Session] = None
 
 
 DEFAULT_INPUT = Path(
@@ -61,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
-    parser.add_argument("--detail-output", type=Path, help="Optional per-instance detail JSONL.")
+    parser.add_argument("--detail-output", type=Path, help="Optional per-instance detail JSON.")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 means all instances.")
     parser.add_argument(
@@ -108,7 +112,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reader-base-url")
     parser.add_argument("--reader-api-key")
     parser.add_argument("--reader-timeout", type=int)
-    parser.add_argument("--reader-max-tokens", type=int, default=256)
+    parser.add_argument("--reader-max-tokens", type=int, default=1024)
     parser.add_argument("--reader-temperature", type=float, default=0.0)
     parser.add_argument(
         "--reader-max-context-chars",
@@ -500,6 +504,40 @@ def truncate_text(text: str, max_chars: int) -> str:
     return text[:keep] + "\n\n[truncated for reader]\n"
 
 
+def reader_http_session() -> requests.Session:
+    global _READER_HTTP_SESSION
+    if _READER_HTTP_SESSION is None:
+        _READER_HTTP_SESSION = requests.Session()
+    return _READER_HTTP_SESSION
+
+
+def log_snippet(value: Any, *, max_chars: int = 800) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "...[truncated]"
+
+
+def extract_chat_message_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif isinstance(text, dict) and isinstance(text.get("value"), str):
+                    parts.append(text["value"])
+        return "".join(parts)
+    return str(value)
+
+
 def call_chat_completion(
     *,
     base_url: str,
@@ -521,13 +559,116 @@ def call_chat_completion(
         "max_tokens": max_tokens,
         "stream": False,
     }
-    response = requests.post(url, json=payload, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    response_data = response.json()
+    logging.info(
+        "Reader LLM request start: model=%s base_url=%s prompt_chars=%s max_tokens=%s "
+        "temperature=%s timeout=%s",
+        model,
+        base_url.rstrip("/"),
+        len(prompt),
+        max_tokens,
+        temperature,
+        timeout,
+    )
+    started = time.perf_counter()
+    try:
+        response = reader_http_session().post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logging.exception(
+            "Reader LLM request failed: model=%s elapsed_ms=%.2f error=%s",
+            model,
+            elapsed_ms,
+            exc,
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    logging.info(
+        "Reader LLM response received: model=%s status=%s elapsed_ms=%.2f response_chars=%s",
+        model,
+        response.status_code,
+        elapsed_ms,
+        len(response.text or ""),
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        logging.error(
+            "Reader LLM HTTP error: model=%s status=%s body=%s",
+            model,
+            response.status_code,
+            log_snippet(response.text),
+        )
+        raise
+
+    try:
+        response_data = response.json()
+    except ValueError:
+        logging.error(
+            "Reader LLM returned non-JSON response: model=%s body=%s",
+            model,
+            log_snippet(response.text),
+        )
+        raise
+
     choices = response_data.get("choices", [])
-    if not choices:
-        raise RuntimeError(f"Reader LLM returned no choices: {response_data}")
-    return str(choices[0].get("message", {}).get("content", "") or "").strip()
+    if not isinstance(choices, list) or not choices:
+        logging.error(
+            "Reader LLM returned no choices: model=%s response_keys=%s usage=%s body=%s",
+            model,
+            sorted(response_data.keys()) if isinstance(response_data, dict) else [],
+            response_data.get("usage") if isinstance(response_data, dict) else None,
+            log_snippet(response_data),
+        )
+        raise RuntimeError(f"Reader LLM returned no choices: {log_snippet(response_data)}")
+
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    content = extract_chat_message_text(message.get("content")).strip()
+    fallback_text = extract_chat_message_text(choice.get("text")).strip()
+    if not content and fallback_text:
+        logging.warning(
+            "Reader LLM returned text outside message.content: model=%s finish_reason=%s text_chars=%s",
+            model,
+            choice.get("finish_reason"),
+            len(fallback_text),
+        )
+        content = fallback_text
+    reasoning = extract_chat_message_text(
+        message.get("reasoning_content") or message.get("reasoning")
+    )
+    usage = response_data.get("usage") if isinstance(response_data, dict) else None
+    finish_reason = choice.get("finish_reason")
+    logging.info(
+        "Reader LLM response parsed: model=%s finish_reason=%s content_chars=%s "
+        "reasoning_chars=%s message_keys=%s usage=%s",
+        model,
+        finish_reason,
+        len(content),
+        len(reasoning),
+        sorted(message.keys()),
+        usage,
+    )
+    if not content:
+        logging.warning(
+            "Reader LLM returned empty message.content: model=%s finish_reason=%s "
+            "reasoning_chars=%s message_keys=%s usage=%s",
+            model,
+            finish_reason,
+            len(reasoning),
+            sorted(message.keys()),
+            usage,
+        )
+        raise RuntimeError(
+            "Reader LLM returned empty message.content "
+            f"(model={model}, finish_reason={finish_reason}, usage={usage})"
+        )
+    return content
 
 
 def build_reader_prompt(
@@ -820,6 +961,14 @@ def write_jsonl_row(path: Path, row: Dict[str, Any]) -> None:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def write_json_output(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(list(rows), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def main() -> int:
     # load_dotenv(REPO_ROOT / ".env")
     args = parse_args()
@@ -828,7 +977,7 @@ def main() -> int:
 
     detail_output = args.detail_output
     if detail_output is None:
-        detail_output = args.output.with_suffix(args.output.suffix + ".details.jsonl")
+        detail_output = args.output.with_suffix(args.output.suffix + ".details.json")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.state_dir.mkdir(parents=True, exist_ok=True)
@@ -855,6 +1004,7 @@ def main() -> int:
     failure_count = 0
     memory_results_by_index: Dict[int, Dict[str, Any]] = {}
     errors_by_index: Dict[int, Dict[str, str]] = {}
+    detail_rows: List[Dict[str, Any]] = []
 
     workers = max(1, int(args.workers or 1))
     if workers > 1:
@@ -943,7 +1093,7 @@ def main() -> int:
     for index, item in enumerate(selected, 1):
         question_id = str(item.get("question_id") or f"item_{index}")
         if index in errors_by_index:
-            write_jsonl_row(detail_output, errors_by_index[index])
+            detail_rows.append(errors_by_index[index])
             continue
         result = memory_results_by_index.get(index)
         if result is None:
@@ -954,7 +1104,7 @@ def main() -> int:
                 "stage": "memory_context",
                 "error": "Memory context worker returned no result",
             }
-            write_jsonl_row(detail_output, error_row)
+            detail_rows.append(error_row)
             continue
         try:
             result = answer_instance_from_memory_context(args=args, result=result)
@@ -965,7 +1115,7 @@ def main() -> int:
                     "hypothesis": result["hypothesis"],
                 },
             )
-            write_jsonl_row(detail_output, result)
+            detail_rows.append(result)
             success_count += 1
             logging.info(
                 "[%s/%s] Answered %s: recall_chars=%s hypothesis_chars=%s",
@@ -978,8 +1128,7 @@ def main() -> int:
         except Exception as exc:
             failure_count += 1
             logging.exception("Failed to answer LongMemEval instance %s: %s", question_id, exc)
-            write_jsonl_row(
-                detail_output,
+            detail_rows.append(
                 {
                     "question_id": question_id,
                     "status": "error",
@@ -987,8 +1136,10 @@ def main() -> int:
                     "error": str(exc),
                     "recall_context": result.get("recall_context", ""),
                     "recall_context_chars": result.get("recall_context_chars", 0),
-                },
+                }
             )
+
+    write_json_output(detail_output, detail_rows)
 
     summary = {
         "input": str(args.input),
