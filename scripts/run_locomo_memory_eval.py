@@ -8,6 +8,7 @@ QA question.
 
 The main output is a JSON list shaped like LoCoMo's evaluator output:
 ``[{"sample_id": "...", "qa": [{"question": "...", "hermes-memory_context_text": "..."}]}]``.
+The detail output is written once by the main process as a JSON list.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import logging
 import os
 import shutil
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -59,10 +61,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
-    parser.add_argument("--detail-output", type=Path, help="Optional per-QA detail JSONL.")
+    parser.add_argument("--detail-output", type=Path, help="Optional per-QA detail JSON.")
     parser.add_argument("--context-key", default=DEFAULT_CONTEXT_KEY)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 means all samples.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes used to build per-sample memory DBs and recall contexts.",
+    )
     parser.add_argument("--sample-id", action="append", help="Only run the given sample_id.")
     parser.add_argument("--qa-start", type=int, default=0)
     parser.add_argument("--qa-limit", type=int, default=0, help="0 means all QA rows per sample.")
@@ -114,7 +122,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def configure_logging(log_path: Path, log_level: str, manager_log_level: str) -> None:
+def configure_logging(
+    log_path: Path,
+    log_level: str,
+    manager_log_level: str,
+    *,
+    stream: bool = True,
+) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     root = logging.getLogger()
     root.handlers.clear()
@@ -125,9 +139,10 @@ def configure_logging(log_path: Path, log_level: str, manager_log_level: str) ->
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    root.addHandler(stream_handler)
+    if stream:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        root.addHandler(stream_handler)
 
     logging.getLogger("agent.memory_node_manager").setLevel(
         getattr(logging, str(manager_log_level).upper(), logging.INFO)
@@ -506,8 +521,7 @@ def run_sample(
     sample: Dict[str, Any],
     embedding_config: Dict[str, Any],
     memory_config: Dict[str, Any],
-    detail_output: Optional[Path],
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     sample_id = str(sample.get("sample_id") or "unknown_sample")
     sample_state_dir = args.state_dir / sample_id
     sample_state_dir.mkdir(parents=True, exist_ok=True)
@@ -543,6 +557,7 @@ def run_sample(
                 for qa in json.loads(json.dumps(sample.get("qa", [])))
             ],
         }
+        detail_rows: List[Dict[str, Any]] = []
         for qa_index, qa in selected_qa_rows(
             sample,
             qa_start=int(args.qa_start),
@@ -557,23 +572,21 @@ def run_sample(
                 tags=["locomo", f"sample_id:{sample_id}"],
             )
             out_sample["qa"][qa_index][args.context_key] = memory_context
-            if detail_output is not None:
-                write_jsonl_row(
-                    detail_output,
-                    {
-                        "sample_id": sample_id,
-                        "qa_index": qa_index,
-                        "question": question,
-                        "answer": qa.get("answer"),
-                        "category": category,
-                        "evidence": qa.get("evidence", []),
-                        "context_key": args.context_key,
-                        "recall_context_chars": len(memory_context or ""),
-                        "recall_context": memory_context,
-                        "db_path": str(db_path),
-                        "db_counts": counts,
-                    },
-                )
+            detail_rows.append(
+                {
+                    "sample_id": sample_id,
+                    "qa_index": qa_index,
+                    "question": question,
+                    "answer": qa.get("answer"),
+                    "category": category,
+                    "evidence": qa.get("evidence", []),
+                    "context_key": args.context_key,
+                    "recall_context_chars": len(memory_context or ""),
+                    "recall_context": memory_context,
+                    "db_path": str(db_path),
+                    "db_counts": counts,
+                }
+            )
 
         out_sample["_hermes_memory_eval"] = {
             "db_path": str(db_path),
@@ -585,15 +598,44 @@ def run_sample(
             "reflect_runs": reflect_runs,
             "db_counts": counts,
         }
-        return out_sample
+        return out_sample, detail_rows
     finally:
         db.close()
 
 
-def write_jsonl_row(path: Path, row: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+def run_sample_worker(
+    payload: Tuple[int, int, Dict[str, Any], argparse.Namespace, Dict[str, Any], Dict[str, Any]],
+) -> Tuple[int, Dict[str, Any], List[Dict[str, Any]]]:
+    index, total, sample, args, embedding_config, memory_config = payload
+    sample_id = str(sample.get("sample_id") or f"sample_{index}")
+    sample_state_dir = args.state_dir / sample_id
+    sample_state_dir.mkdir(parents=True, exist_ok=True)
+    configure_logging(
+        sample_state_dir / "run_locomo_memory_eval.log",
+        args.log_level,
+        args.manager_log_level,
+        stream=False,
+    )
+    logging.info("[%s/%s] Running LoCoMo sample %s", index, total, sample_id)
+    result, detail_rows = run_sample(
+        args=args,
+        sample=sample,
+        embedding_config=embedding_config,
+        memory_config=memory_config,
+    )
+    stats = result["_hermes_memory_eval"]
+    logging.info(
+        "[%s/%s] Finished %s: sessions=%s facts=%s observations=%s interpretations=%s detail_rows=%s",
+        index,
+        total,
+        sample_id,
+        stats["history_session_count"],
+        stats["db_counts"]["facts"],
+        stats["db_counts"]["observations"],
+        stats["db_counts"]["interpretations"],
+        len(detail_rows),
+    )
+    return index, result, detail_rows
 
 
 def write_output(path: Path, samples: Iterable[Dict[str, Any]]) -> None:
@@ -611,7 +653,7 @@ def main() -> int:
 
     detail_output = args.detail_output
     if detail_output is None:
-        detail_output = args.output.with_suffix(args.output.suffix + ".details.jsonl")
+        detail_output = args.output.with_suffix(args.output.suffix + ".details.json")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.state_dir.mkdir(parents=True, exist_ok=True)
@@ -634,49 +676,120 @@ def main() -> int:
         raise RuntimeError("No LoCoMo samples selected")
 
     embedding_config, memory_config = prepare_runtime_configs(args)
-    outputs: List[Dict[str, Any]] = []
     success_count = 0
     failure_count = 0
+    outputs_by_index: Dict[int, Dict[str, Any]] = {}
+    detail_rows_by_index: Dict[int, List[Dict[str, Any]]] = {}
+    errors_by_index: Dict[int, Dict[str, str]] = {}
 
+    workers = max(1, int(args.workers or 1))
+    if workers > 1:
+        logging.info("Running LoCoMo memory evaluation with %s worker processes", workers)
+        payloads = [
+            (index, len(selected), sample, args, embedding_config, memory_config)
+            for index, sample in enumerate(selected, 1)
+        ]
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(run_sample_worker, payload): payload
+                for payload in payloads
+            }
+            for future in as_completed(futures):
+                index, _total, sample, _args, _embedding_config, _memory_config = futures[future]
+                sample_id = str(sample.get("sample_id") or f"sample_{index}")
+                try:
+                    result_index, result, detail_rows = future.result()
+                    outputs_by_index[result_index] = result
+                    detail_rows_by_index[result_index] = detail_rows
+                    logging.info(
+                        "[%s/%s] LoCoMo sample ready %s: detail_rows=%s",
+                        result_index,
+                        len(selected),
+                        sample_id,
+                        len(detail_rows),
+                    )
+                except Exception as exc:
+                    failure_count += 1
+                    errors_by_index[index] = {
+                        "sample_id": sample_id,
+                        "status": "error",
+                        "stage": "sample",
+                        "error": str(exc),
+                    }
+                    logging.exception("Failed LoCoMo sample %s: %s", sample_id, exc)
+    else:
+        for index, sample in enumerate(selected, 1):
+            sample_id = str(sample.get("sample_id") or f"sample_{index}")
+            logging.info("[%s/%s] Running LoCoMo sample %s", index, len(selected), sample_id)
+            try:
+                result, detail_rows = run_sample(
+                    args=args,
+                    sample=sample,
+                    embedding_config=embedding_config,
+                    memory_config=memory_config,
+                )
+                outputs_by_index[index] = result
+                detail_rows_by_index[index] = detail_rows
+                stats = result["_hermes_memory_eval"]
+                logging.info(
+                    "[%s/%s] Finished %s: sessions=%s facts=%s observations=%s interpretations=%s detail_rows=%s",
+                    index,
+                    len(selected),
+                    sample_id,
+                    stats["history_session_count"],
+                    stats["db_counts"]["facts"],
+                    stats["db_counts"]["observations"],
+                    stats["db_counts"]["interpretations"],
+                    len(detail_rows),
+                )
+            except Exception as exc:
+                failure_count += 1
+                errors_by_index[index] = {
+                    "sample_id": sample_id,
+                    "status": "error",
+                    "stage": "sample",
+                    "error": str(exc),
+                }
+                logging.exception("Failed LoCoMo sample %s: %s", sample_id, exc)
+
+    outputs: List[Dict[str, Any]] = []
+    detail_rows_output: List[Dict[str, Any]] = []
     for index, sample in enumerate(selected, 1):
         sample_id = str(sample.get("sample_id") or f"sample_{index}")
-        logging.info("[%s/%s] Running LoCoMo sample %s", index, len(selected), sample_id)
-        try:
-            result = run_sample(
-                args=args,
-                sample=sample,
-                embedding_config=embedding_config,
-                memory_config=memory_config,
-                detail_output=detail_output,
-            )
-            outputs.append(result)
-            success_count += 1
-            stats = result["_hermes_memory_eval"]
-            logging.info(
-                "[%s/%s] Finished %s: sessions=%s facts=%s observations=%s interpretations=%s",
-                index,
-                len(selected),
-                sample_id,
-                stats["history_session_count"],
-                stats["db_counts"]["facts"],
-                stats["db_counts"]["observations"],
-                stats["db_counts"]["interpretations"],
-            )
-        except Exception as exc:
-            failure_count += 1
-            logging.exception("Failed LoCoMo sample %s: %s", sample_id, exc)
+        if index in errors_by_index:
             outputs.append(
                 {
                     "sample_id": sample_id,
                     "qa": sample.get("qa", []),
-                    "_hermes_memory_eval": {
-                        "status": "error",
-                        "error": str(exc),
-                    },
+                    "_hermes_memory_eval": errors_by_index[index],
                 }
             )
+            detail_rows_output.append(errors_by_index[index])
+            continue
+        result = outputs_by_index.get(index)
+        if result is None:
+            failure_count += 1
+            error_row = {
+                "sample_id": sample_id,
+                "status": "error",
+                "stage": "sample",
+                "error": "Sample worker returned no result",
+            }
+            outputs.append(
+                {
+                    "sample_id": sample_id,
+                    "qa": sample.get("qa", []),
+                    "_hermes_memory_eval": error_row,
+                }
+            )
+            detail_rows_output.append(error_row)
+            continue
+        outputs.append(result)
+        detail_rows_output.extend(detail_rows_by_index.get(index, []))
+        success_count += 1
 
     write_output(args.output, outputs)
+    write_output(detail_output, detail_rows_output)
     summary = {
         "input": str(args.input),
         "output": str(args.output),
@@ -689,6 +802,7 @@ def main() -> int:
         "llm_model": args.llm_model,
         "llm_thinking": args.llm_thinking,
         "llm_json_mode": args.llm_json_mode,
+        "workers": workers,
         "recall_top_k": args.recall_top_k,
         "recall_budget": args.recall_budget,
         "feedback_analysis_enabled": args.enable_feedback_analysis,
