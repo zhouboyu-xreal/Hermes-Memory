@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
-from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -34,6 +33,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from agent.memory_node_manager import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, MemoryNodeManager
 from hermes_cli.config import load_config
+from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_constants import get_hermes_home
 import hermes_state
 from hermes_state import SessionDB
 
@@ -112,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reader-base-url")
     parser.add_argument("--reader-api-key")
     parser.add_argument("--reader-timeout", type=int)
-    parser.add_argument("--reader-max-tokens", type=int, default=1024)
+    parser.add_argument("--reader-max-tokens", type=int, default=4096)
     parser.add_argument("--reader-temperature", type=float, default=0.0)
     parser.add_argument(
         "--reader-max-context-chars",
@@ -131,6 +132,15 @@ def parse_args() -> argparse.Namespace:
         default="mid",
         choices=["low", "mid", "high"],
         help="Recall traversal budget passed to MemoryNodeManager.recall().",
+    )
+    parser.add_argument(
+        "--recall-gate-mode",
+        default="force",
+        choices=["auto", "force"],
+        help=(
+            "Recall gate behavior passed to MemoryNodeManager. "
+            "'auto' uses gate analysis; 'force' always attempts recall."
+        ),
     )
     parser.add_argument(
         "--enable-reflect",
@@ -456,21 +466,64 @@ def prepare_runtime_configs(
     memory_config["enable_interpretation_feedback"] = bool(
         args.enable_feedback_analysis
     )
+    memory_config["recall_gate_mode"] = str(args.recall_gate_mode)
     return embedding_config, memory_config
 
 
 def validate_runtime(manager: MemoryNodeManager) -> None:
+    embedding_cfg = getattr(manager, "_embedding_cfg", {}) or {}
+    configured_api_key = str(embedding_cfg.get("api_key") or "").strip()
+    api_key_env = str(embedding_cfg.get("api_key_env") or "").strip()
+    resolved_env_key = ""
+    if configured_api_key.startswith("${") and configured_api_key.endswith("}"):
+        resolved_env_key = configured_api_key[2:-1].strip()
+    api_key_present = bool(
+        (api_key_env and os.environ.get(api_key_env))
+        or (resolved_env_key and os.environ.get(resolved_env_key))
+        or (
+            configured_api_key
+            and not (
+                configured_api_key.startswith("${")
+                and configured_api_key.endswith("}")
+            )
+        )
+        or os.environ.get("EMBEDDING_API_KEY")
+    )
     logging.info(
-        "Embedding runtime: python=%s faiss_available=%s",
+        "Embedding runtime: python=%s faiss_available=%s provider=%s model=%s base_url=%s "
+        "configured_dimensions=%s api_key_env=%s api_key_present=%s",
         sys.version.split()[0],
         hermes_state._HAS_FAISS,
+        embedding_cfg.get("provider"),
+        embedding_cfg.get("model"),
+        embedding_cfg.get("base_url"),
+        embedding_cfg.get("dimensions"),
+        api_key_env or resolved_env_key or "EMBEDDING_API_KEY",
+        api_key_present,
     )
     if not manager._ensure_embedding_client():
         raise RuntimeError("Failed to initialize the configured embedding client")
     probe = manager._embedding_client.embed_text("LongMemEval embedding probe")
     probe_vector = manager._as_embedding_vector(probe)
     if probe_vector is None:
-        raise RuntimeError("The configured embedding provider returned an invalid vector")
+        raw_shape = getattr(probe, "shape", None)
+        raw_size = getattr(probe, "size", None)
+        logging.error(
+            "Embedding probe failed: provider=%s model=%s base_url=%s raw_type=%s raw_shape=%s "
+            "raw_size=%s api_key_present=%s",
+            embedding_cfg.get("provider"),
+            embedding_cfg.get("model"),
+            embedding_cfg.get("base_url"),
+            type(probe).__name__,
+            raw_shape,
+            raw_size,
+            api_key_present,
+        )
+        raise RuntimeError(
+            "The configured embedding provider returned an invalid vector "
+            f"(provider={embedding_cfg.get('provider')}, model={embedding_cfg.get('model')}, "
+            f"base_url={embedding_cfg.get('base_url')}, api_key_present={api_key_present})"
+        )
     logging.info(
         "Embedding probe succeeded: dimensions=%s norm=%.6f",
         probe_vector.size,
@@ -536,6 +589,42 @@ def extract_chat_message_text(value: Any) -> str:
                     parts.append(text["value"])
         return "".join(parts)
     return str(value)
+
+
+def extract_reader_final_answer(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+
+    candidates = [raw]
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 3:
+            candidates.append("\n".join(lines[1:-1]).strip())
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if 0 <= start < end:
+        candidates.append(raw[start : end + 1])
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            answer = parsed.get("final_answer")
+            if answer is None:
+                answer = parsed.get("answer")
+            if answer is not None:
+                answer_text = str(answer).strip()
+                if answer_text:
+                    return answer_text
+
+    logging.warning("Reader response was not valid answer JSON: %s", log_snippet(raw))
+    return ""
 
 
 def call_chat_completion(
@@ -682,16 +771,24 @@ def build_reader_prompt(
         "You are answering a LongMemEval benchmark question using retrieved memory only.\n"
         "Follow these rules strictly:\n"
         "1. Use only the memory context below. Do not invent details.\n"
-        "2. For temporal or knowledge-update questions, prefer the most recent evidence before the question date.\n"
-        "3. If the memory is insufficient, ambiguous, or missing the answer, reply with exactly: "
+        "2. First identify the 1-5 most relevant memory lines or snippets.\n"
+        "3. Ignore irrelevant background memories once you have found the relevant evidence.\n"
+        "4. If the answer text itself appears in memory, return it instead of abstaining.\n"
+        "5. For counting, totaling, or comparison questions, gather all relevant items before answering.\n"
+        "6. For temporal or knowledge-update questions, prefer the most recent applicable evidence before the question date.\n"
+        "7. If the memory truly lacks the answer, set final_answer to exactly: "
         "\"I don't know based on the available memory.\"\n"
-        "4. Answer concisely and directly. Do not explain your reasoning.\n\n"
+        "8. Keep the final answer concise and direct.\n\n"
         f"Question type: {question_type}\n"
         f"Question date: {question_date}\n"
         f"Question: {question}\n\n"
         "Memory context:\n"
         f"{memory_context or '[empty]'}\n\n"
-        "Answer:"
+        "Return valid JSON only, with no markdown or extra text. Use exactly this schema:\n"
+        "{\n"
+        "  \"relevant_evidence\": [\"<most relevant memory snippet>\", \"<optional>\"],\n"
+        "  \"final_answer\": \"<final answer or exactly I don't know based on the available memory.>\"\n"
+        "}\n"
     )
 
 
@@ -705,13 +802,15 @@ def answer_question_with_reader(
 ) -> str:
     if not memory_context.strip():
         return "I don't know based on the available memory."
+
+    truncated_context = truncate_text(memory_context, args.reader_max_context_chars)
     prompt = build_reader_prompt(
         question=question,
         question_type=question_type,
         question_date=question_date,
-        memory_context=truncate_text(memory_context, args.reader_max_context_chars),
+        memory_context=truncated_context,
     )
-    return call_chat_completion(
+    response_text = call_chat_completion(
         base_url=args.reader_base_url,
         api_key=args.reader_api_key,
         model=args.reader_model,
@@ -720,6 +819,10 @@ def answer_question_with_reader(
         max_tokens=int(args.reader_max_tokens),
         temperature=float(args.reader_temperature),
     )
+    answer = extract_reader_final_answer(response_text)
+    if answer:
+        return answer
+    return "I don't know based on the available memory."
 
 
 def replay_sessions_into_memory(
@@ -859,6 +962,7 @@ def build_instance_memory_context(
             top_k=int(args.recall_top_k),
             budget=str(args.recall_budget),
             time_end=effective_question_date_text,
+            recall_gate_mode=str(args.recall_gate_mode),
         )
 
         return {
@@ -970,10 +1074,20 @@ def write_json_output(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
 
 
 def main() -> int:
-    # load_dotenv(REPO_ROOT / ".env")
+    loaded_env_paths = load_hermes_dotenv(
+        hermes_home=get_hermes_home(),
+        project_env=REPO_ROOT / ".env",
+    )
     args = parse_args()
     resolve_llm_args(args)
     configure_logging(args.log_path, args.log_level, args.manager_log_level)
+    if loaded_env_paths:
+        logging.info(
+            "Loaded environment variables from: %s",
+            ", ".join(str(path) for path in loaded_env_paths),
+        )
+    else:
+        logging.info("No Hermes .env file found; using system environment variables")
 
     detail_output = args.detail_output
     if detail_output is None:
@@ -1156,6 +1270,7 @@ def main() -> int:
         "workers": workers,
         "recall_top_k": args.recall_top_k,
         "recall_budget": args.recall_budget,
+        "recall_gate_mode": args.recall_gate_mode,
         "feedback_analysis_enabled": args.enable_feedback_analysis,
         "reflect_every_sessions": args.reflect_every_sessions,
         "fact_extraction_interval": args.fact_extraction_interval,

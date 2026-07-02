@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pytest
 
+import agent.memory_node_manager as memory_node_manager
 import hermes_state
 from agent.memory_node_manager import MemoryNodeManager
 from agent.memory_node_manager import (
@@ -3429,6 +3430,7 @@ def test_memory_node_manager_separates_embedding_and_memory_config(db):
         "max_chars_before_store": 2400,
         "reflect_interval_seconds": 1800,
         "recall_budget": "high",
+        "recall_gate_mode": "force",
         "enable_entity_extraction": False,
         "llm_timeout": 45,
     }
@@ -3446,6 +3448,7 @@ def test_memory_node_manager_separates_embedding_and_memory_config(db):
     assert mgr._max_chars_before_store == 2400
     assert mgr._reflect_interval_seconds == 1800
     assert mgr._recall_budget == "high"
+    assert mgr._recall_gate_mode == "force"
     assert mgr._enable_entity_extraction is False
     assert mgr._llm_timeout == 45
 
@@ -3536,6 +3539,55 @@ def test_recall_gate_respects_llm_skip_regardless_of_confidence(db):
     assert capture.texts == []
 
 
+def test_recall_force_mode_bypasses_llm_skip(db):
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack", "alerts"],
+        fact_type="semantic",
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"recall_gate_mode": "force"},
+        llm_outputs=[
+            json.dumps({
+                "needs_recall": False,
+                "recall_confidence": 0.99,
+                "recall_reason": "self_contained_general_knowledge",
+                "search_text": "Alice Slack alerts",
+                "keywords": ["Alice", "Slack", "alerts"],
+            })
+        ],
+    )
+
+    context = mgr.recall("Alice Slack alerts")
+
+    assert "Alice prefers Slack for urgent alerts." in context
+    assert len(mgr.llm_prompts) == 1
+
+
+def test_recall_force_mode_falls_back_when_analysis_fails(db):
+    _add_memory_node(
+        db,
+        time_key="2026-05-01 10:00:00",
+        summary="Alice prefers Slack for urgent alerts.",
+        keywords=["Alice", "Slack", "alerts"],
+        fact_type="semantic",
+    )
+    mgr = _NoAsyncMemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"recall_gate_mode": "force"},
+    )
+
+    context = mgr.recall("Alice Slack alerts")
+
+    assert "Alice prefers Slack for urgent alerts." in context
+    assert len(mgr.llm_prompts) == 2
+
+
 def test_recall_gate_analysis_failure_stops_recall(db, monkeypatch):
     _add_memory_node(
         db,
@@ -3579,6 +3631,110 @@ def test_analyze_recall_query_retries_when_model_rejects_chat_params(db):
     assert "temperature" in client.completions.calls[0]
     assert "temperature" not in client.completions.calls[1]
     assert "max_completion_tokens" in client.completions.calls[1]
+
+
+def test_shared_llm_client_uses_configured_json_mode_and_thinking(db):
+    payload = json.dumps({
+        "search_text": "Alice Slack alert preference",
+        "keywords": ["Alice", "Slack"],
+        "recall_intent": "state",
+        "intent_confidence": 0.8,
+    })
+    client = _RejectingLLMClient(payload)
+    mgr = MemoryNodeManager(
+        db,
+        embedding_config={},
+        memory_config={"llm_thinking": "disabled", "llm_json_mode": True},
+        llm_client=client,
+        llm_model="gpt-4o-mini",
+        llm_base_url="https://api.openai.com/v1",
+    )
+
+    analysis = mgr._analyze_recall_query("Alice Slack alerts")
+
+    assert analysis["search_text"] == "Alice Slack alert preference"
+    assert len(client.completions.calls) == 2
+    first_call = client.completions.calls[0]
+    assert first_call["response_format"] == {"type": "json_object"}
+    assert first_call["extra_body"] == {"thinking": {"type": "disabled"}}
+    second_call = client.completions.calls[1]
+    assert second_call["response_format"] == {"type": "json_object"}
+    assert second_call["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "temperature" not in second_call
+
+
+def test_raw_llm_api_uses_configured_json_mode_and_thinking(monkeypatch):
+    calls = []
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "{\"ok\": true}"}}]}
+
+    def _fake_post(url, json=None, headers=None, timeout=None):
+        calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+        return _FakeResponse()
+
+    monkeypatch.setattr(memory_node_manager.requests, "post", _fake_post)
+
+    result = memory_node_manager._call_llm_api(
+        "prompt",
+        model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com/v1",
+        api_key="secret",
+        llm_thinking="disabled",
+        llm_json_mode=True,
+    )
+
+    assert result == "{\"ok\": true}"
+    assert len(calls) == 1
+    payload = calls[0]["json"]
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["thinking"] == {"type": "disabled"}
+    assert payload["max_tokens"] == 2048
+    assert calls[0]["headers"]["Authorization"] == "Bearer secret"
+
+
+def test_raw_llm_api_retries_without_json_mode_and_thinking_when_rejected(monkeypatch):
+    calls = []
+
+    class _FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+            self.text = "unsupported response_format and thinking"
+
+        def raise_for_status(self):
+            if "response_format" in self.payload or "thinking" in self.payload:
+                error = memory_node_manager.requests.exceptions.HTTPError("400")
+                error.response = self
+                raise error
+
+        def json(self):
+            return {"choices": [{"message": {"content": "{\"ok\": true}"}}]}
+
+    def _fake_post(url, json=None, headers=None, timeout=None):
+        calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+        return _FakeResponse(json or {})
+
+    monkeypatch.setattr(memory_node_manager.requests, "post", _fake_post)
+
+    result = memory_node_manager._call_llm_api(
+        "prompt",
+        model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com/v1",
+        api_key="secret",
+        llm_thinking="disabled",
+        llm_json_mode=True,
+    )
+
+    assert result == "{\"ok\": true}"
+    assert calls
+    assert "response_format" in calls[0]["json"]
+    assert "thinking" in calls[0]["json"]
+    assert "response_format" not in calls[-1]["json"]
+    assert "thinking" not in calls[-1]["json"]
 
 
 def test_analyze_recall_query_uses_responses_api_for_gpt5_models(db):

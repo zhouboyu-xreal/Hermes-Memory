@@ -461,52 +461,65 @@ RETAIN_FACT_EXTRACTION_PROMPT = """你是长期记忆系统的 fact 提取模块
    - 具体对象：项目、模块、文件、函数、配置项、参数、产品、人物或材料
    - 具体动作或论点：提出、决定、修改、删除、实现、排查、验证、解释或反驳了什么
    - 关键条件和约束：阈值、触发时机、适用范围、禁止事项、依赖和前置条件
+   - 明确时间锚点：原文出现的具体日期、星期、月份、年份、相对时间和事件先后关系
    - 原因、证据和目的：为什么采取该方案，什么现象支持该判断
    - 结果和状态变化：成功、失败、通过、阻塞、待处理，以及修改前后的差异
+   - 可被直接问到的细节答案：人名、机构名、地名、作品名、菜名、商品型号、账号/handle、电话号码/邮箱、百分比、金额、数量、页数、时长、分数、等级、参数、步骤编号、轮班时间、引用原句、颜色/材料/配方/曲谱/代码标识符等
 4. 禁止只写“讨论了某主题”“要求优化相关代码”“助手提供了建议”“处理了某个问题”这类缺少实质内容的描述
 5. 对知识讲解、方案讨论和技术分析，不仅记录“谁讨论了什么”，还要提取其中明确出现的核心概念、方案、取舍、结论和适用条件
 6. 区分事件背景和实质内容：用户提出请求可以是一条 episodic fact；对话确认的稳定技术结论可以单独成为 semantic fact；助手实际完成的修改、测试及其结果可以成为 episodic fact
 7. 只基于输入对话提取。不要把“建议修改”“计划测试”“正在排查”写成“已经修改”“测试通过”或“问题已解决”，除非对话明确提供了完成证据
-8. 尽量保留用户偏好、约束、决定、失败经验、助手建议和明确原因
+8. 尽量保留用户偏好、约束、决定、失败经验、助手建议和明确原因；如果用户后来纠正、更新或否定了较早答案，必须把最新更正值和被更正的旧值一起写清楚
 9. 区分 fact_type（心理学意义上的记忆性质）:
    - semantic: 语义记忆，关于事实、概念、常识、稳定背景、长期偏好或长期规则
    - episodic: 情景记忆，关于具体经历/事件，通常包含特定时间、地点、人物、行为、结果、情绪或状态变化
-10. occurred_start/occurred_end 如果对话没有明确日期，填空字符串
-11. time_confidence 只能是 explicit、inferred_from_turn、unknown：
+10. 时间信息必须保真：
+   - 如果原文出现具体日期/时间、星期、月份、年份或相对时间（如 yesterday、last Saturday、two months ago、mid-February、Monday, February 27th、上周六、两个月前），必须在 text 中保留该时间表达或基于对话发生时间补全后的日期
+   - 如果能够根据“对话发生时间”无歧义换算相对时间，应在 occurred_start/occurred_end 写入补全后的日期或日期范围，并将 time_confidence 标为 explicit；text 中也应保留可读时间锚点，例如“on February 27, 2023”或“two months before the May 28, 2023 conversation”
+   - 如果只能大致定位月份、周或时间段，应保留原始相对表达，并在 occurred_start/occurred_end 写入可保守表示的范围；不能精确换算时不要编造具体日
+   - 如果一个事件的问题答案依赖时间先后，text 必须同时保留事件对象和时间锚点，不能只写事件主题
+11. occurred_start/occurred_end 如果对话没有明确日期或可无歧义推断的相对日期，填空字符串
+12. time_confidence 只能是 explicit、inferred_from_turn、unknown：
    - explicit: 对话中明确给出日期/时间或可无歧义换算
    - inferred_from_turn: 只能基于当前这轮对话发生时间推断
    - unknown: 无法确定时间
-12. entities 遵守下方统一实体提取规则；普通时间表达应写入 occurred_start/occurred_end，不进入 entities
-13. keywords 是用于检索这条 fact 的关键词，保留关键实体、产品、技术、动作和约束
-14. primary_entity 是这条 fact 主要描述的唯一主体，用于后续 observation 分桶：
+13. entities 遵守下方统一实体提取规则；普通时间表达应写入 occurred_start/occurred_end，不进入 entities
+14. keywords 是用于检索这条 fact 的关键词，保留关键实体、产品、技术、动作、约束；对带时间锚点的事件，还必须包含关键时间词或补全日期（如 February 27 2023、mid-February、last Saturday）
+15. primary_entity 是这条 fact 主要描述的唯一主体，用于后续 observation 分桶：
    - 必须输出单个实体对象，并且该实体也必须出现在 entities 中
    - 优先选择 fact 的行为、状态、偏好、决定或经历所归属的主体
    - 仅被提及的对象、建议来源、地点、工具或上下文实体不能自动成为 primary_entity
    - 多人互动事件选择该 fact 主要描述或影响的主体
-15. primary_topic 是这条 fact 唯一的核心主题，用于后续 observation 分桶：
+16. primary_topic 是这条 fact 唯一的核心主题，用于后续 observation 分桶：
    - 必须输出一个具体、稳定的主题字符串，不要输出数组
    - 不要把 entity name 本身当作 primary_topic
    - 同批次语义相同的 facts 应尽量使用完全一致的 primary_topic 表述
    - 不要在 primary_topic 中随意增删“关系、管理、状态、情况、问题”等后缀
-16. fact_subject 只能是 user、assistant、world、project、system、other；表示这条记忆主要关于谁/什么主体
+17. fact_subject 只能是 user、assistant、world、project、system、other；表示这条记忆主要关于谁/什么主体
    - 如果 fact_subject 是 user 或 assistant，可以把 "用户" 或 "助手" 作为 OTHER entity 输出，便于后续按对话主体聚合
-17. fact_kind 只能是 preference、decision、request、recommendation、action、error、context、instruction、other
+18. fact_kind 只能是 preference、decision、request、recommendation、action、error、context、instruction、other
    - instruction 只用于用户明确要求 AI 长期遵守的行为规则、格式偏好、语气偏好或工作方式
    - 临时任务要求、当前轮的一次性请求不要标为 instruction
-18. priority 是 0-100 的整数，表示长期记忆价值：
+19. priority 是 0-100 的整数，表示长期记忆价值：
    - 80-100: 长期偏好、硬约束、健康/安全/核心项目事实、明确长期指令、重要任务进展
-   - 60-79: 可复用经验、一般任务事件、明确决策、失败原因
+   - 60-79: 可复用经验、一般任务事件、明确决策、失败原因、带明确时间锚点且可能用于未来时间推理的个人事件
    - <60: 普通闲聊、一次性问答、无后续价值、重复弱信息；不要输出这条 fact
-19. task_event_like 描述这条 fact 是否是一个可能影响任务状态或步骤的事件；它不要求已经知道具体属于哪个任务
-20. task_event_subject 只能是 user、assistant、both、other；表示任务事件的主体或主要来源
-21. task_relevance 只能是 none、weak、medium、strong：
+20. task_event_like 描述这条 fact 是否是一个可能影响任务状态或步骤的事件；它不要求已经知道具体属于哪个任务
+21. task_event_subject 只能是 user、assistant、both、other；表示任务事件的主体或主要来源
+22. task_relevance 只能是 none、weak、medium、strong：
    - none: 与任务状态或步骤无关
    - weak: 像一个事件，但不足以说明它会影响任务状态或步骤
    - medium: 可能影响某个任务的状态或步骤
    - strong: 明确表示用户正在发起、推进、完成、阻塞、暂停、恢复或决策某个任务
-22. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
-23. 只返回 JSON，不要 markdown，不要额外解释
-24. {output_language_instruction}
+23. causal_relations 只描述本次输出 facts 之间明确存在的关系；source_index/target_index 使用 facts 数组的 0-based 下标
+24. 只返回 JSON，不要 markdown，不要额外解释
+25. {output_language_instruction}
+
+细粒度答案保留规则：
+- 如果对话中出现“某个具体问题的答案”，text 必须包含该答案原值或等价完整短语；不要只保留上位事件。例如要保留“Dr. Arati Prabhakar 是 President's Chief Advisor for Science and Technology”，而不是只写“文章提到 fusion breakthrough”。
+- assistant 长回答中的列表、推荐、论文指标、游戏/文章/菜谱/旅行路线等，如果包含未来可能被问到的具体条目，应至少保留问题目标和关键答案项；信息过多时拆成多条 facts，而不是丢掉数字、名称或参数。
+- 对金额、数量、次数、页数、百分比、时长和日期，text 与 keywords 都要保留原始数值和单位；如果需要由两个数值计算差值/总和，分别保留参与计算的原始数值及其含义。
+- 对用户偏好型对话，不能只写“用户询问建议”；应保留用户已有设备、计划、风格、限制、已尝试方案和明确不想要的方向，使未来建议能体现历史偏好。
 
 fact_kind 定义和判别边界：
 - preference：用户长期或反复表达的喜好、偏好、禁忌、习惯、倾向；不是一次性选择。
@@ -539,6 +552,7 @@ fact_kind 冲突和主体规则：
 - 不要抽取已被更高价值 fact 覆盖的重复信息
 - 如果一条候选 fact 的 priority < 60，不要把它放进 facts 数组
 - 不要因为信息很多就只保留上位主题；应删除低价值信息，而不是删除高价值事实中的关键细节
+- 不要丢弃带明确时间锚点的个人事件；即使它出现在“by the way/顺便说一下”的附带信息中，只要包含用户经历、维护、购买、参加、修理、预约、旅行、会议等可被未来时间问题召回的事实，就应作为独立 episodic fact 保留
 
 task_event_like 判断规则：
 - true: fact 描述了一个可能影响任务生命周期的事件，包括请求、计划、推进、修改、实现、排查、验证、完成、结果、失败、阻塞、暂停、恢复或决策
@@ -548,11 +562,12 @@ task_event_like 判断规则：
 - 用户明确要求、计划、继续、完成、阻塞、暂停或恢复某个任务时，task_relevance 通常是 medium 或 strong
 
 表达原则：
-- 不要求固定句式；结构化字段已经保存时间、主体和类别，text 应优先承载具体内容
+- 不要求固定句式；text 应优先承载具体内容，并在事实含义依赖时间时直接写出具体日期、相对时间或事件顺序；不要因为 occurred_start/occurred_end 已保存时间就从 text 中删除时间锚点
 - preference/context 应写清具体偏好、稳定背景及其适用范围
 - decision/request/action 应写清具体对象、采用或要求的方案、关键条件及结果
 - instruction 应写清 AI 今后需要长期遵守的具体行为
 - assistant episodic 只有在对话明确表明助手实际执行、建议或验证了具体内容时才提取，并保留执行对象和结果
+- 对 temporal reasoning 友好：当两个或多个事件可能被未来问题比较先后、间隔或持续时间时，每个事件都应各自成为包含时间锚点的独立 fact；不要把“某月发生过 A，又讨论了 B”压缩成不含日期的背景摘要
 
 详细程度示例：
 - 不合格："用户要求优化记忆提取逻辑。"
@@ -566,6 +581,7 @@ task_event_like 判断规则：
 - text 是否包含足以区别于同主题其他事实的具体对象、动作、约束或结论？
 - 删除函数名、参数、错误现象、关键条件或结果后是否会改变事实含义？如果会，必须保留。
 - 是否把多个可独立召回的决定、错误、方案或知识结论错误合并成了一条？
+- 是否丢掉了原文中的日期、星期、月份、年份、相对时间或事件先后关系？如果丢掉会影响“哪个先发生/间隔几天/何时发生”的回答，必须补回 text 和 keywords。
 - 是否退化成主题名称、对话行为或没有实质内容的概述？
 - 是否写入了输入对话没有明确支持的意图、原因、完成状态或结果？
 
@@ -1081,7 +1097,12 @@ def _llm_model_requires_responses_api(model: str) -> bool:
 
 
 def _llm_error_text(exc: Exception) -> str:
-    return str(exc or "").lower()
+    parts = [str(exc or "")]
+    response = getattr(exc, "response", None)
+    response_text = getattr(response, "text", None)
+    if response_text:
+        parts.append(str(response_text))
+    return " ".join(parts).lower()
 
 
 def _llm_temperature_rejected(exc: Exception) -> bool:
@@ -1103,9 +1124,109 @@ def _llm_max_tokens_rejected(exc: Exception) -> bool:
     )
 
 
+def _llm_thinking_rejected(exc: Exception) -> bool:
+    text = _llm_error_text(exc)
+    return "thinking" in text and (
+        "unsupported" in text
+        or "not support" in text
+        or "invalid" in text
+        or "unknown" in text
+        or "extra" in text
+    )
+
+
+def _llm_json_mode_rejected(exc: Exception) -> bool:
+    text = _llm_error_text(exc)
+    return (
+        "response_format" in text
+        or "json_object" in text
+        or "json mode" in text
+    ) and (
+        "unsupported" in text
+        or "not support" in text
+        or "invalid" in text
+        or "unknown" in text
+        or "extra" in text
+    )
+
+
 def _llm_unsupported_chat_api(exc: Exception) -> bool:
     text = _llm_error_text(exc)
     return "unsupported_api_for_model" in text or "responses api" in text
+
+
+def _normalize_llm_thinking_mode(value: Any) -> str:
+    text = str(value or "auto").strip().lower()
+    return text if text in {"disabled", "enabled", "auto"} else "auto"
+
+
+def _add_llm_request_options(
+    payload: Dict[str, Any],
+    *,
+    llm_thinking: str = "auto",
+    llm_json_mode: bool = False,
+    shared_client: bool = False,
+) -> Dict[str, Any]:
+    out = dict(payload)
+    if llm_json_mode:
+        out["response_format"] = {"type": "json_object"}
+    thinking = _normalize_llm_thinking_mode(llm_thinking)
+    if thinking != "auto":
+        thinking_payload = {"type": thinking}
+        if shared_client:
+            extra_body = dict(out.get("extra_body") or {})
+            extra_body["thinking"] = thinking_payload
+            out["extra_body"] = extra_body
+        else:
+            out["thinking"] = thinking_payload
+    return out
+
+
+def _strip_llm_request_option(payload: Dict[str, Any], option: str) -> Dict[str, Any]:
+    out = dict(payload)
+    if option == "thinking":
+        out.pop("thinking", None)
+        if isinstance(out.get("extra_body"), dict):
+            extra_body = dict(out["extra_body"])
+            extra_body.pop("thinking", None)
+            if extra_body:
+                out["extra_body"] = extra_body
+            else:
+                out.pop("extra_body", None)
+    elif option == "response_format":
+        out.pop("response_format", None)
+    return out
+
+
+def _llm_chat_attempts(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    option_variants: List[Dict[str, Any]] = [payload]
+    if "thinking" in payload or (
+        isinstance(payload.get("extra_body"), dict)
+        and "thinking" in payload.get("extra_body", {})
+    ):
+        option_variants.append(_strip_llm_request_option(payload, "thinking"))
+    if "response_format" in payload:
+        option_variants.append(_strip_llm_request_option(payload, "response_format"))
+        option_variants.append(
+            _strip_llm_request_option(
+                _strip_llm_request_option(payload, "thinking"),
+                "response_format",
+            )
+        )
+
+    attempts: List[Dict[str, Any]] = []
+    for variant in option_variants:
+        attempts.append(variant)
+        temperature_stripped = dict(variant)
+        temperature_stripped.pop("temperature", None)
+        attempts.append(temperature_stripped)
+        token_swapped = dict(temperature_stripped)
+        if "max_tokens" in token_swapped:
+            token_swapped["max_completion_tokens"] = token_swapped.pop("max_tokens")
+        elif "max_completion_tokens" in token_swapped:
+            token_swapped["max_tokens"] = token_swapped.pop("max_completion_tokens")
+        attempts.append(token_swapped)
+    return attempts
 
 
 def _response_output_text(response: Any) -> str:
@@ -1151,7 +1272,9 @@ def _call_llm_responses_api(prompt: str, model: str, base_url: str, api_key: str
 
 
 def _call_llm_api(prompt: str, model: str, base_url: str, api_key: str,
-                  timeout: int = 120) -> Optional[str]:
+                  timeout: int = 120,
+                  llm_thinking: str = "auto",
+                  llm_json_mode: bool = False) -> Optional[str]:
     """Call an OpenAI-compatible chat completions API with a single user message.
 
     Supports OpenAI, OpenRouter, DeepSeek, vLLM, and any provider that exposes
@@ -1178,32 +1301,25 @@ def _call_llm_api(prompt: str, model: str, base_url: str, api_key: str,
     }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    data = {
+    data = _add_llm_request_options(
+        {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
         "stream": False,
-    }
+        },
+        llm_thinking=llm_thinking,
+        llm_json_mode=llm_json_mode,
+    )
     data.update(
         {"max_completion_tokens": 2048}
         if _llm_prefers_max_completion_tokens(base_url)
         else {"max_tokens": 2048}
     )
 
-    attempts = [data]
-    temperature_stripped = dict(data)
-    temperature_stripped.pop("temperature", None)
-    attempts.append(temperature_stripped)
-    token_swapped = dict(temperature_stripped)
-    if "max_tokens" in token_swapped:
-        token_swapped["max_completion_tokens"] = token_swapped.pop("max_tokens")
-    elif "max_completion_tokens" in token_swapped:
-        token_swapped["max_tokens"] = token_swapped.pop("max_completion_tokens")
-    attempts.append(token_swapped)
-
     seen_payloads = set()
     last_error: Optional[Exception] = None
-    for payload in attempts:
+    for payload in _llm_chat_attempts(data):
         marker = json.dumps(sorted(payload.keys()), ensure_ascii=False)
         if marker in seen_payloads:
             continue
@@ -1218,7 +1334,12 @@ def _call_llm_api(prompt: str, model: str, base_url: str, api_key: str,
             return None
         except requests.exceptions.RequestException as e:
             last_error = e
-            if not (_llm_temperature_rejected(e) or _llm_max_tokens_rejected(e)):
+            if not (
+                _llm_temperature_rejected(e)
+                or _llm_max_tokens_rejected(e)
+                or _llm_thinking_rejected(e)
+                or _llm_json_mode_rejected(e)
+            ):
                 break
     if last_error is not None:
         logger.debug("LLM API call failed: %s", last_error)
@@ -1275,6 +1396,13 @@ class MemoryNodeManager:
         # that answers the user's query, not embedding_config.
         self._llm_model = str(llm_model or DEFAULT_LLM_MODEL)
         self._llm_timeout = int(memory_cfg.get("llm_timeout", 120))
+        self._llm_thinking = _normalize_llm_thinking_mode(
+            memory_cfg.get("llm_thinking", memory_cfg.get("thinking", "auto"))
+        )
+        self._llm_json_mode = self._config_bool(
+            memory_cfg.get("llm_json_mode", memory_cfg.get("json_mode")),
+            False,
+        )
 
         # Raw HTTP fallback config (only used when llm_client is None). These
         # are supplied by the owning agent, not embedding_config.
@@ -1296,6 +1424,9 @@ class MemoryNodeManager:
 
         # Retrieval config
         self._top_k = int(memory_cfg.get("retrieval_top_k", 8))
+        self._recall_gate_mode = self._normalize_recall_gate_mode(
+            memory_cfg.get("recall_gate_mode", memory_cfg.get("recall_mode", "auto"))
+        )
         self._recall_observation_min_embedding_similarity = self._clip_unit_float(
             memory_cfg.get("recall_observation_min_embedding_similarity"),
             0.35,
@@ -1481,25 +1612,21 @@ class MemoryNodeManager:
                 "temperature": 0.3,
                 "timeout": self._llm_timeout,
             }
+            base_kwargs = _add_llm_request_options(
+                base_kwargs,
+                llm_thinking=self._llm_thinking,
+                llm_json_mode=self._llm_json_mode,
+                shared_client=True,
+            )
             base_kwargs.update(
                 {"max_completion_tokens": 2048}
                 if _llm_prefers_max_completion_tokens(llm_base_url)
                 else {"max_tokens": 2048}
             )
-            attempts = [base_kwargs]
-            temperature_stripped = dict(base_kwargs)
-            temperature_stripped.pop("temperature", None)
-            attempts.append(temperature_stripped)
-            token_swapped = dict(temperature_stripped)
-            if "max_tokens" in token_swapped:
-                token_swapped["max_completion_tokens"] = token_swapped.pop("max_tokens")
-            elif "max_completion_tokens" in token_swapped:
-                token_swapped["max_tokens"] = token_swapped.pop("max_completion_tokens")
-            attempts.append(token_swapped)
 
             seen_payloads = set()
             last_error: Optional[Exception] = None
-            for kwargs in attempts:
+            for kwargs in _llm_chat_attempts(base_kwargs):
                 marker = json.dumps(sorted(kwargs.keys()), ensure_ascii=False)
                 if marker in seen_payloads:
                     continue
@@ -1529,7 +1656,12 @@ class MemoryNodeManager:
                                     responses_error,
                                 )
                         break
-                    if _llm_temperature_rejected(e) or _llm_max_tokens_rejected(e):
+                    if (
+                        _llm_temperature_rejected(e)
+                        or _llm_max_tokens_rejected(e)
+                        or _llm_thinking_rejected(e)
+                        or _llm_json_mode_rejected(e)
+                    ):
                         logger.debug("Shared LLM client rejected params, retrying: %s", e)
                         continue
                     break
@@ -1541,6 +1673,8 @@ class MemoryNodeManager:
             base_url=llm_base_url,
             api_key=llm_api_key,
             timeout=self._llm_timeout,
+            llm_thinking=self._llm_thinking,
+            llm_json_mode=self._llm_json_mode,
         )
 
     @staticmethod
@@ -1763,6 +1897,30 @@ class MemoryNodeManager:
             "time_sensitivity": self._normalize_time_sensitivity(data.get("time_sensitivity")),
         }
 
+    def _fallback_recall_query_analysis(self, query: str) -> Optional[Dict[str, Any]]:
+        """Build a conservative retrieval plan when forced recall cannot use LLM analysis."""
+        return self._normalize_recall_query_analysis(
+            {
+                "needs_recall": True,
+                "recall_confidence": 1.0,
+                "recall_reason": "forced_recall_fallback",
+                "search_text": query,
+                "keywords": self._fallback_query_keywords(query),
+                "entities": [],
+                "recall_intent": "balanced",
+                "intent_confidence": 0.0,
+                "layer_preference": {
+                    "interpretations": 0.34,
+                    "observations": 0.33,
+                    "facts": 0.33,
+                },
+                "fact_type_preference": "both",
+                "needs_evidence": True,
+                "time_sensitivity": "none",
+            },
+            query,
+        )
+
     def _analyze_recall_query(self, query: str) -> Optional[Dict[str, Any]]:
         """Analyze a recall query in one LLM call.
 
@@ -1878,6 +2036,26 @@ class MemoryNodeManager:
         }
         text = aliases.get(text, text)
         return text if text in {"source", "force_en", "force_zh"} else "source"
+
+    @staticmethod
+    def _normalize_recall_gate_mode(value: Any) -> str:
+        text = str(value or "auto").strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "analyze": "auto",
+            "gate": "auto",
+            "use_gate": "auto",
+            "recall_gate": "auto",
+            "normal": "auto",
+            "always": "force",
+            "always_recall": "force",
+            "forced": "force",
+            "bypass": "force",
+            "disable_gate": "force",
+            "disabled": "force",
+            "off": "force",
+        }
+        text = aliases.get(text, text)
+        return text if text in {"auto", "force"} else "auto"
 
     @staticmethod
     def _normalize_memory_language_code(value: Any, default: str = "zh") -> str:
@@ -9796,6 +9974,7 @@ class MemoryNodeManager:
         tags: Optional[List[str]] = None,
         time_start: Optional[str] = None,
         time_end: Optional[str] = None,
+        recall_gate_mode: Optional[str] = None,
     ) -> str:
         """Search for memory nodes relevant to *query*.
 
@@ -9815,6 +9994,8 @@ class MemoryNodeManager:
             tags: Optional list of tags to filter by.
             time_start: Optional ISO timestamp start filter.
             time_end: Optional ISO timestamp end filter.
+            recall_gate_mode: "auto" uses the recall gate; "force" bypasses
+                gate skips and always attempts retrieval.
 
         Returns formatted markdown text, or empty string if nothing relevant.
         """
@@ -9825,10 +10006,14 @@ class MemoryNodeManager:
         try:
             k = top_k or self._top_k
             b = budget or self._recall_budget
+            gate_mode = self._normalize_recall_gate_mode(
+                recall_gate_mode or self._recall_gate_mode
+            )
             self._log_info("memory_recall", "start", {
                 "query": self._reflect_log_text(query, limit=300),
                 "top_k": k,
                 "budget": b,
+                "recall_gate_mode": gate_mode,
                 "tags": tags or [],
                 "time_start": time_start,
                 "time_end": time_end,
@@ -9848,14 +10033,20 @@ class MemoryNodeManager:
                 "effective_time_end": te,
             })
 
-            gate = self._rule_based_recall_gate(search_query)
+            gate = (
+                {"decision": "recall", "reason": "forced_recall"}
+                if gate_mode == "force"
+                else self._rule_based_recall_gate(search_query)
+            )
             self._log_info("memory_recall", "gate_decided", {
                 "decision": gate["decision"],
                 "reason": gate["reason"],
+                "mode": gate_mode,
             })
             if gate["decision"] == "skip":
                 self._log_info("memory_recall", "skip", {
                     "reason": gate["reason"],
+                    "recall_gate_mode": gate_mode,
                     "query": self._reflect_log_text(search_query, limit=300),
                     "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
                 })
@@ -9865,23 +10056,35 @@ class MemoryNodeManager:
             # analysis to produce retrieval-oriented search text and strategy.
             query_analysis = self._analyze_recall_query(search_query)
             if not query_analysis:
+                if gate_mode == "force":
+                    query_analysis = self._fallback_recall_query_analysis(search_query)
+                    analysis_source = "fallback_forced"
+                else:
+                    analysis_source = "llm"
+            else:
+                analysis_source = "llm"
+
+            if not query_analysis:
                 self._log_info("memory_recall", "skip", {
                     "reason": "query_analysis_empty",
                     "gate_decision": gate["decision"],
                     "gate_reason": gate["reason"],
+                    "recall_gate_mode": gate_mode,
                     "query": self._reflect_log_text(search_query, limit=300),
                     "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
                 })
                 return ""
-            analysis_source = "llm"
 
             if (
+                gate_mode != "force"
+                and
                 gate["decision"] != "recall"
                 and not query_analysis.get("needs_recall", True)
             ):
                 self._log_info("memory_recall", "skip", {
                     "reason": query_analysis.get("recall_reason") or "llm_recall_not_needed",
                     "decision_source": analysis_source,
+                    "recall_gate_mode": gate_mode,
                     "recall_confidence": query_analysis.get("recall_confidence"),
                     "query": self._reflect_log_text(search_query, limit=300),
                     "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
@@ -9932,6 +10135,7 @@ class MemoryNodeManager:
             self._log_info("memory_recall", "query_analyzed", {
                 "search_text": self._reflect_log_text(query_analysis.get("search_text"), limit=300),
                 "analysis_source": analysis_source,
+                "recall_gate_mode": gate_mode,
                 "needs_recall": query_analysis.get("needs_recall"),
                 "recall_confidence": query_analysis.get("recall_confidence"),
                 "recall_reason": query_analysis.get("recall_reason"),
