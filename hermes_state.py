@@ -851,11 +851,6 @@ class SessionDB:
                     "COALESCE(tool_calls, '') "
                     "FROM messages"
                 )
-            if current_version < 12:
-                # v12: fix knowledge-graph created_at defaults. The original
-                # schema used strftime('%%s','now'), which SQLite stores as the
-                # literal string "%s" instead of a Unix timestamp.
-                self._repair_graph_created_at_placeholders(cursor)
             if current_version < SCHEMA_VERSION:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -922,7 +917,6 @@ class SessionDB:
             "WHERE bundle.id = memory_observations.evidence_bundle_id"
             "), '')"
         )
-        self._repair_graph_created_at_placeholders(cursor)
 
         cursor.execute(
             "UPDATE memory_facts SET primary_topic = "
@@ -937,62 +931,6 @@ class SessionDB:
             "  WHERE mne.fact_id = memory_facts.id"
             ") WHERE primary_entity_id IS NULL"
         )
-
-        # Backfill fact_type from legacy tags for existing retain facts.
-        try:
-            cursor.execute(
-                "UPDATE memory_facts SET fact_type = 'episodic' "
-                "WHERE tags LIKE ?",
-                ('%"fact_type:experience"%',),
-            )
-            cursor.execute(
-                "UPDATE memory_facts SET fact_type = 'episodic' "
-                "WHERE fact_type = 'experience'"
-            )
-            cursor.execute(
-                "UPDATE memory_facts SET fact_type = 'semantic' "
-                "WHERE fact_type IS NULL OR fact_type = '' OR fact_type NOT IN ('semantic', 'episodic')"
-            )
-        except sqlite3.OperationalError:
-            pass
-
-        # Backfill fact_subject from tags / legacy fact_type when possible.
-        try:
-            for fact_subject in ("user", "assistant", "world", "project", "system", "other"):
-                cursor.execute(
-                    "UPDATE memory_facts SET fact_subject = ? WHERE tags LIKE ?",
-                    (fact_subject, f'%"fact_subject:{fact_subject}"%'),
-                )
-            cursor.execute(
-                "UPDATE memory_facts SET fact_subject = 'assistant' "
-                "WHERE fact_subject = 'other' AND tags LIKE ?",
-                ('%"fact_type:experience"%',),
-            )
-            cursor.execute(
-                "UPDATE memory_facts SET fact_subject = 'other' "
-                "WHERE fact_subject IS NULL OR fact_subject = '' "
-                "OR fact_subject NOT IN ('user', 'assistant', 'world', 'project', 'system', 'other')"
-            )
-        except sqlite3.OperationalError:
-            pass
-
-        # Backfill fact_kind from legacy tags for existing retain facts.
-        try:
-            for fact_kind in (
-                "preference", "decision", "request", "recommendation",
-                "action", "error", "context", "instruction",
-                "conversation_summary", "other",
-            ):
-                cursor.execute(
-                    "UPDATE memory_facts SET fact_kind = ? WHERE tags LIKE ?",
-                    (fact_kind, f'%"fact_kind:{fact_kind}"%'),
-                )
-            cursor.execute(
-                "UPDATE memory_facts SET fact_kind = 'other' "
-                "WHERE fact_kind IS NULL OR fact_kind = ''"
-            )
-        except sqlite3.OperationalError:
-            pass
 
         # ── Index on time_key for time-range search ──
         try:
@@ -1041,42 +979,6 @@ class SessionDB:
             logger.debug("Memory node FTS setup skipped: %s", _fts_err)
 
         self._conn.commit()
-
-    def _repair_graph_created_at_placeholders(self, cursor: sqlite3.Cursor) -> None:
-        """Repair graph rows that inherited the legacy literal '%s' default."""
-        try:
-            cursor.execute(
-                """UPDATE entity_nodes
-                   SET created_at = COALESCE(
-                       (
-                           SELECT MIN(CAST(strftime('%s', substr(mn.time_key, 1, 19)) AS REAL))
-                           FROM memory_fact_entities mne
-                           JOIN memory_facts mn ON mn.id = mne.fact_id
-                           WHERE mne.entity_id = entity_nodes.id
-                       ),
-                       CAST(strftime('%s','now') AS REAL)
-                   )
-                   WHERE created_at = '%s'"""
-            )
-            cursor.execute(
-                """UPDATE entity_edges
-                   SET created_at = CAST(strftime('%s','now') AS REAL)
-                   WHERE created_at = '%s'"""
-            )
-            cursor.execute(
-                """UPDATE memory_fact_relations
-                   SET created_at = COALESCE(
-                       (
-                           SELECT CAST(strftime('%s', substr(mn.time_key, 1, 19)) AS REAL)
-                           FROM memory_facts mn
-                           WHERE mn.id = memory_fact_relations.source_fact_id
-                       ),
-                       CAST(strftime('%s','now') AS REAL)
-                   )
-                   WHERE created_at = '%s'"""
-            )
-        except sqlite3.OperationalError:
-            pass
 
     @staticmethod
     def _table_columns(cursor: sqlite3.Cursor, table_name: str) -> List[str]:
