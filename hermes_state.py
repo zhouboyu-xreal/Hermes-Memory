@@ -191,6 +191,7 @@ CREATE TABLE IF NOT EXISTS memory_facts (
     summary TEXT NOT NULL,
     keywords TEXT NOT NULL,
     topic TEXT NOT NULL,
+    tags TEXT DEFAULT '[]',
     primary_entity_id INTEGER REFERENCES entity_nodes(id),
     primary_topic TEXT NOT NULL DEFAULT 'general',
     fact_type TEXT NOT NULL DEFAULT 'semantic',
@@ -489,6 +490,18 @@ CREATE INDEX IF NOT EXISTS idx_memory_interpretation_feedback_interp
 ON memory_interpretation_feedback(interpretation_id, status);
 """
 
+DECLARATIVE_SCHEMA_SQL = "\n".join(
+    (
+        SCHEMA_SQL,
+        MEMORY_FACTS_SQL,
+        KNOWLEDGE_GRAPH_SQL,
+        MEMORY_EVIDENCE_BUNDLES_SQL,
+        MEMORY_OBSERVATIONS_SQL,
+        MEMORY_INTERPRETATIONS_SQL,
+        MEMORY_INTERPRETATION_FEEDBACK_SQL,
+    )
+)
+
 
 class SessionDB:
     """
@@ -652,7 +665,7 @@ class SessionDB:
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
-        """Extract expected columns per table from SCHEMA_SQL.
+        """Extract expected columns per table from declarative CREATE TABLE SQL.
 
         Uses an in-memory SQLite database to parse the SQL — SQLite itself
         handles all syntax (DEFAULT expressions with commas, inline
@@ -660,7 +673,7 @@ class SessionDB:
         edge cases.  The in-memory DB is opened, the schema DDL is
         executed, and PRAGMA table_info extracts the column metadata.
 
-        Adding a column to SCHEMA_SQL is all that's needed; the
+        Adding a column to the table's CREATE TABLE SQL is all that's needed; the
         reconciliation loop picks it up automatically.
         """
         ref = sqlite3.connect(":memory:")
@@ -694,19 +707,19 @@ class SessionDB:
             ref.close()
 
     def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
-        """Ensure live tables have every column declared in SCHEMA_SQL.
+        """Ensure live tables have every declared CREATE TABLE column.
 
         Follows the Beets/sqlite-utils pattern: the CREATE TABLE definition
-        in SCHEMA_SQL is the single source of truth for the desired schema.
+        is the single source of truth for the desired schema.
         On every startup this method diffs the live columns (via PRAGMA
         table_info) against the declared columns, and ADDs any that are
         missing.
 
         This makes column additions a declarative operation — just add
-        the column to SCHEMA_SQL and it appears on the next startup.
+        the column to the CREATE TABLE SQL and it appears on the next startup.
         Version-gated migration blocks are no longer needed for ADD COLUMN.
         """
-        expected = self._parse_schema_columns(SCHEMA_SQL)
+        expected = self._parse_schema_columns(DECLARATIVE_SCHEMA_SQL)
         for table_name, declared_cols in expected.items():
             # Get current columns from the live table
             try:
@@ -741,9 +754,9 @@ class SessionDB:
         """Create tables and FTS if they don't exist, reconcile columns.
 
         Schema management follows the declarative reconciliation pattern
-        (Beets, sqlite-utils): SCHEMA_SQL is the single source of truth.
+        (Beets, sqlite-utils): CREATE TABLE SQL is the single source of truth.
         On existing databases, _reconcile_columns() diffs live columns
-        against SCHEMA_SQL and ADDs any missing ones.  This eliminates
+        against the declared schema and ADDs any missing ones.  This eliminates
         the version-gated migration chain for column additions, making
         it impossible for reordered or inserted migrations to skip columns.
 
@@ -755,7 +768,7 @@ class SessionDB:
         cursor.executescript(SCHEMA_SQL)
 
         # ── Declarative column reconciliation ──────────────────────────
-        # Diff live tables against SCHEMA_SQL and ADD any missing columns.
+        # Diff live tables against the declarative schema and ADD any missing columns.
         # This is idempotent and self-healing: even if a version-gated
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
@@ -888,73 +901,15 @@ class SessionDB:
 
         # ── Knowledge Graph tables + FTS5 ──
         cursor.executescript(KNOWLEDGE_GRAPH_SQL)
-        for col_name, col_type in {
-            "co_entities": "TEXT DEFAULT '{}'",
-        }.items():
-            try:
-                cursor.execute(
-                    f"ALTER TABLE entity_nodes ADD COLUMN {col_name} {col_type}"
-                )
-            except sqlite3.OperationalError:
-                pass
-        for col_name, col_type in {
-            "semantic_score": "REAL DEFAULT 0.0",
-            "causal_score": "REAL DEFAULT 0.0",
-            "temporal_score": "REAL DEFAULT 0.0",
-            "entity_score": "REAL DEFAULT 0.0",
-            "weight": "REAL DEFAULT 1.0",
-            "metadata": "TEXT DEFAULT '{}'",
-        }.items():
-            try:
-                cursor.execute(
-                    f"ALTER TABLE memory_fact_relations ADD COLUMN {col_name} {col_type}"
-                )
-            except sqlite3.OperationalError:
-                pass
         try:
             cursor.execute("SELECT * FROM entity_nodes_fts LIMIT 0")
         except sqlite3.OperationalError:
             cursor.executescript(ENTITY_FTS_SQL)
         cursor.executescript(MEMORY_EVIDENCE_BUNDLES_SQL)
-        try:
-            cursor.execute(
-                "ALTER TABLE memory_evidence_bundles "
-                "ADD COLUMN canonical_topic_embedding BLOB"
-            )
-        except sqlite3.OperationalError:
-            pass
-        try:
-            cursor.execute(
-                "ALTER TABLE memory_evidence_bundle_sources "
-                "ADD COLUMN pending_observation INTEGER NOT NULL DEFAULT 0"
-            )
-        except sqlite3.OperationalError:
-            pass
-        self._drop_obsolete_evidence_bundle_columns(cursor)
-        self._drop_legacy_memory_entity_columns(cursor)
         cursor.executescript(MEMORY_INTERPRETATIONS_SQL)
         cursor.executescript(MEMORY_INTERPRETATION_FEEDBACK_SQL)
         cursor.executescript(MEMORY_OBSERVATIONS_SQL)
-        for table_name in ("memory_observations", "memory_interpretations"):
-            for col_name, col_type in {
-                "decay_score": "REAL DEFAULT 1.0",
-                "decay_updated_at": "TEXT",
-                "decay_half_life_days": "REAL",
-            }.items():
-                try:
-                    cursor.execute(
-                        f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
-                    )
-                except sqlite3.OperationalError:
-                    pass
-        for col_name in ("entity_name", "topic_key"):
-            try:
-                cursor.execute(
-                    "ALTER TABLE memory_observations "
-                    f"ADD COLUMN {col_name} TEXT NOT NULL DEFAULT ''"
-                )
-            except sqlite3.OperationalError:
-                pass
+        self._reconcile_columns(cursor)
         cursor.execute(
             "UPDATE memory_observations SET "
             "entity_name = COALESCE(("
@@ -967,68 +922,8 @@ class SessionDB:
             "WHERE bundle.id = memory_observations.evidence_bundle_id"
             "), '')"
         )
-        for table_name in ("memory_interpretations",):
-            for col_name, col_type in {
-                "embedding": "BLOB",
-                "embedding_text": "TEXT NOT NULL DEFAULT ''",
-                "embedding_updated_at": "TEXT",
-            }.items():
-                try:
-                    cursor.execute(
-                        f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
-                    )
-                except sqlite3.OperationalError:
-                    pass
-        self._migrate_memory_opinions_to_interpretations(cursor)
         self._repair_graph_created_at_placeholders(cursor)
 
-        # ── Add tags column to memory_facts if missing ──
-        try:
-            cursor.execute("ALTER TABLE memory_facts ADD COLUMN tags TEXT DEFAULT '[]'")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # ── Add explicit fact_type column to memory_facts if missing ──
-        try:
-            cursor.execute("ALTER TABLE memory_facts ADD COLUMN fact_type TEXT NOT NULL DEFAULT 'semantic'")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # ── Add explicit fact_subject column to memory_facts if missing ──
-        try:
-            cursor.execute("ALTER TABLE memory_facts ADD COLUMN fact_subject TEXT NOT NULL DEFAULT 'other'")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # ── Add explicit fact_kind column to memory_facts if missing ──
-        try:
-            cursor.execute("ALTER TABLE memory_facts ADD COLUMN fact_kind TEXT NOT NULL DEFAULT 'other'")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        # ── Memory node detail fields live directly on memory_facts ──
-        try:
-            cursor.execute("ALTER TABLE memory_facts ADD COLUMN original_dialog TEXT")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-
-        for col_name, col_type in {
-            "task_event_like": "INTEGER",
-            "task_event_subject": "TEXT",
-            "task_relevance": "TEXT",
-            "entity_names": "TEXT NOT NULL DEFAULT '[]'",
-            "primary_entity_id": "INTEGER REFERENCES entity_nodes(id)",
-            "primary_topic": "TEXT NOT NULL DEFAULT 'general'",
-            "decay_score": "REAL DEFAULT 1.0",
-            "decay_updated_at": "TEXT",
-            "decay_half_life_days": "REAL",
-        }.items():
-            try:
-                cursor.execute(
-                    f"ALTER TABLE memory_facts ADD COLUMN {col_name} {col_type}"
-                )
-            except sqlite3.OperationalError:
-                pass
         cursor.execute(
             "UPDATE memory_facts SET primary_topic = "
             "CASE WHEN instr(trim(topic), ' ') > 0 "
@@ -1202,96 +1097,6 @@ class SessionDB:
         except (TypeError, ValueError):
             return None
         return None
-
-    def _drop_obsolete_evidence_bundle_columns(
-        self,
-        cursor: sqlite3.Cursor,
-    ) -> None:
-        """Keep evidence bundles as entity/topic fact containers only."""
-        for index_name in (
-            "idx_memory_evidence_bundles_entity_topic",
-            "idx_memory_evidence_bundles_status",
-        ):
-            cursor.execute(f"DROP INDEX IF EXISTS {index_name}")
-
-        columns = set(self._table_columns(cursor, "memory_evidence_bundles"))
-        for column in (
-            "summary",
-            "keywords",
-            "embedding",
-            "embedding_text",
-            "embedding_updated_at",
-            "confidence",
-            "active",
-            "status",
-        ):
-            if column in columns:
-                cursor.execute(
-                    f"ALTER TABLE memory_evidence_bundles DROP COLUMN {column}"
-                )
-
-        cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memory_evidence_bundles_entity_topic "
-            "ON memory_evidence_bundles(entity_id, topic_key, bundle_type)"
-        )
-
-    def _drop_legacy_memory_entity_columns(self, cursor: sqlite3.Cursor) -> None:
-        """Remove old subject/target entity id columns; no legacy data backfill."""
-        interpretation_columns = set(self._table_columns(cursor, "memory_interpretations"))
-        if interpretation_columns and "entity_id" not in interpretation_columns:
-            try:
-                cursor.execute("ALTER TABLE memory_interpretations ADD COLUMN entity_id INTEGER REFERENCES entity_nodes(id)")
-            except sqlite3.OperationalError as exc:
-                logger.debug("add memory_interpretations.entity_id skipped: %s", exc)
-
-        for index_name in (
-            "idx_memory_interpretations_subject",
-            "idx_memory_interpretations_target",
-        ):
-            try:
-                cursor.execute(f"DROP INDEX IF EXISTS {index_name}")
-            except sqlite3.OperationalError:
-                pass
-
-        for table_name in ("memory_evidence_bundles", "memory_interpretations"):
-            columns = set(self._table_columns(cursor, table_name))
-            for column in ("subject_entity_id", "target_entity_id"):
-                if column not in columns:
-                    continue
-                try:
-                    cursor.execute(f"ALTER TABLE {table_name} DROP COLUMN {column}")
-                except sqlite3.OperationalError as exc:
-                    logger.debug("drop legacy %s.%s skipped: %s", table_name, column, exc)
-
-    def _migrate_memory_opinions_to_interpretations(self, cursor: sqlite3.Cursor) -> None:
-        """Copy rows from the short-lived opinion table name to interpretations."""
-        try:
-            has_opinions = cursor.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_opinions'"
-            ).fetchone()
-            if not has_opinions:
-                return
-            opinion_columns = set(self._table_columns(cursor, "memory_opinions"))
-            entity_expr = "entity_id" if "entity_id" in opinion_columns else "NULL"
-            cursor.execute(
-                "INSERT INTO memory_interpretations "
-                "(id, entity_id, subject_text, target_text, "
-                "scope, interpretation_type, claim, polarity, strength, confidence, "
-                "status, conflict_status, resolution, action_implication, "
-                "evidence_fact_ids, evidence_observation_ids, "
-                "counter_evidence_fact_ids, counter_evidence_observation_ids, "
-                "metadata, created_at, updated_at, last_supported_at) "
-                f"SELECT id, {entity_expr}, subject_text, target_text, "
-                "scope, interpretation_type, claim, polarity, strength, confidence, "
-                "status, conflict_status, resolution, action_implication, "
-                "evidence_fact_ids, evidence_observation_ids, "
-                "counter_evidence_fact_ids, counter_evidence_observation_ids, "
-                "metadata, created_at, updated_at, last_supported_at "
-                "FROM memory_opinions "
-                "WHERE id NOT IN (SELECT id FROM memory_interpretations)"
-            )
-        except sqlite3.OperationalError:
-            pass
 
     # =========================================================================
     # Session lifecycle

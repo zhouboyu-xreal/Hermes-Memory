@@ -3788,6 +3788,7 @@ def test_memory_evidence_bundle_schema_contains_only_container_fields(db):
         "entity_id",
         "topic_key",
         "topic_label",
+        "canonical_topic_embedding",
         "bundle_type",
         "created_at",
         "updated_at",
