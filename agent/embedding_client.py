@@ -194,6 +194,9 @@ class _OpenAIBackend:
         env_ref = re.fullmatch(r"\${([A-Za-z_][A-Za-z0-9_]*)}", self.api_key)
         if env_ref:
             self.api_key = os.environ.get(env_ref.group(1), "").strip()
+        api_key_env = str(config.get("api_key_env") or "").strip()
+        if not self.api_key and api_key_env:
+            self.api_key = os.environ.get(api_key_env, "").strip()
         if not self.api_key:
             self.api_key = os.environ.get("EMBEDDING_API_KEY", "").strip()
         self.timeout = config.get("timeout", 60)

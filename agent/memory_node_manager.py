@@ -9114,8 +9114,8 @@ class MemoryNodeManager:
         return rule_intent
 
     @staticmethod
-    def _recall_layer_limits(k: int, intent: str) -> Dict[str, int]:
-        """Allocate a small recall budget across the three memory layers."""
+    def _recall_limits_by_intent(k: int, intent: str) -> Dict[str, int]:
+        """Allocate the final recall budget across the three memory layers."""
         base = max(1, int(k or 1))
         if intent == "action":
             return {
@@ -9141,25 +9141,37 @@ class MemoryNodeManager:
             "facts": base,
         }
 
+    @staticmethod
+    def _cal_raw_candidate_limits_from_recall_limits(recall_limits: Dict[str, int]) -> Dict[str, int]:
+        """Expand final recall limits into coarse candidate-pool limits."""
+        interpretation_limit = max(0, int(recall_limits.get("interpretations", 0) or 0))
+        observation_limit = max(0, int(recall_limits.get("observations", 0) or 0))
+        fact_limit = max(0, int(recall_limits.get("facts", 0) or 0))
+        return {
+            "interpretations": max(24, min(40, interpretation_limit * 8)),
+            "observations": max(32, min(80, observation_limit * 10)),
+            "facts": max(40, min(120, fact_limit * 12)),
+        }
+    
     @classmethod
     def _apply_recall_layer_preference(
         cls,
-        layer_limits: Dict[str, int],
+        recall_limits: Dict[str, int],
         layer_preference: Dict[str, float],
     ) -> Dict[str, int]:
         """Blend LLM layer preference into the rule-derived recall budget."""
         if not layer_preference:
-            return dict(layer_limits)
+            return dict(recall_limits)
         keys = ("interpretations", "observations", "facts")
-        total_budget = max(1, sum(max(0, int(layer_limits.get(key, 0) or 0)) for key in keys))
-        base_total = max(1, sum(max(0, int(layer_limits.get(key, 0) or 0)) for key in keys))
+        total_budget = max(1, sum(max(0, int(recall_limits.get(key, 0) or 0)) for key in keys))
+        base_total = max(1, sum(max(0, int(recall_limits.get(key, 0) or 0)) for key in keys))
         base_share = {
-            key: max(0, int(layer_limits.get(key, 0) or 0)) / base_total
+            key: max(0, int(recall_limits.get(key, 0) or 0)) / base_total
             for key in keys
         }
         normalized_preference = cls._normalize_recall_layer_preference(layer_preference)
         if not normalized_preference:
-            return dict(layer_limits)
+            return dict(recall_limits)
         blended = {
             key: (base_share.get(key, 0.0) * 0.55) + (normalized_preference.get(key, 0.0) * 0.45)
             for key in keys
@@ -9816,15 +9828,15 @@ class MemoryNodeManager:
         recall_terms: Optional[List[str]] = None,
         terms: Optional[List[str]] = None,
         intent: str,
-        layer_limits: Dict[str, int],
+        recall_limits: Dict[str, int],
         fact_type_preference: str = "both",
         interpretation_min_embedding_similarity: Optional[float] = None,
         observation_min_embedding_similarity: Optional[float] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Rank candidates independently within each memory layer."""
-        interpretation_limit = max(0, int(layer_limits.get("interpretations", 0) or 0))
-        observation_limit = max(0, int(layer_limits.get("observations", 0) or 0))
-        fact_limit = max(0, int(layer_limits.get("facts", 0) or 0))
+        interpretation_limit = max(0, int(recall_limits.get("interpretations", 0) or 0))
+        observation_limit = max(0, int(recall_limits.get("observations", 0) or 0))
+        fact_limit = max(0, int(recall_limits.get("facts", 0) or 0))
         active_terms = recall_terms if recall_terms is not None else (terms or [])
         rank_keywords = keywords if keywords is not None else active_terms
         rank_entities = entities or []
@@ -9877,10 +9889,7 @@ class MemoryNodeManager:
         keywords: List[str],
         entities: List[Any],
         query_embedding: np.ndarray,
-        candidate_limits: Dict[str, int],
         raw_candidate_limits: Dict[str, int],
-        layer_limits: Dict[str, int],
-        fact_type_preference: str,
         budget: str,
         time_start: Optional[str],
         time_end: Optional[str],
@@ -9912,21 +9921,10 @@ class MemoryNodeManager:
             embedding_keys=("embedding", "evidence_centroid_embedding"),
         )
 
-        fact_candidate_limit = max(
-            raw_candidate_limits.get("facts", candidate_limits["facts"]),
-            layer_limits["facts"] * 3,
-            layer_limits["facts"] + 4,
-        )
-        semantic_candidate_limit = max(1, fact_candidate_limit)
-        episodic_candidate_limit = max(1, fact_candidate_limit)
-        if fact_type_preference == "semantic":
-            episodic_candidate_limit = max(1, layer_limits["facts"])
-        elif fact_type_preference == "episodic":
-            semantic_candidate_limit = max(1, layer_limits["facts"])
         semantic_candidates = self._db.retrieve_memory_fact_raw_candidates(
             keywords,
             query_embedding,
-            top_k=semantic_candidate_limit,
+            top_k=raw_candidate_limits["facts"],
             budget=budget,
             time_start=time_start, time_end=time_end,
             tags=tags,
@@ -9936,7 +9934,7 @@ class MemoryNodeManager:
         episodic_candidates = self._db.retrieve_memory_fact_raw_candidates(
             keywords,
             query_embedding,
-            top_k=episodic_candidate_limit,
+            top_k=raw_candidate_limits["facts"],
             budget=budget,
             time_start=time_start, time_end=time_end,
             tags=tags,
@@ -10276,20 +10274,12 @@ class MemoryNodeManager:
                 query_analysis.get("recall_intent", "balanced"),
                 float(query_analysis.get("intent_confidence") or 0.0),
             )
-            layer_limits = self._apply_recall_layer_preference(
-                self._recall_layer_limits(k, recall_intent),
+            recall_limits = self._apply_recall_layer_preference(
+                self._recall_limits_by_intent(k, recall_intent),
                 query_analysis.get("layer_preference", {}),
             )
             recall_terms = self._recall_search_terms(search_query, keywords, entities)
-            candidate_limits = {
-                layer: max(limit * 3, limit + 4)
-                for layer, limit in layer_limits.items()
-            }
-            raw_candidate_limits = {
-                "interpretations": max(candidate_limits["interpretations"] * 20, 200),
-                "observations": max(candidate_limits["observations"] * 20, 200),
-                "facts": max(candidate_limits["facts"] * 10, 50),
-            }
+            raw_candidate_limits = self._cal_raw_candidate_limits_from_recall_limits(recall_limits)
             self._log_info("memory_recall", "query_analyzed", {
                 "search_text": self._reflect_log_text(query_analysis.get("search_text"), limit=300),
                 "analysis_source": analysis_source,
@@ -10306,8 +10296,7 @@ class MemoryNodeManager:
                 "fact_type_preference": query_analysis.get("fact_type_preference", "both"),
                 "time_sensitivity": query_analysis.get("time_sensitivity"),
                 "needs_evidence": query_analysis.get("needs_evidence"),
-                "layer_limits": layer_limits,
-                "candidate_limits": candidate_limits,
+                "recall_limits": recall_limits,
                 "raw_candidate_limits": raw_candidate_limits,
                 "embedding_text": self._reflect_log_text(query_embedding_text, limit=300),
             })
@@ -10321,10 +10310,7 @@ class MemoryNodeManager:
                 keywords=keywords,
                 entities=entities,
                 query_embedding=query_embedding,
-                candidate_limits=candidate_limits,
                 raw_candidate_limits=raw_candidate_limits,
-                layer_limits=layer_limits,
-                fact_type_preference=query_analysis.get("fact_type_preference", "both"),
                 budget=b,
                 time_start=ts,
                 time_end=te,
@@ -10341,7 +10327,7 @@ class MemoryNodeManager:
                 query_embedding=query_embedding,
                 recall_terms=recall_terms,
                 intent=recall_intent,
-                layer_limits=layer_limits,
+                recall_limits=recall_limits,
                 fact_type_preference=query_analysis.get("fact_type_preference", "both"),
                 interpretation_min_embedding_similarity=self._recall_interpretation_min_embedding_similarity,
                 observation_min_embedding_similarity=self._recall_observation_min_embedding_similarity,

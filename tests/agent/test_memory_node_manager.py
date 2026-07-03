@@ -4426,7 +4426,7 @@ def test_recall_rerank_sorts_within_each_layer():
         episodic_facts=[],
         terms=["calibration"],
         intent="balanced",
-        layer_limits={"interpretations": 0, "observations": 2, "facts": 0},
+        recall_limits={"interpretations": 0, "observations": 2, "facts": 0},
     )
 
     assert [item["id"] for item in ranked["observations"]] == [2, 1]
