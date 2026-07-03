@@ -4405,14 +4405,14 @@ def test_recall_emits_structured_stage_logs(db, monkeypatch, caplog):
     assert finish["payload"]["counts"]["semantic_facts"] == 1
 
 
-def test_recall_rerank_preserves_layer_order_after_selection():
-    ranked = MemoryNodeManager._rank_recall_candidates(
+def test_recall_rerank_sorts_within_each_layer():
+    ranked = MemoryNodeManager._rank_recall_raw_candidates(
         interpretations=[],
         observations=[
             {
                 "id": 1,
-                "summary": "Layer-local search ranked this observation first.",
-                "keywords": ["workflow"],
+                "summary": "Layer-local search ranked this observation first for calibration workflow.",
+                "keywords": ["workflow", "calibration"],
                 "confidence": 0.4,
             },
             {
@@ -4429,8 +4429,8 @@ def test_recall_rerank_preserves_layer_order_after_selection():
         layer_limits={"interpretations": 0, "observations": 2, "facts": 0},
     )
 
-    assert [item["id"] for item in ranked["observations"]] == [1, 2]
-    assert ranked["observations"][1]["_recall_score"] > ranked["observations"][0]["_recall_score"]
+    assert [item["id"] for item in ranked["observations"]] == [2, 1]
+    assert ranked["observations"][0]["_recall_score"] > ranked["observations"][1]["_recall_score"]
 
 
 def test_recall_formats_current_interpretations_before_evidence(db, monkeypatch):

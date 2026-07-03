@@ -2584,7 +2584,7 @@ class SessionDB:
     MEMORY_TOP_K_CAUSAL = 5
     MEMORY_UPDATE_CAUSAL_THRESHOLD = 0.60
     MEMORY_QUERY_RETRIEVAL_THRESHOLD = 0.3
-    MEMORY_QUERY_TOP_K = 8
+    MEMORY_QUERY_FACT_TOP_K = 8
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
@@ -2851,7 +2851,7 @@ class SessionDB:
                 safe_parts.append(part)
         return " OR ".join(safe_parts) if safe_parts else text
 
-    def _search_memory_keyword(
+    def _search_memory_fact_using_keyword(
         self,
         keyword: str,
         limit: int = 20,
@@ -2984,7 +2984,7 @@ class SessionDB:
         )
         return {row[0]: row[1] for row in cursor.fetchall()}
 
-    def _search_memory_vector(
+    def _search_memory_fact_using_vector(
         self,
         query_embedding: np.ndarray,
         top_k: int = 20,
@@ -3102,7 +3102,7 @@ class SessionDB:
         top_k = int(self._memory_faiss_index.ntotal)
         if top_k <= 0:
             return {}
-        scores = self._search_memory_vector(query_embedding, top_k=top_k)
+        scores = self._search_memory_fact_using_vector(query_embedding, top_k=top_k)
         out: Dict[int, float] = {}
         for fact_id, score in scores.items():
             if exclude_fact_id is not None and fact_id == exclude_fact_id:
@@ -3520,7 +3520,7 @@ class SessionDB:
 
     # ── Public API ────────────────────────────────────────────────────────
 
-    def memory_add_fact(
+    def add_memory_fact(
         self,
         time_key: str,
         summary: str,
@@ -3614,113 +3614,8 @@ class SessionDB:
             self._memory_save_faiss()
 
         return fact_id
-        
-    def memory_relation_candidates(
-        self,
-        fact_id: int,
-        query_embedding: np.ndarray,
-        keywords: Optional[List[str]] = None,
-        top_k: int = None,
-        budget: str = "mid",
-    ) -> tuple[List[Dict[str, Any]], List[int]]:
-        """Find candidate prior facts for cross-fact causal relation extraction.
 
-        Uses HindSight-style multi-signal candidate generation instead of only
-        vector cosine similarity:
-        - semantic FAISS neighbors
-        - keyword / BM25 matches from fact keywords
-        - entity overlap
-        - nearby prior memories in time
-        - graph neighbors from explicit fact relations and entity edges
-
-        The final candidate order is fused with Reciprocal Rank Fusion, then
-        the LLM relation classifier decides whether a real relation exists.
-        """
-        if top_k is None:
-            top_k = self.MEMORY_TOP_K_CAUSAL
-
-        current = self._memory_get_fact(fact_id)
-        if not current:
-            return [], []
-
-        search_limit = max(top_k * 4, 20)
-        current_time = current.get("time_key", "")
-        current_fact_type = self._normalize_memory_fact_type(current.get("fact_type", "semantic"))
-        allowed_rows = self._conn.execute(
-            "SELECT id FROM memory_facts WHERE id != ? AND time_key <= ? AND fact_type = ?",
-            (fact_id, current_time, current_fact_type),
-        ).fetchall()
-        allowed_ids = {row[0] for row in allowed_rows}
-        if not allowed_ids:
-            return [], []
-
-        keyword_query = " OR ".join(keywords or current.get("keywords", []))
-        keyword_scores = (
-            self._search_memory_keyword(keyword_query, limit=search_limit, allowed_ids=allowed_ids)
-            if keyword_query else {}
-        )
-        keyword_ranking = self._memory_filter_ranked_ids(
-            self._memory_rank_scores(keyword_scores, higher_is_better=False),
-            allowed_ids=allowed_ids,
-        )
-
-        semantic_scores = self._search_memory_vector(
-            query_embedding,
-            top_k=search_limit,
-            allowed_ids=allowed_ids,
-        )
-        semantic_ranking = self._memory_filter_ranked_ids(
-            self._memory_rank_scores(semantic_scores, higher_is_better=True),
-            allowed_ids=allowed_ids,
-        )
-
-        entity_ranking = self._memory_entity_overlap_ranked(
-            fact_id,
-            allowed_ids=allowed_ids,
-            limit=search_limit,
-        )
-        temporal_ranking = self._memory_temporal_near_ranked(
-            fact_id,
-            allowed_ids=allowed_ids,
-            limit=search_limit,
-        )
-
-        seed_ids = self._memory_filter_ranked_ids(
-            semantic_ranking[:top_k] + keyword_ranking[:top_k] + entity_ranking[:top_k] + temporal_ranking[:top_k],
-            allowed_ids=allowed_ids,
-        )
-        graph_depth = {"low": 0, "mid": 1, "high": 3}.get(budget, 1)
-        graph_ranking = self._memory_graph_expand_ranked(
-            seed_ids,
-            depth=graph_depth,
-            allowed_ids=allowed_ids,
-            limit=search_limit,
-        )
-
-        rankings: List[Tuple[List[int], float]] = []
-        if semantic_ranking:
-            rankings.append((semantic_ranking, 1.0))
-        if keyword_ranking:
-            rankings.append((keyword_ranking, 1.0))
-        if entity_ranking:
-            rankings.append((entity_ranking, 1.1))
-        if temporal_ranking:
-            rankings.append((temporal_ranking, 0.8))
-        if graph_ranking:
-            rankings.append((graph_ranking, 0.7))
-
-        ranked_ids = self._memory_rrf(rankings)[:top_k] if rankings else []
-        facts: List[Dict[str, Any]] = []
-        fact_ids: List[int] = []
-        for candidate_id in ranked_ids:
-            fact = self._memory_get_fact(candidate_id)
-            if not fact:
-                continue
-            facts.append(fact)
-            fact_ids.append(candidate_id)
-        return facts, fact_ids
-
-    def search_memory_facts(
+    def retrieve_memory_fact_raw_candidates(
         self, keyword: str, query_embedding: np.ndarray, top_k: int = None,
         budget: str = "mid",
         time_start: Optional[str] = None,
@@ -3730,11 +3625,11 @@ class SessionDB:
         fact_types: Optional[List[str]] = None,
         include_graph: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Search raw fact memories with keyword, vector, and temporal signals.
+        """Retrieve a broad fact candidate pool plus raw retrieval signals.
 
         *keyword* is passed to FTS5 MATCH (use ``" OR "``-joined terms).
         *query_embedding* is a (1, EMBEDDING_DIM) float32 numpy array.
-        *top_k* overrides ``MEMORY_QUERY_TOP_K`` (default).
+        *top_k* controls the candidate pool size.
         *budget* controls graph traversal depth only when ``include_graph`` is true.
         *time_start*, *time_end*: optional ISO timestamp strings (``"2026-04-20 10:00:00"``).
             When specified, time range is the PRIMARY filter — all facts in range
@@ -3748,9 +3643,9 @@ class SessionDB:
             the fact/observation/interpretation memory architecture.
         """
         if top_k is None:
-            top_k = self.MEMORY_QUERY_TOP_K
+            top_k = self.MEMORY_QUERY_FACT_TOP_K
 
-        search_limit = max(top_k * 4, 20)
+        candidate_limit = max(1, int(top_k or self.MEMORY_QUERY_FACT_TOP_K))
         keyword_query = " OR ".join(keyword) if isinstance(keyword, list) else str(keyword or "")
 
         # ── Step 1: Primary filters ──
@@ -3774,8 +3669,6 @@ class SessionDB:
             _time_ids = set(_temporal_ranking)
             if not _time_ids:
                 return []  # No facts in the requested time range
-            # Actual top-k is at most the number of facts in time range
-            top_k = min(top_k, len(_time_ids))
 
         _tag_ids: Optional[set] = None
         if tags:
@@ -3831,19 +3724,22 @@ class SessionDB:
             # allowed_ids because FAISS has no native time predicate.
             keyword_allowed_ids = None
         fts_results = (
-            self._search_memory_keyword(
+            self._search_memory_fact_using_keyword(
                 keyword_query,
-                limit=search_limit,
+                limit=candidate_limit,
                 allowed_ids=keyword_allowed_ids,
                 time_start=time_start,
                 time_end=time_end,
             )
             if keyword_query else {}
         )
-        vec_results = self._search_memory_vector(
-            query_embedding,
-            top_k=search_limit,
-            allowed_ids=allowed_ids,
+        vec_results = (
+            self._search_memory_fact_using_vector(
+                query_embedding,
+                top_k=candidate_limit,
+                allowed_ids=allowed_ids,
+            )
+            if query_embedding is not None else {}
         )
 
         keyword_ranking = self._memory_filter_ranked_ids(
@@ -3859,75 +3755,57 @@ class SessionDB:
             allowed_ids=allowed_ids,
         )
 
-        seed_ids = self._memory_filter_ranked_ids(
-            semantic_ranking[:top_k] + keyword_ranking[:top_k] + temporal_ranking[:top_k],
-            allowed_ids=allowed_ids,
+        seed_source_ids = (
+            semantic_ranking[:candidate_limit]
+            + keyword_ranking[:candidate_limit]
+            + temporal_ranking[:candidate_limit]
         )
 
         graph_ranking: List[int] = []
         if include_graph:
             _graph_depth = {"low": 0, "mid": 1, "high": 3}.get(budget, 1)
             graph_ranking = self._memory_graph_expand_ranked(
-                seed_ids,
+                seed_source_ids,
                 depth=_graph_depth,
                 allowed_ids=allowed_ids,
-                limit=search_limit,
+                limit=candidate_limit,
             )
 
-        # ── Step 3: Reciprocal Rank Fusion ──
-        rankings: List[Tuple[List[int], float]] = []
-        if semantic_ranking:
-            rankings.append((semantic_ranking, 1.0))
-        if keyword_ranking:
-            rankings.append((keyword_ranking, 1.0))
-        if temporal_ranking:
-            rankings.append((temporal_ranking, 0.9))
-        if graph_ranking:
-            rankings.append((graph_ranking, 0.45))
-
-        rrf_scores, first_seen = self._memory_rrf_scores(rankings) if rankings else ({}, {})
-        ranked_ids = sorted(
-            rrf_scores,
-            key=lambda fact_id: (-rrf_scores[fact_id], first_seen.get(fact_id, 0)),
-        ) if rrf_scores else []
-
-        # Time-filtered recall should still return memories in the requested
-        # interval even when semantic/keyword channels are sparse.
-        if _time_ids is not None and len(ranked_ids) < top_k:
-            existing = set(ranked_ids)
-            for fact_id in temporal_ranking:
+        # ── Step 3: Keep retrieval-channel signals on a broad pool ──
+        candidate_ids: List[int] = []
+        existing: set = set()
+        for channel_ids in (seed_source_ids, graph_ranking):
+            for fact_id in channel_ids[:candidate_limit]:
                 if fact_id in existing:
                     continue
-                ranked_ids.append(fact_id)
+                candidate_ids.append(fact_id)
                 existing.add(fact_id)
-                if len(ranked_ids) >= top_k:
-                    break
 
-        ranked_ids = self._memory_decay_rerank(
-            ranked_ids,
-            rrf_scores,
-            first_seen,
-            limit=max(top_k * 3, top_k),
-        )
+        if not candidate_ids and allowed_ids:
+            placeholders = ",".join("?" for _ in allowed_ids)
+            fallback_cursor = self._conn.execute(
+                f"SELECT id FROM memory_facts WHERE id IN ({placeholders}) ORDER BY time_key DESC LIMIT ?",
+                [*allowed_ids, candidate_limit],
+            )
+            candidate_ids = [int(row[0]) for row in fallback_cursor.fetchall()]
 
         facts: List[Dict[str, Any]] = []
-        for fact_id in ranked_ids[:top_k]:
+        semantic_rank_by_id = {fact_id: rank for rank, fact_id in enumerate(semantic_ranking, 1)}
+        keyword_rank_by_id = {fact_id: rank for rank, fact_id in enumerate(keyword_ranking, 1)}
+        temporal_rank_by_id = {fact_id: rank for rank, fact_id in enumerate(temporal_ranking, 1)}
+        graph_rank_by_id = {fact_id: rank for rank, fact_id in enumerate(graph_ranking, 1)}
+        for fact_id in candidate_ids:
             fact = self._memory_get_fact(fact_id)
             if fact:
                 fact["embedding_similarity"] = float(vec_results.get(fact_id, 0.0) or 0.0)
                 fact["keyword_score"] = (
                     None if fact_id not in fts_results else float(fts_results[fact_id])
                 )
-                fact["temporal_rank"] = (
-                    temporal_ranking.index(fact_id) + 1
-                    if fact_id in temporal_ranking else None
-                )
-                fact["retrieval_score"] = float(rrf_scores.get(fact_id, 0.0) or 0.0)
+                fact["semantic_rank"] = semantic_rank_by_id.get(fact_id)
+                fact["keyword_rank"] = keyword_rank_by_id.get(fact_id)
+                fact["temporal_rank"] = temporal_rank_by_id.get(fact_id)
                 if graph_ranking:
-                    fact["graph_rank"] = (
-                        graph_ranking.index(fact_id) + 1
-                        if fact_id in graph_ranking else None
-                    )
+                    fact["graph_rank"] = graph_rank_by_id.get(fact_id)
                 facts.append(fact)
         return facts
 
@@ -4385,7 +4263,7 @@ class SessionDB:
 
     # ── Normalized memory node relations ─────────────────────────────────
 
-    def memory_add_fact_relation(
+    def add_memory_fact_relation(
         self, source_fact_id: int, target_fact_id: int,
         relation_type: str, confidence: float = 1.0,
         semantic_score: Optional[float] = None,

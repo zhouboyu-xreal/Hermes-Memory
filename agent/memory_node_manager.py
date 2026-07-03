@@ -7059,7 +7059,7 @@ class MemoryNodeManager:
                 target_id = fact_ids[int(relation["target_index"])]
                 relation_type = str(relation["relation"])
                 confidence = float(relation.get("confidence", 1.0) or 1.0)
-                self._db.memory_add_fact_relation(
+                self._db.add_memory_fact_relation(
                     source_fact_id=source_id,
                     target_fact_id=target_id,
                     relation_type=relation_type,
@@ -7300,7 +7300,7 @@ class MemoryNodeManager:
         return False
 
     @staticmethod
-    def _feedback_text_terms(value: Any) -> set[str]:
+    def _memory_text_terms(value: Any) -> set[str]:
         text = unicodedata.normalize("NFKC", str(value or "")).casefold()
         terms = {
             token
@@ -7350,8 +7350,8 @@ class MemoryNodeManager:
                 "resolution",
             )
         )
-        source_terms = cls._feedback_text_terms(source_text)
-        candidate_terms = cls._feedback_text_terms(candidate_text)
+        source_terms = cls._memory_text_terms(source_text)
+        candidate_terms = cls._memory_text_terms(candidate_text)
         if not source_terms or not candidate_terms:
             return 0.0
         overlap = source_terms & candidate_terms
@@ -8050,7 +8050,7 @@ class MemoryNodeManager:
                 
                 # ── Step 3: Store the new fact node (SYNC) ──
                 fact_store_started_at = time.monotonic()
-                fact_id = self._db.memory_add_fact(
+                fact_id = self._db.add_memory_fact(
                     time_key=self._memory_time_key(
                         idx,
                         turn_timestamp=batch_timestamp,
@@ -9454,6 +9454,33 @@ class MemoryNodeManager:
         return max(0.0, min(1.0, float(similarity)))
 
     @classmethod
+    def _annotate_recall_embedding_similarities(
+        cls,
+        candidates: List[Dict[str, Any]],
+        *,
+        query_embedding: Optional[np.ndarray],
+        embedding_keys: Tuple[str, ...],
+    ) -> List[Dict[str, Any]]:
+        """Attach coarse embedding similarity signals to raw recall candidates."""
+        annotated: List[Dict[str, Any]] = []
+        for candidate in candidates or []:
+            item = dict(candidate)
+            similarities = [
+                similarity
+                for key in embedding_keys
+                if (
+                    similarity := cls._recall_embedding_similarity(
+                        query_embedding,
+                        item.get(key),
+                    )
+                ) is not None
+            ]
+            if similarities:
+                item["embedding_similarity"] = round(float(max(similarities)), 4)
+            annotated.append(item)
+        return annotated
+
+    @classmethod
     def _rank_interpretation_search_candidates(
         cls,
         candidates: List[Dict[str, Any]],
@@ -9466,7 +9493,7 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         """Filter and rank interpretation rows fetched by SessionDB."""
         terms = cls._recall_keyword_terms(keyword)
-        query_text_terms = cls._feedback_text_terms(keyword)
+        query_text_terms = cls._memory_text_terms(keyword)
         entity_terms = cls._recall_entity_terms(entities)
         threshold = (
             None
@@ -9488,7 +9515,7 @@ class MemoryNodeManager:
                 for key in ("claim", "scope", "target_text", "action_implication")
             )
             if query_text_terms:
-                boundary_terms = cls._feedback_text_terms(boundary_text)
+                boundary_terms = cls._memory_text_terms(boundary_text)
                 if not (query_text_terms & boundary_terms):
                     continue
             entity_haystack = str(item.get("entity_name") or "").lower()
@@ -9554,7 +9581,12 @@ class MemoryNodeManager:
             ),
             reverse=True,
         )
-        return [item for _, item in scored[:max(1, int(top_k or 3))]]
+        ranked: List[Dict[str, Any]] = []
+        for rank, (score, item) in enumerate(scored[:max(1, int(top_k or 3))], 1):
+            item["_recall_score"] = round(float(score), 4)
+            item["_recall_rank"] = rank
+            ranked.append(item)
+        return ranked
 
     @classmethod
     def _rank_observation_search_candidates(
@@ -9636,7 +9668,139 @@ class MemoryNodeManager:
             ),
             reverse=True,
         )
-        return [item for _, item in scored[:max(1, int(top_k or 3))]]
+        ranked: List[Dict[str, Any]] = []
+        for rank, (score, item) in enumerate(scored[:max(1, int(top_k or 3))], 1):
+            item["_recall_score"] = round(float(score), 4)
+            item["_recall_rank"] = rank
+            ranked.append(item)
+        return ranked
+
+    @classmethod
+    def _rank_fact_recall_candidates(
+        cls,
+        candidates: List[Dict[str, Any]],
+        *,
+        terms: List[str],
+        intent: str,
+        fact_type_preference: str,
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        """Rank fact candidates inside the fact layer using raw DB signals."""
+        preferred_type = str(fact_type_preference or "both").strip().lower()
+        deduped: List[Dict[str, Any]] = []
+        seen_ids = set()
+        for candidate in candidates or []:
+            item = dict(candidate)
+            item_id = item.get("id")
+            if item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+            deduped.append(item)
+
+        def _ranked_ids(field: str) -> List[int]:
+            ranked: List[Tuple[int, int]] = []
+            for item in deduped:
+                item_id = item.get("id")
+                try:
+                    rank = int(item.get(field) or 0)
+                except (TypeError, ValueError):
+                    rank = 0
+                if item_id is not None and rank > 0:
+                    try:
+                        ranked.append((rank, int(item_id)))
+                    except (TypeError, ValueError):
+                        continue
+            ranked.sort(key=lambda pair: pair[0])
+            return [item_id for _, item_id in ranked]
+
+        rrf_scores: Dict[int, float] = {}
+        first_seen: Dict[int, int] = {}
+        first_seen_order = 0
+        for ranking, weight in (
+            (_ranked_ids("semantic_rank"), 1.0),
+            (_ranked_ids("keyword_rank"), 1.0),
+            (_ranked_ids("temporal_rank"), 0.9),
+            (_ranked_ids("graph_rank"), 0.45),
+        ):
+            for rank, fact_id in enumerate(ranking, 1):
+                if fact_id not in first_seen:
+                    first_seen[fact_id] = first_seen_order
+                    first_seen_order += 1
+                rrf_scores[fact_id] = rrf_scores.get(fact_id, 0.0) + (weight / (60 + rank))
+
+        scored: List[Tuple[float, str, int, Dict[str, Any]]] = []
+        for sequence, item in enumerate(deduped):
+            item_id = item.get("id")
+            haystack = cls._recall_item_text("fact", item)
+            matched_terms = [term for term in terms if term and term in haystack]
+            text_score = min(2.0, len(matched_terms) * 0.35)
+            try:
+                embedding_score = max(0.0, float(item.get("embedding_similarity") or 0.0))
+            except (TypeError, ValueError):
+                embedding_score = 0.0
+            keyword_raw = item.get("keyword_score")
+            try:
+                keyword_channel_score = (
+                    0.0
+                    if keyword_raw is None
+                    else 1.0 / (1.0 + max(0.0, float(keyword_raw)))
+                )
+            except (TypeError, ValueError):
+                keyword_channel_score = 0.0
+            try:
+                item_id_int = int(item_id) if item_id is not None else None
+            except (TypeError, ValueError):
+                item_id_int = None
+            if item_id_int is not None:
+                rank_fusion_score = max(0.0, float(rrf_scores.get(item_id_int, 0.0)))
+            else:
+                try:
+                    rank_fusion_score = max(
+                        0.0,
+                        float(item.get("rank_fusion_score") or item.get("retrieval_score") or 0.0),
+                    )
+                except (TypeError, ValueError):
+                    rank_fusion_score = 0.0
+            try:
+                raw_decay_score = item.get("decay_score")
+                decay_score = cls._clip_unit_float(
+                    1.0 if raw_decay_score is None else raw_decay_score,
+                    1.0,
+                )
+            except (TypeError, ValueError):
+                decay_score = 1.0
+            fact_type = str(item.get("fact_type") or "").lower()
+            preference_bonus = (
+                0.35
+                if preferred_type in {"semantic", "episodic"} and fact_type == preferred_type
+                else 0.0
+            )
+            if item_id_int is not None:
+                item["rank_fusion_score"] = round(float(rank_fusion_score), 6)
+                item["first_seen_rank"] = first_seen.get(item_id_int)
+            score = (
+                text_score
+                + (embedding_score * 1.5)
+                + (keyword_channel_score * 0.8)
+                + (rank_fusion_score * 8.0)
+                + (decay_score * 0.65)
+                + cls._recall_intent_bonus("fact", intent, item)
+                + preference_bonus
+            )
+            item["_recall_score"] = round(float(score), 4)
+            scored.append((
+                float(score),
+                item.get("time_key") or "",
+                -sequence,
+                item,
+            ))
+
+        scored.sort(key=lambda pair: (pair[0], pair[1], pair[2]), reverse=True)
+        ranked: List[Dict[str, Any]] = []
+        for rank, (_, _, _, item) in enumerate(scored[:max(0, int(top_k or 0))], 1):
+            item["_recall_rank"] = rank
+            ranked.append(item)
+        return ranked
 
     @classmethod
     def _rank_recall_raw_candidates(
@@ -9646,67 +9810,66 @@ class MemoryNodeManager:
         observations: List[Dict[str, Any]],
         semantic_facts: List[Dict[str, Any]],
         episodic_facts: List[Dict[str, Any]],
-        terms: List[str],
+        keywords: Optional[List[str]] = None,
+        entities: Optional[List[Any]] = None,
+        query_embedding: Optional[np.ndarray] = None,
+        recall_terms: Optional[List[str]] = None,
+        terms: Optional[List[str]] = None,
         intent: str,
         layer_limits: Dict[str, int],
+        fact_type_preference: str = "both",
+        interpretation_min_embedding_similarity: Optional[float] = None,
+        observation_min_embedding_similarity: Optional[float] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """Select final recall candidates while preserving each layer's own order."""
-        total_budget = max(1, sum(max(0, int(value or 0)) for value in layer_limits.values()))
-        flexible_cap = max(1, int(total_budget * 0.6))
-        caps = {
-            "interpretations": max(layer_limits.get("interpretations", 0), flexible_cap),
-            "observations": max(layer_limits.get("observations", 0), flexible_cap),
-            "semantic_facts": max(1, min(total_budget, flexible_cap)),
-            "episodic_facts": max(1, min(total_budget, flexible_cap)),
+        """Rank candidates independently within each memory layer."""
+        interpretation_limit = max(0, int(layer_limits.get("interpretations", 0) or 0))
+        observation_limit = max(0, int(layer_limits.get("observations", 0) or 0))
+        fact_limit = max(0, int(layer_limits.get("facts", 0) or 0))
+        active_terms = recall_terms if recall_terms is not None else (terms or [])
+        rank_keywords = keywords if keywords is not None else active_terms
+        rank_entities = entities or []
+        ranked_interpretations = (
+            cls._rank_interpretation_search_candidates(
+                interpretations,
+                keyword=rank_keywords,
+                entities=rank_entities,
+                top_k=interpretation_limit,
+                query_embedding=query_embedding,
+                min_embedding_similarity=interpretation_min_embedding_similarity,
+            )
+            if interpretation_limit > 0 else []
+        )
+        ranked_observations = (
+            cls._rank_observation_search_candidates(
+                observations,
+                keyword=rank_keywords,
+                entities=rank_entities,
+                top_k=observation_limit,
+                query_embedding=query_embedding,
+                min_embedding_similarity=observation_min_embedding_similarity,
+            )
+            if observation_limit > 0 else []
+        )
+        ranked_semantic_facts = cls._rank_fact_recall_candidates(
+            semantic_facts or [],
+            terms=active_terms,
+            intent=intent,
+            fact_type_preference=fact_type_preference,
+            top_k=fact_limit,
+        )
+        ranked_episodic_facts = cls._rank_fact_recall_candidates(
+            episodic_facts or [],
+            terms=active_terms,
+            intent=intent,
+            fact_type_preference=fact_type_preference,
+            top_k=fact_limit,
+        )
+        return {
+            "interpretations": ranked_interpretations,
+            "observations": ranked_observations,
+            "semantic_facts": ranked_semantic_facts,
+            "episodic_facts": ranked_episodic_facts,
         }
-        candidates: List[Tuple[float, int, str, Dict[str, Any]]] = []
-        sequence = 0
-        groups = [
-            ("interpretations", "interpretation", interpretations),
-            ("observations", "observation", observations),
-            ("semantic_facts", "fact", semantic_facts),
-            ("episodic_facts", "fact", episodic_facts),
-        ]
-        for bucket, layer, items in groups:
-            for rank, item in enumerate(items or [], 1):
-                sequence += 1
-                score = cls._recall_candidate_score(
-                    layer=layer,
-                    item=item,
-                    rank=rank,
-                    terms=terms,
-                    intent=intent,
-                )
-                item["_recall_score"] = score
-                item["_recall_rank"] = rank
-                candidates.append((score, sequence, bucket, item))
-
-        candidates.sort(key=lambda candidate: (-candidate[0], candidate[1]))
-        selected = {
-            "interpretations": [],
-            "observations": [],
-            "semantic_facts": [],
-            "episodic_facts": [],
-        }
-        selected_ids = {key: set() for key in selected}
-
-        for _score, _sequence, bucket, item in candidates:
-            if sum(len(values) for values in selected.values()) >= total_budget:
-                break
-            if len(selected[bucket]) >= caps[bucket]:
-                continue
-            item_id = item.get("id")
-            if item_id in selected_ids[bucket]:
-                continue
-            selected_ids[bucket].add(item_id)
-            selected[bucket].append(item)
-        for items in selected.values():
-            items.sort(key=lambda item: int(item.get("_recall_rank") or 0))
-        return selected
-
-    @classmethod
-    def _rank_recall_candidates(cls, **kwargs: Any) -> Dict[str, List[Dict[str, Any]]]:
-        return cls._rank_recall_raw_candidates(**kwargs)
 
     def _retrieve_recall_raw_candidates(
         self,
@@ -9728,35 +9891,29 @@ class MemoryNodeManager:
         List[Dict[str, Any]],
         List[Dict[str, Any]],
     ]:
-        """Retrieve and rank first-pass recall candidates for each memory layer."""
+        """Retrieve broad first-pass recall candidates for each memory layer."""
         raw_interpretation_candidates = self._db.search_memory_interpretations(
             entities=entities,
             top_k=raw_candidate_limits["interpretations"],
         )
-        interpretation_candidates = self._rank_interpretation_search_candidates(
+        interpretation_candidates = self._annotate_recall_embedding_similarities(
             raw_interpretation_candidates,
-            keyword=keywords,
-            entities=entities,
-            top_k=candidate_limits["interpretations"],
             query_embedding=query_embedding,
-            min_embedding_similarity=self._recall_interpretation_min_embedding_similarity,
+            embedding_keys=("embedding",),
         )
 
         raw_observation_candidates = self._db.search_memory_observations(
             entities=entities,
             top_k=raw_candidate_limits["observations"],
         )
-        observation_candidates = self._rank_observation_search_candidates(
+        observation_candidates = self._annotate_recall_embedding_similarities(
             raw_observation_candidates,
-            keyword=keywords,
-            entities=entities,
-            top_k=candidate_limits["observations"],
             query_embedding=query_embedding,
-            min_embedding_similarity=self._recall_observation_min_embedding_similarity,
+            embedding_keys=("embedding", "evidence_centroid_embedding"),
         )
 
         fact_candidate_limit = max(
-            candidate_limits["facts"],
+            raw_candidate_limits.get("facts", candidate_limits["facts"]),
             layer_limits["facts"] * 3,
             layer_limits["facts"] + 4,
         )
@@ -9766,7 +9923,7 @@ class MemoryNodeManager:
             episodic_candidate_limit = max(1, layer_limits["facts"])
         elif fact_type_preference == "episodic":
             semantic_candidate_limit = max(1, layer_limits["facts"])
-        semantic_candidates = self._db.search_memory_facts(
+        semantic_candidates = self._db.retrieve_memory_fact_raw_candidates(
             keywords,
             query_embedding,
             top_k=semantic_candidate_limit,
@@ -9776,7 +9933,7 @@ class MemoryNodeManager:
             fact_types=["semantic"],
         )
 
-        episodic_candidates = self._db.search_memory_facts(
+        episodic_candidates = self._db.retrieve_memory_fact_raw_candidates(
             keywords,
             query_embedding,
             top_k=episodic_candidate_limit,
@@ -10129,8 +10286,9 @@ class MemoryNodeManager:
                 for layer, limit in layer_limits.items()
             }
             raw_candidate_limits = {
-                "interpretations": max(candidate_limits["interpretations"] * 10, 50),
-                "observations": max(candidate_limits["observations"] * 10, 50),
+                "interpretations": max(candidate_limits["interpretations"] * 20, 200),
+                "observations": max(candidate_limits["observations"] * 20, 200),
+                "facts": max(candidate_limits["facts"] * 10, 50),
             }
             self._log_info("memory_recall", "query_analyzed", {
                 "search_text": self._reflect_log_text(query_analysis.get("search_text"), limit=300),
@@ -10178,9 +10336,15 @@ class MemoryNodeManager:
                 observations=observation_candidates,
                 semantic_facts=semantic_candidates,
                 episodic_facts=episodic_candidates,
-                terms=recall_terms,
+                keywords=keywords,
+                entities=entities,
+                query_embedding=query_embedding,
+                recall_terms=recall_terms,
                 intent=recall_intent,
                 layer_limits=layer_limits,
+                fact_type_preference=query_analysis.get("fact_type_preference", "both"),
+                interpretation_min_embedding_similarity=self._recall_interpretation_min_embedding_similarity,
+                observation_min_embedding_similarity=self._recall_observation_min_embedding_similarity,
             )
 
             interpretation_nodes = ranked_recall["interpretations"]
