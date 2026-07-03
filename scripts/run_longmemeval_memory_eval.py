@@ -45,9 +45,7 @@ _READER_HTTP_SESSION: Optional[requests.Session] = None
 DEFAULT_INPUT = Path(
     "/Users/zhouboyu/Documents/xreal/项目/agent_memory/benchmark/LongMemEval/data/longmemeval_oracle.json"
 )
-DEFAULT_OUTPUT = REPO_ROOT / "tmp" / "longmemeval" / "longmemeval_oracle_hermes.jsonl"
-DEFAULT_STATE_DIR = REPO_ROOT / "tmp" / "longmemeval" / "state"
-DEFAULT_LOG_PATH = REPO_ROOT / "tmp" / "longmemeval" / "run_longmemeval_memory_eval.log"
+DEFAULT_OUTPUT_ROOT_DIR = REPO_ROOT / "tmp" / "longmemeval"
 
 
 @dataclass(frozen=True)
@@ -63,9 +61,17 @@ def parse_args() -> argparse.Namespace:
         description="Run Hermes memory benchmark inference on LongMemEval."
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
-    parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
+    parser.add_argument("--output-root-dir", type=Path, default=DEFAULT_OUTPUT_ROOT_DIR)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help=(
+            "Optional explicit run output directory. By default a run directory "
+            "is created under --output-root-dir from the input filename and timestamp."
+        ),
+    )
+    parser.add_argument("--state-dir", type=Path)
+    parser.add_argument("--log-path", type=Path)
     parser.add_argument("--detail-output", type=Path, help="Optional per-instance detail JSON.")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 means all instances.")
@@ -302,6 +308,45 @@ def remove_existing_outputs(
         detail_output_path.unlink()
     if state_dir.exists():
         shutil.rmtree(state_dir)
+
+
+def _safe_output_name(value: str) -> str:
+    cleaned = "".join(
+        char if char.isalnum() or char in {"-", "_", "."} else "_"
+        for char in str(value or "").strip()
+    ).strip("._")
+    return cleaned or "longmemeval"
+
+
+def resolve_output_paths(args: argparse.Namespace) -> Tuple[Path, Path]:
+    input_stem = _safe_output_name(args.input.stem)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    output_root_dir = Path(args.output_root_dir or DEFAULT_OUTPUT_ROOT_DIR)
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else output_root_dir / f"{input_stem}_{timestamp}"
+    )
+    args.output_root_dir = output_root_dir
+    args.output_dir = output_dir
+
+    args.state_dir = Path(args.state_dir) if args.state_dir else output_dir / "state"
+    args.log_path = (
+        Path(args.log_path)
+        if args.log_path
+        else output_dir / "run_longmemeval_memory_eval.log"
+    )
+
+    brief_output = output_dir / f"{input_stem}_hermes.jsonl"
+    if args.detail_output:
+        detail_output = Path(args.detail_output)
+        if not detail_output.is_absolute():
+            detail_output = output_dir / detail_output
+    else:
+        detail_output = output_dir / f"{input_stem}_hermes.jsonl.details.json"
+    args.detail_output = detail_output
+    return brief_output, detail_output
 
 
 def load_dataset(path: Path) -> List[Dict[str, Any]]:
@@ -1080,6 +1125,15 @@ def main() -> int:
     )
     args = parse_args()
     resolve_llm_args(args)
+    brief_output, detail_output = resolve_output_paths(args)
+    remove_existing_outputs(
+        output_path=brief_output,
+        detail_output_path=detail_output,
+        state_dir=args.state_dir,
+        overwrite=bool(args.overwrite),
+    )
+    brief_output.parent.mkdir(parents=True, exist_ok=True)
+    args.state_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(args.log_path, args.log_level, args.manager_log_level)
     if loaded_env_paths:
         logging.info(
@@ -1088,21 +1142,6 @@ def main() -> int:
         )
     else:
         logging.info("No Hermes .env file found; using system environment variables")
-
-    detail_output = args.detail_output
-    if detail_output is None:
-        detail_output = args.output.with_suffix(args.output.suffix + ".details.json")
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.state_dir.mkdir(parents=True, exist_ok=True)
-    remove_existing_outputs(
-        output_path=args.output,
-        detail_output_path=detail_output,
-        state_dir=args.state_dir,
-        overwrite=bool(args.overwrite),
-    )
-    args.state_dir.mkdir(parents=True, exist_ok=True)
-
     instances = load_dataset(args.input)
     selected = filter_instances(
         instances,
@@ -1223,7 +1262,7 @@ def main() -> int:
         try:
             result = answer_instance_from_memory_context(args=args, result=result)
             write_jsonl_row(
-                args.output,
+                brief_output,
                 {
                     "question_id": result["question_id"],
                     "hypothesis": result["hypothesis"],
@@ -1257,9 +1296,12 @@ def main() -> int:
 
     summary = {
         "input": str(args.input),
-        "output": str(args.output),
+        "output_root_dir": str(args.output_root_dir),
+        "output_dir": str(args.output_dir),
+        "output": str(brief_output),
         "detail_output": str(detail_output),
         "state_dir": str(args.state_dir),
+        "log_path": str(args.log_path),
         "instances_requested": len(selected),
         "instances_succeeded": success_count,
         "instances_failed": failure_count,
