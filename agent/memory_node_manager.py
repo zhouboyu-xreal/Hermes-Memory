@@ -5313,26 +5313,7 @@ class MemoryNodeManager:
     def _search_interpretation_candidates_for_observation(
         self,
         observation: Dict[str, Any],
-        observation_id: int,
     ) -> List[Dict[str, Any]]:
-        candidates: List[Dict[str, Any]] = []
-        seen: set[int] = set()
-
-        try:
-            existing = self._db.get_interpretations_for_observation(
-                int(observation_id),
-                limit=10,
-            )
-        except Exception:
-            existing = []
-        for item in existing:
-            try:
-                item_id = int(item["id"])
-            except (TypeError, ValueError, KeyError):
-                continue
-            candidates.append(item)
-            seen.add(item_id)
-
         query = " ".join(
             str(part or "").strip()
             for part in [
@@ -5344,34 +5325,20 @@ class MemoryNodeManager:
             if str(part or "").strip()
         )
         entities = [observation.get("entity_name")] if observation.get("entity_name") else []
+        entity_ids = [
+            int(observation["entity_id"])
+        ] if str(observation.get("entity_id") or "").isdigit() else []
         try:
-            searched = self._db.search_memory_interpretations(
+            return self._db.search_memory_interpretations(
                 query,
                 entities=entities,
+                entity_ids=entity_ids,
                 top_k=50,
                 statuses=["current", "conflicted"],
                 min_confidence=0.35,
             )
         except Exception:
-            searched = []
-        searched = self._rank_interpretation_search_candidates(
-            searched,
-            keyword=query,
-            entities=entities,
-            top_k=12,
-            query_embedding=None,
-            min_embedding_similarity=None,
-        )
-        for item in searched:
-            try:
-                item_id = int(item["id"])
-            except (TypeError, ValueError, KeyError):
-                continue
-            if item_id in seen:
-                continue
-            candidates.append(item)
-            seen.add(item_id)
-        return candidates
+            return []
 
     def _judge_observation_value_for_interpretation(
         self,
@@ -5383,7 +5350,6 @@ class MemoryNodeManager:
         source_facts = item.get("source_facts", [])
         interpretation_candidates = self._search_interpretation_candidates_for_observation(
             observation,
-            observation_id,
         )
         scored_interpretation_candidates: List[Tuple[float, str, Dict[str, Any]]] = []
         for candidate in interpretation_candidates:

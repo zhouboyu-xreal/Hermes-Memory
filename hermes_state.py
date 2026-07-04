@@ -2557,6 +2557,48 @@ class SessionDB:
                 safe_parts.append(part)
         return " OR ".join(safe_parts) if safe_parts else text
 
+    @classmethod
+    def _memory_keyword_terms(cls, keyword: Any, *, limit: int = 8) -> List[str]:
+        if keyword is None:
+            return []
+        if isinstance(keyword, (list, tuple, set)):
+            raw_parts = [str(item or "") for item in keyword]
+        elif isinstance(keyword, dict):
+            raw_parts = [
+                str(value or "")
+                for value in keyword.values()
+                if not isinstance(value, (dict, list, tuple, set))
+            ]
+        else:
+            raw_parts = [str(keyword or "")]
+        terms: List[str] = []
+        seen: set[str] = set()
+        for raw_part in raw_parts:
+            for term in re.findall(r"[0-9A-Za-z_\u4e00-\u9fff]+", raw_part):
+                clean = term.strip().lower()
+                if not clean or clean in {"and", "or", "not"}:
+                    continue
+                if not cls._contains_cjk(clean) and len(clean) < 2:
+                    continue
+                if clean in seen:
+                    continue
+                seen.add(clean)
+                terms.append(clean)
+                if len(terms) >= max(1, int(limit or 8)):
+                    return terms
+        return terms
+
+    @staticmethod
+    def _memory_like_pattern(term: str) -> str:
+        bs = chr(92)
+        escaped = (
+            str(term or "")
+            .replace(bs, bs + bs)
+            .replace("%", bs + "%")
+            .replace("_", bs + "_")
+        )
+        return f"%{escaped}%"
+
     def _search_memory_fact_using_keyword(
         self,
         keyword: str,
@@ -4372,13 +4414,16 @@ class SessionDB:
         statuses: Optional[List[str]] = None,
         min_confidence: float = 0.4,
     ) -> List[Dict[str, Any]]:
-        """Fetch current/conflicted agent interpretations for manager-side recall ranking."""
+        """Fetch raw interpretation candidates for manager-side ranking."""
         normalized_statuses = [
             self._normalize_memory_interpretation_status(status)
             for status in (statuses or ["current", "conflicted"])
         ]
         normalized_statuses = list(dict.fromkeys(normalized_statuses))
         placeholders = ",".join("?" for _ in normalized_statuses)
+        clean_limit = max(1, int(top_k or 3))
+        confidence_floor = max(0.0, min(1.0, float(min_confidence or 0.0)))
+        keyword_terms = self._memory_keyword_terms(keyword)
         clean_entity_ids = self._json_int_list(entity_ids or [])
         entity_names: List[str] = []
         for entity in entities or []:
@@ -4402,26 +4447,81 @@ class SessionDB:
         clean_entity_ids = list(dict.fromkeys(clean_entity_ids))
         if (entities or entity_ids) and not clean_entity_ids:
             return []
-        params: List[Any] = [
-            *normalized_statuses,
-            max(0.0, min(1.0, float(min_confidence or 0.0))),
-        ]
-        where = [
+
+        base_where = [
             f"mo.status IN ({placeholders})",
             "mo.confidence >= ?",
         ]
+        base_params: List[Any] = [*normalized_statuses, confidence_floor]
         if clean_entity_ids:
             entity_placeholders = ",".join("?" for _ in clean_entity_ids)
-            where.append(f"mo.entity_id IN ({entity_placeholders})")
-            params.extend(clean_entity_ids)
-        rows = self._conn.execute(
-            "SELECT mo.*, en.name AS entity_name "
-            "FROM memory_interpretations mo "
-            "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
-            f"WHERE {' AND '.join(where)}",
-            params,
-        ).fetchall()
-        items = [self._memory_interpretation_from_row(row) for row in rows]
+            base_where.append(f"mo.entity_id IN ({entity_placeholders})")
+            base_params.extend(clean_entity_ids)
+
+        rows_by_id: Dict[int, Any] = {}
+
+        def _add_rows(rows: List[Any]) -> None:
+            for row in rows:
+                try:
+                    row_id = int(row["id"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                rows_by_id.setdefault(row_id, row)
+
+        should_fetch_base = bool(clean_entity_ids) or not keyword_terms
+        if should_fetch_base:
+            base_rows = self._conn.execute(
+                "SELECT mo.*, en.name AS entity_name "
+                "FROM memory_interpretations mo "
+                "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
+                f"WHERE {' AND '.join(base_where)} "
+                "ORDER BY COALESCE(mo.last_supported_at, mo.updated_at, mo.created_at, '') DESC, "
+                "mo.id DESC "
+                "LIMIT ?",
+                base_params + [clean_limit],
+            ).fetchall()
+            _add_rows(base_rows)
+
+        if keyword_terms:
+            like_fields = [
+                "mo.subject_text",
+                "mo.scope",
+                "mo.interpretation_type",
+                "mo.claim",
+                "mo.resolution",
+                "mo.action_implication",
+                "mo.embedding_text",
+                "mo.metadata",
+                "en.name",
+            ]
+            keyword_clauses: List[str] = []
+            keyword_params: List[Any] = []
+            bs = chr(92)
+            for term in keyword_terms:
+                pattern = self._memory_like_pattern(term)
+                term_clause = " OR ".join(
+                    f"{field} LIKE ? ESCAPE '{bs}'"
+                    for field in like_fields
+                )
+                keyword_clauses.append(f"({term_clause})")
+                keyword_params.extend([pattern] * len(like_fields))
+            keyword_rows = self._conn.execute(
+                "SELECT mo.*, en.name AS entity_name "
+                "FROM memory_interpretations mo "
+                "LEFT JOIN entity_nodes en ON en.id = mo.entity_id "
+                f"WHERE {' AND '.join(base_where)} "
+                f"AND ({' OR '.join(keyword_clauses)}) "
+                "ORDER BY COALESCE(mo.last_supported_at, mo.updated_at, mo.created_at, '') DESC, "
+                "mo.id DESC "
+                "LIMIT ?",
+                base_params + keyword_params + [clean_limit],
+            ).fetchall()
+            _add_rows(keyword_rows)
+
+        items = [
+            self._memory_interpretation_from_row(row)
+            for row in rows_by_id.values()
+        ]
         items.sort(
             key=lambda item: (
                 item.get("last_supported_at")
@@ -4432,7 +4532,7 @@ class SessionDB:
             ),
             reverse=True,
         )
-        return items[:max(1, int(top_k or 3))]
+        return items
 
     def get_interpretations_for_observation(
         self,
