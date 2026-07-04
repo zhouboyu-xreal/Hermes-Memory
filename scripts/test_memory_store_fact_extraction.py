@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 import requests
-from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -29,14 +28,14 @@ if str(REPO_ROOT) not in sys.path:
 
 from agent.memory_node_manager import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL, MemoryNodeManager
 from hermes_cli.config import load_config
+from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_constants import get_hermes_home
 import hermes_state
 from hermes_state import SessionDB
 
 
 DEFAULT_INPUT = Path("/Users/zhouboyu/Downloads/history_dialogue.json")
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "tmp" / "memory_store_fact_test"
-DEFAULT_LOG_PATH = REPO_ROOT / "tmp" / "memory_store_fact_test" / "memory_store_extraction_test.log"
+DEFAULT_OUTPUT_ROOT_DIR = REPO_ROOT / "tmp" / "memory_store_fact_test"
 
 SAMPLE_ID_RE = re.compile(r"(?:^|_)sample(\d+)$")
 
@@ -375,9 +374,17 @@ def parse_args() -> argparse.Namespace:
             "script. Defaults to json."
         ),
     )
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-root-dir", type=Path, default=DEFAULT_OUTPUT_ROOT_DIR)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help=(
+            "Optional explicit run output directory. By default a run directory "
+            "is created under --output-root-dir from the test dataset name and timestamp."
+        ),
+    )
     parser.add_argument("--db-name", default="memory_store_fact_test.db")
-    parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
+    parser.add_argument("--log-path", type=Path)
     parser.add_argument("--limit", type=int, default=0, help="Limit turns for smoke testing; 0 means all.")
     parser.add_argument("--start", type=int, default=0, help="Start offset in flattened turns.")
     parser.add_argument("--overwrite", action="store_true", help="Replace existing output DB/report files.")
@@ -441,6 +448,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--manager-log-level", default="INFO")
     return parser.parse_args()
+
+
+def _safe_output_name(value: str) -> str:
+    cleaned = "".join(
+        char if char.isalnum() or char in {"-", "_", "."} else "_"
+        for char in str(value or "").strip()
+    ).strip("._")
+    return cleaned or "memory_store_fact_test"
+
+
+def resolve_output_paths(args: argparse.Namespace) -> Tuple[Path, Path]:
+    dataset_name = (
+        args.input.stem
+        if args.sample_source == "json"
+        else "python_test_samples"
+    )
+    dataset_stem = _safe_output_name(dataset_name)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    output_root_dir = Path(args.output_root_dir or DEFAULT_OUTPUT_ROOT_DIR)
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir
+        else output_root_dir / f"{dataset_stem}_{timestamp}"
+    )
+    args.output_root_dir = output_root_dir
+    args.output_dir = output_dir
+    args.log_path = (
+        Path(args.log_path)
+        if args.log_path
+        else output_dir / "memory_store_extraction_test.log"
+    )
+
+    db_path = output_dir / args.db_name
+    report_path = output_dir / "memory_store_fact_report.jsonl"
+    return db_path, report_path
 
 
 def remove_existing_outputs(db_path: Path, report_path: Path, overwrite: bool) -> None:
@@ -529,6 +572,15 @@ def configure_logging(log_path: Path, log_level: str, manager_log_level: str) ->
     )
 
 
+def _configured_embedding_api_key_env(embedding_config: Dict[str, Any]) -> str:
+    api_key_env = str(embedding_config.get("api_key_env") or "").strip()
+    if api_key_env:
+        return api_key_env
+    api_key = str(embedding_config.get("api_key") or "").strip()
+    match = re.fullmatch(r"\${([A-Za-z_][A-Za-z0-9_]*)}", api_key)
+    return match.group(1) if match else ""
+
+
 def validate_embedding_runtime(
     manager: MemoryNodeManager,
     db: SessionDB,
@@ -552,6 +604,18 @@ def validate_embedding_runtime(
             "FAISS is unavailable in the active Python environment "
             f"({sys.executable}). Run this script with an environment that "
             "provides the 'faiss' module."
+        )
+    configured_api_key_env = _configured_embedding_api_key_env(embedding_config)
+    if (
+        configured_api_key_env
+        and not os.getenv(configured_api_key_env)
+        and not os.getenv("EMBEDDING_API_KEY")
+    ):
+        raise RuntimeError(
+            "Embedding API key environment variable is not set: "
+            f"{configured_api_key_env}. memory.yaml configures embedding.api_key "
+            f"or embedding.api_key_env to use this variable. Alternatively, "
+            f"set EMBEDDING_API_KEY as the generic embedding fallback."
         )
     if not manager._ensure_embedding_client():
         raise RuntimeError("Failed to initialize the configured embedding client")
@@ -596,12 +660,19 @@ def log_faiss_state(db: SessionDB, event: str) -> None:
 
 
 def main() -> int:
-    # load_dotenv(REPO_ROOT / ".env")
-    # load_dotenv(get_hermes_home() / ".env")
-
+    loaded_env_paths = load_hermes_dotenv(
+        hermes_home=get_hermes_home(),
+        project_env=REPO_ROOT / ".env",
+    )
     args = parse_args()
+    db_path, report_path = resolve_output_paths(args)
     resolve_llm_args(args)
     configure_logging(args.log_path, args.log_level, args.manager_log_level)
+    if loaded_env_paths:
+        logging.info(
+            "Loaded environment variables from: %s",
+            ", ".join(str(path) for path in loaded_env_paths),
+        )
     
     if not args.llm_api_key and args.llm_base_url.rstrip("/") == DEFAULT_LLM_BASE_URL:
         raise RuntimeError(
@@ -617,8 +688,6 @@ def main() -> int:
         raise RuntimeError("No user/assistant turns found in input")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    db_path = args.output_dir / args.db_name
-    report_path = args.output_dir / "memory_store_fact_report.jsonl"
     remove_existing_outputs(db_path, report_path, args.overwrite)
 
     report_rows: List[Dict[str, Any]] = []
@@ -838,6 +907,9 @@ def main() -> int:
     summary = {
         "sample_source": args.sample_source,
         "input": str(args.input) if args.sample_source == "json" else "PYTHON_TEST_SAMPLES",
+        "output_root_dir": str(args.output_root_dir),
+        "output_dir": str(args.output_dir),
+        "log_path": str(args.log_path),
         "db_path": str(db_path),
         "report_path": str(report_path),
         "turns_processed": len(turns),
