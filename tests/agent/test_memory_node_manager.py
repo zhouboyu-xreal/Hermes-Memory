@@ -777,7 +777,7 @@ def test_reflect_applies_pending_interpretation_feedback_first(db):
     report = mgr.reflect(limit=10)
 
     row = db._conn.execute(
-        "SELECT claim, target_text, confidence, status, conflict_status, action_implication, metadata "
+        "SELECT claim, scope, confidence, status, conflict_status, action_implication, metadata "
         "FROM memory_interpretations WHERE id = ?",
         (interpretation_id,),
     ).fetchone()
@@ -787,7 +787,7 @@ def test_reflect_applies_pending_interpretation_feedback_first(db):
     metadata = json.loads(row["metadata"])
     assert report["interpretation_feedback"]["applied"] == 1
     assert row["claim"] == "用户当前健康困扰更偏向睡眠状态，而不是工作压力。"
-    assert row["target_text"] == "睡眠状态"
+    assert row["scope"] == "health"
     assert row["confidence"] == pytest.approx(0.86)
     assert row["conflict_status"] == "resolved"
     assert "睡眠状态" in row["action_implication"]
@@ -3026,7 +3026,7 @@ def test_memory_search_uses_temporal_channel_when_semantic_and_keyword_are_empty
     monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
     monkeypatch.setattr(db, "_search_memory_keyword", lambda *args, **kwargs: {})
 
-    nodes = db.search_memory_facts(
+    nodes = db.retrieve_memory_fact_raw_candidates(
         "no-match",
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
@@ -3053,10 +3053,10 @@ def test_memory_search_facts_excludes_graph_neighbors_by_default(db, monkeypatch
     alice_id = db.entity_add_entity("Alice", "PERSON")
     db.entity_link_node(slack, alice_id)
     db.entity_link_node(calendar, alice_id)
-    db.memory_add_node_relation(slack, calendar, "semantic", confidence=0.9)
+    db.add_memory_fact_relation(slack, calendar, "semantic", confidence=0.9)
     monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
 
-    nodes = db.search_memory_facts(
+    nodes = db.retrieve_memory_fact_raw_candidates(
         ["Slack"],
         np.ones((1, 1536), dtype=np.float32),
         top_k=3,
@@ -3090,12 +3090,12 @@ def test_memory_search_rrf_includes_graph_neighbors_when_enabled(db, monkeypatch
     alice_id = db.entity_add_entity("Alice", "PERSON")
     db.entity_link_node(slack, alice_id)
     db.entity_link_node(calendar, alice_id)
-    db.memory_add_node_relation(slack, calendar, "semantic", confidence=0.9)
+    db.add_memory_fact_relation(slack, calendar, "semantic", confidence=0.9)
     charlie_id = db.entity_add_entity("Charlie", "PERSON")
     db.entity_link_node(unrelated, charlie_id)
     monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
 
-    nodes = db.search_memory_facts(
+    nodes = db.retrieve_memory_fact_raw_candidates(
         ["Slack"],
         np.ones((1, 1536), dtype=np.float32),
         top_k=3,
@@ -3125,13 +3125,13 @@ def test_memory_search_filters_by_fact_type(db, monkeypatch):
     )
     monkeypatch.setattr(db, "_search_memory_vector", lambda *args, **kwargs: {})
 
-    semantic_nodes = db.search_memory_facts(
+    semantic_nodes = db.retrieve_memory_fact_raw_candidates(
         ["Alice", "Slack"],
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
         fact_types=["semantic"],
     )
-    episodic_nodes = db.search_memory_facts(
+    episodic_nodes = db.retrieve_memory_fact_raw_candidates(
         ["Alice", "Slack"],
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
@@ -3267,7 +3267,7 @@ def test_memory_search_pushes_time_candidate_ids_to_vector_channel(db, monkeypat
 
     monkeypatch.setattr(db, "_search_memory_vector", fake_vector_search)
 
-    nodes = db.search_memory_facts(
+    nodes = db.retrieve_memory_fact_raw_candidates(
         "Slack",
         np.ones((1, 1536), dtype=np.float32),
         top_k=5,
@@ -3303,7 +3303,7 @@ def test_memory_search_reranks_final_candidates_by_decay_score(db, monkeypatch):
         lambda *args, **kwargs: {stale: 0.01, fresh: 0.02},
     )
 
-    nodes = db.search_memory_facts(
+    nodes = db.retrieve_memory_fact_raw_candidates(
         "Alice alerts",
         np.ones((1, 1536), dtype=np.float32),
         top_k=2,
@@ -5343,8 +5343,8 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
 
     assert report["evidence_bundles_consolidated"] == 1
     interpretation = db._conn.execute(
-        "SELECT claim, entity_id, target_text, scope, interpretation_type, confidence, "
-        "action_implication, evidence_node_ids, evidence_observation_ids, metadata "
+        "SELECT claim, entity_id, scope, interpretation_type, confidence, "
+        "action_implication, evidence_fact_ids, evidence_observation_ids, metadata "
         "FROM memory_interpretations"
     ).fetchone()
     evidence_bundle_id = db._conn.execute(
@@ -5357,12 +5357,11 @@ def test_reflect_generates_interpretation_from_consolidated_observation(db):
     assert set(bundle_metadata) <= {"decay"}
     assert interpretation["entity_id"] == alice
     assert interpretation["interpretation_type"] == "explicit_preference"
-    assert interpretation["target_text"] == "urgent alert routing"
-    assert interpretation["scope"] == "alert-workflow"
+    assert interpretation["scope"] == "alert-routing"
     assert interpretation["confidence"] == pytest.approx(0.88)
     assert "优先使用 Slack" in interpretation["claim"]
     assert "优先建议 Slack" in interpretation["action_implication"]
-    assert json.loads(interpretation["evidence_node_ids"]) == node_ids[:2]
+    assert json.loads(interpretation["evidence_fact_ids"]) == node_ids[:2]
     evidence_observation_ids = json.loads(
         interpretation["evidence_observation_ids"]
     )
@@ -7674,15 +7673,16 @@ def test_interpretation_generation_prompt_defines_interpretation_contract():
     assert "confidence 不要超过 0.75" in INTERPRETATION_GENERATION_PROMPT
     assert "should_create=false" in INTERPRETATION_GENERATION_PROMPT
     assert "action_implication" in INTERPRETATION_GENERATION_PROMPT
-    assert "evidence_node_ids" in INTERPRETATION_GENERATION_PROMPT
+    assert "primary_topic" in INTERPRETATION_GENERATION_PROMPT
+    assert "evidence_fact_ids" in INTERPRETATION_GENERATION_PROMPT
     assert "evidence_observation_ids 是支持该 interpretation 的 observation id" in INTERPRETATION_GENERATION_PROMPT
-    assert "counter_evidence_node_ids 是反驳、削弱、限定或造成冲突的底层 fact id" in INTERPRETATION_GENERATION_PROMPT
+    assert "counter_evidence_fact_ids 是反驳、削弱、限定或造成冲突的底层 fact id" in INTERPRETATION_GENERATION_PROMPT
     assert "如果只是证据不足，不要把无关事实放入 counter_evidence_*" in INTERPRETATION_GENERATION_PROMPT
     assert "interpretation_type 只能是 insight、task" in INTERPRETATION_GENERATION_PROMPT
     assert "conflict_resolution" in INTERPRETATION_GENERATION_PROMPT
     assert "更新一条已经存在的 interpretation" in INTERPRETATION_UPDATE_PROMPT
     assert "新的 observation" in INTERPRETATION_UPDATE_PROMPT
-    assert "evidence_node_ids 是直接支持更新后 interpretation 的底层 fact id" in INTERPRETATION_UPDATE_PROMPT
+    assert "evidence_fact_ids 是直接支持更新后 interpretation 的底层 fact id" in INTERPRETATION_UPDATE_PROMPT
     assert "evidence_observation_ids 是支持更新后 interpretation 的 observation id" in INTERPRETATION_UPDATE_PROMPT
     assert "counter_evidence_observation_ids 是反驳、削弱、限定或造成冲突的 observation id" in INTERPRETATION_UPDATE_PROMPT
 
@@ -7716,7 +7716,7 @@ def test_observation_source_nodes_match_topic_key_exactly(db):
         summary="Alice wants outdoor activities.",
         keywords=["户外活动"],
     )
-    low_intensity = db.memory_add_node(
+    low_intensity = db.add_memory_fact(
         time_key="2026-05-01 11:00:00",
         summary="Alice wants low-intensity outdoor activities.",
         keywords=["低强度户外活动"],
@@ -7901,7 +7901,7 @@ def test_memory_node_relations_store_multidimensional_scores(db):
     db.entity_link_node(source, alice_id)
     db.entity_link_node(target, alice_id)
 
-    db.memory_add_node_relation(
+    db.add_memory_fact_relation(
         source_node_id=source,
         target_node_id=target,
         relation_type="semantic",
@@ -7945,9 +7945,9 @@ def test_memory_graph_expand_uses_priority_beam_search(db):
         keywords=["target"],
     )
 
-    db.memory_add_node_relation(seed, weak_direct, "semantic", confidence=0.2, weight=0.2)
-    db.memory_add_node_relation(seed, strong_bridge, "semantic", confidence=0.9, weight=0.9)
-    db.memory_add_node_relation(strong_bridge, strong_second_hop, "semantic", confidence=0.9, weight=0.9)
+    db.add_memory_fact_relation(seed, weak_direct, "semantic", confidence=0.2, weight=0.2)
+    db.add_memory_fact_relation(seed, strong_bridge, "semantic", confidence=0.9, weight=0.9)
+    db.add_memory_fact_relation(strong_bridge, strong_second_hop, "semantic", confidence=0.9, weight=0.9)
 
     ranked = db._memory_graph_expand_ranked(
         [seed],

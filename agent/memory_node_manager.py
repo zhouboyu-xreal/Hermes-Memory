@@ -729,8 +729,7 @@ supporting facts:
 - conflict_status 只能是 none、resolved、unresolved。
 - polarity 只能是 positive、negative、mixed、neutral。
 - strength/confidence 是 0.0-1.0；inferred 类型如果证据少，confidence 不要超过 0.75。
-- scope 是这条解释适用的范围，尽量短，如 "memory-system-design"。
-- target_text 是解释指向的对象、方案、习惯、项目状态或风险。
+- primary_topic 由你输出，表示这条 interpretation 最核心的 observation topic；必须来自输入 topic 或 observation_metadata.topic_key/topic_label，不要自由创造新主题。
 - action_implication 描述这条解释未来如何影响 Agent 行为；如果没有明确行动含义，应 should_create=false。
 - evidence_fact_ids 是直接支持该 interpretation 的底层 fact id，表示“为什么 Agent 相信这个解释”；只能使用 supporting facts 中出现的 id。
 - evidence_observation_ids 是支持该 interpretation 的 observation id，表示“哪些中层归纳支撑这个解释”；只能使用输入 observation 的 id。
@@ -743,8 +742,7 @@ supporting facts:
 {{
   "should_create": true,
   "claim": "Agent 当前解释为...",
-  "target_text": "解释对象",
-  "scope": "适用范围",
+  "primary_topic": "核心 observation topic",
   "interpretation_type": "insight | task | explicit_preference | explicit_instruction | inferred_preference | behavior_pattern | project_state | task_risk | constraint | conflict_resolution | strategy | other",
   "polarity": "positive | negative | mixed | neutral",
   "strength": 0.0,
@@ -831,7 +829,6 @@ conflict_status: {conflict_status}
 polarity: {polarity}
 strength: {strength}
 confidence: {confidence}
-target_text: {target_text}
 scope: {scope}
 claim: {claim}
 resolution: {resolution}
@@ -876,8 +873,7 @@ supporting facts:
 {{
   "should_update": true,
   "claim": "更新后的 Agent 当前解释...",
-  "target_text": "解释对象",
-  "scope": "适用范围",
+  "primary_topic": "核心 observation topic",
   "interpretation_type": "insight | task | explicit_preference | explicit_instruction | inferred_preference | behavior_pattern | project_state | task_risk | constraint | conflict_resolution | strategy | other",
   "polarity": "positive | negative | mixed | neutral",
   "strength": 0.0,
@@ -930,8 +926,7 @@ supporting facts:
 {{
   "should_update": true,
   "claim": "更新后的 Agent 当前解释",
-  "target_text": "解释对象",
-  "scope": "适用范围",
+  "primary_topic": "核心 observation topic",
   "interpretation_type": "insight | task | explicit_preference | explicit_instruction | inferred_preference | behavior_pattern | project_state | task_risk | constraint | conflict_resolution | strategy | other",
   "polarity": "positive | negative | mixed | neutral",
   "strength": 0.0,
@@ -959,7 +954,7 @@ INTERPRETATION_FEEDBACK_ANALYSIS_PROMPT = """你是长期记忆系统的 interpr
 - feedback 必须绑定到输入中的 interpretation_id。
 - recall 只是候选召回，不代表每个 recalled_interpretation 都和 current_user_message 有关；如果某条 interpretation 与当前用户消息没有直接反馈关系，feedback_type=unrelated。
 - 用户经常反馈的是上一轮 assistant 的具体建议或行动方案，而不是否定 recalled_interpretation 本身；这类情况 feedback_target=assistant_response，不能更新 interpretation。
-- 只有当用户明确确认、否认、修正或表示过时的是 interpretation 的核心 claim/scope/action_implication 时，feedback_target 才能是 interpretation_claim 或 both。
+- 只有当用户明确确认、否认、修正或表示过时的是 interpretation 的核心 claim/action_implication 时，feedback_target 才能是 interpretation_claim 或 both。
 - reject 必须要求用户明确否认 interpretation 的核心判断；“这个建议不适合我”“计划太难执行”通常只是 assistant_response 反馈，除非它同时明确否认了 interpretation claim。
 - has_feedback=true 仅表示至少存在一条 accept/reject/modify/defer/outdated；如果全部是 unrelated 或 none，has_feedback=false。
 
@@ -1014,7 +1009,7 @@ user_feedback:
 
 更新要求：
 - 只会为 feedback_type=modify 或 reject 调用本 prompt。
-- modify：吸收用户 correction，更新 claim/action_implication/scope/resolution；不要保留已被用户纠正的错误推断。
+- modify：吸收用户 correction，更新 claim/action_implication/resolution；不要保留已被用户纠正的错误推断。
 - reject：用户明确否认原 interpretation 的核心 claim。不要简单地把原 claim 取反；如果用户提供了明确替代含义，围绕替代含义重写 claim；如果用户只是表达不接受但没有给出可校准的新含义，输出 {{"should_update": false}}。
 - accept/defer/outdated/none/related 不应由本 prompt 处理。
 
@@ -1031,8 +1026,7 @@ user_feedback:
 {{
   "should_update": true,
   "claim": "更新后的 Agent 当前解释",
-  "target_text": "解释对象",
-  "scope": "适用范围",
+  "primary_topic": "核心 observation topic",
   "interpretation_type": "insight | task | explicit_preference | explicit_instruction | inferred_preference | behavior_pattern | project_state | task_risk | constraint | conflict_resolution | strategy | other",
   "polarity": "positive | negative | mixed | neutral",
   "strength": 0.0,
@@ -1551,7 +1545,6 @@ class MemoryNodeManager:
     def _build_interpretation_embedding_text(
         *,
         entity_name: str = "",
-        target_text: str = "",
         scope: str = "",
         interpretation_type: str = "",
         claim: str = "",
@@ -1562,7 +1555,6 @@ class MemoryNodeManager:
             part
             for part in [
                 f"entity: {entity_name}" if entity_name else "",
-                f"target: {target_text}" if target_text else "",
                 f"scope: {scope}" if scope else "",
                 f"type: {interpretation_type}" if interpretation_type else "",
                 f"claim: {claim}" if claim else "",
@@ -1571,6 +1563,41 @@ class MemoryNodeManager:
             ]
             if part
         )
+
+    @classmethod
+    def _interpretation_scope_from_observations(
+        cls,
+        observations: List[Dict[str, Any]],
+        *,
+        fallback: str = "general",
+        max_topics: int = 3,
+    ) -> str:
+        """Derive interpretation scope from linked observation topics."""
+        counts: Dict[str, int] = {}
+        for observation in observations or []:
+            topic_key = cls._topic_key(
+                observation.get("topic_key")
+                or observation.get("topic_label")
+                or ""
+            )
+            if not topic_key:
+                continue
+            counts[topic_key] = counts.get(topic_key, 0) + 1
+        if not counts:
+            clean_fallback = str(fallback or "general").strip()
+            return clean_fallback or "general"
+        ranked = sorted(counts, key=lambda topic: (-counts[topic], topic))
+        selected = ranked[: max(1, int(max_topics or 1))]
+        return "|".join(selected)
+
+    @classmethod
+    def _primary_topic_from_scope(cls, scope: str, fallback: str = "general") -> str:
+        for part in str(scope or "").split("|"):
+            topic = cls._topic_key(part)
+            if topic:
+                return topic
+        clean_fallback = cls._topic_key(fallback)
+        return clean_fallback or "general"
 
     # ── LLM call (shared client when available) ─────────────────────────
 
@@ -4386,6 +4413,13 @@ class MemoryNodeManager:
             "source": "interpretation_generation",
             **metadata_out,
         }
+        primary_topic = str(
+            data.get("primary_topic")
+            or observation.get("topic_key")
+            or observation.get("topic_label")
+            or "general"
+        ).strip() or "general"
+        metadata_out["primary_topic"] = self._topic_key(primary_topic) or primary_topic
         if len(evidence_observation_ids) == 1:
             metadata_out.setdefault("evidence_shape", "single_observation")
             if interpretation_type not in {"task", "explicit_preference", "explicit_instruction"}:
@@ -4393,8 +4427,6 @@ class MemoryNodeManager:
         return {
             "claim": claim,
             "subject_text": str(data.get("subject_text") or "agent").strip() or "agent",
-            "target_text": str(data.get("target_text") or "").strip(),
-            "scope": str(data.get("scope") or "general").strip() or "general",
             "interpretation_type": interpretation_type,
             "polarity": polarity,
             "strength": max(0.0, min(1.0, strength)),
@@ -4462,7 +4494,6 @@ class MemoryNodeManager:
             polarity=interpretation.get("polarity", "neutral"),
             strength=interpretation.get("strength", 0.5),
             confidence=interpretation.get("confidence", 0.5),
-            target_text=interpretation.get("target_text", ""),
             scope=interpretation.get("scope", "general"),
             claim=interpretation.get("claim", ""),
             resolution=interpretation.get("resolution", ""),
@@ -4553,11 +4584,12 @@ class MemoryNodeManager:
             "source": "interpretation_update",
             **metadata_out,
         }
+        primary_topic = str(data.get("primary_topic") or "").strip()
+        if primary_topic:
+            metadata_out["primary_topic"] = self._topic_key(primary_topic) or primary_topic
         return {
             "claim": claim,
             "subject_text": str(interpretation.get("subject_text") or "agent").strip() or "agent",
-            "target_text": str(data.get("target_text") or interpretation.get("target_text") or "").strip(),
-            "scope": str(data.get("scope") or interpretation.get("scope") or "general").strip() or "general",
             "interpretation_type": interpretation_type,
             "polarity": polarity,
             "strength": max(0.0, min(1.0, strength)),
@@ -4642,7 +4674,7 @@ class MemoryNodeManager:
         interpretation_payload = {
             key: interpretation.get(key)
             for key in (
-                "id", "claim", "target_text", "scope", "interpretation_type",
+                "id", "claim", "scope", "interpretation_type",
                 "polarity", "strength", "confidence", "status",
                 "conflict_status", "resolution", "action_implication",
                 "evidence_fact_ids", "evidence_observation_ids",
@@ -4773,19 +4805,14 @@ class MemoryNodeManager:
             "source": "interpretation_batch_update",
             **metadata_out,
         }
+        primary_topic = str(data.get("primary_topic") or "").strip()
+        if primary_topic:
+            metadata_out["primary_topic"] = self._topic_key(primary_topic) or primary_topic
         return {
             "claim": claim,
             "subject_text": str(
                 interpretation.get("subject_text") or "agent"
             ).strip() or "agent",
-            "target_text": str(
-                data.get("target_text")
-                or interpretation.get("target_text")
-                or ""
-            ).strip(),
-            "scope": str(
-                data.get("scope") or interpretation.get("scope") or "general"
-            ).strip() or "general",
             "interpretation_type": interpretation_type,
             "polarity": polarity,
             "strength": max(0.0, min(1.0, strength)),
@@ -5093,11 +5120,11 @@ class MemoryNodeManager:
             elif evidence_mixture in {"balanced_mixed", "episodic_dominant"} and evidence_shape in {"repeated_pattern", "confirmation"}:
                 score += 0.04
                 reasons.append("episodic_preference_pattern")
-            target_terms = cls._match_terms(interpretation.get("target_text"), interpretation.get("scope"))
+            target_terms = cls._match_terms(interpretation.get("scope"))
             target_overlap = cls._term_overlap_score(observation_terms, target_terms)
             if target_overlap:
                 score += min(0.08, target_overlap * 0.08)
-                reasons.append("preference_target")
+                reasons.append("preference_scope")
 
         elif interpretation_family == "task":
             if observation_type in {"task_state", "task_progress", "decision"}:
@@ -5242,7 +5269,6 @@ class MemoryNodeManager:
         interpretation_topic = self._topic_key(
             metadata.get("topic_key")
             or interpretation.get("scope")
-            or interpretation.get("target_text")
             or ""
         )
         if observation_topic and interpretation_topic and observation_topic == interpretation_topic:
@@ -5258,7 +5284,6 @@ class MemoryNodeManager:
         interpretation_terms = self._match_terms(
             interpretation.get("claim"),
             interpretation.get("action_implication"),
-            interpretation.get("target_text"),
             interpretation.get("scope"),
         )
         overlap = self._term_overlap_score(observation_terms, interpretation_terms)
@@ -5404,7 +5429,6 @@ class MemoryNodeManager:
             candidate_payloads.append({
                 "id": candidate_id,
                 "claim": candidate.get("claim"),
-                "target_text": candidate.get("target_text"),
                 "scope": candidate.get("scope"),
                 "interpretation_type": candidate.get("interpretation_type"),
                 "status": candidate.get("status"),
@@ -5624,11 +5648,28 @@ class MemoryNodeManager:
         }
 
         claim = updated.get("claim", interpretation.get("claim", ""))
-        target_text = updated.get(
-            "target_text",
-            interpretation.get("target_text", ""),
+        scope_observation_ids = list(dict.fromkeys([
+            *evidence_observation_ids,
+            *[
+                int(assignment["item"]["observation_id"])
+                for assignment in assignments
+            ],
+        ]))
+        scope_observations = self._db.get_observations_by_ids(scope_observation_ids)
+        if not scope_observations:
+            scope_observations = [
+                assignment["item"]["observation"]
+                for assignment in assignments
+            ]
+        scope = self._interpretation_scope_from_observations(
+            scope_observations,
+            fallback=interpretation.get("scope", "general"),
         )
-        scope = updated.get("scope", interpretation.get("scope", "general"))
+        metadata["primary_topic"] = (
+            self._topic_key(metadata.get("primary_topic") or "")
+            or self._primary_topic_from_scope(scope)
+        )
+        metadata["scope_topic_keys"] = [topic for topic in scope.split("|") if topic]
         interpretation_type = updated.get(
             "interpretation_type",
             interpretation.get("interpretation_type", "insight"),
@@ -5648,7 +5689,6 @@ class MemoryNodeManager:
                 or assignments[0]["item"]["observation"].get("entity_name")
                 or ""
             ),
-            target_text=target_text,
             scope=scope,
             interpretation_type=interpretation_type,
             claim=claim,
@@ -5667,7 +5707,6 @@ class MemoryNodeManager:
                 "subject_text",
                 interpretation.get("subject_text", ""),
             ),
-            target_text=target_text,
             scope=scope,
             interpretation_type=interpretation_type,
             polarity=updated.get(
@@ -6058,6 +6097,19 @@ class MemoryNodeManager:
             return None
 
         source_fact_ids = [int(fact["id"]) for fact in all_source_facts if fact.get("id") is not None]
+        linked_observations = [item["observation"] for item in items]
+        derived_scope = self._interpretation_scope_from_observations(
+            linked_observations,
+            fallback=representative.get("topic_key") or representative.get("topic_label") or "general",
+        )
+        llm_primary_topic = self._topic_key(
+            self._json_dict(interpretation.get("metadata", {})).get("primary_topic")
+            or ""
+        )
+        primary_topic = llm_primary_topic or self._primary_topic_from_scope(
+            derived_scope,
+            fallback=representative.get("topic_key") or representative.get("topic_label") or "general",
+        )
         metadata = {
             **(interpretation["metadata"] or {}),
             "observation_id": int(observation_ids[0]),
@@ -6066,13 +6118,14 @@ class MemoryNodeManager:
             "entity_name": representative.get("entity_name"),
             "topic_key": representative.get("topic_key"),
             "topic_label": representative.get("topic_label"),
+            "primary_topic": primary_topic,
+            "scope_topic_keys": [topic for topic in derived_scope.split("|") if topic],
             "observation_type": representative.get("observation_type", "observation"),
             "interpretation_cluster_family": family,
         }
         embedding_text = self._build_interpretation_embedding_text(
             entity_name=representative.get("entity_name") or "",
-            target_text=interpretation["target_text"],
-            scope=interpretation["scope"],
+            scope=derived_scope,
             interpretation_type=interpretation["interpretation_type"],
             claim=interpretation["claim"],
             action_implication=interpretation["action_implication"],
@@ -6082,8 +6135,7 @@ class MemoryNodeManager:
             claim=interpretation["claim"],
             entity_id=representative.get("entity_id"),
             subject_text=interpretation["subject_text"],
-            target_text=interpretation["target_text"],
-            scope=interpretation["scope"],
+            scope=derived_scope,
             interpretation_type=interpretation["interpretation_type"],
             polarity=interpretation["polarity"],
             strength=interpretation["strength"],
@@ -7344,7 +7396,6 @@ class MemoryNodeManager:
             for key in (
                 "claim",
                 "scope",
-                "target_text",
                 "interpretation_type",
                 "action_implication",
                 "resolution",
@@ -7417,7 +7468,6 @@ class MemoryNodeManager:
                 "status": item.get("status"),
                 "confidence": item.get("confidence"),
                 "scope": item.get("scope"),
-                "target_text": item.get("target_text"),
                 "action_implication": item.get("action_implication"),
                 "resolution": item.get("resolution"),
                 "entity_name": item.get("entity_name") or metadata.get("entity_name"),
@@ -8527,7 +8577,6 @@ class MemoryNodeManager:
             for key in (
                 "id",
                 "claim",
-                "target_text",
                 "scope",
                 "interpretation_type",
                 "polarity",
@@ -8595,8 +8644,6 @@ class MemoryNodeManager:
             polarity = "neutral"
         return {
             "claim": str(data.get("claim") or interpretation.get("claim") or "").strip(),
-            "target_text": str(data.get("target_text") or interpretation.get("target_text") or "").strip(),
-            "scope": str(data.get("scope") or interpretation.get("scope") or "general").strip() or "general",
             "interpretation_type": interpretation_type,
             "polarity": polarity,
             "strength": self._clip_unit_float(data.get("strength"), float(interpretation.get("strength") or 0.5)),
@@ -8612,7 +8659,17 @@ class MemoryNodeManager:
                 or interpretation.get("action_implication")
                 or ""
             ).strip(),
-            "metadata": self._json_dict(data.get("metadata", {})),
+            "metadata": {
+                **self._json_dict(data.get("metadata", {})),
+                **(
+                    {
+                        "primary_topic": self._topic_key(data.get("primary_topic") or "")
+                        or str(data.get("primary_topic") or "").strip()
+                    }
+                    if str(data.get("primary_topic") or "").strip()
+                    else {}
+                ),
+            },
         }
 
     def _fallback_update_interpretation_using_feedback(
@@ -8649,8 +8706,6 @@ class MemoryNodeManager:
             resolution = str(feedback.get("evidence_text") or "User deferred this interpretation.").strip()
         return {
             "claim": interpretation.get("claim", ""),
-            "target_text": interpretation.get("target_text", ""),
-            "scope": interpretation.get("scope", "general"),
             "interpretation_type": interpretation.get("interpretation_type", "insight"),
             "polarity": interpretation.get("polarity", "neutral"),
             "strength": strength,
@@ -8746,8 +8801,11 @@ class MemoryNodeManager:
             or interpretation.get("action_implication")
             or ""
         ).strip()
-        target_text = str(update.get("target_text") or interpretation.get("target_text") or "").strip()
-        scope = str(update.get("scope") or interpretation.get("scope") or "general").strip() or "general"
+        scope = str(interpretation.get("scope") or "general").strip() or "general"
+        metadata["primary_topic"] = metadata.get("primary_topic") or self._primary_topic_from_scope(scope)
+        metadata["scope_topic_keys"] = metadata.get("scope_topic_keys") or [
+            topic for topic in scope.split("|") if topic
+        ]
         interpretation_type = str(
             update.get("interpretation_type")
             or interpretation.get("interpretation_type")
@@ -8756,7 +8814,6 @@ class MemoryNodeManager:
         resolution = str(update.get("resolution") or interpretation.get("resolution") or "").strip()
         embedding_text = self._build_interpretation_embedding_text(
             entity_name=interpretation.get("entity_name") or metadata.get("entity_name") or "",
-            target_text=target_text,
             scope=scope,
             interpretation_type=interpretation_type,
             claim=claim,
@@ -8768,7 +8825,6 @@ class MemoryNodeManager:
             claim=claim,
             entity_id=interpretation.get("entity_id") or metadata.get("entity_id"),
             subject_text=interpretation.get("subject_text", ""),
-            target_text=target_text,
             scope=scope,
             interpretation_type=interpretation_type,
             polarity=update.get("polarity", interpretation.get("polarity", "neutral")),
@@ -9309,7 +9365,7 @@ class MemoryNodeManager:
     def _recall_item_text(layer: str, item: Dict[str, Any]) -> str:
         if layer == "interpretation":
             keys = (
-                "claim", "action_implication", "subject_text", "target_text",
+                "claim", "action_implication", "subject_text",
                 "scope", "interpretation_type", "resolution", "entity_name",
             )
         elif layer == "observation":
@@ -9518,13 +9574,13 @@ class MemoryNodeManager:
             content_haystack = " ".join(
                 str(item.get(key) or "")
                 for key in (
-                    "claim", "action_implication", "subject_text", "target_text",
+                    "claim", "action_implication", "subject_text",
                     "scope", "interpretation_type", "resolution",
                 )
             ).lower()
             boundary_text = " ".join(
                 str(item.get(key) or "")
-                for key in ("claim", "scope", "target_text", "action_implication")
+                for key in ("claim", "scope", "action_implication")
             )
             if query_text_terms:
                 boundary_terms = cls._memory_text_terms(boundary_text)

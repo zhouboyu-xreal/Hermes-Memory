@@ -405,7 +405,6 @@ CREATE TABLE IF NOT EXISTS memory_interpretations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_id INTEGER REFERENCES entity_nodes(id),
     subject_text TEXT NOT NULL DEFAULT '',
-    target_text TEXT NOT NULL DEFAULT '',
     scope TEXT NOT NULL DEFAULT 'general',
     interpretation_type TEXT NOT NULL DEFAULT 'behavior_pattern',
     claim TEXT NOT NULL,
@@ -4155,7 +4154,6 @@ class SessionDB:
         claim: str,
         entity_id: Optional[int] = None,
         subject_text: str = "",
-        target_text: str = "",
         scope: str = "general",
         interpretation_type: str = "behavior_pattern",
         polarity: str = "neutral",
@@ -4173,6 +4171,7 @@ class SessionDB:
         embedding_text: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         interpretation_id: Optional[int] = None,
+        **_ignored_fields: Any,
     ) -> int:
         """Create or update an agent interpretation over memory evidence.
 
@@ -4188,7 +4187,6 @@ class SessionDB:
         normalized_status = self._normalize_memory_interpretation_status(status)
         normalized_conflict = self._normalize_memory_interpretation_conflict_status(conflict_status)
         clean_subject = str(subject_text or "").strip()
-        clean_target = str(target_text or "").strip()
         clean_scope = str(scope or "general").strip() or "general"
         clean_polarity = str(polarity or "neutral").strip().lower() or "neutral"
         strength_value = max(0.0, min(1.0, float(strength or 0.0)))
@@ -4223,14 +4221,13 @@ class SessionDB:
                 existing = conn.execute(
                     "SELECT id FROM memory_interpretations "
                     "WHERE entity_id IS ? "
-                    "AND subject_text = ? AND target_text = ? "
-                    "AND scope = ? AND interpretation_type = ? "
+                    "AND subject_text = ? AND scope = ? "
+                    "AND interpretation_type = ? "
                     "AND status IN ('current', 'conflicted') "
                     "ORDER BY updated_at DESC, id DESC LIMIT 1",
                     (
                         clean_entity_id,
                         clean_subject,
-                        clean_target,
                         clean_scope,
                         normalized_type,
                     ),
@@ -4281,8 +4278,8 @@ class SessionDB:
                 )
                 conn.execute(
                     "UPDATE memory_interpretations SET "
-                    "entity_id = ?, subject_text = ?, target_text = ?, "
-                    "scope = ?, interpretation_type = ?, claim = ?, "
+                    "entity_id = ?, subject_text = ?, scope = ?, "
+                    "interpretation_type = ?, claim = ?, "
                     "polarity = ?, strength = ?, confidence = ?, status = ?, "
                     "conflict_status = ?, resolution = ?, action_implication = ?, "
                     "evidence_fact_ids = ?, evidence_observation_ids = ?, "
@@ -4293,7 +4290,6 @@ class SessionDB:
                     (
                         clean_entity_id,
                         clean_subject,
-                        clean_target,
                         clean_scope,
                         normalized_type,
                         clean_claim,
@@ -4328,18 +4324,17 @@ class SessionDB:
                 return int(existing_id)
             cursor = conn.execute(
                 "INSERT INTO memory_interpretations "
-                "(entity_id, subject_text, target_text, "
-                "scope, interpretation_type, claim, polarity, strength, confidence, "
+                "(entity_id, subject_text, scope, "
+                "interpretation_type, claim, polarity, strength, confidence, "
                 "status, conflict_status, resolution, action_implication, "
                 "evidence_fact_ids, evidence_observation_ids, "
                 "counter_evidence_fact_ids, counter_evidence_observation_ids, "
                 "embedding, embedding_text, embedding_updated_at, "
                 "metadata, created_at, updated_at, last_supported_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     clean_entity_id,
                     clean_subject,
-                    clean_target,
                     clean_scope,
                     normalized_type,
                     clean_claim,
