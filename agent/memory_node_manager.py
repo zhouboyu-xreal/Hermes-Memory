@@ -9970,12 +9970,10 @@ class MemoryNodeManager:
                 **self._recall_log_observation_items(observation_candidates)
             },
             "semantic_facts": {
-                **self._recall_log_observation_items(semantic_candidates, limit=semantic_candidate_limit),
-                "top_k": semantic_candidate_limit,
+                **self._recall_log_observation_items(semantic_candidates),
             },
             "episodic_facts": {
-                **self._recall_log_observation_items(episodic_candidates, limit=episodic_candidate_limit),
-                "top_k": episodic_candidate_limit,
+                **self._recall_log_observation_items(episodic_candidates),
             },
         })
         return interpretation_candidates, observation_candidates, semantic_candidates, episodic_candidates
