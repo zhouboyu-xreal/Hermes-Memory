@@ -1564,6 +1564,40 @@ class MemoryNodeManager:
             if part
         )
 
+    @staticmethod
+    def build_fact_embedding_text(
+        *,
+        summary: str = "",
+        primary_entity: str = "",
+        primary_topic: str = "",
+    ) -> str:
+        return "\n".join(
+            part
+            for part in [
+                f"entity: {primary_entity}" if primary_entity else "",
+                f"topic: {primary_topic}" if primary_topic else "",
+                f"summary: {summary}" if summary else "",
+            ]
+            if part
+        )
+
+    @staticmethod
+    def build_observation_embedding_text(
+        *,
+        summary: str = "",
+        topic: str = "",
+        observation_type: str = "",
+    ) -> str:
+        return "\n".join(
+            part
+            for part in [
+                f"topic: {topic}" if topic else "",
+                f"type: {observation_type}" if observation_type else "",
+                f"summary: {summary}" if summary else "",
+            ]
+            if part
+        )
+
     @classmethod
     def _interpretation_scope_from_observations(
         cls,
@@ -3786,6 +3820,7 @@ class MemoryNodeManager:
         *,
         observation_type: str,
         summary: str,
+        topic_key: str,
         source_facts: List[Dict[str, Any]],
         confidence: float,
         previous_metadata: Optional[Dict[str, Any]] = None,
@@ -3819,10 +3854,12 @@ class MemoryNodeManager:
         })
         if change_summary:
             metadata["last_change_summary"] = change_summary
-        embedding_text = "\n".join([
-            f"Observation type: {observation_type}",
-            f"Summary text: {summary}",
-        ])
+        topic = self._topic_key(topic_key)
+        embedding_text = self.build_observation_embedding_text(
+            summary=summary,
+            topic=topic,
+            observation_type=observation_type,
+        )
         return {
             "observation_type": observation_type,
             "summary": summary,
@@ -4045,6 +4082,7 @@ class MemoryNodeManager:
                 record = self._observation_record_from_sources(
                     observation_type=str(existing["observation_type"]),
                     summary=summary,
+                    topic_key=str(evidence_bundle.get("topic_key") or "general"),
                     source_facts=combined_facts,
                     confidence=(
                         generated["confidence"]
@@ -4131,6 +4169,7 @@ class MemoryNodeManager:
                 record = self._observation_record_from_sources(
                     observation_type=str(candidate["observation_type"]),
                     summary=summary,
+                    topic_key=str(evidence_bundle.get("topic_key") or "general"),
                     source_facts=candidate_facts,
                     confidence=(
                         generated["confidence"]
@@ -8005,6 +8044,7 @@ class MemoryNodeManager:
                 topics = [primary_topic]
                 primary_entity = fact.get("primary_entity")
                 primary_entity_id: Optional[int] = None
+                primary_entity_name = ""
                 if isinstance(primary_entity, dict):
                     primary_entity_name = str(primary_entity.get("name") or "").strip()
                     primary_entity_type = (
@@ -8056,8 +8096,13 @@ class MemoryNodeManager:
                     }
                 )
                 # ── Step 2: Generate embedding (SYNC) ──
+                fact_embedding_text = self.build_fact_embedding_text(
+                    summary=summary,
+                    primary_entity=primary_entity_name,
+                    primary_topic=primary_topic,
+                )
                 embedding_started_at = time.monotonic()
-                embedding = self._embedding_client.embed_text(summary)
+                embedding = self._embedding_client.embed_text(fact_embedding_text)
                 embedding_elapsed_ms += time.monotonic() - embedding_started_at
                 if embedding is None:
                     skipped_embedding_failure_count += 1

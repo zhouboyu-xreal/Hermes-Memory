@@ -2441,7 +2441,7 @@ def _add_memory_node(
     task_event_subject="",
     task_relevance="",
 ):
-    return db.memory_add_fact(
+    return db.add_memory_fact(
         time_key=time_key,
         summary=summary,
         keywords=keywords,
